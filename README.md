@@ -107,18 +107,76 @@ directory). `-e NAME=VALUE` sets a variable, `-e NAME` forwards a local one, and
 `--env-file` loads literal `NAME=VALUE` lines. Otherwise, commands inherit the
 environment of the agent (or, on the daemon's system, of the daemon).
 
+The `remotePrologue` configuration parameter (or the `--remote-prologue` flag of
+`mutagen sync create`) names a POSIX shell script that the executing endpoint
+sources before each command, such as one that activates a conda environment.
+Since paths usually differ between systems, it can also be specified per
+endpoint (under `configurationAlpha` or `configurationBeta`, or with
+`--remote-prologue-alpha` and `--remote-prologue-beta`). Absolute and `~` paths
+are interpreted on the executing endpoint's system (so quote `~` in flags to
+prevent your shell from expanding it locally), while other paths are resolved
+against its synchronization root:
+
+```yaml
+sync:
+  code:
+    alpha: "."
+    beta: "server:~/project"
+    remote: beta
+    configurationBeta:
+      remotePrologue: "~/.config/remote-prologue.sh"
+```
+
+```sh
+# ~/.config/remote-prologue.sh on server (sourced by /bin/sh)
+eval "$("$HOME/miniconda3/bin/conda" shell.posix hook)"
+conda activate "${CONDA_ENV:-base}"
+```
+
+The prologue applies to commands submitted from inside the session root,
+including those using `--cwd`, unless `--no-prologue` is specified; commands
+submitted from outside the root with `--session` don't use it. It sees variables
+set with `-e` and `--env-file`, and the command is located (using the `PATH` it
+sets) only after it has been sourced, so `remote -e CONDA_ENV=test pytest` works
+even if `pytest` exists only in that environment. If the prologue fails or exits
+the shell, then the command isn't run and `remote` exits with status 126.
+Prologues aren't supported on Windows endpoints.
+
 Options must precede the command, and arguments are passed without shell
 interpretation, so shell syntax requires an explicit shell. Standard streams and
 the exit status are preserved (255 indicates that the command couldn't be
 routed), but no pseudo-terminal is allocated. Commands can only be routed while the
 session is connected, and the daemon connects command channels in the
-background, so SSH authentication must work non-interactively. Commands see the
-files currently present on the executing endpoint; run `mutagen sync flush`
-first when needed.
+background, so SSH authentication must work non-interactively.
+
+`remote` flushes the session (as `mutagen sync flush` does) before the command,
+so that it sees local changes, and after it, so that its changes are present
+locally when `remote` exits. This works from either endpoint, since the daemon
+performs the flush. If flushing fails, then `remote` prints a warning and
+continues with the command's exit status; `--no-flush` skips both flushes, and
+`remote --flush` only flushes. `--timeout` includes the time spent flushing.
+
+After each flush, `remote` also warns about content that the session couldn't
+synchronize: conflicts (paths modified on both endpoints, which aren't
+synchronized until one copy is deleted) and problems such as permission errors.
+`remote --diff` shows how the remote copies of conflicting files, or of the
+specified paths, differ from the local copies as a unified diff, and exits with
+status 1 if any differ. Single-file sessions are supported: use `--session`
+from outside the file root. When one endpoint has replaced a directory with a
+file, its former children are compared as missing entries. Large conflict
+reports may omit change details; warnings give the omitted counts, and explicit
+paths can still be compared with `remote --diff <path>`. `--timeout` also bounds
+reading and hashing files during comparison.
 
 Any process running as your user on a submitting endpoint's system can run
 commands on the executing endpoint, so only enable remote commands toward
 endpoints whose systems you trust as much as the executing endpoint itself.
+
+The [`skills/mutagen-remote`](skills/mutagen-remote/SKILL.md) agent skill
+teaches coding agents to use `remote`, covering synchronization, quoting,
+prologues, exit statuses, and long-running jobs. For Claude
+Code, copy or link that directory into `~/.claude/skills/` on each system where
+agents submit commands.
 
 
 ## Community

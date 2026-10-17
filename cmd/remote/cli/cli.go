@@ -32,20 +32,50 @@ const (
 	timeoutExitCode = 124
 )
 
-// usage is the usage summary printed before the option list.
+// usage is the usage summary printed before the option list. It's written to
+// be sufficient on its own for people and agents unfamiliar with remote.
 const usage = `Usage: remote [options] <command> [<args>...]
+       remote --flush [options]
+       remote --diff [options] [<path>...]
 
 Run a command on the opposite endpoint of the Mutagen synchronization session
-whose root contains the current directory. Commands run in the corresponding
-directory on the opposite endpoint. Sessions must be connected and have remote
-commands enabled with the remote configuration parameter (or the --remote flag
-of mutagen sync create).
+whose root contains the current directory, in the corresponding directory
+there. Standard input, output, error, and the exit status are forwarded.
 
-Arguments are passed without shell interpretation, so shell syntax requires an
-explicit shell. Options must precede the command. Standard streams and the exit
-status are forwarded, but no pseudo-terminal is allocated. Exit status 255
-indicates that the command couldn't be routed, while 126 and 127 indicate that
-it couldn't be started.
+Examples:
+  remote pytest -x tests/
+  remote sh -c 'make && ./bin/app'      (shell syntax needs an explicit shell)
+  remote -e CONDA_ENV=torch python train.py
+  remote --timeout 10m make bench
+  remote --flush                        (only synchronize)
+  remote --diff                         (show how conflicting files differ)
+
+Notes:
+  - No remote shell interprets the arguments, and your local shell expands
+    variables, globs, and ~ before remote sees them. Use sh -c '...' for
+    anything that should be expanded remotely.
+  - Options must precede the command.
+  - The session is synchronized before the command, so that it sees local
+    changes, and after it, so that its changes are present locally when remote
+    exits. Failure to synchronize only produces a warning, as do conflicts
+    (files modified on both endpoints, which stay unsynchronized until one
+    copy is deleted) and other content that couldn't be synchronized.
+  - remote --diff shows how the remote copies of the given paths, or of the
+    conflicting files, differ from the local copies, as a unified diff
+    (- local, + remote). For a single-file session, use --session from outside
+    its root. Large conflict reports may omit changes and say how many;
+    specify paths to compare omitted files. --timeout also covers file reads.
+  - No terminal is allocated, so interactive programs don't work.
+  - If the opposite endpoint has a remote prologue, then /bin/sh sources it
+    before each command submitted from inside the root (even with --cwd).
+
+Exit status is the command's own, or:
+  255  not routed (no connected session with remote commands, or ambiguous),
+       or remote --flush failed to synchronize
+  127  command not found
+  126  command couldn't be started, or the prologue failed
+  124  --timeout expired before the command finished
+With --diff, it's 0 if the copies are identical and 1 if they differ.
 
 Options:
 `
@@ -92,16 +122,17 @@ func parse(arguments []string) (*options, error) {
 	flags.SetOutput(io.Discard)
 	flags.SetInterspersed(false)
 	flags.SortFlags = false
-	flags.StringVarP(&result.session, "session", "s", os.Getenv("MUTAGEN_REMOTE_SESSION"), "Select a session by name or identifier (default $MUTAGEN_REMOTE_SESSION)")
-	flags.StringVarP(&result.directory, "cwd", "C", "", "Override the working directory on the opposite endpoint")
-	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set NAME=VALUE, or forward a local variable by NAME (repeatable)")
-	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read literal NAME=VALUE entries from a file (repeatable)")
-	flags.DurationVar(&result.timeout, "timeout", 0, "Cancel the command after this duration")
+	// Names in backquotes are used as value placeholders in usage information.
+	flags.StringVarP(&result.session, "session", "s", "", "Use the session with this `NAME` or identifier, which also allows running outside its root (default $MUTAGEN_REMOTE_SESSION)")
+	flags.StringVarP(&result.directory, "cwd", "C", "", "Run in `DIR`: absolute and ~ paths are on the opposite endpoint, others are relative to the corresponding directory")
+	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set `NAME[=VALUE]`, where a bare NAME forwards the local value (repeatable)")
+	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read literal NAME=VALUE lines from `FILE` (repeatable)")
+	flags.DurationVar(&result.timeout, "timeout", 0, "Exit after `DURATION`, such as 30s or 10m, killing the command if it's running")
 	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the opposite endpoint's remote prologue")
 	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize the session before and after the command")
 	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
 	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
-	flags.BoolVarP(&result.help, "help", "h", false, "Show help information")
+	flags.BoolVarP(&result.help, "help", "h", false, "Show this help")
 	flags.BoolVar(&result.version, "version", false, "Show version information")
 	if err := flags.Parse(arguments); err != nil {
 		if err == pflag.ErrHelp {
@@ -112,6 +143,9 @@ func parse(arguments []string) (*options, error) {
 	}
 	result.arguments = flags.Args()
 	result.flags = flags
+	if !flags.Changed("session") {
+		result.session = os.Getenv("MUTAGEN_REMOTE_SESSION")
+	}
 	if result.timeout < 0 {
 		return nil, errors.New("timeout must not be negative")
 	} else if result.flush && result.noFlush {
@@ -137,7 +171,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(fmt.Errorf("%w (see remote --help)", err))
 	} else if options.help {
-		fmt.Fprint(stdout, usage, options.flags.FlagUsages())
+		fmt.Fprint(stdout, usage, options.flags.FlagUsagesWrapped(80))
 		return 0
 	} else if options.version {
 		fmt.Fprintln(stdout, mutagen.Version)
