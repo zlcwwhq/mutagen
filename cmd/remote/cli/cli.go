@@ -65,6 +65,12 @@ type options struct {
 	// noPrologue indicates that the opposite endpoint's prologue should not be
 	// sourced.
 	noPrologue bool
+	// flush indicates that synchronization was explicitly requested, which
+	// allows omitting the command.
+	flush bool
+	// noFlush indicates that the session should not be synchronized before
+	// and after the command.
+	noFlush bool
 	// help indicates that usage information was requested.
 	help bool
 	// version indicates that version information was requested.
@@ -89,6 +95,8 @@ func parse(arguments []string) (*options, error) {
 	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read literal NAME=VALUE entries from a file (repeatable)")
 	flags.DurationVar(&result.timeout, "timeout", 0, "Cancel the command after this duration")
 	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the opposite endpoint's remote prologue")
+	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize the session before and after the command")
+	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
 	flags.BoolVarP(&result.help, "help", "h", false, "Show help information")
 	flags.BoolVar(&result.version, "version", false, "Show version information")
 	if err := flags.Parse(arguments); err != nil {
@@ -102,7 +110,9 @@ func parse(arguments []string) (*options, error) {
 	result.flags = flags
 	if result.timeout < 0 {
 		return nil, errors.New("timeout must not be negative")
-	} else if !result.help && !result.version && len(result.arguments) == 0 {
+	} else if result.flush && result.noFlush {
+		return nil, errors.New("--flush and --no-flush are mutually exclusive")
+	} else if !result.help && !result.version && !result.flush && len(result.arguments) == 0 {
 		return nil, errors.New("no command specified")
 	}
 	return result, nil
@@ -128,20 +138,23 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	// Prepare the request. The working directory path, and whether the
+	// Prepare the request, if any. The working directory path, and whether the
 	// prologue applies, are determined by the session root once the route is
 	// located.
-	environment, err := loadEnvironment(options.environmentFiles, options.environment)
-	if err != nil {
-		return fail(err)
-	}
-	request := &remote.Request{
-		Arguments:   options.arguments,
-		Environment: environment,
-		Directory:   options.directory,
-	}
-	if err := request.EnsureValid(); err != nil {
-		return fail(err)
+	var request *remote.Request
+	if len(options.arguments) > 0 {
+		environment, err := loadEnvironment(options.environmentFiles, options.environment)
+		if err != nil {
+			return fail(err)
+		}
+		request = &remote.Request{
+			Arguments:   options.arguments,
+			Environment: environment,
+			Directory:   options.directory,
+		}
+		if err := request.EnsureValid(); err != nil {
+			return fail(err)
+		}
 	}
 
 	// Terminate the command on timeout or termination signals.
@@ -168,7 +181,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		case <-ctx.Done():
 		}
 	}()
-	interrupted := func() (int, bool) {
+	interrupted := func(activity string) (int, bool) {
 		if ctx.Err() == nil {
 			return 0, false
 		}
@@ -177,19 +190,51 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if number, ok := received.(syscall.Signal); ok {
 			return 128 + int(number), true
 		} else if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			fmt.Fprintln(stderr, "remote: command timed out after", options.timeout)
+			fmt.Fprintf(stderr, "remote: timed out after %v while %s\n", options.timeout, activity)
 			return timeoutExitCode, true
 		}
 		return failureExitCode, true
 	}
+	warn := func(format string, arguments ...any) {
+		fmt.Fprintf(stderr, "remote: warning: "+format+"\n", arguments...)
+	}
 
-	// Locate the route and run the command.
+	// Determine the working directory, which locates the session.
 	directory, err := os.Getwd()
 	if err != nil {
 		return fail(fmt.Errorf("unable to determine working directory: %w", err))
 	}
-	connection, target, err := remote.Dial(ctx, directory, options.session)
-	if interruptedCode, ok := interrupted(); ok {
+
+	// synchronize forces a synchronization cycle for the session, reporting
+	// whether the session was located.
+	synchronize := func() (bool, error) {
+		connection, _, err := remote.Dial(ctx, directory, options.session, remote.OperationFlush)
+		if err != nil {
+			return false, err
+		}
+		return true, remote.Flush(ctx, connection)
+	}
+
+	// Synchronize local changes before the command. Failure to locate the
+	// session is fatal, since it would also prevent running the command, but
+	// failure to synchronize isn't, since the command may still be useful.
+	if !options.noFlush {
+		located, err := synchronize()
+		if interruptedCode, ok := interrupted("synchronizing"); ok {
+			return interruptedCode
+		} else if err != nil && (!located || request == nil) {
+			return fail(err)
+		} else if err != nil {
+			warn("unable to synchronize before the command, which may see outdated files: %v", err)
+		}
+	}
+	if request == nil {
+		return 0
+	}
+
+	// Locate the route and run the command.
+	connection, target, err := remote.Dial(ctx, directory, options.session, remote.OperationExecute)
+	if interruptedCode, ok := interrupted("running the command"); ok {
 		return interruptedCode
 	} else if err != nil {
 		return fail(err)
@@ -197,7 +242,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	request.Path = target.Path
 	request.Prologue = target.Contained && !options.noPrologue
 	code, err := remote.Execute(ctx, connection, request, stdin, stdout, stderr)
-	if interruptedCode, ok := interrupted(); ok {
+	if interruptedCode, ok := interrupted("running the command"); ok {
 		return interruptedCode
 	} else if err != nil {
 		// Startup failures such as missing commands report conventional exit
@@ -207,6 +252,20 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return code
 		}
 		return failureExitCode
+	}
+
+	// Synchronize the command's changes back. Once the command has finished,
+	// its exit status takes precedence over failure to do so (including
+	// timeouts), but not over signals.
+	if !options.noFlush {
+		if _, err := synchronize(); err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				err = fmt.Errorf("timed out after %v", options.timeout)
+			} else if interruptedCode, ok := interrupted("synchronizing"); ok {
+				return interruptedCode
+			}
+			warn("unable to synchronize after the command, whose changes may not be present locally yet: %v", err)
+		}
 	}
 	return code
 }

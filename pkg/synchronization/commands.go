@@ -2,6 +2,7 @@ package synchronization
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -32,12 +33,19 @@ type CommandProtocolHandler interface {
 	) (remote.Channel, error)
 }
 
+// errFlushTerminated indicates that synchronization stopped before a flush
+// requested by a submission completed.
+var errFlushTerminated = errors.New("synchronization stopped before the flush completed")
+
 // commandRelay routes commands submitted on each endpoint's system to the
 // opposite endpoint. Routes always pass through the daemon, so neither endpoint
-// needs connectivity to the other, regardless of where the daemon runs.
+// needs connectivity to the other, regardless of where the daemon runs. It also
+// performs flushes requested by submissions.
 type commandRelay struct {
 	// logger is the relay logger.
 	logger *logging.Logger
+	// flushRequests is the synchronization loop's flush request channel.
+	flushRequests chan chan error
 	// channelsLock guards channels.
 	channelsLock sync.Mutex
 	// channels holds the connected alpha and beta channels (or nil).
@@ -67,10 +75,15 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		return func() {}
 	}
 
+	// The relay submits flush requests directly to the synchronization loop
+	// rather than using flush, whose lifecycle lock may be held by an operation
+	// waiting for the relay to stop. The request channel is fixed while the
+	// synchronization loop runs.
+	relay := &commandRelay{logger: c.logger.Sublogger("commands"), flushRequests: c.flushRequests}
+
 	// Each endpoint submits commands if and only if its opposite executes.
 	// Prologues are endpoint-specific, since they're interpreted on the
 	// executing endpoint's system.
-	relay := &commandRelay{logger: c.logger.Sublogger("commands")}
 	prologues := [2]string{
 		c.mergedAlphaConfiguration.RemotePrologue,
 		c.mergedBetaConfiguration.RemotePrologue,
@@ -162,8 +175,18 @@ func (r *commandRelay) accept(ctx context.Context, index int, channel remote.Cha
 	}
 }
 
-// route connects a submission to the executor of the specified endpoint.
+// route handles a submission by performing a flush or by connecting it to the
+// executor of the specified endpoint.
 func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser, target int) {
+	operation, err := remote.ReceiveSubmission(ctx, submission)
+	if err != nil {
+		remote.Reject(submission, err)
+		return
+	} else if operation == remote.OperationFlush {
+		r.logger.Debug("Forcing synchronization cycle for submission")
+		remote.Respond(submission, r.flush(ctx))
+		return
+	}
 	r.channelsLock.Lock()
 	channel := r.channels[target]
 	r.channelsLock.Unlock()
@@ -179,4 +202,21 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		return
 	}
 	remote.Splice(submission, execution)
+}
+
+// flush forces a synchronization cycle and waits for it to complete, failing if
+// the context (and thus synchronization) is cancelled first.
+func (r *commandRelay) flush(ctx context.Context) error {
+	request := make(chan error, 1)
+	select {
+	case r.flushRequests <- request:
+	case <-ctx.Done():
+		return errFlushTerminated
+	}
+	select {
+	case err := <-request:
+		return err
+	case <-ctx.Done():
+		return errFlushTerminated
+	}
 }

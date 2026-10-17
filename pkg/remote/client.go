@@ -124,6 +124,24 @@ func Execute(ctx context.Context, connection io.ReadWriteCloser, request *Reques
 	return response.ExitCode, nil
 }
 
+// Flush waits for the synchronization cycle requested by a flush submission (see
+// Dial) to complete. It owns and closes the connection. Cancellation abandons
+// the wait, but not the synchronization cycle.
+func Flush(ctx context.Context, connection io.ReadWriteCloser) error {
+	defer connection.Close()
+	stop := context.AfterFunc(ctx, func() { connection.Close() })
+	var response status
+	err := readMessage(connection, &response)
+	if !stop() {
+		return ctx.Err()
+	} else if err != nil {
+		return fmt.Errorf("unable to receive synchronization status: %w", err)
+	} else if response.Error != "" {
+		return errors.New(response.Error)
+	}
+	return nil
+}
+
 // inputReader distinguishes failed source reads from normal remote input closure.
 type inputReader struct {
 	io.Reader

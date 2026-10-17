@@ -26,7 +26,7 @@ func runRemoteCommand(directory string, arguments ...string) (string, int, error
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		connection, target, err := remote.Dial(ctx, directory, "")
+		connection, target, err := remote.Dial(ctx, directory, "", remote.OperationExecute)
 		var output bytes.Buffer
 		var code int
 		if err == nil {
@@ -36,6 +36,25 @@ func runRemoteCommand(directory string, arguments ...string) (string, int, error
 		cancel()
 		if err == nil || time.Now().After(deadline) {
 			return strings.TrimSpace(output.String()), code, err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// flushRemote forces a synchronization cycle through the session containing
+// the specified directory, as the remote executable does around commands,
+// retrying while command channels are still connecting.
+func flushRemote(directory string) error {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		connection, _, err := remote.Dial(ctx, directory, "", remote.OperationFlush)
+		if err == nil {
+			err = remote.Flush(ctx, connection)
+		}
+		cancel()
+		if err == nil || time.Now().After(deadline) {
+			return err
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -72,13 +91,15 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 	}
 
 	// Create a session with an in-memory beta (which uses an agent-style
-	// executor) and remote commands enabled in both directions.
+	// executor) and remote commands enabled in both directions. Watching is
+	// disabled, so that only flushes trigger synchronization.
 	ctx := context.Background()
 	sessionID, err := synchronizationManager.Create(
 		ctx,
 		&url.URL{Path: alphaRoot},
 		&url.URL{Protocol: netpipe.Protocol_Netpipe, Path: betaRoot},
 		&synchronization.Configuration{
+			WatchMode:         synchronization.WatchMode_WatchModeNoWatch,
 			RemoteCommandMode: synchronization.RemoteCommandMode_RemoteCommandModeBoth,
 		},
 		&synchronization.Configuration{RemotePrologue: alphaPrologue},
@@ -92,8 +113,8 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 		t.Fatal("unable to create session:", err)
 	}
 	defer synchronizationManager.Terminate(ctx, &selection.Selection{Specifications: []string{sessionID}}, "")
-	if err := waitForSuccessfulSynchronizationCycle(ctx, sessionID, false, false, false); err != nil {
-		t.Fatal("unable to wait for synchronization:", err)
+	if err := flushRemote(alphaRoot); err != nil {
+		t.Fatal("unable to perform initial synchronization:", err)
 	}
 
 	// Commands submitted on either endpoint run in the corresponding directory
@@ -115,13 +136,29 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 		t.Fatalf("incorrect exit status: %d, %v", code, err)
 	}
 
+	// Flushes submitted from either endpoint synchronize changes in both
+	// directions before returning.
+	if err := os.WriteFile(filepath.Join(alphaRoot, "sub", "edited"), []byte("edited"), 0600); err != nil {
+		t.Fatal(err)
+	} else if err := flushRemote(alphaRoot); err != nil {
+		t.Fatal("unable to flush from alpha:", err)
+	} else if output, code, err := runRemoteCommand(filepath.Join(alphaRoot, "sub"), "cat", "edited"); err != nil || code != 0 || output != "edited" {
+		t.Fatalf("flushed change not visible on beta: %d, %q, %v", code, output, err)
+	} else if _, code, err := runRemoteCommand(filepath.Join(alphaRoot, "sub"), "sh", "-c", "printf produced > produced"); err != nil || code != 0 {
+		t.Fatalf("unable to produce file on beta: %d, %v", code, err)
+	} else if err := flushRemote(filepath.Join(betaRoot, "sub")); err != nil {
+		t.Fatal("unable to flush from beta:", err)
+	} else if data, err := os.ReadFile(filepath.Join(alphaRoot, "sub", "produced")); err != nil || string(data) != "produced" {
+		t.Fatalf("flushed change not present on alpha: %q, %v", data, err)
+	}
+
 	// Terminating the session removes its registrations.
 	if err := synchronizationManager.Terminate(ctx, &selection.Selection{Specifications: []string{sessionID}}, ""); err != nil {
 		t.Fatal("unable to terminate session:", err)
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if _, _, err := remote.Dial(dialCtx, alphaRoot, ""); err == nil {
+	if _, _, err := remote.Dial(dialCtx, alphaRoot, "", remote.OperationExecute); err == nil {
 		t.Fatal("registration remained after termination")
 	}
 }

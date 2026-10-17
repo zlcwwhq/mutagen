@@ -90,7 +90,7 @@ func TestDialSelection(t *testing.T) {
 	dial := func(directory, session string) (*Target, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		connection, target, err := Dial(ctx, directory, session)
+		connection, target, err := Dial(ctx, directory, session, OperationExecute)
 		if err == nil {
 			connection.Close()
 		}
@@ -267,6 +267,10 @@ func TestAgentChannel(t *testing.T) {
 		submission, err := channel.Accept()
 		if err != nil {
 			return
+		} else if operation, err := ReceiveSubmission(context.Background(), submission); err != nil || operation != OperationExecute {
+			t.Error("incorrect submission:", operation, err)
+			submission.Close()
+			return
 		}
 		execution, server := net.Pipe()
 		go Serve(context.Background(), server, opposite, "")
@@ -274,7 +278,7 @@ func TestAgentChannel(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	connection, target, err := Dial(ctx, filepath.Join(root, "sub"), "")
+	connection, target, err := Dial(ctx, filepath.Join(root, "sub"), "", OperationExecute)
 	if err != nil {
 		t.Fatal(err)
 	} else if directory := inspectDirectory(t, connection, target.Path); directory != filepath.Join(opposite, "sub") {
@@ -305,7 +309,7 @@ func TestAgentChannelWithoutExecution(t *testing.T) {
 	// Endpoints that don't submit commands don't register.
 	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, _, err := Dial(ctx, root, ""); err == nil {
+	if _, _, err := Dial(ctx, root, "", OperationExecute); err == nil {
 		t.Fatal("non-submitting endpoint registered")
 	}
 }
@@ -321,7 +325,7 @@ func TestAgentChannelInstallationFailure(t *testing.T) {
 	// Submission still works with a separately installed executable.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if connection, _, err := Dial(ctx, root, ""); err != nil {
+	if connection, _, err := Dial(ctx, root, "", OperationExecute); err != nil {
 		t.Fatal(err)
 	} else {
 		connection.Close()
@@ -577,6 +581,10 @@ func TestLocalChannel(t *testing.T) {
 		submission, err := channel.Accept()
 		if err != nil {
 			return
+		} else if operation, err := ReceiveSubmission(context.Background(), submission); err != nil || operation != OperationExecute {
+			t.Error("incorrect submission:", operation, err)
+			submission.Close()
+			return
 		}
 		execution, err := channel.Open(context.Background())
 		if err != nil {
@@ -587,7 +595,7 @@ func TestLocalChannel(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	connection, target, err := Dial(ctx, filepath.Join(root, "sub"), "")
+	connection, target, err := Dial(ctx, filepath.Join(root, "sub"), "", OperationExecute)
 	if err != nil {
 		t.Fatal(err)
 	} else if directory := inspectDirectory(t, connection, target.Path); directory != filepath.Join(root, "sub") {
@@ -603,5 +611,65 @@ func TestLocalChannel(t *testing.T) {
 		t.Fatal("accept succeeded after closure")
 	} else if _, err := channel.Open(context.Background()); err == nil {
 		t.Fatal("open succeeded after closure")
+	}
+}
+
+func TestFlush(t *testing.T) {
+	useTestRegistry(t)
+	root := t.TempDir()
+	channel, err := NewLocalChannel(nil, &Endpoint{Session: "sync_test", Root: root, Submit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { channel.Close() })
+
+	// Respond to flush submissions as the daemon would, with the specified
+	// results.
+	results := make(chan error)
+	go func() {
+		for {
+			submission, err := channel.Accept()
+			if err != nil {
+				return
+			} else if operation, err := ReceiveSubmission(context.Background(), submission); err != nil || operation != OperationFlush {
+				t.Error("incorrect submission:", operation, err)
+				submission.Close()
+				continue
+			}
+			Respond(submission, <-results)
+		}
+	}()
+	flush := func(ctx context.Context, result error) error {
+		connection, _, err := Dial(ctx, root, "", OperationFlush)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { results <- result }()
+		return Flush(ctx, connection)
+	}
+
+	// Completion and failure are reported.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := flush(ctx, nil); err != nil {
+		t.Fatal("flush failed:", err)
+	} else if err := flush(ctx, errors.New("synchronization stopped")); err == nil || err.Error() != "synchronization stopped" {
+		t.Fatal("flush failure not reported:", err)
+	}
+
+	// Cancellation abandons the wait.
+	ctx, cancel = context.WithCancel(context.Background())
+	connection, _, err := Dial(ctx, root, "", OperationFlush)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := Flush(ctx, connection); !errors.Is(err, context.Canceled) {
+		t.Fatal("cancellation not reported:", err)
+	}
+	select {
+	case results <- nil:
+	case <-time.After(5 * time.Second):
+		t.Fatal("abandoned flush not received")
 	}
 }

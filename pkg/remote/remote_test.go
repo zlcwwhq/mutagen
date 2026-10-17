@@ -452,6 +452,34 @@ func TestRouteRejection(t *testing.T) {
 	}
 }
 
+func TestReceiveSubmission(t *testing.T) {
+	receive := func(ctx context.Context, header *submission) (Operation, error) {
+		client, server := net.Pipe()
+		defer client.Close()
+		if header != nil {
+			go writeMessage(client, header)
+		}
+		return ReceiveSubmission(ctx, server)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, operation := range []Operation{OperationExecute, OperationFlush} {
+		if received, err := receive(ctx, &submission{Operation: operation}); err != nil || received != operation {
+			t.Fatalf("operation %d received incorrectly: %d, %v", operation, received, err)
+		}
+	}
+	if _, err := receive(ctx, &submission{Operation: OperationFlush + 1}); err == nil {
+		t.Fatal("unsupported operation accepted")
+	}
+
+	// Cancellation interrupts the wait for a header.
+	ctx, cancel = context.WithCancel(context.Background())
+	time.AfterFunc(10*time.Millisecond, cancel)
+	if _, err := receive(ctx, nil); !errors.Is(err, context.Canceled) {
+		t.Fatal("cancellation not reported:", err)
+	}
+}
+
 func TestMessageLimits(t *testing.T) {
 	var buffer bytes.Buffer
 	if err := writeMessage(&buffer, strings.Repeat("x", maximumMessageSize)); err == nil {
