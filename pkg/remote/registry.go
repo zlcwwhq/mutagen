@@ -195,6 +195,10 @@ type Target struct {
 	// Path is the slash-separated submission directory relative to Root. It is
 	// empty if the submission directory is the root or lies outside it.
 	Path string
+	// Contained indicates whether the submission directory lies inside Root,
+	// in which case Path identifies the corresponding directory on the
+	// opposite endpoint.
+	Contained bool
 }
 
 // candidate is a registration matching a submission.
@@ -354,11 +358,12 @@ func Dial(ctx context.Context, directory, session string) (net.Conn, *Target, er
 				return nil, nil, fmt.Errorf("unable to handshake with session %s: %w", describe(c.Session, c.Name), err)
 			}
 			return connection, &Target{
-				Session: c.Session,
-				Name:    c.Name,
-				Alpha:   c.Alpha,
-				Root:    c.Root,
-				Path:    c.path,
+				Session:   c.Session,
+				Name:      c.Name,
+				Alpha:     c.Alpha,
+				Root:      c.Root,
+				Path:      c.path,
+				Contained: c.contained,
 			}, nil
 		}
 		start = end

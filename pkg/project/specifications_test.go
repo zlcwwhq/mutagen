@@ -153,6 +153,24 @@ sync:
 		}
 	}
 
+	// Prologues can be specified for the session or for each endpoint, since
+	// they're interpreted on the executing endpoint's system.
+	specifications = testSpecifications(t, `
+sync:
+  example:
+    alpha: ./alpha
+    beta: ./beta
+    remote: true
+    remotePrologue: .remote-prologue
+    configurationBeta: {remotePrologue: ~/miniconda3/etc/profile.d/conda.sh}
+`)
+	if s := specifications.Synchronization[0]; s.Configuration.RemotePrologue != ".remote-prologue" ||
+		s.ConfigurationAlpha.RemotePrologue != "" ||
+		s.ConfigurationBeta.RemotePrologue != "~/miniconda3/etc/profile.d/conda.sh" {
+		t.Errorf("incorrect remote prologues: %q, %q, %q", s.Configuration.RemotePrologue,
+			s.ConfigurationAlpha.RemotePrologue, s.ConfigurationBeta.RemotePrologue)
+	}
+
 	// Unknown values are rejected when the file is loaded.
 	path := filepath.Join(t.TempDir(), DefaultConfigurationFileName)
 	contents := "sync:\n  example: {alpha: ./alpha, beta: ./beta, remote: both}\n"

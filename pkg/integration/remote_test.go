@@ -19,7 +19,9 @@ import (
 )
 
 // runRemoteCommand submits a command from the specified directory, retrying
-// while command channels are still connecting.
+// while command channels are still connecting. As with the remote executable,
+// the executing endpoint's prologue is requested when the directory lies inside
+// the submitting root.
 func runRemoteCommand(directory string, arguments ...string) (string, int, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
@@ -28,7 +30,7 @@ func runRemoteCommand(directory string, arguments ...string) (string, int, error
 		var output bytes.Buffer
 		var code int
 		if err == nil {
-			request := &remote.Request{Arguments: arguments, Path: target.Path}
+			request := &remote.Request{Arguments: arguments, Path: target.Path, Prologue: target.Contained}
 			code, err = remote.Execute(ctx, connection, request, strings.NewReader(""), &output, io.Discard)
 		}
 		cancel()
@@ -59,6 +61,16 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Create endpoint-specific prologues: beta's is synchronized from alpha and
+	// specified relative to its root, while alpha's lies outside its root.
+	if err := os.WriteFile(filepath.Join(alphaRoot, "prologue.sh"), []byte("export REMOTE_PROLOGUE=beta\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	alphaPrologue := filepath.Join(directory, "alpha-prologue.sh")
+	if err := os.WriteFile(alphaPrologue, []byte("export REMOTE_PROLOGUE=alpha\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
 	// Create a session with an in-memory beta (which uses an agent-style
 	// executor) and remote commands enabled in both directions.
 	ctx := context.Background()
@@ -69,8 +81,8 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 		&synchronization.Configuration{
 			RemoteCommandMode: synchronization.RemoteCommandMode_RemoteCommandModeBoth,
 		},
-		&synchronization.Configuration{},
-		&synchronization.Configuration{},
+		&synchronization.Configuration{RemotePrologue: alphaPrologue},
+		&synchronization.Configuration{RemotePrologue: "prologue.sh"},
 		"remoteCommands",
 		nil,
 		false,
@@ -85,16 +97,16 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 	}
 
 	// Commands submitted on either endpoint run in the corresponding directory
-	// of the opposite endpoint.
-	for _, test := range []struct{ from, to string }{
-		{filepath.Join(alphaRoot, "sub"), filepath.Join(betaRoot, "sub")},
-		{filepath.Join(betaRoot, "sub"), filepath.Join(alphaRoot, "sub")},
+	// of the opposite endpoint, after sourcing that endpoint's prologue.
+	for _, test := range []struct{ from, to, prologue string }{
+		{filepath.Join(alphaRoot, "sub"), filepath.Join(betaRoot, "sub"), "beta"},
+		{filepath.Join(betaRoot, "sub"), filepath.Join(alphaRoot, "sub"), "alpha"},
 	} {
-		output, code, err := runRemoteCommand(test.from, "sh", "-c", "pwd -P")
+		output, code, err := runRemoteCommand(test.from, "sh", "-c", `pwd -P; printf %s "$REMOTE_PROLOGUE"`)
 		if err != nil || code != 0 {
 			t.Fatalf("command from %s failed: %d, %v", test.from, code, err)
-		} else if output != test.to {
-			t.Fatalf("command from %s ran in %s instead of %s", test.from, output, test.to)
+		} else if expected := test.to + "\n" + test.prologue; output != expected {
+			t.Fatalf("command from %s produced %q instead of %q", test.from, output, expected)
 		}
 	}
 

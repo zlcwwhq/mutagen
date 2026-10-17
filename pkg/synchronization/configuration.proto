@@ -153,6 +153,14 @@ message Configuration {
     // from the opposite endpoint via the remote executable.
     RemoteCommandMode remoteCommandMode = 91;
 
-    // Fields 92-100 are reserved for future remote command configuration
+    // RemotePrologue specifies the path of a POSIX shell script that an
+    // executing endpoint sources before running each command submitted from
+    // within the opposite endpoint's synchronization root. Absolute and
+    // home-relative paths are interpreted on the executing endpoint's system,
+    // while other paths are resolved against its synchronization root. An empty
+    // value specifies that no prologue should be used.
+    string remotePrologue = 92;
+
+    // Fields 93-100 are reserved for future remote command configuration
     // parameters.
 }

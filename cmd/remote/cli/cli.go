@@ -62,6 +62,9 @@ type options struct {
 	environmentFiles []string
 	// timeout is the command timeout, or zero for none.
 	timeout time.Duration
+	// noPrologue indicates that the opposite endpoint's prologue should not be
+	// sourced.
+	noPrologue bool
 	// help indicates that usage information was requested.
 	help bool
 	// version indicates that version information was requested.
@@ -85,6 +88,7 @@ func parse(arguments []string) (*options, error) {
 	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set NAME=VALUE, or forward a local variable by NAME (repeatable)")
 	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read literal NAME=VALUE entries from a file (repeatable)")
 	flags.DurationVar(&result.timeout, "timeout", 0, "Cancel the command after this duration")
+	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the opposite endpoint's remote prologue")
 	flags.BoolVarP(&result.help, "help", "h", false, "Show help information")
 	flags.BoolVar(&result.version, "version", false, "Show version information")
 	if err := flags.Parse(arguments); err != nil {
@@ -124,8 +128,9 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	// Prepare the request. The working directory path is determined by the
-	// session root once the route is located.
+	// Prepare the request. The working directory path, and whether the
+	// prologue applies, are determined by the session root once the route is
+	// located.
 	environment, err := loadEnvironment(options.environmentFiles, options.environment)
 	if err != nil {
 		return fail(err)
@@ -190,6 +195,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return fail(err)
 	}
 	request.Path = target.Path
+	request.Prologue = target.Contained && !options.noPrologue
 	code, err := remote.Execute(ctx, connection, request, stdin, stdout, stderr)
 	if interruptedCode, ok := interrupted(); ok {
 		return interruptedCode

@@ -15,10 +15,11 @@ import (
 )
 
 // Serve executes one command received over a routed connection, resolving its
-// working directory against the specified normalized synchronization root. It
-// owns and closes the connection and cancels the command if the client
-// disconnects.
-func Serve(ctx context.Context, connection io.ReadWriteCloser, root string) error {
+// working directory against the specified normalized synchronization root and
+// sourcing the specified resolved prologue (if non-empty) first if the command
+// requests it. It owns and closes the connection and cancels the command if the
+// client disconnects.
+func Serve(ctx context.Context, connection io.ReadWriteCloser, root, prologue string) error {
 	// Report that the route has reached an executing endpoint.
 	if err := writeMessage(connection, &status{}); err != nil {
 		connection.Close()
@@ -53,7 +54,7 @@ func Serve(ctx context.Context, connection io.ReadWriteCloser, root string) erro
 	if err := readMessage(control, &request); err != nil {
 		return fmt.Errorf("unable to receive command: %w", err)
 	}
-	response := run(ctx, root, &request, input, output, errorOutput)
+	response := run(ctx, root, prologue, &request, input, output, errorOutput)
 	input.Close()
 	output.CloseWrite()
 	errorOutput.CloseWrite()
@@ -79,7 +80,7 @@ func workingDirectory(root string, request *Request) (string, error) {
 }
 
 // run prepares and executes a command without interpreting its arguments.
-func run(ctx context.Context, root string, request *Request, stdin io.Reader, stdout, stderr io.Writer) result {
+func run(ctx context.Context, root, prologue string, request *Request, stdin io.Reader, stdout, stderr io.Writer) result {
 	if err := request.EnsureValid(); err != nil {
 		return result{Error: err.Error()}
 	}
@@ -95,12 +96,20 @@ func run(ctx context.Context, root string, request *Request, stdin io.Reader, st
 	} else if !info.IsDir() {
 		return result{ExitCode: 126, Error: fmt.Sprintf("working directory is not a directory: %s", directory)}
 	}
-	path, err := lookPath(request.Arguments[0], directory, append(os.Environ(), request.Environment...))
-	if err != nil {
+	// A prologue may change PATH, so the prologue's shell locates the command
+	// once the prologue has been sourced.
+	arguments := request.Arguments
+	var path string
+	if request.Prologue && prologue != "" {
+		if arguments, err = prologueArguments(prologue, arguments); err != nil {
+			return result{ExitCode: 126, Error: err.Error()}
+		}
+		path = arguments[0]
+	} else if path, err = lookPath(arguments[0], directory, append(os.Environ(), request.Environment...)); err != nil {
 		return result{ExitCode: 127, Error: fmt.Sprintf("unable to find command: %v", err)}
 	}
-	command := exec.CommandContext(ctx, path, request.Arguments[1:]...)
-	command.Args[0] = request.Arguments[0]
+	command := exec.CommandContext(ctx, path, arguments[1:]...)
+	command.Args[0] = arguments[0]
 	command.Dir = directory
 	command.Env = append(command.Environ(), request.Environment...)
 	configureProcess(command)
