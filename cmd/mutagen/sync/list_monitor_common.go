@@ -410,6 +410,14 @@ func printSession(state *synchronization.State, mode common.SessionDisplayMode) 
 			permissionsModeDescription += fmt.Sprintf(" (%s)", defaultPermissionsMode.Description())
 		}
 		fmt.Println("\tPermissions mode:", permissionsModeDescription)
+
+		// Compute and print the remote command mode.
+		remoteCommandModeDescription := configuration.RemoteCommandMode.Description()
+		if configuration.RemoteCommandMode.IsDefault() {
+			defaultRemoteCommandMode := state.Session.Version.DefaultRemoteCommandMode()
+			remoteCommandModeDescription += fmt.Sprintf(" (%s)", defaultRemoteCommandMode.Description())
+		}
+		fmt.Println("\tRemote commands:", remoteCommandModeDescription)
 	}
 
 	// Compute and print alpha-specific configuration.

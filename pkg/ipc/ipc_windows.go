@@ -12,6 +12,10 @@ import (
 	"github.com/Microsoft/go-winio"
 )
 
+// pipeBufferSize is the size of the input and output buffers allocated for
+// named pipes.
+const pipeBufferSize = 64 * 1024
+
 // DialContext attempts to establish an IPC connection, timing out if the
 // provided context expires.
 func DialContext(ctx context.Context, path string) (net.Conn, error) {
@@ -75,9 +79,14 @@ func NewListener(path string) (net.Listener, error) {
 	//  SIDs: https://msdn.microsoft.com/en-us/library/windows/desktop/aa379602(v=vs.85).aspx
 	securityDescriptor := fmt.Sprintf("D:P(A;;GA;;;%s)", sid)
 
-	// Create the pipe configuration.
+	// Create the pipe configuration. We allocate buffers to match the semantics
+	// of UNIX domain sockets, where small writes complete without waiting for
+	// the peer to read them. Without buffers, a write blocks until the peer
+	// reads it, so peers that both write before reading would deadlock.
 	configuration := &winio.PipeConfig{
 		SecurityDescriptor: securityDescriptor,
+		InputBufferSize:    pipeBufferSize,
+		OutputBufferSize:   pipeBufferSize,
 	}
 
 	// Attempt to create (and open) the endpoint path where we will record the

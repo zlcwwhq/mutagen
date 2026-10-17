@@ -203,6 +203,17 @@ func (c *Configuration) EnsureValid(endpointSpecific bool) error {
 		}
 	}
 
+	// Verify that the remote command mode is unspecified or supported.
+	if endpointSpecific {
+		if !c.RemoteCommandMode.IsDefault() {
+			return errors.New("remote command mode cannot be specified on an endpoint-specific basis")
+		}
+	} else {
+		if !(c.RemoteCommandMode.IsDefault() || c.RemoteCommandMode.Supported()) {
+			return errors.New("unknown or unsupported remote command mode")
+		}
+	}
+
 	// Success.
 	return nil
 }
@@ -235,7 +246,8 @@ func (c *Configuration) Equal(other *Configuration) bool {
 		c.DefaultDirectoryMode == other.DefaultDirectoryMode &&
 		c.DefaultOwner == other.DefaultOwner &&
 		c.DefaultGroup == other.DefaultGroup &&
-		c.CompressionAlgorithm == other.CompressionAlgorithm
+		c.CompressionAlgorithm == other.CompressionAlgorithm &&
+		c.RemoteCommandMode == other.RemoteCommandMode
 }
 
 // MergeConfigurations merges two configurations of differing priorities. Both
@@ -378,6 +390,13 @@ func MergeConfigurations(lower, higher *Configuration) *Configuration {
 		result.CompressionAlgorithm = higher.CompressionAlgorithm
 	} else {
 		result.CompressionAlgorithm = lower.CompressionAlgorithm
+	}
+
+	// Merge the remote command mode.
+	if !higher.RemoteCommandMode.IsDefault() {
+		result.RemoteCommandMode = higher.RemoteCommandMode
+	} else {
+		result.RemoteCommandMode = lower.RemoteCommandMode
 	}
 
 	// Done.

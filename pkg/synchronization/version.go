@@ -235,3 +235,14 @@ func (v Version) DefaultCompressionAlgorithm() compression.Algorithm {
 		panic("unknown or unsupported session version")
 	}
 }
+
+// DefaultRemoteCommandMode returns the default remote command mode for the
+// session version.
+func (v Version) DefaultRemoteCommandMode() RemoteCommandMode {
+	switch v {
+	case Version_Version1:
+		return RemoteCommandMode_RemoteCommandModeDisabled
+	default:
+		panic("unknown or unsupported session version")
+	}
+}

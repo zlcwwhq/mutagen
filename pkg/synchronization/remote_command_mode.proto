@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package synchronization;
+
+option go_package = "github.com/mutagen-io/mutagen/pkg/synchronization";
+
+// RemoteCommandMode specifies which endpoints execute commands submitted from
+// the opposite endpoint via the remote executable.
+enum RemoteCommandMode {
+    // RemoteCommandMode_RemoteCommandModeDefault represents an unspecified
+    // remote command mode. It should be converted to one of the following
+    // values based on the desired default behavior.
+    RemoteCommandModeDefault = 0;
+    // RemoteCommandMode_RemoteCommandModeDisabled specifies that neither
+    // endpoint executes commands.
+    RemoteCommandModeDisabled = 1;
+    // RemoteCommandMode_RemoteCommandModeAlpha specifies that alpha executes
+    // commands submitted from beta.
+    RemoteCommandModeAlpha = 2;
+    // RemoteCommandMode_RemoteCommandModeBeta specifies that beta executes
+    // commands submitted from alpha.
+    RemoteCommandModeBeta = 3;
+    // RemoteCommandMode_RemoteCommandModeBoth specifies that each endpoint
+    // executes commands submitted from the other.
+    RemoteCommandModeBoth = 4;
+}

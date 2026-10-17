@@ -29,6 +29,9 @@ const (
 	agentPackage = "github.com/mutagen-io/mutagen/cmd/mutagen-agent"
 	// cliPackage is the Go package URL to use for building Mutagen binaries.
 	cliPackage = "github.com/mutagen-io/mutagen/cmd/mutagen"
+	// remotePackage is the Go package URL to use for building remote command
+	// executables.
+	remotePackage = "github.com/mutagen-io/mutagen/cmd/remote"
 
 	// agentBuildSubdirectoryName is the name of the build subdirectory where
 	// agent binaries are built.
@@ -36,6 +39,11 @@ const (
 	// cliBuildSubdirectoryName is the name of the build subdirectory where CLI
 	// binaries are built.
 	cliBuildSubdirectoryName = "cli"
+	// remoteBuildSubdirectoryName is the name of the build subdirectory where
+	// remote command executables are built. It differs from remoteBaseName
+	// because the executable for the current platform is copied to the root of
+	// the build directory.
+	remoteBuildSubdirectoryName = "remotes"
 	// releaseBuildSubdirectoryName is the name of the build subdirectory where
 	// release bundles are built.
 	releaseBuildSubdirectoryName = "release"
@@ -46,6 +54,9 @@ const (
 	// cliBaseName is the name of the Mutagen binary without any path or
 	// extension.
 	cliBaseName = "mutagen"
+	// remoteBaseName is the name of the remote command executable without any
+	// path or extension.
+	remoteBaseName = "remote"
 
 	// minimumMacOSVersion is the minimum version of macOS that
 	// we'll support. This is pinned to the oldest version of
@@ -600,12 +611,16 @@ func build() error {
 	// Create the necessary build directory hierarchy.
 	agentBuildSubdirectoryPath := filepath.Join(buildPath, agentBuildSubdirectoryName)
 	cliBuildSubdirectoryPath := filepath.Join(buildPath, cliBuildSubdirectoryName)
+	remoteBuildSubdirectoryPath := filepath.Join(buildPath, remoteBuildSubdirectoryName)
 	releaseBuildSubdirectoryPath := filepath.Join(buildPath, releaseBuildSubdirectoryName)
 	if err := os.MkdirAll(agentBuildSubdirectoryPath, 0700); err != nil {
 		return fmt.Errorf("unable to create agent build subdirectory: %w", err)
 	}
 	if err := os.MkdirAll(cliBuildSubdirectoryPath, 0700); err != nil {
 		return fmt.Errorf("unable to create CLI build subdirectory: %w", err)
+	}
+	if err := os.MkdirAll(remoteBuildSubdirectoryPath, 0700); err != nil {
+		return fmt.Errorf("unable to create remote build subdirectory: %w", err)
 	}
 	if mode == "release" || mode == "release-slim" {
 		if err := os.MkdirAll(releaseBuildSubdirectoryPath, 0700); err != nil {
@@ -672,6 +687,22 @@ func build() error {
 		}
 	}
 
+	// Build remote executables. These are only needed alongside the CLI on the
+	// daemon's system, since agents act as the remote executable on endpoints.
+	log.Println("Building remote executables...")
+	for _, target := range cliTargets {
+		log.Println("Building remote executable for", target)
+		remoteBuildPath := filepath.Join(remoteBuildSubdirectoryPath, target.Name())
+		if err := target.Build(remotePackage, remoteBuildPath, enableSSPLEnhancements, disableDebug); err != nil {
+			return fmt.Errorf("unable to build remote executable: %w", err)
+		}
+		if macosCodesignIdentity != "" && target.GOOS == "darwin" {
+			if err := macOSCodeSign(remoteBuildPath, macosCodesignIdentity); err != nil {
+				return fmt.Errorf("unable to code sign remote executable for macOS: %w", err)
+			}
+		}
+	}
+
 	// Build the agent bundle.
 	log.Println("Building agent bundle...")
 	agentBundlePath := filepath.Join(buildPath, agent.BundleName)
@@ -699,6 +730,7 @@ func build() error {
 
 			// Compute paths.
 			cliBuildPath := filepath.Join(cliBuildSubdirectoryPath, target.Name())
+			remoteBuildPath := filepath.Join(remoteBuildSubdirectoryPath, target.Name())
 			releaseBundlePath := filepath.Join(
 				releaseBuildSubdirectoryPath,
 				fmt.Sprintf("mutagen_%s_v%s.tar.gz", target.Name(), mutagen.Version),
@@ -710,6 +742,9 @@ func build() error {
 			} else if err = releaseBundle.Add(target.ExecutableName(cliBaseName), cliBuildPath, 0755); err != nil {
 				releaseBundle.Close()
 				return fmt.Errorf("unable to add CLI to release bundle: %w", err)
+			} else if err = releaseBundle.Add(target.ExecutableName(remoteBaseName), remoteBuildPath, 0755); err != nil {
+				releaseBundle.Close()
+				return fmt.Errorf("unable to add remote executable to release bundle: %w", err)
 			} else if err = releaseBundle.Add("", agentBundlePath, 0644); err != nil {
 				releaseBundle.Close()
 				return fmt.Errorf("unable to add agent bundle to release bundle: %w", err)
@@ -719,12 +754,17 @@ func build() error {
 		}
 	}
 
-	// Relocate the CLI binary for the current platform.
-	log.Println("Copying binary for testing")
+	// Relocate the CLI and remote binaries for the current platform.
+	log.Println("Copying binaries for testing")
 	localCLIBuildPath := filepath.Join(cliBuildSubdirectoryPath, localTarget.Name())
 	localCLIRelocationPath := filepath.Join(buildPath, localTarget.ExecutableName(cliBaseName))
 	if err := copyFile(localCLIBuildPath, localCLIRelocationPath); err != nil {
 		return fmt.Errorf("unable to copy current platform CLI: %w", err)
+	}
+	localRemoteBuildPath := filepath.Join(remoteBuildSubdirectoryPath, localTarget.Name())
+	localRemoteRelocationPath := filepath.Join(buildPath, localTarget.ExecutableName(remoteBaseName))
+	if err := copyFile(localRemoteBuildPath, localRemoteRelocationPath); err != nil {
+		return fmt.Errorf("unable to copy current platform remote executable: %w", err)
 	}
 
 	// Success.

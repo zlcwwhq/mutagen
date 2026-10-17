@@ -159,6 +159,9 @@ sync:
 		"alpha":         func(s *synchronization.Session) { s.Alpha.Path += "-changed" },
 		"beta":          func(s *synchronization.Session) { s.Beta.Path += "-changed" },
 		"configuration": func(s *synchronization.Session) { s.Configuration.MaximumEntryCount = 100 },
+		"remote commands": func(s *synchronization.Session) {
+			s.Configuration.RemoteCommandMode = synchronization.RemoteCommandMode_RemoteCommandModeBoth
+		},
 		"alpha configuration": func(s *synchronization.Session) {
 			s.ConfigurationAlpha.WatchPollingInterval = 10
 		},
