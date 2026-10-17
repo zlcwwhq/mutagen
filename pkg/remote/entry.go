@@ -1,12 +1,14 @@
 package remote
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"syscall"
 )
 
 // MaximumComparedFileSize is the size of the largest files whose contents
@@ -46,10 +48,15 @@ type Entry struct {
 }
 
 // ReadEntry reads the entry at the specified path, without following a final
-// symbolic link.
-func ReadEntry(path string) (*Entry, error) {
+// symbolic link. Cancellation interrupts reading and hashing file contents.
+func ReadEntry(ctx context.Context, path string) (*Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(path)
-	if errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		// A parent may be a file on this endpoint and a directory on the
+		// other, in which case its children are missing on this endpoint.
 		return &Entry{Kind: EntryMissing}, nil
 	} else if err != nil {
 		return nil, err
@@ -74,23 +81,54 @@ func ReadEntry(path string) (*Entry, error) {
 		return nil, err
 	}
 	defer file.Close()
-	entry := &Entry{Kind: EntryFile, Executable: info.Mode()&0111 != 0}
+	stop := context.AfterFunc(ctx, func() { file.Close() })
+	defer stop()
+	return readFileEntry(ctx, file, info.Size(), info.Mode()&0111 != 0)
+}
+
+// entryReader checks for cancellation between file reads. Wrapping the reader
+// also prevents io.Copy from bypassing these checks via an optimized copy.
+type entryReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *entryReader) Read(buffer []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.reader.Read(buffer)
+	if cancellation := r.ctx.Err(); cancellation != nil {
+		return n, cancellation
+	}
+	return n, err
+}
+
+// readFileEntry reads and hashes file contents, retaining small files for
+// textual comparison. The size hint may be stale if the file is being modified.
+func readFileEntry(ctx context.Context, source io.Reader, size int64, executable bool) (*Entry, error) {
+	reader := &entryReader{ctx: ctx, reader: source}
+	entry := &Entry{Kind: EntryFile, Executable: executable}
 	hasher := sha256.New()
-	if info.Size() <= MaximumComparedFileSize {
-		if entry.Data, err = io.ReadAll(io.LimitReader(file, MaximumComparedFileSize+1)); err != nil {
+	var err error
+	if size <= MaximumComparedFileSize {
+		if entry.Data, err = io.ReadAll(io.LimitReader(reader, MaximumComparedFileSize+1)); err != nil {
 			return nil, err
 		}
 		hasher.Write(entry.Data)
 		entry.Size = int64(len(entry.Data))
 		if entry.Size > MaximumComparedFileSize {
 			entry.Data = nil
-			copied, err := io.Copy(hasher, file)
+			copied, err := io.Copy(hasher, reader)
 			if err != nil {
 				return nil, err
 			}
 			entry.Size += copied
 		}
-	} else if entry.Size, err = io.Copy(hasher, file); err != nil {
+	} else if entry.Size, err = io.Copy(hasher, reader); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	entry.Digest = fmt.Sprintf("%x", hasher.Sum(nil))

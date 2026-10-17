@@ -1,5 +1,11 @@
 package remote
 
+import (
+	"encoding/json"
+	"errors"
+	"slices"
+)
+
 // Report describes content that a session couldn't synchronize, as of the
 // synchronization cycle performed by a flush. Paths are slash-separated and
 // relative to the synchronization root.
@@ -30,6 +36,9 @@ type Conflict struct {
 	Alpha []Change
 	// Beta contains the relevant changes on beta.
 	Beta []Change
+	// ExcludedChanges is the number of changes omitted to fit the report into
+	// a protocol message. Root is retained for comparison and diagnostics.
+	ExcludedChanges uint64 `json:",omitempty"`
 }
 
 // Change describes a change on one endpoint since the last synchronization.
@@ -52,4 +61,50 @@ type Problem struct {
 	Path string
 	// Error describes the problem.
 	Error string
+}
+
+// boundReport makes a report fit into a flush response, without modifying the
+// original. Conflict counts alone don't bound the size: a single conflict can
+// include changes to every file beneath a replaced directory. Trim the longest
+// change lists first, retaining conflict roots and counting omitted changes.
+// Oversized problems and roots are omitted only after change lists are empty.
+func boundReport(report *Report) (*Report, error) {
+	bounded := *report
+	bounded.Conflicts = slices.Clone(report.Conflicts)
+	for {
+		data, err := json.Marshal(&flushResponse{Report: &bounded})
+		if err != nil {
+			return nil, err
+		} else if len(data) <= maximumMessageSize {
+			return &bounded, nil
+		}
+
+		// Halving a list bounds the number of encoding attempts, even when
+		// a report contains a very large number of changes.
+		var longest *[]Change
+		var conflict *Conflict
+		for c := range bounded.Conflicts {
+			candidate := &bounded.Conflicts[c]
+			for _, changes := range []*[]Change{&candidate.Alpha, &candidate.Beta} {
+				if len(*changes) > 0 && (longest == nil || len(*changes) > len(*longest)) {
+					longest, conflict = changes, candidate
+				}
+			}
+		}
+		if longest != nil {
+			removed := (len(*longest) + 1) / 2
+			conflict.ExcludedChanges += uint64(removed)
+			*longest = (*longest)[:len(*longest)-removed]
+		} else if len(bounded.Problems) > 0 {
+			removed := (len(bounded.Problems) + 1) / 2
+			bounded.ExcludedProblems += uint64(removed)
+			bounded.Problems = bounded.Problems[:len(bounded.Problems)-removed]
+		} else if len(bounded.Conflicts) > 0 {
+			removed := (len(bounded.Conflicts) + 1) / 2
+			bounded.ExcludedConflicts += uint64(removed)
+			bounded.Conflicts = bounded.Conflicts[:len(bounded.Conflicts)-removed]
+		} else {
+			return nil, errors.New("synchronization report exceeds size limit")
+		}
+	}
 }

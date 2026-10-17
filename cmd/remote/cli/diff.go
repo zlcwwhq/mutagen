@@ -298,7 +298,9 @@ func compare(ctx context.Context, directory, session string, target *remote.Targ
 	locator := newLocator(target)
 	var paths []string
 	if len(arguments) == 0 {
-		if paths = conflictPaths(report); len(paths) == 0 {
+		if paths = conflictPaths(report); len(paths) == 0 && report.ExcludedConflicts > 0 {
+			return false, fmt.Errorf("%d conflicts were omitted from the report; specify paths with --diff to compare them", report.ExcludedConflicts)
+		} else if len(paths) == 0 {
 			fmt.Fprintln(errorOutput, "remote: there are no conflicts to compare")
 		}
 	}
@@ -311,11 +313,7 @@ func compare(ctx context.Context, directory, session string, target *remote.Targ
 	}
 	var differ bool
 	for _, path := range paths {
-		// The root is a directory on both endpoints while synchronizing.
-		if path == "" {
-			continue
-		}
-		local, err := remote.ReadEntry(filepath.Join(target.Root, filepath.FromSlash(path)))
+		local, err := remote.ReadEntry(ctx, filepath.Join(target.Root, filepath.FromSlash(path)))
 		if err != nil {
 			return differ, fmt.Errorf("unable to read %s: %w", locator.display(path), err)
 		}

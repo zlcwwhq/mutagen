@@ -48,16 +48,18 @@ func Reject(connection io.ReadWriteCloser, err error) {
 
 // RespondToFlush reports the outcome of a flush submission, including a report
 // of content that the session couldn't synchronize if it succeeded, and closes
-// the connection.
-func RespondToFlush(connection io.ReadWriteCloser, report *Report, err error) {
+// the connection. It returns any error encountered sending the response.
+func RespondToFlush(connection io.ReadWriteCloser, report *Report, err error) error {
+	defer connection.Close()
 	if err != nil {
-		Reject(connection, err)
-		return
+		return writeMessage(connection, &status{Error: err.Error()})
 	} else if report == nil {
 		report = &Report{}
 	}
-	writeMessage(connection, &flushResponse{Report: report})
-	connection.Close()
+	if report, err = boundReport(report); err != nil {
+		return writeMessage(connection, &status{Error: err.Error()})
+	}
+	return writeMessage(connection, &flushResponse{Report: report})
 }
 
 // Splice forwards data between the two halves of a route until both directions

@@ -157,8 +157,11 @@ func Flush(ctx context.Context, connection io.ReadWriteCloser) (*Report, error) 
 
 // Fetch reads the entry at a slash-separated path, relative to the opposite
 // endpoint's synchronization root, over an established route (see Dial). It
-// owns and closes the connection.
+// owns and closes the connection. An empty path refers to the root itself.
 func Fetch(ctx context.Context, connection io.ReadWriteCloser, path string) (*Entry, error) {
+	if path == "" {
+		path = "."
+	}
 	var data bytes.Buffer
 	response, err := execute(ctx, connection, &Request{File: path}, strings.NewReader(""), &data, io.Discard)
 	if err != nil {

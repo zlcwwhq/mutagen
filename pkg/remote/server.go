@@ -81,8 +81,8 @@ func workingDirectory(root string, request *Request) (string, error) {
 
 // sendEntry reads the entry at a slash-separated path relative to the root and
 // sends any data that it includes as output.
-func sendEntry(root, path string, output io.Writer) result {
-	entry, err := ReadEntry(filepath.Join(root, filepath.FromSlash(path)))
+func sendEntry(ctx context.Context, root, path string, output io.Writer) result {
+	entry, err := ReadEntry(ctx, filepath.Join(root, filepath.FromSlash(path)))
 	if err != nil {
 		return result{Error: fmt.Sprintf("unable to read %s: %v", path, err)}
 	} else if _, err := output.Write(entry.Data); err != nil {
@@ -97,7 +97,7 @@ func run(ctx context.Context, root, prologue string, request *Request, stdin io.
 	if err := request.EnsureValid(); err != nil {
 		return result{Error: err.Error()}
 	} else if request.File != "" {
-		return sendEntry(root, request.File, stdout)
+		return sendEntry(ctx, root, request.File, stdout)
 	}
 	directory, err := workingDirectory(root, request)
 	if err != nil {

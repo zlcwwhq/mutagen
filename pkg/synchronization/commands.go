@@ -191,10 +191,14 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		return
 	} else if operation == remote.OperationFlush {
 		r.logger.Debug("Forcing synchronization cycle for submission")
-		if err := r.flush(ctx); err != nil {
-			remote.RespondToFlush(submission, nil, err)
-		} else {
-			remote.RespondToFlush(submission, r.report(), nil)
+		stop := context.AfterFunc(ctx, func() { submission.Close() })
+		defer stop()
+		var report *remote.Report
+		if err = r.flush(ctx); err == nil {
+			report = r.report()
+		}
+		if err := remote.RespondToFlush(submission, report, err); err != nil {
+			r.logger.Debug("Unable to send synchronization report:", err)
 		}
 		return
 	}

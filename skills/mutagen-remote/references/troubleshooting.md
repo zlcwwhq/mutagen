@@ -55,6 +55,13 @@ Each flush rescans both roots, which can take seconds for very large trees. Use
 `--no-flush` for commands that don't depend on recent edits, and suggest that
 the user ignore large generated directories in the session.
 
+For a session that synchronizes a single file, run `remote -s <name-or-id>
+--diff` from outside its root, or pass the local file's absolute path after
+`--diff`. File/directory conflicts are supported: children beneath a file are
+treated as missing on that endpoint. Large reports may omit change details and
+show an omitted count; use `remote --diff <path>` to compare specific omitted
+files. `--timeout` also covers reading and hashing files during comparison.
+
 ## Commands missing from the remote environment
 
 Remote commands inherit the Mutagen agent's non-interactive environment, so

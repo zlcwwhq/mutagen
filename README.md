@@ -161,7 +161,12 @@ synchronize: conflicts (paths modified on both endpoints, which aren't
 synchronized until one copy is deleted) and problems such as permission errors.
 `remote --diff` shows how the remote copies of conflicting files, or of the
 specified paths, differ from the local copies as a unified diff, and exits with
-status 1 if any differ.
+status 1 if any differ. Single-file sessions are supported: use `--session`
+from outside the file root. When one endpoint has replaced a directory with a
+file, its former children are compared as missing entries. Large conflict
+reports may omit change details; warnings give the omitted counts, and explicit
+paths can still be compared with `remote --diff <path>`. `--timeout` also bounds
+reading and hashing files during comparison.
 
 Any process running as your user on a submitting endpoint's system can run
 commands on the executing endpoint, so only enable remote commands toward

@@ -167,6 +167,9 @@ func (r *reporter) describeConflict(conflict remote.Conflict) string {
 			changes = append(changes, description+" "+side.name)
 		}
 	}
+	if conflict.ExcludedChanges > 0 {
+		changes = append(changes, fmt.Sprintf("...and %d more changes (specify paths with remote --diff to compare them)", conflict.ExcludedChanges))
+	}
 	return r.locator.display(conflict.Root) + ": " + strings.Join(changes, ", ")
 }
 
@@ -190,6 +193,12 @@ func conflictPaths(report *remote.Report) []string {
 	var paths []string
 	seen := make(map[string]bool)
 	for _, conflict := range report.Conflicts {
+		// A truncated list may omit the root change, but comparing the root
+		// still shows file differences or a directory replaced by a file.
+		if conflict.ExcludedChanges > 0 && !seen[conflict.Root] {
+			seen[conflict.Root] = true
+			paths = append(paths, conflict.Root)
+		}
 		for _, changes := range [][]remote.Change{conflict.Alpha, conflict.Beta} {
 			for _, change := range changes {
 				if !seen[change.Path] {

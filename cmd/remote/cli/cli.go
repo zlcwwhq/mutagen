@@ -62,7 +62,9 @@ Notes:
     copy is deleted) and other content that couldn't be synchronized.
   - remote --diff shows how the remote copies of the given paths, or of the
     conflicting files, differ from the local copies, as a unified diff
-    (- local, + remote).
+    (- local, + remote). For a single-file session, use --session from outside
+    its root. Large conflict reports may omit changes and say how many;
+    specify paths to compare omitted files. --timeout also covers file reads.
   - No terminal is allocated, so interactive programs don't work.
   - If the opposite endpoint has a remote prologue, then /bin/sh sources it
     before each command submitted from inside the root (even with --cwd).

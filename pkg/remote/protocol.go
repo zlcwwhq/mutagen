@@ -37,7 +37,7 @@ type Request struct {
 	Prologue bool
 	// File is the slash-separated path, relative to the target root, of an
 	// entry to read (see ReadEntry) instead of running a command. Requests for
-	// files specify no arguments.
+	// files specify no arguments. A dot refers to the root itself.
 	File string
 }
 
@@ -54,7 +54,7 @@ func (r *Request) EnsureValid() error {
 	if r != nil && r.File != "" {
 		if len(r.Arguments) > 0 {
 			return errors.New("file requests must not specify a command")
-		} else if !utf8.ValidString(r.File) || strings.IndexByte(r.File, 0) >= 0 || r.File == "." || !validRelativePath(r.File) {
+		} else if !utf8.ValidString(r.File) || strings.IndexByte(r.File, 0) >= 0 || !validRelativePath(r.File) {
 			return errors.New("requested file path must be relative to the synchronization root")
 		}
 		return nil

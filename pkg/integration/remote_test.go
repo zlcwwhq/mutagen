@@ -222,3 +222,111 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 		t.Fatal("registration remained after termination")
 	}
 }
+
+// createRemoteDiffSession creates a session with only alpha submitting, so it
+// can also be selected from outside the roots when synchronizing single files.
+func createRemoteDiffSession(t *testing.T, alphaRoot, betaRoot string) string {
+	t.Helper()
+	ctx := context.Background()
+	sessionID, err := synchronizationManager.Create(ctx,
+		&url.URL{Path: alphaRoot},
+		&url.URL{Protocol: netpipe.Protocol_Netpipe, Path: betaRoot},
+		&synchronization.Configuration{
+			WatchMode:         synchronization.WatchMode_WatchModeNoWatch,
+			RemoteCommandMode: synchronization.RemoteCommandMode_RemoteCommandModeBeta,
+		},
+		&synchronization.Configuration{}, &synchronization.Configuration{},
+		"remoteDiff", nil, false, "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := synchronizationManager.Terminate(ctx, &selection.Selection{Specifications: []string{sessionID}}, ""); err != nil {
+			t.Error("unable to terminate session:", err)
+		}
+	})
+	if _, err := flushRemote(alphaRoot); err != nil {
+		t.Fatal("unable to synchronize:", err)
+	}
+
+	// The executor channel connects independently of synchronization. Wait
+	// until it can serve entries before exercising the command line.
+	readyContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for {
+		connection, _, err := remote.Dial(readyContext, alphaRoot, sessionID, remote.OperationExecute)
+		if err == nil {
+			_, err = remote.Fetch(readyContext, connection, "")
+		}
+		if err == nil {
+			break
+		} else if readyContext.Err() != nil {
+			t.Fatal("executor didn't connect:", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return sessionID
+}
+
+func TestRemoteDiffFileRoot(t *testing.T) {
+	directory := t.TempDir()
+	alphaRoot, betaRoot := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta")
+	if err := os.WriteFile(alphaRoot, []byte("base\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := createRemoteDiffSession(t, alphaRoot, betaRoot)
+	if err := os.WriteFile(alphaRoot, []byte("local\n"), 0600); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(betaRoot, []byte("remote\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both automatic conflict comparison and an explicit root path must
+	// compare the file, even though submission occurs outside the root.
+	for _, paths := range [][]string{nil, {alphaRoot}} {
+		arguments := append([]string{"--timeout", "5s", "--session", sessionID, "--diff"}, paths...)
+		code, output, errorOutput := runRemote(t, directory, arguments...)
+		if code != 1 || !strings.Contains(output, "-local\n+remote\n") {
+			t.Fatalf("root file wasn't compared: %d, %q, %q", code, output, errorOutput)
+		}
+	}
+}
+
+func TestRemoteDiffTypeConflict(t *testing.T) {
+	for _, replaceAlpha := range []bool{true, false} {
+		name := "remote file"
+		if replaceAlpha {
+			name = "local file"
+		}
+		t.Run(name, func(t *testing.T) {
+			directory := t.TempDir()
+			alphaRoot, betaRoot := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta")
+			if err := os.MkdirAll(filepath.Join(alphaRoot, "d"), 0700); err != nil {
+				t.Fatal(err)
+			} else if err := os.WriteFile(filepath.Join(alphaRoot, "d", "f"), []byte("base\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			createRemoteDiffSession(t, alphaRoot, betaRoot)
+			replaced, modified := alphaRoot, betaRoot
+			if !replaceAlpha {
+				replaced, modified = betaRoot, alphaRoot
+			}
+			if err := os.RemoveAll(filepath.Join(replaced, "d")); err != nil {
+				t.Fatal(err)
+			} else if err := os.WriteFile(filepath.Join(replaced, "d"), []byte("replacement\n"), 0600); err != nil {
+				t.Fatal(err)
+			} else if err := os.WriteFile(filepath.Join(modified, "d", "f"), []byte("edited\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			code, output, errorOutput := runRemote(t, alphaRoot, "--timeout", "5s", "--diff")
+			change := "-edited\n"
+			if replaceAlpha {
+				change = "+edited\n"
+			}
+			if code != 1 || !strings.Contains(output, "d: ") || !strings.Contains(output, change) {
+				t.Fatalf("type conflict wasn't compared: %d, %q, %q", code, output, errorOutput)
+			}
+		})
+	}
+}

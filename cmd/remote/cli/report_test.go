@@ -111,3 +111,19 @@ func TestReporter(t *testing.T) {
 		t.Fatal("incorrect conflict paths:", paths)
 	}
 }
+
+func TestTruncatedConflict(t *testing.T) {
+	conflict := remote.Conflict{
+		Root:            "d",
+		Beta:            []remote.Change{{Path: "d/file", Old: "file", New: "file"}},
+		ExcludedChanges: 42,
+	}
+	report := &remote.Report{Conflicts: []remote.Conflict{conflict}}
+	var output strings.Builder
+	newReporter(&output, &remote.Target{Root: t.TempDir(), Contained: true}).print(report)
+	if !strings.Contains(output.String(), "42 more changes") || !strings.Contains(output.String(), "specify paths with remote --diff") {
+		t.Fatal("omissions weren't explained:", output.String())
+	} else if paths := conflictPaths(report); strings.Join(paths, ",") != "d,d/file" {
+		t.Fatal("truncated conflict root wasn't compared:", paths)
+	}
+}

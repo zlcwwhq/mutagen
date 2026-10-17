@@ -266,7 +266,7 @@ func TestInvalidRequests(t *testing.T) {
 	}
 
 	// File requests must name a path inside the root, without a command.
-	for _, path := range []string{".", "..", "../sibling", "/absolute", "a/../b", "a/", "a\\b", "a\x00"} {
+	for _, path := range []string{"..", "../sibling", "/absolute", "a/../b", "a/", "a\\b", "a\x00"} {
 		if (&Request{File: path}).EnsureValid() == nil {
 			t.Fatalf("invalid file path %q accepted", path)
 		}
@@ -291,11 +291,14 @@ func TestFetch(t *testing.T) {
 		return fmt.Sprintf("%x", sha256.Sum256(data))
 	}
 	expected := map[string]*Entry{
-		"file":      {Kind: EntryFile, Size: 3, Digest: digest([]byte("a\nb")), Data: []byte("a\nb")},
-		"empty":     {Kind: EntryFile, Digest: digest(nil)},
-		"large":     {Kind: EntryFile, Size: int64(len(large)), Digest: digest(large)},
-		"directory": {Kind: EntryDirectory},
-		"missing":   {Kind: EntryMissing},
+		"":           {Kind: EntryDirectory},
+		".":          {Kind: EntryDirectory},
+		"file":       {Kind: EntryFile, Size: 3, Digest: digest([]byte("a\nb")), Data: []byte("a\nb")},
+		"empty":      {Kind: EntryFile, Digest: digest(nil)},
+		"large":      {Kind: EntryFile, Size: int64(len(large)), Digest: digest(large)},
+		"directory":  {Kind: EntryDirectory},
+		"missing":    {Kind: EntryMissing},
+		"file/child": {Kind: EntryMissing},
 	}
 	if runtime.GOOS != "windows" {
 		if err := os.WriteFile(filepath.Join(root, "executable"), []byte("#!/bin/sh\n"), 0700); err != nil {
@@ -315,7 +318,7 @@ func TestFetch(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		fetched, err := Fetch(ctx, client, name)
 		cancel()
-		local, localErr := ReadEntry(filepath.Join(root, name))
+		local, localErr := ReadEntry(context.Background(), filepath.Join(root, name))
 		if err != nil || localErr != nil {
 			t.Fatalf("unable to read %s: %v, %v", name, err, localErr)
 		}
@@ -327,6 +330,26 @@ func TestFetch(t *testing.T) {
 			if !bytes.Equal(actual.Data, entry.Data) || !reflect.DeepEqual(actualMetadata, metadata) {
 				t.Errorf("%s read incorrectly: %+v", name, actual)
 			}
+		}
+	}
+}
+
+func TestFetchFileRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "file")
+	contents := []byte("root file\n")
+	if err := os.WriteFile(root, contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"", "."} {
+		client, server := net.Pipe()
+		go Serve(context.Background(), server, root, "")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		entry, err := Fetch(ctx, client, path)
+		cancel()
+		if err != nil {
+			t.Fatal("unable to fetch root:", err)
+		} else if entry.Kind != EntryFile || !bytes.Equal(entry.Data, contents) {
+			t.Fatalf("incorrect root contents: %+v", entry)
 		}
 	}
 }

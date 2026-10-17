@@ -1,13 +1,25 @@
 package cli
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"strings"
 	"testing"
 
 	"github.com/mutagen-io/mutagen/pkg/remote"
 )
+
+func TestCompareOmittedConflicts(t *testing.T) {
+	var errorOutput strings.Builder
+	target := &remote.Target{Root: t.TempDir(), Contained: true}
+	report := &remote.Report{ExcludedConflicts: 1}
+	if _, err := compare(context.Background(), target.Root, "", target, report, nil, io.Discard, &errorOutput); err == nil ||
+		!strings.Contains(err.Error(), "specify paths") || strings.Contains(errorOutput.String(), "no conflicts") {
+		t.Fatalf("omitted conflicts reported as identical: %v, %q", err, errorOutput.String())
+	}
+}
 
 // longestCommonSubsequence computes the length of the longest common
 // subsequence of two line sequences.
