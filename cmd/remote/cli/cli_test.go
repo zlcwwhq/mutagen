@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -62,6 +63,24 @@ func TestParseDiff(t *testing.T) {
 	for _, arguments := range [][]string{{"--diff", "--flush"}, {"--diff", "--no-flush", "a"}} {
 		if _, err := parse(arguments); err == nil {
 			t.Fatalf("conflicting options accepted: %v", arguments)
+		}
+	}
+}
+
+func TestHelp(t *testing.T) {
+	var output strings.Builder
+	if code := Run([]string{"--help"}, strings.NewReader(""), &output, io.Discard); code != 0 {
+		t.Fatal("help failed:", code)
+	}
+	help := output.String()
+	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--diff"} {
+		if !strings.Contains(help, expected) {
+			t.Errorf("help is missing %q", expected)
+		}
+	}
+	for _, unexpected := range []string{"stringArray", "duration "} {
+		if strings.Contains(help, unexpected) {
+			t.Errorf("help contains flag type %q instead of a placeholder", unexpected)
 		}
 	}
 }
