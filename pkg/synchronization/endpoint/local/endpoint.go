@@ -21,8 +21,6 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/fastpath"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
-	dockerignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/docker"
-	mutagenignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/mutagen"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/local/staging"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
 	"github.com/mutagen-io/mutagen/pkg/timeutil"
@@ -275,40 +273,10 @@ func NewEndpoint(
 		symbolicLinkMode = version.DefaultSymbolicLinkMode()
 	}
 
-	// Compute the effective ignore syntax.
-	ignoreSyntax := configuration.IgnoreSyntax
-	if ignoreSyntax.IsDefault() {
-		ignoreSyntax = version.DefaultIgnoreSyntax()
-	}
-
-	// Compute a combined ignore list and create the ignorer.
-	var ignores []string
-	ignores = append(ignores, configuration.DefaultIgnores...)
-	ignores = append(ignores, configuration.Ignores...)
-	var ignorer ignore.Ignorer
-	if ignoreSyntax == ignore.Syntax_SyntaxMutagen {
-		if i, err := mutagenignore.NewIgnorer(ignores); err != nil {
-			return nil, fmt.Errorf("unable to create Mutagen-style ignorer: %w", err)
-		} else {
-			ignorer = i
-		}
-	} else if ignoreSyntax == ignore.Syntax_SyntaxDocker {
-		if i, err := dockerignore.NewIgnorer(ignores); err != nil {
-			return nil, fmt.Errorf("unable to create Docker-style ignorer: %w", err)
-		} else {
-			ignorer = i
-		}
-	} else {
-		panic("unhandled ignore syntax")
-	}
-
-	// Compute the effective VCS ignore mode and add VCS ignores if necessary.
-	ignoreVCSMode := configuration.IgnoreVCSMode
-	if ignoreVCSMode.IsDefault() {
-		ignoreVCSMode = version.DefaultIgnoreVCSMode()
-	}
-	if ignoreVCSMode == ignore.IgnoreVCSMode_IgnoreVCSModeIgnore {
-		ignorer = ignore.IgnoreVCS(ignorer)
+	// Create the ignorer.
+	ignorer, err := synchronization.NewIgnorer(configuration, version)
+	if err != nil {
+		return nil, err
 	}
 
 	// Track whether or not any non-default ownership or directory permissions
