@@ -106,8 +106,8 @@ func (c *Configuration) EnsureValid(endpointSpecific bool) error {
 	// here because we don't yet know the ignore syntax being used (even if it's
 	// not a default value, it could be overridden in a different configuration
 	// that will be merged on top of this one). These ignores will eventually be
-	// validated at endpoint initialization time, but there's no convenient way
-	// to do it earlier in the session creation or loading process.
+	// validated (using NewIgnorer) when session creation is requested and at
+	// endpoint initialization time.
 	if endpointSpecific && len(c.DefaultIgnores) > 0 {
 		return errors.New("default ignores cannot be specified on an endpoint-specific basis (and are deprecated)")
 	}
@@ -116,9 +116,9 @@ func (c *Configuration) EnsureValid(endpointSpecific bool) error {
 	// is the only meaningful validation that we can do here because we don't
 	// yet know the ignore syntax being used (even if it's not a default value,
 	// it could be overridden in a different configuration that will be merged
-	// on top of this one). These ignores will eventually be validated at
-	// endpoint initialization time, but there's no convenient way to do it
-	// earlier in the session creation or loading process.
+	// on top of this one). These ignores will eventually be validated (using
+	// NewIgnorer) when session creation is requested and at endpoint
+	// initialization time.
 	if endpointSpecific && len(c.Ignores) > 0 {
 		return errors.New("ignores cannot be specified on an endpoint-specific basis")
 	}

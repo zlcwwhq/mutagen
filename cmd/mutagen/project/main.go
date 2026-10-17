@@ -49,6 +49,7 @@ func init() {
 	// Register commands.
 	ProjectCommand.AddCommand(
 		startCommand,
+		applyCommand,
 		runCommand,
 		listCommand,
 		flushCommand,

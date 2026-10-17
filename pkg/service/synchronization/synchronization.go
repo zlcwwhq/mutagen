@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/mutagen-io/mutagen/pkg/selection"
+	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/url"
 )
 
@@ -42,6 +43,13 @@ func (s *CreationSpecification) ensureValid() error {
 	// Verify that the beta-specific configuration is valid.
 	if err := s.ConfigurationBeta.EnsureValid(true); err != nil {
 		return fmt.Errorf("invalid beta-specific configuration: %w", err)
+	}
+
+	// Verify that ignores are valid. Ignores aren't endpoint-specific, so the
+	// session configuration is final in this regard. New sessions are always
+	// created with the default session version.
+	if _, err := synchronization.NewIgnorer(s.Configuration, synchronization.DefaultVersion); err != nil {
+		return fmt.Errorf("invalid ignores: %w", err)
 	}
 
 	// Verify that the name is valid.

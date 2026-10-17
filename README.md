@@ -20,6 +20,41 @@ guides. You can find information about all of Mutagen's features in the
 [documentation](https://mutagen.io/documentation).
 
 
+## Applying project configuration
+
+Use `mutagen project apply` to apply changes to `mutagen.yml` without restarting
+unchanged sessions:
+
+```sh
+mutagen project apply --dry-run
+mutagen project apply
+```
+
+The command starts the project if needed and matches existing sessions by type
+and name within that project. It creates new sessions, terminates removed
+sessions, and recreates sessions whose endpoints or merged configurations have
+changed. Unchanged sessions retain their identifiers, synchronization history,
+scan caches, and paused state. Renaming a session removes the old session and
+creates a new one; replaced synchronization sessions start with fresh history
+and scan caches. Docker environment variables such as `DOCKER_HOST` are not
+compared: retained sessions keep the environment they were created with, while
+new and replaced sessions use the current environment.
+
+Use `-f path/to/project.yml` for another project file. Relative endpoint paths
+are resolved against its directory. Global configuration is included unless
+`--no-global-configuration` is specified; use this flag consistently with
+`project start` and previous `apply` invocations. `--paused` pauses newly created
+and replacement sessions without changing retained sessions. Replacements also
+preserve the previous session's paused state.
+
+Creation hooks run only when starting a project. Applying changes to an existing
+project does not run lifecycle hooks. `flushOnCreate` applies only to newly
+created, unpaused sessions. Changes are not transactional: if an operation fails,
+completed changes remain and another `apply` reconciles the remaining sessions.
+Startup hooks are not replayed when retrying an existing project. The command
+runs once; it does not watch the YAML file for changes.
+
+
 ## Installation
 
 You can find
