@@ -57,3 +57,49 @@ The `go generate` commands used by Mutagen rely on Go module support being
 enabled. You will also need to have the `protoc` compiler (with support for
 Protocol Buffers 3) available in your path, but not the Go generator, which will
 be built as part of the `go generate` command.
+
+## Fork CI and releases
+
+The `zlcwwhq/mutagen` fork runs CI for pushes to `master` and
+`release-branch-*`, pull requests, and manual workflow dispatches. Ordinary
+builds use slim bundles; release tags build the complete platform matrix on
+macOS. Sidecar container images are not built or published by this workflow.
+
+Create a release by tagging a commit with the upstream version followed by
+`-zlcwwhq.X.Y.Z`. For example, when the upstream numeric version in
+`pkg/mutagen/version.go` is `0.19.0`:
+
+```sh
+git tag v0.19.0-zlcwwhq.0.1.0
+git push origin v0.19.0-zlcwwhq.0.1.0
+```
+
+The three fork version components are maintained independently of the upstream
+version and cannot have leading zeroes. CI rejects tags with a mismatched
+upstream version. The upstream `dev` marker is replaced by the fork suffix;
+other upstream prerelease identifiers are preserved, for example
+`v0.19.0-rc1-zlcwwhq.0.1.0`. A tag based on an upstream development snapshot
+still contains development code; the fork tag does not imply an upstream
+stable release.
+
+CI stamps `VersionTag` only in its working checkouts, so the CLI, agents, and
+archive filenames all contain the complete fork version. The committed source
+retains upstream version constants for easier merges. Tagged builds use the
+normal release data directory (`~/.mutagen`), rather than `~/.mutagen-dev`.
+For an equivalent local release build, first run:
+
+```sh
+go run ./scripts/ci/releaseversion -tag v0.19.0-zlcwwhq.0.1.0 -write
+```
+
+After all platform jobs pass, CI creates a **draft GitHub Release** containing
+CLI bundles (each with the remote executable and the matching agent bundle) and
+`SHA256SUMS`. Review the draft and publish it in GitHub. Reruns can replace draft assets but
+will not overwrite a published release. macOS code signing, Apple notarization,
+and GPG checksum signing are disabled; no signing secrets or Docker registry
+credentials are needed. The release job uses the repository's `GITHUB_TOKEN`
+with `contents: write`; all other jobs have read-only repository access.
+
+If GitHub disables Actions after forking, open the repository's Actions tab
+and enable workflows. Pushes of upstream tags without `-zlcwwhq.X.Y.Z` do not
+trigger fork releases.
