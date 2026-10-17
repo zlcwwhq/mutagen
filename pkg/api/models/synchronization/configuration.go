@@ -80,6 +80,9 @@ type Configuration struct {
 	// Remote specifies which endpoints execute commands submitted from the
 	// opposite endpoint via the remote executable.
 	Remote synchronization.RemoteCommandMode `json:"remote,omitempty" yaml:"remote" mapstructure:"remote"`
+	// RemotePrologue specifies the path of a POSIX shell script that executing
+	// endpoints source before running remote commands.
+	RemotePrologue string `json:"remotePrologue,omitempty" yaml:"remotePrologue" mapstructure:"remotePrologue"`
 }
 
 // loadFromInternal sets a configuration to match an internal
@@ -120,6 +123,7 @@ func (c *Configuration) loadFromInternal(configuration *synchronization.Configur
 
 	// Propagate remote command configuration.
 	c.Remote = configuration.RemoteCommandMode
+	c.RemotePrologue = configuration.RemotePrologue
 }
 
 // ToInternal converts a public configuration representation to an internal
@@ -147,5 +151,6 @@ func (c *Configuration) ToInternal() *synchronization.Configuration {
 		DefaultGroup:           c.Permissions.DefaultGroup,
 		CompressionAlgorithm:   c.Compression.Algorithm,
 		RemoteCommandMode:      c.Remote,
+		RemotePrologue:         c.RemotePrologue,
 	}
 }

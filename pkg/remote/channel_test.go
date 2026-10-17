@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -97,7 +98,7 @@ func TestDialSelection(t *testing.T) {
 	}
 
 	// The most specific containing root wins.
-	if target, err := dial(filepath.Join(inner, "x"), ""); err != nil || target.Session != "sync_inner" || target.Path != "x" || target.Alpha {
+	if target, err := dial(filepath.Join(inner, "x"), ""); err != nil || target.Session != "sync_inner" || target.Path != "x" || target.Alpha || !target.Contained {
 		t.Fatalf("incorrect nested selection: %+v, %v", target, err)
 	} else if target, err := dial(filepath.Join(outer, "y"), ""); err != nil || target.Session != "sync_outer" || target.Path != "y" || !target.Alpha {
 		t.Fatalf("incorrect outer selection: %+v, %v", target, err)
@@ -110,9 +111,9 @@ func TestDialSelection(t *testing.T) {
 		t.Fatal("directory outside all roots accepted")
 	} else if _, err := dial(outer+"-sibling", ""); err == nil {
 		t.Fatal("sibling prefix matched")
-	} else if target, err := dial(outside, "outer-name"); err != nil || target.Session != "sync_outer" || target.Path != "" {
+	} else if target, err := dial(outside, "outer-name"); err != nil || target.Session != "sync_outer" || target.Path != "" || target.Contained {
 		t.Fatalf("incorrect explicit selection by name: %+v, %v", target, err)
-	} else if target, err := dial(filepath.Join(inner, "x"), "sync_outer"); err != nil || target.Path != "inner/x" {
+	} else if target, err := dial(filepath.Join(inner, "x"), "sync_outer"); err != nil || target.Path != "inner/x" || !target.Contained {
 		t.Fatalf("incorrect explicit selection by identifier: %+v, %v", target, err)
 	} else if _, err := dial(outer, "missing"); err == nil {
 		t.Fatal("unknown session accepted")
@@ -268,7 +269,7 @@ func TestAgentChannel(t *testing.T) {
 			return
 		}
 		execution, server := net.Pipe()
-		go Serve(context.Background(), server, opposite)
+		go Serve(context.Background(), server, opposite, "")
 		Splice(submission, execution)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -518,6 +519,47 @@ func TestAgentChannelLiveness(t *testing.T) {
 		}
 	case <-time.After(10 * livenessInterval):
 		t.Fatal("stalled executor did not terminate")
+	}
+}
+
+func TestChannelPrologue(t *testing.T) {
+	// Prologues are sourced by a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+	useTestRegistry(t)
+
+	// Both kinds of channel resolve relative prologues against the root.
+	root := resolveSymbolicLinks(t.TempDir())
+	if err := os.WriteFile(filepath.Join(root, "prologue.sh"), []byte("export REMOTE_VALUE=from-prologue\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &Endpoint{Session: "sync_test", Root: root, Execute: true, Prologue: "prologue.sh"}
+	local, err := NewLocalChannel(nil, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { local.Close() })
+	for name, channel := range map[string]Channel{"local": local, "agent": testChannel(t, endpoint, nil)} {
+		for _, requested := range []bool{true, false} {
+			route, err := channel.Open(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := &Request{Arguments: []string{"sh", "-c", `printf %s "$REMOTE_VALUE"`}, Prologue: requested}
+			var output bytes.Buffer
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			code, err := Execute(ctx, route, request, strings.NewReader(""), &output, io.Discard)
+			cancel()
+			if expected := map[bool]string{true: "from-prologue"}[requested]; err != nil || code != 0 || output.String() != expected {
+				t.Errorf("incorrect %s channel output with prologue %t: %d, %q, %v", name, requested, code, output.String(), err)
+			}
+		}
+	}
+
+	// Endpoints that don't execute commands ignore their prologue.
+	if _, err := NewLocalChannel(nil, &Endpoint{Session: "sync_test", Root: root, Prologue: "~nonexistent-user/prologue.sh"}); err != nil {
+		t.Fatal("prologue resolved for non-executing endpoint:", err)
 	}
 }
 

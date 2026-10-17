@@ -46,6 +46,7 @@ compression:
   algorithm: deflate
 
 remote: true
+remotePrologue: "~/.remote-prologue"
 `
 )
 
@@ -74,6 +75,7 @@ var expectedConfiguration = &synchronization.Configuration{
 	DefaultOwner:         "george",
 	DefaultGroup:         "presidents",
 	RemoteCommandMode:    synchronization.RemoteCommandMode_RemoteCommandModeBoth,
+	RemotePrologue:       "~/.remote-prologue",
 }
 
 // TestLoadConfiguration tests loading a YAML-based session configuration.
@@ -163,6 +165,9 @@ func TestLoadConfiguration(t *testing.T) {
 	}
 	if configuration.RemoteCommandMode != expectedConfiguration.RemoteCommandMode {
 		t.Error("remote command mode mismatch:", configuration.RemoteCommandMode, "!=", expectedConfiguration.RemoteCommandMode)
+	}
+	if configuration.RemotePrologue != expectedConfiguration.RemotePrologue {
+		t.Error("remote prologue mismatch:", configuration.RemotePrologue, "!=", expectedConfiguration.RemotePrologue)
 	}
 }
 

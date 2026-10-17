@@ -176,6 +176,11 @@ func printEndpoint(name string, url *urlpkg.URL, configuration *synchronization.
 			}
 			fmt.Println("\t\tCompression:", compressionAlgorithm)
 		}
+
+		// Print the remote prologue, if any.
+		if configuration.RemotePrologue != "" {
+			fmt.Println("\t\tRemote prologue:", terminal.NeutralizeControlCharacters(configuration.RemotePrologue))
+		}
 	}
 
 	// At this point, there's no other status information that will be displayed

@@ -3,6 +3,7 @@ package synchronization
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/mutagen-io/mutagen/pkg/comparison"
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
@@ -214,6 +215,12 @@ func (c *Configuration) EnsureValid(endpointSpecific bool) error {
 		}
 	}
 
+	// Verify that the remote prologue path can be passed to the operating
+	// system. Its existence can only be checked by the executing endpoint.
+	if strings.IndexByte(c.RemotePrologue, 0) >= 0 {
+		return errors.New("remote prologue path contains a null byte")
+	}
+
 	// Success.
 	return nil
 }
@@ -247,7 +254,8 @@ func (c *Configuration) Equal(other *Configuration) bool {
 		c.DefaultOwner == other.DefaultOwner &&
 		c.DefaultGroup == other.DefaultGroup &&
 		c.CompressionAlgorithm == other.CompressionAlgorithm &&
-		c.RemoteCommandMode == other.RemoteCommandMode
+		c.RemoteCommandMode == other.RemoteCommandMode &&
+		c.RemotePrologue == other.RemotePrologue
 }
 
 // MergeConfigurations merges two configurations of differing priorities. Both
@@ -397,6 +405,13 @@ func MergeConfigurations(lower, higher *Configuration) *Configuration {
 		result.RemoteCommandMode = higher.RemoteCommandMode
 	} else {
 		result.RemoteCommandMode = lower.RemoteCommandMode
+	}
+
+	// Merge the remote prologue.
+	if higher.RemotePrologue != "" {
+		result.RemotePrologue = higher.RemotePrologue
+	} else {
+		result.RemotePrologue = lower.RemotePrologue
 	}
 
 	// Done.

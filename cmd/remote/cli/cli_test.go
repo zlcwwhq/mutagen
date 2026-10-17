@@ -28,6 +28,15 @@ func TestParseArgumentBoundary(t *testing.T) {
 	}
 }
 
+func TestParseNoPrologue(t *testing.T) {
+	if options, err := parse([]string{"true"}); err != nil || options.noPrologue {
+		t.Fatal("prologue disabled by default:", err)
+	} else if options, err := parse([]string{"--no-prologue", "true", "--no-prologue"}); err != nil || !options.noPrologue ||
+		!reflect.DeepEqual(options.arguments, []string{"true", "--no-prologue"}) {
+		t.Fatalf("--no-prologue parsed incorrectly: %+v, %v", options, err)
+	}
+}
+
 func TestSessionEnvironmentDefault(t *testing.T) {
 	t.Setenv("MUTAGEN_REMOTE_SESSION", "from-environment")
 	if options, err := parse([]string{"true"}); err != nil || options.session != "from-environment" {

@@ -469,6 +469,7 @@ func createMain(_ *cobra.Command, arguments []string) error {
 		DefaultGroup:           createConfiguration.defaultGroup,
 		CompressionAlgorithm:   compressionAlgorithm,
 		RemoteCommandMode:      remoteCommandMode,
+		RemotePrologue:         createConfiguration.remotePrologue,
 	})
 
 	// Create the creation specification.
@@ -487,6 +488,7 @@ func createMain(_ *cobra.Command, arguments []string) error {
 			DefaultOwner:         createConfiguration.defaultOwnerAlpha,
 			DefaultGroup:         createConfiguration.defaultGroupAlpha,
 			CompressionAlgorithm: compressionAlgorithmAlpha,
+			RemotePrologue:       createConfiguration.remotePrologueAlpha,
 		},
 		ConfigurationBeta: &synchronization.Configuration{
 			ProbeMode:            probeModeBeta,
@@ -499,6 +501,7 @@ func createMain(_ *cobra.Command, arguments []string) error {
 			DefaultOwner:         createConfiguration.defaultOwnerBeta,
 			DefaultGroup:         createConfiguration.defaultGroupBeta,
 			CompressionAlgorithm: compressionAlgorithmBeta,
+			RemotePrologue:       createConfiguration.remotePrologueBeta,
 		},
 		Name:   createConfiguration.name,
 		Labels: labels,
@@ -681,6 +684,18 @@ var createConfiguration struct {
 	// remote specifies which endpoints execute commands submitted from the
 	// opposite endpoint via the remote executable.
 	remote string
+	// remotePrologue specifies the shell script that executing endpoints
+	// source before running remote commands, with endpoint-specific
+	// specifications taking priority.
+	remotePrologue string
+	// remotePrologueAlpha specifies the shell script that alpha sources before
+	// running remote commands, taking priority over remotePrologue on alpha if
+	// specified.
+	remotePrologueAlpha string
+	// remotePrologueBeta specifies the shell script that beta sources before
+	// running remote commands, taking priority over remotePrologue on beta if
+	// specified.
+	remotePrologueBeta string
 }
 
 func init() {
@@ -759,6 +774,9 @@ func init() {
 
 	// Wire up remote command flags.
 	flags.StringVar(&createConfiguration.remote, "remote", "", "Specify which endpoints execute remote commands (true|alpha|beta|false)")
+	flags.StringVar(&createConfiguration.remotePrologue, "remote-prologue", "", "Specify a shell script that executing endpoints source before remote commands")
+	flags.StringVar(&createConfiguration.remotePrologueAlpha, "remote-prologue-alpha", "", "Specify a shell script that alpha sources before remote commands")
+	flags.StringVar(&createConfiguration.remotePrologueBeta, "remote-prologue-beta", "", "Specify a shell script that beta sources before remote commands")
 
 	// Set up flag normalization. This is only required to handle aliases.
 	flags.SetNormalizeFunc(func(f *pflag.FlagSet, name string) pflag.NormalizedName {

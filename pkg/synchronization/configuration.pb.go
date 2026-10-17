@@ -97,8 +97,15 @@ type Configuration struct {
 	// RemoteCommandMode specifies which endpoints execute commands submitted
 	// from the opposite endpoint via the remote executable.
 	RemoteCommandMode RemoteCommandMode `protobuf:"varint,91,opt,name=remoteCommandMode,proto3,enum=synchronization.RemoteCommandMode" json:"remoteCommandMode,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// RemotePrologue specifies the path of a POSIX shell script that an
+	// executing endpoint sources before running each command submitted from
+	// within the opposite endpoint's synchronization root. Absolute and
+	// home-relative paths are interpreted on the executing endpoint's system,
+	// while other paths are resolved against its synchronization root. An empty
+	// value specifies that no prologue should be used.
+	RemotePrologue string `protobuf:"bytes,92,opt,name=remotePrologue,proto3" json:"remotePrologue,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Configuration) Reset() {
@@ -278,11 +285,18 @@ func (x *Configuration) GetRemoteCommandMode() RemoteCommandMode {
 	return RemoteCommandMode_RemoteCommandModeDefault
 }
 
+func (x *Configuration) GetRemotePrologue() string {
+	if x != nil {
+		return x.RemotePrologue
+	}
+	return ""
+}
+
 var File_synchronization_configuration_proto protoreflect.FileDescriptor
 
 const file_synchronization_configuration_proto_rawDesc = "" +
 	"\n" +
-	"#synchronization/configuration.proto\x12\x0fsynchronization\x1a$filesystem/behavior/probe_mode.proto\x1a)synchronization/remote_command_mode.proto\x1a\x1fsynchronization/scan_mode.proto\x1a synchronization/stage_mode.proto\x1a synchronization/watch_mode.proto\x1a+synchronization/compression/algorithm.proto\x1a\x1fsynchronization/core/mode.proto\x1a+synchronization/core/permissions_mode.proto\x1a-synchronization/core/symbolic_link_mode.proto\x1a(synchronization/core/ignore/syntax.proto\x1a1synchronization/core/ignore/ignore_vcs_mode.proto\x1a'synchronization/hashing/algorithm.proto\"\x90\t\n" +
+	"#synchronization/configuration.proto\x12\x0fsynchronization\x1a$filesystem/behavior/probe_mode.proto\x1a)synchronization/remote_command_mode.proto\x1a\x1fsynchronization/scan_mode.proto\x1a synchronization/stage_mode.proto\x1a synchronization/watch_mode.proto\x1a+synchronization/compression/algorithm.proto\x1a\x1fsynchronization/core/mode.proto\x1a+synchronization/core/permissions_mode.proto\x1a-synchronization/core/symbolic_link_mode.proto\x1a(synchronization/core/ignore/syntax.proto\x1a1synchronization/core/ignore/ignore_vcs_mode.proto\x1a'synchronization/hashing/algorithm.proto\"\xb8\t\n" +
 	"\rConfiguration\x12K\n" +
 	"\x13synchronizationMode\x18\v \x01(\x0e2\x19.core.SynchronizationModeR\x13synchronizationMode\x12>\n" +
 	"\x10hashingAlgorithm\x18\x11 \x01(\x0e2\x12.hashing.AlgorithmR\x10hashingAlgorithm\x12,\n" +
@@ -304,7 +318,8 @@ const file_synchronization_configuration_proto_rawDesc = "" +
 	"\fdefaultOwner\x18A \x01(\tR\fdefaultOwner\x12\"\n" +
 	"\fdefaultGroup\x18B \x01(\tR\fdefaultGroup\x12J\n" +
 	"\x14compressionAlgorithm\x18Q \x01(\x0e2\x16.compression.AlgorithmR\x14compressionAlgorithm\x12P\n" +
-	"\x11remoteCommandMode\x18[ \x01(\x0e2\".synchronization.RemoteCommandModeR\x11remoteCommandModeB3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
+	"\x11remoteCommandMode\x18[ \x01(\x0e2\".synchronization.RemoteCommandModeR\x11remoteCommandMode\x12&\n" +
+	"\x0eremotePrologue\x18\\ \x01(\tR\x0eremotePrologueB3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
 
 var (
 	file_synchronization_configuration_proto_rawDescOnce sync.Once

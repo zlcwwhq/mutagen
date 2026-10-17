@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -69,15 +70,16 @@ func helperRequest(t *testing.T, mode string, arguments ...string) *Request {
 // Requests specify absolute working directories, so no root is needed.
 func executeTest(t *testing.T, ctx context.Context, request *Request, input io.Reader, output, errorOutput io.Writer) (int, error) {
 	t.Helper()
-	return executeInRootTest(t, ctx, "", request, input, output, errorOutput)
+	return executeInRootTest(t, ctx, "", "", request, input, output, errorOutput)
 }
 
-// executeInRootTest is executeTest with an explicit synchronization root.
-func executeInRootTest(t *testing.T, ctx context.Context, root string, request *Request, input io.Reader, output, errorOutput io.Writer) (int, error) {
+// executeInRootTest is executeTest with an explicit synchronization root and
+// resolved prologue.
+func executeInRootTest(t *testing.T, ctx context.Context, root, prologue string, request *Request, input io.Reader, output, errorOutput io.Writer) (int, error) {
 	t.Helper()
 	client, server := net.Pipe()
 	served := make(chan error, 1)
-	go func() { served <- Serve(context.Background(), server, root) }()
+	go func() { served <- Serve(context.Background(), server, root, prologue) }()
 	if input == nil {
 		input = strings.NewReader("")
 	}
@@ -298,7 +300,7 @@ func TestExecuteInMappedDirectory(t *testing.T) {
 	var output bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if code, err := executeInRootTest(t, ctx, root, request, nil, &output, nil); err != nil || code != 0 {
+	if code, err := executeInRootTest(t, ctx, root, "", request, nil, &output, nil); err != nil || code != 0 {
 		t.Fatalf("execution failed: %d, %v", code, err)
 	}
 	var actual []json.RawMessage
@@ -309,6 +311,134 @@ func TestExecuteInMappedDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireSameDirectory(t, directory, filepath.Join(root, "sub", "dir"))
+}
+
+func TestResolvePrologue(t *testing.T) {
+	root := t.TempDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	absolute := filepath.Join(t.TempDir(), "prologue.sh")
+	for _, test := range []struct {
+		prologue, expected string
+	}{
+		{"", ""},
+		{"prologue.sh", filepath.Join(root, "prologue.sh")},
+		{"tools/../env.sh", filepath.Join(root, "env.sh")},
+		{absolute, absolute},
+		{"~/prologue.sh", filepath.Join(home, "prologue.sh")},
+	} {
+		if actual, err := resolvePrologue(root, test.prologue); err != nil || actual != test.expected {
+			t.Errorf("incorrect resolution of %q: %q, %v", test.prologue, actual, err)
+		}
+	}
+}
+
+func TestExecutePrologue(t *testing.T) {
+	// Prologues are sourced by a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+
+	// Create a command that's only found using the PATH set by the prologue,
+	// as is the case for commands provided by conda environments.
+	root := t.TempDir()
+	bin := filepath.Join(t.TempDir(), "bin")
+	mkdirs(t, filepath.Join(root, "sub"), bin)
+	command := "#!/bin/sh\nprintf 'found:%s' \"$REMOTE_VALUE\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "mutagen-prologue-command"), []byte(command), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writePrologue := func(name, contents string) string {
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	// The prologue sees submitted variables, and changing its positional
+	// parameters doesn't affect the command.
+	prologue := writePrologue("prologue.sh", fmt.Sprintf(
+		"PATH='%s':\"$PATH\"\nexport REMOTE_VALUE=\"prologue:$REMOTE_VALUE\"\nset -- clobbered\n", bin,
+	))
+	execute := func(prologue string, request *Request) (int, string, string, error) {
+		t.Helper()
+		var output, errorOutput bytes.Buffer
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		code, err := executeInRootTest(t, ctx, root, prologue, request, nil, &output, &errorOutput)
+		return code, output.String(), errorOutput.String(), err
+	}
+	environment := []string{"REMOTE_VALUE=submitted"}
+
+	// Requested prologues run before the command, which is located afterward.
+	request := &Request{Arguments: []string{"mutagen-prologue-command"}, Environment: environment, Path: "sub", Prologue: true}
+	if code, output, _, err := execute(prologue, request); err != nil || code != 0 || output != "found:prologue:submitted" {
+		t.Fatalf("prologue not applied: %d, %q, %v", code, output, err)
+	}
+
+	// Prologues only run when requested.
+	request.Prologue = false
+	if code, _, _, err := execute(prologue, request); err == nil || code != 127 {
+		t.Fatalf("unrequested prologue applied: %d, %v", code, err)
+	}
+
+	// Arguments, working directories, and exit codes are preserved.
+	arguments := []string{"", "two words", "--help", "$HOME", "*"}
+	request = helperRequest(t, "inspect", arguments...)
+	request.Environment = append(request.Environment, environment...)
+	request.Directory, request.Path, request.Prologue = "", "sub", true
+	code, output, _, err := execute(prologue, request)
+	if err != nil || code != 0 {
+		t.Fatalf("execution failed: %d, %v", code, err)
+	}
+	var actual []json.RawMessage
+	var directory, value string
+	var received []string
+	if err := json.Unmarshal([]byte(output), &actual); err != nil {
+		t.Fatal(err)
+	}
+	json.Unmarshal(actual[0], &directory)
+	json.Unmarshal(actual[1], &value)
+	json.Unmarshal(actual[2], &received)
+	requireSameDirectory(t, directory, filepath.Join(root, "sub"))
+	if value != "prologue:submitted" || !reflect.DeepEqual(received, arguments) {
+		t.Fatalf("incorrect metadata: %s", output)
+	}
+	request = helperRequest(t, "exit")
+	request.Directory, request.Prologue = "", true
+	if code, _, _, err := execute(prologue, request); err != nil || code != 37 {
+		t.Fatalf("incorrect exit status: %d, %v", code, err)
+	}
+
+	// Commands that can't be found after the prologue are reported as such.
+	request = &Request{Arguments: []string{"mutagen-no-such-command"}, Prologue: true}
+	if code, _, _, err := execute(prologue, request); err != nil || code != 127 {
+		t.Fatalf("missing command not reported: %d, %v", code, err)
+	}
+
+	// Prologue failures prevent the command from running, regardless of how
+	// the prologue fails.
+	request = &Request{Arguments: []string{"mutagen-prologue-command"}, Prologue: true}
+	for name, contents := range map[string]string{
+		"status":  "false\n",
+		"exit":    "exit 0\n",
+		"errexit": "set -e\nfalse\ntrue\n",
+		"syntax":  "if then\n",
+	} {
+		failing := writePrologue(name+".sh", fmt.Sprintf("PATH='%s':\"$PATH\"\n%s", bin, contents))
+		if code, output, errorOutput, err := execute(failing, request); err != nil || code != 126 || output != "" ||
+			!strings.Contains(errorOutput, "prologue "+failing+" failed with exit status") {
+			t.Errorf("%s prologue failure not reported: %d, %q, %q, %v", name, code, output, errorOutput, err)
+		}
+	}
+
+	// Missing prologues are reported without running the command.
+	if code, _, _, err := execute(filepath.Join(root, "missing.sh"), request); err == nil || code != 126 ||
+		!strings.Contains(err.Error(), "unable to access prologue") {
+		t.Fatalf("missing prologue not reported: %d, %v", code, err)
+	}
 }
 
 func TestRouteRejection(t *testing.T) {

@@ -68,17 +68,24 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 	}
 
 	// Each endpoint submits commands if and only if its opposite executes.
+	// Prologues are endpoint-specific, since they're interpreted on the
+	// executing endpoint's system.
 	relay := &commandRelay{logger: c.logger.Sublogger("commands")}
+	prologues := [2]string{
+		c.mergedAlphaConfiguration.RemotePrologue,
+		c.mergedBetaConfiguration.RemotePrologue,
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	var maintainers sync.WaitGroup
 	for index, url := range []*urlpkg.URL{c.session.Alpha, c.session.Beta} {
 		endpoint := &remote.Endpoint{
-			Session: c.session.Identifier,
-			Name:    c.session.Name,
-			Root:    url.Path,
-			Alpha:   index == 0,
-			Submit:  (index == 0 && betaExecutes) || (index == 1 && alphaExecutes),
-			Execute: (index == 0 && alphaExecutes) || (index == 1 && betaExecutes),
+			Session:  c.session.Identifier,
+			Name:     c.session.Name,
+			Root:     url.Path,
+			Alpha:    index == 0,
+			Submit:   (index == 0 && betaExecutes) || (index == 1 && alphaExecutes),
+			Execute:  (index == 0 && alphaExecutes) || (index == 1 && betaExecutes),
+			Prologue: prologues[index],
 		}
 		maintainers.Add(1)
 		go func() {

@@ -45,6 +45,11 @@ type Endpoint struct {
 	// Execute indicates whether the endpoint executes commands submitted from
 	// the opposite endpoint.
 	Execute bool
+	// Prologue is the path of a shell script that the endpoint sources before
+	// executing commands that request it, if any. Absolute and home-relative
+	// paths are interpreted on the endpoint's system, while other paths are
+	// resolved against Root.
+	Prologue string
 }
 
 // Channel connects the daemon to one endpoint's command facilities. Routes
@@ -68,6 +73,8 @@ type localChannel struct {
 	root string
 	// execute indicates whether the endpoint executes commands.
 	execute bool
+	// prologue is the resolved prologue path, if any.
+	prologue string
 	// ctx is cancelled when the channel is closed.
 	ctx context.Context
 	// cancel cancels ctx.
@@ -89,10 +96,17 @@ func NewLocalChannel(logger *logging.Logger, endpoint *Endpoint) (Channel, error
 	if err != nil {
 		return nil, fmt.Errorf("unable to normalize synchronization root: %w", err)
 	}
+	var prologue string
+	if endpoint.Execute {
+		if prologue, err = resolvePrologue(root, endpoint.Prologue); err != nil {
+			return nil, fmt.Errorf("unable to resolve remote prologue: %w", err)
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	channel := &localChannel{
 		root:     root,
 		execute:  endpoint.Execute,
+		prologue: prologue,
 		ctx:      ctx,
 		cancel:   cancel,
 		acceptor: newAcceptor(ctx),
@@ -130,7 +144,7 @@ func (c *localChannel) Open(_ context.Context) (io.ReadWriteCloser, error) {
 	c.tasks.Add(1)
 	go func() {
 		defer c.tasks.Done()
-		Serve(c.ctx, server, c.root)
+		Serve(c.ctx, server, c.root, c.prologue)
 	}()
 	return client, nil
 }
@@ -302,6 +316,8 @@ type serverInitialization struct {
 	endpoint Endpoint
 	// root is the normalized synchronization root.
 	root string
+	// prologue is the resolved prologue path, if any.
+	prologue string
 	// listener accepts local submissions. It is nil if submission is disabled.
 	listener net.Listener
 	// err is the initialization error, if any.
@@ -331,6 +347,11 @@ func initializeServer(carrier multiplexing.Carrier, install ExecutableInstaller)
 		return fail(fmt.Errorf("unable to normalize synchronization root: %w", err))
 	}
 	result.root = root
+	if endpoint.Execute {
+		if result.prologue, err = resolvePrologue(root, endpoint.Prologue); err != nil {
+			return fail(fmt.Errorf("unable to resolve remote prologue: %w", err))
+		}
+	}
 	response := &initializeResponse{}
 	if endpoint.Submit {
 		if result.listener, err = register(endpoint, root); err != nil {
@@ -382,7 +403,7 @@ func ServeChannel(ctx context.Context, logger *logging.Logger, stream io.ReadWri
 	if initialization.err != nil {
 		return initialization.err
 	}
-	endpoint, root, listener := &initialization.endpoint, initialization.root, initialization.listener
+	endpoint, root, prologue, listener := &initialization.endpoint, initialization.root, initialization.prologue, initialization.listener
 
 	// Multiplex routes and terminate all routes and commands on disconnection.
 	multiplexer := multiplexing.Multiplex(carrier, true, channelMultiplexerConfiguration())
@@ -436,7 +457,7 @@ func ServeChannel(ctx context.Context, logger *logging.Logger, stream io.ReadWri
 			defer tasks.Done()
 			if !endpoint.Execute {
 				Reject(stream, errExecutionDisabled)
-			} else if err := Serve(ctx, stream, root); err != nil {
+			} else if err := Serve(ctx, stream, root, prologue); err != nil {
 				logger.Debug("Command route failed:", err)
 			}
 		}()

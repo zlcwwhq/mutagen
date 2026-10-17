@@ -168,6 +168,9 @@ sync:
 		"beta configuration": func(s *synchronization.Session) {
 			s.ConfigurationBeta.WatchPollingInterval = 10
 		},
+		"beta remote prologue": func(s *synchronization.Session) {
+			s.ConfigurationBeta.RemotePrologue = "prologue.sh"
+		},
 		"parameters": func(s *synchronization.Session) {
 			s.Beta.Parameters = map[string]string{"parameter": "value"}
 		},

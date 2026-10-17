@@ -30,6 +30,11 @@ type Request struct {
 	// home-relative values are interpreted on the target system, while other
 	// values are resolved against the directory specified by Path.
 	Directory string
+	// Prologue indicates whether the executing endpoint's prologue, if any,
+	// should be sourced before the command. Submitters request it when the
+	// submission directory lies inside the submitting root (and thus Path
+	// identifies the corresponding directory), regardless of Directory.
+	Prologue bool
 }
 
 // EnsureValid checks that command metadata can be represented losslessly by
