@@ -6,11 +6,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mutagen-io/mutagen/cmd/remote/cli"
 	"github.com/mutagen-io/mutagen/pkg/integration/protocols/netpipe"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/selection"
@@ -43,21 +45,32 @@ func runRemoteCommand(directory string, arguments ...string) (string, int, error
 
 // flushRemote forces a synchronization cycle through the session containing
 // the specified directory, as the remote executable does around commands,
-// retrying while command channels are still connecting.
-func flushRemote(directory string) error {
+// retrying while command channels are still connecting. It returns the
+// synchronization report.
+func flushRemote(directory string) (*remote.Report, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		connection, _, err := remote.Dial(ctx, directory, "", remote.OperationFlush)
+		var report *remote.Report
 		if err == nil {
-			err = remote.Flush(ctx, connection)
+			report, err = remote.Flush(ctx, connection)
 		}
 		cancel()
 		if err == nil || time.Now().After(deadline) {
-			return err
+			return report, err
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// runRemote runs the remote command line in the specified directory.
+func runRemote(t *testing.T, directory string, arguments ...string) (int, string, string) {
+	t.Helper()
+	t.Chdir(directory)
+	var output, errorOutput strings.Builder
+	code := cli.Run(arguments, strings.NewReader(""), &output, &errorOutput)
+	return code, output.String(), errorOutput.String()
 }
 
 func TestRemoteCommandsInMemory(t *testing.T) {
@@ -113,7 +126,7 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 		t.Fatal("unable to create session:", err)
 	}
 	defer synchronizationManager.Terminate(ctx, &selection.Selection{Specifications: []string{sessionID}}, "")
-	if err := flushRemote(alphaRoot); err != nil {
+	if _, err := flushRemote(alphaRoot); err != nil {
 		t.Fatal("unable to perform initial synchronization:", err)
 	}
 
@@ -140,16 +153,63 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 	// directions before returning.
 	if err := os.WriteFile(filepath.Join(alphaRoot, "sub", "edited"), []byte("edited"), 0600); err != nil {
 		t.Fatal(err)
-	} else if err := flushRemote(alphaRoot); err != nil {
+	} else if _, err := flushRemote(alphaRoot); err != nil {
 		t.Fatal("unable to flush from alpha:", err)
 	} else if output, code, err := runRemoteCommand(filepath.Join(alphaRoot, "sub"), "cat", "edited"); err != nil || code != 0 || output != "edited" {
 		t.Fatalf("flushed change not visible on beta: %d, %q, %v", code, output, err)
 	} else if _, code, err := runRemoteCommand(filepath.Join(alphaRoot, "sub"), "sh", "-c", "printf produced > produced"); err != nil || code != 0 {
 		t.Fatalf("unable to produce file on beta: %d, %v", code, err)
-	} else if err := flushRemote(filepath.Join(betaRoot, "sub")); err != nil {
+	} else if _, err := flushRemote(filepath.Join(betaRoot, "sub")); err != nil {
 		t.Fatal("unable to flush from beta:", err)
 	} else if data, err := os.ReadFile(filepath.Join(alphaRoot, "sub", "produced")); err != nil || string(data) != "produced" {
 		t.Fatalf("flushed change not present on alpha: %q, %v", data, err)
+	}
+
+	// Modifying a synchronized file on both endpoints creates a conflict, which
+	// flushes report.
+	alphaShared, betaShared := filepath.Join(alphaRoot, "sub", "shared"), filepath.Join(betaRoot, "sub", "shared")
+	if err := os.WriteFile(alphaShared, []byte("base\n"), 0600); err != nil {
+		t.Fatal(err)
+	} else if report, err := flushRemote(alphaRoot); err != nil || !report.Empty() {
+		t.Fatalf("unable to synchronize shared file: %+v, %v", report, err)
+	} else if err := os.WriteFile(alphaShared, []byte("local\n"), 0600); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(betaShared, []byte("remote\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	expectedConflict := remote.Conflict{
+		Root:  "sub/shared",
+		Alpha: []remote.Change{{Path: "sub/shared", Old: "file", New: "file"}},
+		Beta:  []remote.Change{{Path: "sub/shared", Old: "file", New: "file"}},
+	}
+	if report, err := flushRemote(alphaRoot); err != nil || len(report.Conflicts) != 1 || !reflect.DeepEqual(report.Conflicts[0], expectedConflict) {
+		t.Fatalf("conflict not reported: %+v, %v", report, err)
+	}
+
+	// The remote executable warns about the conflict once per invocation and
+	// shows it as a diff from the local copy to the remote one.
+	warning := "remote:   shared: modified file locally, modified file remotely\n"
+	if code, _, errorOutput := runRemote(t, filepath.Join(alphaRoot, "sub"), "true"); code != 0 || strings.Count(errorOutput, warning) != 1 {
+		t.Fatalf("conflict not reported by command: %d, %q", code, errorOutput)
+	} else if code, output, errorOutput := runRemote(t, filepath.Join(alphaRoot, "sub"), "--diff"); code != 1 ||
+		output != "--- shared (local)\n+++ shared (remote)\n@@ -1 +1 @@\n-local\n+remote\n" || !strings.Contains(errorOutput, warning) {
+		t.Fatalf("conflict not shown as diff: %d, %q, %q", code, output, errorOutput)
+	} else if code, output, errorOutput := runRemote(t, filepath.Join(betaRoot, "sub"), "--diff", "shared", "file"); code != 1 ||
+		output != "--- shared (local)\n+++ shared (remote)\n@@ -1 +1 @@\n-remote\n+local\n" {
+		t.Fatalf("paths not compared from beta: %d, %q, %q", code, output, errorOutput)
+	} else if code, _, errorOutput := runRemote(t, filepath.Join(alphaRoot, "sub"), "--diff", "missing"); code != 255 ||
+		!strings.Contains(errorOutput, "missing doesn't exist locally or remotely") {
+		t.Fatalf("nonexistent path not reported: %d, %q", code, errorOutput)
+	}
+
+	// Deleting one copy resolves the conflict in favor of the other.
+	if err := os.Remove(betaShared); err != nil {
+		t.Fatal(err)
+	} else if code, output, errorOutput := runRemote(t, filepath.Join(alphaRoot, "sub"), "--diff"); code != 0 || output != "" ||
+		errorOutput != "remote: there are no conflicts to compare\n" {
+		t.Fatalf("conflict not resolved: %d, %q, %q", code, output, errorOutput)
+	} else if data, err := os.ReadFile(betaShared); err != nil || string(data) != "local\n" {
+		t.Fatalf("remaining copy not synchronized: %q, %v", data, err)
 	}
 
 	// Terminating the session removes its registrations.

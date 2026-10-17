@@ -53,6 +53,19 @@ func TestParseFlush(t *testing.T) {
 	}
 }
 
+func TestParseDiff(t *testing.T) {
+	if options, err := parse([]string{"--diff"}); err != nil || !options.diff || len(options.arguments) != 0 {
+		t.Fatal("--diff without paths rejected:", err)
+	} else if options, err := parse([]string{"--diff", "a", "--flush"}); err != nil || !reflect.DeepEqual(options.arguments, []string{"a", "--flush"}) {
+		t.Fatal("--diff paths parsed incorrectly:", options, err)
+	}
+	for _, arguments := range [][]string{{"--diff", "--flush"}, {"--diff", "--no-flush", "a"}} {
+		if _, err := parse(arguments); err == nil {
+			t.Fatalf("conflicting options accepted: %v", arguments)
+		}
+	}
+}
+
 func TestSessionEnvironmentDefault(t *testing.T) {
 	t.Setenv("MUTAGEN_REMOTE_SESSION", "from-environment")
 	if options, err := parse([]string{"true"}); err != nil || options.session != "from-environment" {
@@ -70,7 +83,7 @@ func TestRunFailures(t *testing.T) {
 	} else if code := Run(nil, strings.NewReader(""), &output, &errorOutput); code != failureExitCode {
 		t.Fatal("missing command not reported:", code)
 	}
-	for _, arguments := range [][]string{{"true"}, {"--no-flush", "true"}, {"--flush"}} {
+	for _, arguments := range [][]string{{"true"}, {"--no-flush", "true"}, {"--flush"}, {"--diff"}} {
 		errorOutput.Reset()
 		if code := Run(arguments, strings.NewReader(""), &output, &errorOutput); code != failureExitCode ||
 			strings.Count(errorOutput.String(), "no connected session") != 1 || strings.Contains(errorOutput.String(), "warning") {

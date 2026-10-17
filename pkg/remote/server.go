@@ -14,11 +14,11 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/multiplexing"
 )
 
-// Serve executes one command received over a routed connection, resolving its
-// working directory against the specified normalized synchronization root and
-// sourcing the specified resolved prologue (if non-empty) first if the command
-// requests it. It owns and closes the connection and cancels the command if the
-// client disconnects.
+// Serve executes one command (or answers one file request) received over a
+// routed connection, resolving its working directory against the specified
+// normalized synchronization root and sourcing the specified resolved prologue
+// (if non-empty) first if the command requests it. It owns and closes the
+// connection and cancels the command if the client disconnects.
 func Serve(ctx context.Context, connection io.ReadWriteCloser, root, prologue string) error {
 	// Report that the route has reached an executing endpoint.
 	if err := writeMessage(connection, &status{}); err != nil {
@@ -79,10 +79,25 @@ func workingDirectory(root string, request *Request) (string, error) {
 	return filepath.Join(base, request.Directory), nil
 }
 
-// run prepares and executes a command without interpreting its arguments.
+// sendEntry reads the entry at a slash-separated path relative to the root and
+// sends any data that it includes as output.
+func sendEntry(root, path string, output io.Writer) result {
+	entry, err := ReadEntry(filepath.Join(root, filepath.FromSlash(path)))
+	if err != nil {
+		return result{Error: fmt.Sprintf("unable to read %s: %v", path, err)}
+	} else if _, err := output.Write(entry.Data); err != nil {
+		return result{Error: fmt.Sprintf("unable to send file contents: %v", err)}
+	}
+	return result{Entry: entry}
+}
+
+// run prepares and executes a command without interpreting its arguments, or
+// sends a requested file.
 func run(ctx context.Context, root, prologue string, request *Request, stdin io.Reader, stdout, stderr io.Writer) result {
 	if err := request.EnsureValid(); err != nil {
 		return result{Error: err.Error()}
+	} else if request.File != "" {
+		return sendEntry(root, request.File, stdout)
 	}
 	directory, err := workingDirectory(root, request)
 	if err != nil {

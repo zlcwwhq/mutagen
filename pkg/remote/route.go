@@ -46,14 +46,17 @@ func Reject(connection io.ReadWriteCloser, err error) {
 	connection.Close()
 }
 
-// Respond reports the outcome of a submission that the daemon handles itself,
-// such as a flush, and closes the connection.
-func Respond(connection io.ReadWriteCloser, err error) {
+// RespondToFlush reports the outcome of a flush submission, including a report
+// of content that the session couldn't synchronize if it succeeded, and closes
+// the connection.
+func RespondToFlush(connection io.ReadWriteCloser, report *Report, err error) {
 	if err != nil {
 		Reject(connection, err)
 		return
+	} else if report == nil {
+		report = &Report{}
 	}
-	writeMessage(connection, &status{})
+	writeMessage(connection, &flushResponse{Report: report})
 	connection.Close()
 }
 

@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -624,8 +625,12 @@ func TestFlush(t *testing.T) {
 	t.Cleanup(func() { channel.Close() })
 
 	// Respond to flush submissions as the daemon would, with the specified
-	// results.
-	results := make(chan error)
+	// outcomes.
+	type outcome struct {
+		report *Report
+		err    error
+	}
+	outcomes := make(chan outcome)
 	go func() {
 		for {
 			submission, err := channel.Accept()
@@ -636,24 +641,37 @@ func TestFlush(t *testing.T) {
 				submission.Close()
 				continue
 			}
-			Respond(submission, <-results)
+			result := <-outcomes
+			RespondToFlush(submission, result.report, result.err)
 		}
 	}()
-	flush := func(ctx context.Context, result error) error {
+	flush := func(ctx context.Context, result outcome) (*Report, error) {
 		connection, _, err := Dial(ctx, root, "", OperationFlush)
 		if err != nil {
 			t.Fatal(err)
 		}
-		go func() { results <- result }()
+		go func() { outcomes <- result }()
 		return Flush(ctx, connection)
 	}
 
-	// Completion and failure are reported.
+	// Reports and failures are transmitted.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := flush(ctx, nil); err != nil {
-		t.Fatal("flush failed:", err)
-	} else if err := flush(ctx, errors.New("synchronization stopped")); err == nil || err.Error() != "synchronization stopped" {
+	report := &Report{
+		Conflicts: []Conflict{{
+			Root:  "out",
+			Alpha: []Change{{Path: "out", Old: "directory"}},
+			Beta:  []Change{{Path: "out/log", Old: "file", New: "file"}},
+		}},
+		ExcludedConflicts: 2,
+		Problems:          []Problem{{Alpha: true, Path: "secret", Error: "permission denied"}},
+		ExcludedProblems:  1,
+	}
+	if received, err := flush(ctx, outcome{report: report}); err != nil || !reflect.DeepEqual(received, report) {
+		t.Fatalf("report transmitted incorrectly: %+v, %v", received, err)
+	} else if received, err := flush(ctx, outcome{}); err != nil || received == nil || !received.Empty() {
+		t.Fatalf("missing report not treated as empty: %+v, %v", received, err)
+	} else if _, err := flush(ctx, outcome{err: errors.New("synchronization stopped")}); err == nil || err.Error() != "synchronization stopped" {
 		t.Fatal("flush failure not reported:", err)
 	}
 
@@ -664,11 +682,11 @@ func TestFlush(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancel()
-	if err := Flush(ctx, connection); !errors.Is(err, context.Canceled) {
+	if _, err := Flush(ctx, connection); !errors.Is(err, context.Canceled) {
 		t.Fatal("cancellation not reported:", err)
 	}
 	select {
-	case results <- nil:
+	case outcomes <- outcome{}:
 	case <-time.After(5 * time.Second):
 		t.Fatal("abandoned flush not received")
 	}
