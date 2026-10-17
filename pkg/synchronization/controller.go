@@ -69,7 +69,8 @@ type controller struct {
 	// lifecycleLock guards access to disabled, cancel, flushRequests, and done.
 	// Only the current holder of the lifecycle lock may set any of these fields
 	// or invoke cancel. The synchronization loop may close close done or
-	// receive from flushRequests without holding the lifecycle lock. Moreover,
+	// receive from flushRequests without holding the lifecycle lock, and its
+	// command relay may send to flushRequests while it runs. Moreover,
 	// previous lifecycle lock holders may continue to send to flushRequests and
 	// poll on done after storing them in separate variables and releasing the
 	// lifecycle lock. Any code wishing to set these fields must first acquire

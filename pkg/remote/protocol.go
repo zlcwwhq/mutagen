@@ -62,9 +62,28 @@ func (r *Request) EnsureValid() error {
 	return nil
 }
 
-// status reports whether a command route reached an executing endpoint. It is
-// written by the executing endpoint on success or by any intermediate hop that
-// is unable to establish the route.
+// Operation identifies what a submission requests from the daemon.
+type Operation uint8
+
+const (
+	// OperationExecute requests a route to the opposite endpoint's executor.
+	OperationExecute Operation = iota
+	// OperationFlush requests a synchronization cycle, whose completion the
+	// daemon reports with a status message.
+	OperationFlush
+)
+
+// submission is the header of each submission, written by the submitting
+// client and consumed by the daemon before it handles the submission.
+type submission struct {
+	// Operation is the requested operation.
+	Operation Operation
+}
+
+// status reports whether a command route reached an executing endpoint, or
+// whether a flush completed. It is written by the executing endpoint (or, for
+// flushes, the daemon) on success or by any intermediate hop that is unable to
+// establish the route.
 type status struct {
 	// Error is the routing error, if any.
 	Error string

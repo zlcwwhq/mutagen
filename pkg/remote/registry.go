@@ -245,12 +245,12 @@ func describe(session, name string) string {
 	return session
 }
 
-// Dial connects to the command route of the registered endpoint whose root
-// most specifically contains the specified directory. If session is non-empty,
-// only endpoints of sessions with that identifier or name are considered, and
-// the directory may lie outside the root. The returned connection has
-// completed its version handshake and is suitable for Execute.
-func Dial(ctx context.Context, directory, session string) (net.Conn, *Target, error) {
+// Dial submits the specified operation through the registered endpoint whose
+// root most specifically contains the specified directory. If session is
+// non-empty, only endpoints of sessions with that identifier or name are
+// considered, and the directory may lie outside the root. The returned
+// connection is suitable for Execute or Flush, depending on the operation.
+func Dial(ctx context.Context, directory, session string, operation Operation) (net.Conn, *Target, error) {
 	registry, err := filesystem.Mutagen(false, registryDirectoryName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to compute command registry directory: %w", err)
@@ -351,6 +351,12 @@ func Dial(ctx context.Context, directory, session string) (net.Conn, *Target, er
 			connection, c := live[0].connection, live[0].candidate
 			stop := context.AfterFunc(ctx, func() { connection.Close() })
 			err := mutagen.ClientVersionHandshake(connection)
+			if err == nil {
+				// A hop that rejects the submission may close the connection
+				// before reading the header, so write errors are ignored in
+				// favor of the status that the caller reads next.
+				writeMessage(connection, &submission{Operation: operation})
+			}
 			if !stop() {
 				return nil, nil, ctx.Err()
 			} else if err != nil {

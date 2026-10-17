@@ -2,6 +2,7 @@ package remote
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -11,13 +12,48 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/mutagen"
 )
 
-// handshakeTimeout bounds the version handshake with a local submission.
-const handshakeTimeout = 10 * time.Second
+const (
+	// handshakeTimeout bounds the version handshake with a local submission.
+	handshakeTimeout = 10 * time.Second
+	// submissionTimeout bounds the time that the daemon waits for a
+	// submission's header.
+	submissionTimeout = 30 * time.Second
+)
+
+// ReceiveSubmission reads the header of a submission arriving at the daemon and
+// returns the requested operation. The connection is closed if the header isn't
+// received within a timeout or before cancellation.
+func ReceiveSubmission(ctx context.Context, connection io.ReadWriteCloser) (Operation, error) {
+	ctx, cancel := context.WithTimeout(ctx, submissionTimeout)
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() { connection.Close() })
+	var header submission
+	err := readMessage(connection, &header)
+	if !stop() {
+		return 0, fmt.Errorf("submission not received: %w", ctx.Err())
+	} else if err != nil {
+		return 0, fmt.Errorf("unable to receive submission: %w", err)
+	} else if header.Operation != OperationExecute && header.Operation != OperationFlush {
+		return 0, fmt.Errorf("unsupported submission operation: %d", header.Operation)
+	}
+	return header.Operation, nil
+}
 
 // Reject reports a routing failure to the submitting side of a route and
 // closes the connection.
 func Reject(connection io.ReadWriteCloser, err error) {
 	writeMessage(connection, &status{Error: err.Error()})
+	connection.Close()
+}
+
+// Respond reports the outcome of a submission that the daemon handles itself,
+// such as a flush, and closes the connection.
+func Respond(connection io.ReadWriteCloser, err error) {
+	if err != nil {
+		Reject(connection, err)
+		return
+	}
+	writeMessage(connection, &status{})
 	connection.Close()
 }
 

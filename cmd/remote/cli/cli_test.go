@@ -37,6 +37,22 @@ func TestParseNoPrologue(t *testing.T) {
 	}
 }
 
+func TestParseFlush(t *testing.T) {
+	if options, err := parse([]string{"true"}); err != nil || options.flush || options.noFlush {
+		t.Fatal("flush options set by default:", err)
+	} else if options, err := parse([]string{"--no-flush", "true"}); err != nil || !options.noFlush {
+		t.Fatal("--no-flush not recognized:", err)
+	} else if options, err := parse([]string{"--flush"}); err != nil || !options.flush || len(options.arguments) != 0 {
+		t.Fatal("--flush without a command rejected:", err)
+	} else if options, err := parse([]string{"--flush", "true"}); err != nil || !options.flush || len(options.arguments) != 1 {
+		t.Fatal("--flush with a command rejected:", err)
+	} else if _, err := parse([]string{"--flush", "--no-flush"}); err == nil {
+		t.Fatal("conflicting flush options accepted")
+	} else if _, err := parse([]string{"--no-flush"}); err == nil {
+		t.Fatal("--no-flush without a command accepted")
+	}
+}
+
 func TestSessionEnvironmentDefault(t *testing.T) {
 	t.Setenv("MUTAGEN_REMOTE_SESSION", "from-environment")
 	if options, err := parse([]string{"true"}); err != nil || options.session != "from-environment" {
@@ -53,8 +69,13 @@ func TestRunFailures(t *testing.T) {
 		t.Fatal("version failed:", code)
 	} else if code := Run(nil, strings.NewReader(""), &output, &errorOutput); code != failureExitCode {
 		t.Fatal("missing command not reported:", code)
-	} else if code := Run([]string{"true"}, strings.NewReader(""), &output, &errorOutput); code != failureExitCode || !strings.Contains(errorOutput.String(), "no connected session") {
-		t.Fatal("missing session not reported:", code, errorOutput.String())
+	}
+	for _, arguments := range [][]string{{"true"}, {"--no-flush", "true"}, {"--flush"}} {
+		errorOutput.Reset()
+		if code := Run(arguments, strings.NewReader(""), &output, &errorOutput); code != failureExitCode ||
+			strings.Count(errorOutput.String(), "no connected session") != 1 || strings.Contains(errorOutput.String(), "warning") {
+			t.Fatalf("missing session not reported by %v: %d, %q", arguments, code, errorOutput.String())
+		}
 	}
 }
 
