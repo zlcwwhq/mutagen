@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
@@ -49,6 +50,9 @@ type commandRelay struct {
 	flushRequests chan chan error
 	// report reports content that the session couldn't synchronize.
 	report func() *remote.Report
+	// conflicts lists the session's conflicts for resolution, or is nil if
+	// the session's synchronization mode doesn't support resolution.
+	conflicts func() []remote.ConflictRoot
 	// channelsLock guards channels.
 	channelsLock sync.Mutex
 	// channels holds the connected alpha and beta channels (or nil).
@@ -86,6 +90,17 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		logger:        c.logger.Sublogger("commands"),
 		flushRequests: c.flushRequests,
 		report:        c.remoteReport,
+	}
+
+	// Resolution writes the same result to both endpoints, which is only
+	// consistent with the two-way-safe mode, since other modes give alpha
+	// precedence.
+	synchronizationMode := c.session.Configuration.SynchronizationMode
+	if synchronizationMode.IsDefault() {
+		synchronizationMode = c.session.Version.DefaultSynchronizationMode()
+	}
+	if synchronizationMode == core.SynchronizationMode_SynchronizationModeTwoWaySafe {
+		relay.conflicts = c.remoteConflicts
 	}
 
 	// Each endpoint submits commands if and only if its opposite executes.
@@ -189,6 +204,20 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 	if err != nil {
 		remote.Reject(submission, err)
 		return
+	} else if operation == remote.OperationConflicts {
+		r.logger.Debug("Forcing synchronization cycle for conflict listing")
+		stop := context.AfterFunc(ctx, func() { submission.Close() })
+		defer stop()
+		var conflicts []remote.ConflictRoot
+		if r.conflicts == nil {
+			err = errors.New("conflict resolution requires the two-way-safe synchronization mode")
+		} else if err = r.flush(ctx); err == nil {
+			conflicts = r.conflicts()
+		}
+		if err := remote.RespondWithConflicts(submission, conflicts, err); err != nil {
+			r.logger.Debug("Unable to send conflicts:", err)
+		}
+		return
 	} else if operation == remote.OperationFlush {
 		r.logger.Debug("Forcing synchronization cycle for submission")
 		stop := context.AfterFunc(ctx, func() { submission.Close() })
@@ -196,6 +225,7 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		var report *remote.Report
 		if err = r.flush(ctx); err == nil {
 			report = r.report()
+			report.Resolution = r.conflicts != nil
 		}
 		if err := remote.RespondToFlush(submission, report, err); err != nil {
 			r.logger.Debug("Unable to send synchronization report:", err)
@@ -286,6 +316,36 @@ func (c *controller) remoteReport() *remote.Report {
 		}
 	}
 	return report
+}
+
+// remoteConflicts lists all of the session's conflicts as of its last
+// synchronization cycle, sorted by root path, for resolution.
+func (c *controller) remoteConflicts() []remote.ConflictRoot {
+	c.stateLock.Lock()
+	conflicts := slices.Clone(c.state.Conflicts)
+	c.stateLock.UnlockWithoutNotify()
+	core.SortConflicts(conflicts)
+	result := make([]remote.ConflictRoot, len(conflicts))
+	for c, conflict := range conflicts {
+		result[c] = remote.ConflictRoot{Path: conflict.Root, Resolvable: resolvable(conflict)}
+	}
+	return result
+}
+
+// resolvable determines whether a conflict is between regular files at a
+// non-root path. In the two-way-safe mode, a conflict's changes on each side
+// then consist of a single change at the conflict root.
+func resolvable(conflict *core.Conflict) bool {
+	if conflict.Root == "" {
+		return false
+	}
+	for _, changes := range [][]*core.Change{conflict.AlphaChanges, conflict.BetaChanges} {
+		if len(changes) != 1 || changes[0].Path != conflict.Root ||
+			changes[0].New == nil || changes[0].New.Kind != core.EntryKind_File {
+			return false
+		}
+	}
+	return true
 }
 
 // remoteChanges converts changes for remote reports.

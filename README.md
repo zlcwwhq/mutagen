@@ -158,7 +158,7 @@ continues with the command's exit status; `--no-flush` skips both flushes, and
 
 After each flush, `remote` also warns about content that the session couldn't
 synchronize: conflicts (paths modified on both endpoints, which aren't
-synchronized until one copy is deleted) and problems such as permission errors.
+synchronized until resolved) and problems such as permission errors.
 `remote --diff` shows how the remote copies of conflicting files, or of the
 specified paths, differ from the local copies as a unified diff, and exits with
 status 1 if any differ. Single-file sessions are supported: use `--session`
@@ -167,6 +167,43 @@ file, its former children are compared as missing entries. Large conflict
 reports may omit change details; warnings give the omitted counts, and explicit
 paths can still be compared with `remote --diff <path>`. `--timeout` also bounds
 reading and hashing files during comparison.
+
+In two-way-safe sessions, `remote` can also resolve conflicts between two
+files:
+
+```sh
+remote --conflicts                    # synchronize and list every conflict
+remote --conflict-checkout src/app.go # download both copies into a workspace
+# Edit the printed merged file, resolving its conflict markers.
+remote --conflict-apply src/app.go    # write it to both copies and verify
+```
+
+Checkout downloads both complete copies, however large, into a workspace in
+the Mutagen data directory (which must be outside the synchronization root)
+and prints the paths of its `local`, `remote`, and `merged` files. Regions where
+text copies differ are enclosed in Git-style conflict markers, without a common
+base version, while binary copies get no merged file. Checking out again keeps
+an existing workspace and its edits. Instead of the merged file, apply can use
+an original copy (`--take local` or `--take remote`) or delete both copies
+(`--delete`); copies that differ in executability require `--executable` or
+`--take`. `--json` prints machine-readable results, and `--conflict-discard`
+removes a workspace without changing either copy.
+
+Apply replaces each copy only if it matches one of the checked-out copies,
+then flushes and checks that no conflict involves the file and that both
+copies have the result before removing the workspace. Either checked-out copy
+is accepted on both endpoints, since synchronization doesn't pause between the
+writes and may copy one over a partially applied result (such as a deletion),
+which also removes the conflict. If either copy was edited since checkout,
+apply fails without overwriting the edit; discard the workspace and check out
+again. Any other failed apply can be retried, even if the conflict is no
+longer listed or the merged file was edited since (copies that have a result
+applied before are replaced too), and copies that already match the result are
+left as they are. A conflict operation fails while another one on the same file
+is running.
+Conflicts involving directories, symbolic links, or unsynchronizable content
+are listed but must be resolved manually, as must conflicts in other
+synchronization modes.
 
 Any process running as your user on a submitting endpoint's system can run
 commands on the executing endpoint, so only enable remote commands toward

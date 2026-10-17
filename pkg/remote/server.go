@@ -92,12 +92,23 @@ func sendEntry(ctx context.Context, root, path string, output io.Writer) result 
 }
 
 // run prepares and executes a command without interpreting its arguments, or
-// sends a requested file.
+// performs a requested file operation.
 func run(ctx context.Context, root, prologue string, request *Request, stdin io.Reader, stdout, stderr io.Writer) result {
 	if err := request.EnsureValid(); err != nil {
 		return result{Error: err.Error()}
 	} else if request.File != "" {
 		return sendEntry(ctx, root, request.File, stdout)
+	} else if request.Copy != "" {
+		entry, err := CopyFile(ctx, root, request.Copy, stdout)
+		if err != nil {
+			return result{Error: fmt.Sprintf("unable to copy %s: %v", request.Copy, err)}
+		}
+		return result{Entry: entry}
+	} else if request.Replace != nil {
+		if err := ReplaceFile(ctx, root, request.Replace, stdin); err != nil {
+			return result{Error: fmt.Sprintf("unable to replace %s: %v", request.Replace.Path, err)}
+		}
+		return result{}
 	}
 	directory, err := workingDirectory(root, request)
 	if err != nil {

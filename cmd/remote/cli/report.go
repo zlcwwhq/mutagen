@@ -29,17 +29,22 @@ func newLocator(target *remote.Target) *locator {
 	return &locator{root: target.Root, base: target.Path, contained: target.Contained}
 }
 
-// display formats a path relative to the root for display, relative to the
-// working directory if it's inside the root and as an absolute path otherwise.
-// Control characters are neutralized.
-func (l *locator) display(relative string) string {
+// local converts a path relative to the root to a local path, relative to the
+// working directory if it's inside the root and absolute otherwise.
+func (l *locator) local(relative string) string {
 	local := filepath.Join(l.root, filepath.FromSlash(relative))
 	if l.contained {
 		if result, err := filepath.Rel(filepath.Join(l.root, filepath.FromSlash(l.base)), local); err == nil {
 			local = result
 		}
 	}
-	return terminal.NeutralizeControlCharacters(local)
+	return local
+}
+
+// display formats a path relative to the root for display (see local), with
+// control characters neutralized.
+func (l *locator) display(relative string) string {
+	return terminal.NeutralizeControlCharacters(l.local(relative))
 }
 
 // resolve converts a local path argument to a path relative to the root.
@@ -108,7 +113,12 @@ func (r *reporter) print(report *remote.Report) {
 	if report.ExcludedConflicts > 0 {
 		conflicts = append(conflicts, fmt.Sprintf("...and %d more conflicts", report.ExcludedConflicts))
 	}
-	r.section("these conflicts aren't synchronized until one side's copy is deleted (see remote --diff):", conflicts)
+	// Only sessions that support resolution refer to it.
+	heading := "these conflicts aren't synchronized until one side's copy is deleted (see remote --diff):"
+	if report.Resolution {
+		heading = "these conflicts aren't synchronized until resolved (see remote --diff and remote --conflicts):"
+	}
+	r.section(heading, conflicts)
 	var problems []string
 	for _, problem := range report.Problems {
 		side := "remote"

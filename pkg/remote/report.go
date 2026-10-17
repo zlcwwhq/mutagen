@@ -19,6 +19,9 @@ type Report struct {
 	Problems []Problem
 	// ExcludedProblems is the number of problems omitted from Problems.
 	ExcludedProblems uint64
+	// Resolution indicates whether remote can resolve the session's conflicts
+	// (see ListConflicts), which requires the two-way-safe mode.
+	Resolution bool `json:",omitempty"`
 }
 
 // Empty indicates whether the report contains no conflicts or problems.

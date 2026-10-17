@@ -39,6 +39,13 @@ type Request struct {
 	// entry to read (see ReadEntry) instead of running a command. Requests for
 	// files specify no arguments. A dot refers to the root itself.
 	File string
+	// Copy is the slash-separated path, relative to the target root, of a
+	// regular file whose complete contents are sent as output (see CopyFile)
+	// instead of running a command.
+	Copy string
+	// Replace requests replacement of a file by contents read from input (see
+	// ReplaceFile) instead of running a command.
+	Replace *Replacement `json:",omitempty"`
 }
 
 // validRelativePath determines whether a slash-separated path lies inside the
@@ -51,7 +58,18 @@ func validRelativePath(value string) bool {
 // EnsureValid checks that command metadata can be represented losslessly by
 // the protocol and passed to the operating system.
 func (r *Request) EnsureValid() error {
-	if r != nil && r.File != "" {
+	if r != nil && (r.Copy != "" || r.Replace != nil) {
+		path := r.Copy
+		if r.Replace != nil {
+			path = r.Replace.Path
+		}
+		if len(r.Arguments) > 0 || r.File != "" || (r.Copy != "" && r.Replace != nil) {
+			return errors.New("file operations must not specify a command or another operation")
+		} else if path == "" || path == "." || !utf8.ValidString(path) || strings.IndexByte(path, 0) >= 0 || !validRelativePath(path) {
+			return errors.New("file operation path must be relative to, and not the same as, the synchronization root")
+		}
+		return nil
+	} else if r != nil && r.File != "" {
 		if len(r.Arguments) > 0 {
 			return errors.New("file requests must not specify a command")
 		} else if !utf8.ValidString(r.File) || strings.IndexByte(r.File, 0) >= 0 || !validRelativePath(r.File) {
@@ -88,6 +106,9 @@ const (
 	// OperationFlush requests a synchronization cycle, whose completion the
 	// daemon reports with a status message.
 	OperationFlush
+	// OperationConflicts requests a synchronization cycle followed by a
+	// complete listing of the session's conflicts (see ListConflicts).
+	OperationConflicts
 )
 
 // submission is the header of each submission, written by the submitting
