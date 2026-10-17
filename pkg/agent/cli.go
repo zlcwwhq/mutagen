@@ -7,8 +7,10 @@ const (
 	CommandForwarder = "forwarder"
 	// CommandSynchronizer is the name of the agent synchronizer command.
 	CommandSynchronizer = "synchronizer"
+	// CommandExecutor is the name of the agent remote command executor command.
+	CommandExecutor = "executor"
 
-	// FlagLogLevel is the flag for specifying the log level for the forwarder
-	// and synchronizer commands (without the preceding double-dash).
+	// FlagLogLevel is the flag for specifying the log level for the forwarder,
+	// synchronizer, and executor commands (without the preceding double-dash).
 	FlagLogLevel = "log-level"
 )

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -180,7 +181,7 @@ func connect(logger *logging.Logger, transport Transport, mode, prompter string,
 // connection mode, and prompter.
 func Dial(logger *logging.Logger, transport Transport, mode, prompter string) (io.ReadWriteCloser, error) {
 	// Validate that the mode is sane.
-	if !(mode == CommandSynchronizer || mode == CommandForwarder) {
+	if !(mode == CommandSynchronizer || mode == CommandForwarder || mode == CommandExecutor) {
 		return nil, errors.New("invalid agent dial mode")
 	}
 
@@ -214,4 +215,37 @@ func Dial(logger *logging.Logger, transport Transport, mode, prompter string) (i
 		return nil, err
 	}
 	return stream, nil
+}
+
+// DialContext is a cancellable variant of Dial. If the context is cancelled
+// before dialing completes, then dialing continues in the background and any
+// resulting connection is closed.
+func DialContext(ctx context.Context, logger *logging.Logger, transport Transport, mode, prompter string) (io.ReadWriteCloser, error) {
+	// Create a channel to deliver the dialing result.
+	type dialResult struct {
+		stream io.ReadWriteCloser
+		err    error
+	}
+	results := make(chan dialResult)
+
+	// Perform dialing in a background Goroutine so that we can monitor for
+	// cancellation.
+	go func() {
+		stream, err := Dial(logger, transport, mode, prompter)
+		select {
+		case results <- dialResult{stream, err}:
+		case <-ctx.Done():
+			if stream != nil {
+				stream.Close()
+			}
+		}
+	}()
+
+	// Wait for dialing results or cancellation.
+	select {
+	case result := <-results:
+		return result.stream, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }

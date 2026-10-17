@@ -5,6 +5,7 @@ package synchronization;
 option go_package = "github.com/mutagen-io/mutagen/pkg/synchronization";
 
 import "filesystem/behavior/probe_mode.proto";
+import "synchronization/remote_command_mode.proto";
 import "synchronization/scan_mode.proto";
 import "synchronization/stage_mode.proto";
 import "synchronization/watch_mode.proto";
@@ -143,5 +144,15 @@ message Configuration {
     compression.Algorithm compressionAlgorithm = 81;
 
     // Fields 82-90 are reserved for future compression configuration
+    // parameters.
+
+
+    // Remote command configuration parameters (fields 91-100).
+
+    // RemoteCommandMode specifies which endpoints execute commands submitted
+    // from the opposite endpoint via the remote executable.
+    RemoteCommandMode remoteCommandMode = 91;
+
+    // Fields 92-100 are reserved for future remote command configuration
     // parameters.
 }

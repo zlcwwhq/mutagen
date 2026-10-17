@@ -35,6 +35,12 @@ platform are placed in the root of the build directory for easy testing, e.g.:
     go run scripts/build.go
     build/mutagen --help
 
+The build also produces `build/remote` (`build/remote.exe` on Windows), the
+standalone remote command executable, which release archives include alongside
+the CLI. The agent bundle doesn't include it: agents act as the remote
+executable when invoked by that name, so endpoints install `remote` as a link to
+the agent.
+
 
 ## Protocol Buffers code generation
 

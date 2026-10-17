@@ -77,6 +77,9 @@ type Configuration struct {
 		// Algorithm specifies the compression algorithm.
 		Algorithm compression.Algorithm `json:"algorithm,omitempty" yaml:"algorithm" mapstructure:"algorithm"`
 	} `json:"compression" yaml:"compression" mapstructure:"compression"`
+	// Remote specifies which endpoints execute commands submitted from the
+	// opposite endpoint via the remote executable.
+	Remote synchronization.RemoteCommandMode `json:"remote,omitempty" yaml:"remote" mapstructure:"remote"`
 }
 
 // loadFromInternal sets a configuration to match an internal
@@ -114,6 +117,9 @@ func (c *Configuration) loadFromInternal(configuration *synchronization.Configur
 
 	// Propagate compression configuration.
 	c.Compression.Algorithm = configuration.CompressionAlgorithm
+
+	// Propagate remote command configuration.
+	c.Remote = configuration.RemoteCommandMode
 }
 
 // ToInternal converts a public configuration representation to an internal
@@ -140,5 +146,6 @@ func (c *Configuration) ToInternal() *synchronization.Configuration {
 		DefaultOwner:           c.Permissions.DefaultOwner,
 		DefaultGroup:           c.Permissions.DefaultGroup,
 		CompressionAlgorithm:   c.Compression.Algorithm,
+		RemoteCommandMode:      c.Remote,
 	}
 }

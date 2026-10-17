@@ -44,6 +44,8 @@ permissions:
 
 compression:
   algorithm: deflate
+
+remote: true
 `
 )
 
@@ -71,6 +73,7 @@ var expectedConfiguration = &synchronization.Configuration{
 	DefaultDirectoryMode: 0755,
 	DefaultOwner:         "george",
 	DefaultGroup:         "presidents",
+	RemoteCommandMode:    synchronization.RemoteCommandMode_RemoteCommandModeBoth,
 }
 
 // TestLoadConfiguration tests loading a YAML-based session configuration.
@@ -157,6 +160,9 @@ func TestLoadConfiguration(t *testing.T) {
 	}
 	if configuration.DefaultGroup != expectedConfiguration.DefaultGroup {
 		t.Error("default owner mismatch:", configuration.DefaultGroup, "!=", expectedConfiguration.DefaultGroup)
+	}
+	if configuration.RemoteCommandMode != expectedConfiguration.RemoteCommandMode {
+		t.Error("remote command mode mismatch:", configuration.RemoteCommandMode, "!=", expectedConfiguration.RemoteCommandMode)
 	}
 }
 

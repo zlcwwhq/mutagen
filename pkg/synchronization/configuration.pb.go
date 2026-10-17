@@ -94,8 +94,11 @@ type Configuration struct {
 	// CompressionAlgorithm specifies the compression algorithm to use when
 	// communicating with the endpoint. This only applies to remote endpoints.
 	CompressionAlgorithm compression.Algorithm `protobuf:"varint,81,opt,name=compressionAlgorithm,proto3,enum=compression.Algorithm" json:"compressionAlgorithm,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// RemoteCommandMode specifies which endpoints execute commands submitted
+	// from the opposite endpoint via the remote executable.
+	RemoteCommandMode RemoteCommandMode `protobuf:"varint,91,opt,name=remoteCommandMode,proto3,enum=synchronization.RemoteCommandMode" json:"remoteCommandMode,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Configuration) Reset() {
@@ -268,11 +271,18 @@ func (x *Configuration) GetCompressionAlgorithm() compression.Algorithm {
 	return compression.Algorithm(0)
 }
 
+func (x *Configuration) GetRemoteCommandMode() RemoteCommandMode {
+	if x != nil {
+		return x.RemoteCommandMode
+	}
+	return RemoteCommandMode_RemoteCommandModeDefault
+}
+
 var File_synchronization_configuration_proto protoreflect.FileDescriptor
 
 const file_synchronization_configuration_proto_rawDesc = "" +
 	"\n" +
-	"#synchronization/configuration.proto\x12\x0fsynchronization\x1a$filesystem/behavior/probe_mode.proto\x1a\x1fsynchronization/scan_mode.proto\x1a synchronization/stage_mode.proto\x1a synchronization/watch_mode.proto\x1a+synchronization/compression/algorithm.proto\x1a\x1fsynchronization/core/mode.proto\x1a+synchronization/core/permissions_mode.proto\x1a-synchronization/core/symbolic_link_mode.proto\x1a(synchronization/core/ignore/syntax.proto\x1a1synchronization/core/ignore/ignore_vcs_mode.proto\x1a'synchronization/hashing/algorithm.proto\"\xbe\b\n" +
+	"#synchronization/configuration.proto\x12\x0fsynchronization\x1a$filesystem/behavior/probe_mode.proto\x1a)synchronization/remote_command_mode.proto\x1a\x1fsynchronization/scan_mode.proto\x1a synchronization/stage_mode.proto\x1a synchronization/watch_mode.proto\x1a+synchronization/compression/algorithm.proto\x1a\x1fsynchronization/core/mode.proto\x1a+synchronization/core/permissions_mode.proto\x1a-synchronization/core/symbolic_link_mode.proto\x1a(synchronization/core/ignore/syntax.proto\x1a1synchronization/core/ignore/ignore_vcs_mode.proto\x1a'synchronization/hashing/algorithm.proto\"\x90\t\n" +
 	"\rConfiguration\x12K\n" +
 	"\x13synchronizationMode\x18\v \x01(\x0e2\x19.core.SynchronizationModeR\x13synchronizationMode\x12>\n" +
 	"\x10hashingAlgorithm\x18\x11 \x01(\x0e2\x12.hashing.AlgorithmR\x10hashingAlgorithm\x12,\n" +
@@ -293,7 +303,8 @@ const file_synchronization_configuration_proto_rawDesc = "" +
 	"\x14defaultDirectoryMode\x18@ \x01(\rR\x14defaultDirectoryMode\x12\"\n" +
 	"\fdefaultOwner\x18A \x01(\tR\fdefaultOwner\x12\"\n" +
 	"\fdefaultGroup\x18B \x01(\tR\fdefaultGroup\x12J\n" +
-	"\x14compressionAlgorithm\x18Q \x01(\x0e2\x16.compression.AlgorithmR\x14compressionAlgorithmB3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
+	"\x14compressionAlgorithm\x18Q \x01(\x0e2\x16.compression.AlgorithmR\x14compressionAlgorithm\x12P\n" +
+	"\x11remoteCommandMode\x18[ \x01(\x0e2\".synchronization.RemoteCommandModeR\x11remoteCommandModeB3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
 
 var (
 	file_synchronization_configuration_proto_rawDescOnce sync.Once
@@ -321,6 +332,7 @@ var file_synchronization_configuration_proto_goTypes = []any{
 	(ignore.IgnoreVCSMode)(0),     // 9: ignore.IgnoreVCSMode
 	(core.PermissionsMode)(0),     // 10: core.PermissionsMode
 	(compression.Algorithm)(0),    // 11: compression.Algorithm
+	(RemoteCommandMode)(0),        // 12: synchronization.RemoteCommandMode
 }
 var file_synchronization_configuration_proto_depIdxs = []int32{
 	1,  // 0: synchronization.Configuration.synchronizationMode:type_name -> core.SynchronizationMode
@@ -334,11 +346,12 @@ var file_synchronization_configuration_proto_depIdxs = []int32{
 	9,  // 8: synchronization.Configuration.ignoreVCSMode:type_name -> ignore.IgnoreVCSMode
 	10, // 9: synchronization.Configuration.permissionsMode:type_name -> core.PermissionsMode
 	11, // 10: synchronization.Configuration.compressionAlgorithm:type_name -> compression.Algorithm
-	11, // [11:11] is the sub-list for method output_type
-	11, // [11:11] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	12, // 11: synchronization.Configuration.remoteCommandMode:type_name -> synchronization.RemoteCommandMode
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_configuration_proto_init() }
@@ -346,6 +359,7 @@ func file_synchronization_configuration_proto_init() {
 	if File_synchronization_configuration_proto != nil {
 		return
 	}
+	file_synchronization_remote_command_mode_proto_init()
 	file_synchronization_scan_mode_proto_init()
 	file_synchronization_stage_mode_proto_init()
 	file_synchronization_watch_mode_proto_init()

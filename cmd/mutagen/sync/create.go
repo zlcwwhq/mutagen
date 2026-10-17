@@ -438,6 +438,14 @@ func createMain(_ *cobra.Command, arguments []string) error {
 		}
 	}
 
+	// Validate and convert the remote command mode specification.
+	var remoteCommandMode synchronization.RemoteCommandMode
+	if createConfiguration.remote != "" {
+		if err := remoteCommandMode.UnmarshalText([]byte(createConfiguration.remote)); err != nil {
+			return fmt.Errorf("unable to parse remote command mode: %w", err)
+		}
+	}
+
 	// Create the command line configuration and merge it into our cumulative
 	// configuration.
 	configuration = synchronization.MergeConfigurations(configuration, &synchronization.Configuration{
@@ -460,6 +468,7 @@ func createMain(_ *cobra.Command, arguments []string) error {
 		DefaultOwner:           createConfiguration.defaultOwner,
 		DefaultGroup:           createConfiguration.defaultGroup,
 		CompressionAlgorithm:   compressionAlgorithm,
+		RemoteCommandMode:      remoteCommandMode,
 	})
 
 	// Create the creation specification.
@@ -669,6 +678,9 @@ var createConfiguration struct {
 	// compressionBeta specifies the compression algorithm to use when
 	// communicating with a remote beta endpoint.
 	compressionBeta string
+	// remote specifies which endpoints execute commands submitted from the
+	// opposite endpoint via the remote executable.
+	remote string
 }
 
 func init() {
@@ -744,6 +756,9 @@ func init() {
 	flags.StringVarP(&createConfiguration.compression, "compression", "C", "", "Specify compression algorithm ("+compressionFlagOptions+")")
 	flags.StringVar(&createConfiguration.compressionAlpha, "compression-alpha", "", "Specify compression algorithm for alpha ("+compressionFlagOptions+")")
 	flags.StringVar(&createConfiguration.compressionBeta, "compression-beta", "", "Specify compression algorithm for beta ("+compressionFlagOptions+")")
+
+	// Wire up remote command flags.
+	flags.StringVar(&createConfiguration.remote, "remote", "", "Specify which endpoints execute remote commands (true|alpha|beta|false)")
 
 	// Set up flag normalization. This is only required to handle aliases.
 	flags.SetNormalizeFunc(func(f *pflag.FlagSet, name string) pflag.NormalizedName {

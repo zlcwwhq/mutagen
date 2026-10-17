@@ -62,6 +62,65 @@ You can find
 in the [Mutagen documentation](https://mutagen.io/documentation).
 
 
+## Remote commands
+
+The `remote` executable runs a command on the opposite endpoint of a
+synchronization session, in the directory corresponding to the current one:
+invoked inside alpha's root, it runs the command on beta, and invoked inside
+beta's root, it runs the command on alpha. Commands are routed through the
+Mutagen daemon over its own agent connections, so the endpoints don't need to
+reach each other and the daemon can run on a third system.
+
+Remote commands are enabled per session with the `remote` configuration
+parameter, whose value names the endpoints that execute commands: `true`
+(both), `alpha`, `beta`, or `false` (the default). It can be specified with the
+`--remote` flag of `mutagen sync create`, under a session (or `defaults`) in
+`mutagen.yml` project files, or under `sync.defaults` in global configuration:
+
+```yaml
+sync:
+  code:
+    alpha: "."
+    beta: "server:~/project"
+    remote: true
+```
+
+```sh
+mutagen sync create --remote=true ~/project server:~/project
+cd ~/project/service
+remote go test ./...                    # runs in ~/project/service on server
+remote -e NODE_ENV=test --env-file .env.remote npm test
+remote --timeout 2m sh -c 'make build && make test'
+```
+
+On the daemon's system, `remote` is installed alongside `mutagen`. On SSH and
+Docker endpoints, the agent installs it next to itself as a link to itself (a
+symbolic link, or a hard link on Windows), normally at
+`~/.mutagen/agents/<version>/remote`. Invoke it by
+that path, or put that directory on `PATH`; links to it must also be named
+`remote`.
+
+Use `--session` (or `MUTAGEN_REMOTE_SESSION`) to select a session by name or
+identifier, which also allows invocation outside its root. `--cwd` overrides the
+working directory (relative values are resolved against the corresponding
+directory). `-e NAME=VALUE` sets a variable, `-e NAME` forwards a local one, and
+`--env-file` loads literal `NAME=VALUE` lines. Otherwise, commands inherit the
+environment of the agent (or, on the daemon's system, of the daemon).
+
+Options must precede the command, and arguments are passed without shell
+interpretation, so shell syntax requires an explicit shell. Standard streams and
+the exit status are preserved (255 indicates that the command couldn't be
+routed), but no pseudo-terminal is allocated. Commands can only be routed while the
+session is connected, and the daemon connects command channels in the
+background, so SSH authentication must work non-interactively. Commands see the
+files currently present on the executing endpoint; run `mutagen sync flush`
+first when needed.
+
+Any process running as your user on a submitting endpoint's system can run
+commands on the executing endpoint, so only enable remote commands toward
+endpoints whose systems you trust as much as the executing endpoint itself.
+
+
 ## Community
 
 The [Mutagen Community Slack Workspace](https://mutagen.io/slack) is the place

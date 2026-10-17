@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/mutagen-io/mutagen/pkg/configuration/global"
+	"github.com/mutagen-io/mutagen/pkg/synchronization"
 )
 
 // testConfiguration loads project YAML through the production loader.
@@ -127,18 +128,54 @@ sync:
 	}
 }
 
+// TestSessionSpecificationsRemoteCommands verifies that remote commands can be
+// enabled in project files, including with unquoted YAML booleans.
+func TestSessionSpecificationsRemoteCommands(t *testing.T) {
+	t.Chdir(t.TempDir())
+	specifications := testSpecifications(t, `
+sync:
+  defaults:
+    alpha: ./alpha
+    beta: ./beta
+    remote: true
+  alphaOnly: {remote: alpha}
+  disabled: {remote: false}
+  inherited: {}
+`)
+	expected := map[string]synchronization.RemoteCommandMode{
+		"alphaOnly": synchronization.RemoteCommandMode_RemoteCommandModeAlpha,
+		"disabled":  synchronization.RemoteCommandMode_RemoteCommandModeDisabled,
+		"inherited": synchronization.RemoteCommandMode_RemoteCommandModeBoth,
+	}
+	for _, s := range specifications.Synchronization {
+		if s.Configuration.RemoteCommandMode != expected[s.Name] {
+			t.Errorf("incorrect remote command mode for %s: %s", s.Name, s.Configuration.RemoteCommandMode)
+		}
+	}
+
+	// Unknown values are rejected when the file is loaded.
+	path := filepath.Join(t.TempDir(), DefaultConfigurationFileName)
+	contents := "sync:\n  example: {alpha: ./alpha, beta: ./beta, remote: both}\n"
+	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	} else if _, err := LoadConfiguration(path); err == nil {
+		t.Fatal("invalid remote command mode accepted")
+	}
+}
+
 // TestSessionSpecificationsInvalid verifies that configuration that the daemon
 // would reject is detected before any sessions are modified.
 func TestSessionSpecificationsInvalid(t *testing.T) {
 	t.Chdir(t.TempDir())
 	for name, contents := range map[string]string{
-		"session name":            "sync:\n  1invalid: {alpha: ./alpha, beta: ./beta}\n",
-		"missing URL":             "sync:\n  example: {alpha: ./alpha}\n",
-		"endpoint-specific mode":  "sync:\n  example: {alpha: ./alpha, beta: ./beta, configurationBeta: {mode: two-way-safe}}\n",
-		"Mutagen-style ignores":   "sync:\n  example: {alpha: ./alpha, beta: ./beta, ignore: {paths: ['!']}}\n",
-		"Docker-style ignores":    "sync:\n  example: {alpha: ./alpha, beta: ./beta, ignore: {syntax: docker, paths: ['!']}}\n",
-		"default ignores":         "sync:\n  defaults: {ignore: {paths: ['!']}}\n  example: {alpha: ./alpha, beta: ./beta}\n",
-		"forwarding session name": "forward:\n  1invalid: {source: 'tcp:127.0.0.1:8000', destination: 'tcp:127.0.0.1:8001'}\n",
+		"session name":             "sync:\n  1invalid: {alpha: ./alpha, beta: ./beta}\n",
+		"missing URL":              "sync:\n  example: {alpha: ./alpha}\n",
+		"endpoint-specific mode":   "sync:\n  example: {alpha: ./alpha, beta: ./beta, configurationBeta: {mode: two-way-safe}}\n",
+		"endpoint-specific remote": "sync:\n  example: {alpha: ./alpha, beta: ./beta, configurationAlpha: {remote: true}}\n",
+		"Mutagen-style ignores":    "sync:\n  example: {alpha: ./alpha, beta: ./beta, ignore: {paths: ['!']}}\n",
+		"Docker-style ignores":     "sync:\n  example: {alpha: ./alpha, beta: ./beta, ignore: {syntax: docker, paths: ['!']}}\n",
+		"default ignores":          "sync:\n  defaults: {ignore: {paths: ['!']}}\n  example: {alpha: ./alpha, beta: ./beta}\n",
+		"forwarding session name":  "forward:\n  1invalid: {source: 'tcp:127.0.0.1:8000', destination: 'tcp:127.0.0.1:8001'}\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := NewSessionSpecifications(testConfiguration(t, contents), nil, "project", false); err == nil {

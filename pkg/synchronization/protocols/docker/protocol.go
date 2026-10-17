@@ -8,6 +8,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/agent"
 	"github.com/mutagen-io/mutagen/pkg/agent/transport/docker"
 	"github.com/mutagen-io/mutagen/pkg/logging"
+	remotecommands "github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/remote"
 	urlpkg "github.com/mutagen-io/mutagen/pkg/url"
@@ -83,6 +84,38 @@ func (h *protocolHandler) Connect(
 
 	// Create the endpoint client.
 	return remote.NewEndpoint(logger, stream, url.Path, session, version, configuration, alpha)
+}
+
+// ConnectCommands implements synchronization.CommandProtocolHandler using an
+// agent in executor mode, which also installs the remote executable if needed.
+func (h *protocolHandler) ConnectCommands(
+	ctx context.Context,
+	logger *logging.Logger,
+	url *urlpkg.URL,
+	endpoint *remotecommands.Endpoint,
+) (remotecommands.Channel, error) {
+	// Verify that the URL is of the correct kind and protocol.
+	if url.Kind != urlpkg.Kind_Synchronization {
+		panic("non-synchronization URL dispatched to synchronization protocol handler")
+	} else if url.Protocol != urlpkg.Protocol_Docker {
+		panic("non-Docker URL dispatched to Docker protocol handler")
+	}
+
+	// Create a Docker agent transport. Command channels are maintained in the
+	// background, so no prompter is available.
+	transport, err := docker.NewTransport(url.Host, url.User, url.Environment, url.Parameters, "")
+	if err != nil {
+		return nil, fmt.Errorf("unable to create Docker transport: %w", err)
+	}
+
+	// Dial an agent in executor mode.
+	stream, err := agent.DialContext(ctx, logger, transport, agent.CommandExecutor, "")
+	if err != nil {
+		return nil, fmt.Errorf("unable to dial agent executor: %w", err)
+	}
+
+	// Create the channel.
+	return remotecommands.NewChannel(ctx, logger, stream, endpoint)
 }
 
 func init() {

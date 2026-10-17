@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/mutagen-io/mutagen/pkg/logging"
+	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/local"
 	urlpkg "github.com/mutagen-io/mutagen/pkg/url"
@@ -40,6 +41,26 @@ func (h *protocolHandler) Connect(
 
 	// Success.
 	return endpoint, nil
+}
+
+// ConnectCommands implements synchronization.CommandProtocolHandler. Local
+// endpoints register with the daemon's own command registry and execute
+// commands within the daemon process.
+func (h *protocolHandler) ConnectCommands(
+	_ context.Context,
+	logger *logging.Logger,
+	url *urlpkg.URL,
+	endpoint *remote.Endpoint,
+) (remote.Channel, error) {
+	// Verify that the URL is of the correct kind and protocol.
+	if url.Kind != urlpkg.Kind_Synchronization {
+		panic("non-synchronization URL dispatched to synchronization protocol handler")
+	} else if url.Protocol != urlpkg.Protocol_Local {
+		panic("non-local URL dispatched to local protocol handler")
+	}
+
+	// Create the channel.
+	return remote.NewLocalChannel(logger, endpoint)
 }
 
 func init() {

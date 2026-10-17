@@ -6,6 +6,7 @@ import (
 	"net"
 
 	"github.com/mutagen-io/mutagen/pkg/logging"
+	remotecommands "github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/remote"
 	urlpkg "github.com/mutagen-io/mutagen/pkg/url"
@@ -96,6 +97,57 @@ func (h *synchronizationProtocolHandler) Connect(
 
 	// Success.
 	return endpoint, nil
+}
+
+// waitingCommandChannel wraps and implements remote.Channel, but waits for the
+// in-memory executor to terminate after closing the channel. As with
+// waitingSynchronizationEndpoint, this is necessary for test cleanup.
+type waitingCommandChannel struct {
+	// Channel is the underlying channel.
+	remotecommands.Channel
+	// done is closed when the executor terminates.
+	done <-chan struct{}
+}
+
+// Close implements remote.Channel.Close.
+func (w *waitingCommandChannel) Close() error {
+	result := w.Channel.Close()
+	<-w.done
+	return result
+}
+
+// ConnectCommands implements synchronization.CommandProtocolHandler by serving
+// an executor in a background Goroutine connected via an in-memory connection.
+// The executor shares the test process' command registry, so both endpoints'
+// registrations coexist as they would on separate systems.
+func (h *synchronizationProtocolHandler) ConnectCommands(
+	ctx context.Context,
+	logger *logging.Logger,
+	url *urlpkg.URL,
+	endpoint *remotecommands.Endpoint,
+) (remotecommands.Channel, error) {
+	// Verify that the URL is of the correct kind and protocol.
+	if url.Kind != urlpkg.Kind_Synchronization {
+		panic("non-synchronization URL dispatched to synchronization protocol handler")
+	} else if url.Protocol != Protocol_Netpipe {
+		panic("non-netpipe URL dispatched to netpipe protocol handler")
+	}
+
+	// Serve the executor in the background. No remote executable is installed.
+	clientConnection, serverConnection := net.Pipe()
+	executorDone := make(chan struct{})
+	go func() {
+		remotecommands.ServeChannel(context.Background(), logger.Sublogger("executor"), serverConnection, nil)
+		close(executorDone)
+	}()
+
+	// Create the channel.
+	channel, err := remotecommands.NewChannel(ctx, logger, clientConnection, endpoint)
+	if err != nil {
+		<-executorDone
+		return nil, fmt.Errorf("unable to create in-memory command channel: %w", err)
+	}
+	return &waitingCommandChannel{channel, executorDone}, nil
 }
 
 func init() {

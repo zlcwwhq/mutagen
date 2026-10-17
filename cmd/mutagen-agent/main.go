@@ -5,6 +5,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/mutagen-io/mutagen/cmd/remote/cli"
+
+	"github.com/mutagen-io/mutagen/pkg/agent"
 	"github.com/mutagen-io/mutagen/pkg/mutagen"
 )
 
@@ -66,12 +69,19 @@ func init() {
 		installCommand,
 		synchronizerCommand,
 		forwarderCommand,
+		executorCommand,
 		versionCommand,
 		legalCommand,
 	)
 }
 
 func main() {
+	// The remote executable is installed on endpoints as a link to the agent,
+	// so if we've been invoked by that name, then act as it.
+	if agent.IsRemoteExecutable(os.Args[0]) {
+		os.Exit(cli.Run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	// Execute the root command.
 	if err := rootCommand.Execute(); err != nil {
 		os.Exit(1)

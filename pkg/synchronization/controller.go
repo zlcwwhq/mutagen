@@ -787,9 +787,12 @@ func (c *controller) run(ctx context.Context, alpha, beta Endpoint) {
 		c.synchronizing = make(chan struct{})
 		c.stateLock.UnlockWithoutNotify()
 
-		// Perform synchronization.
+		// Perform synchronization. Commands are routed between endpoints only
+		// while both are connected for synchronization.
 		c.logger.Debug("Entering synchronization loop")
+		stopCommandRelay := c.startCommandRelay(ctx)
 		err := c.synchronize(ctx, alpha, beta)
+		stopCommandRelay()
 		c.logger.Debug("Synchronization loop terminated with error:", err)
 
 		// Indicate that the synchronization loop is no longer synchronizing.
