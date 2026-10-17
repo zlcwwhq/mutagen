@@ -87,6 +87,14 @@ func run(ctx context.Context, root string, request *Request, stdin io.Reader, st
 	if err != nil {
 		return result{Error: fmt.Sprintf("invalid working directory: %v", err)}
 	}
+	// Check the working directory explicitly, since a missing one (such as an
+	// ignored or not yet synchronized directory) would otherwise be reported as
+	// a missing executable by the operating system.
+	if info, err := os.Stat(directory); err != nil {
+		return result{ExitCode: 126, Error: fmt.Sprintf("unable to access working directory: %v", err)}
+	} else if !info.IsDir() {
+		return result{ExitCode: 126, Error: fmt.Sprintf("working directory is not a directory: %s", directory)}
+	}
 	path, err := lookPath(request.Arguments[0], directory, append(os.Environ(), request.Environment...))
 	if err != nil {
 		return result{ExitCode: 127, Error: fmt.Sprintf("unable to find command: %v", err)}

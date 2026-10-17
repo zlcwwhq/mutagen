@@ -14,7 +14,7 @@ import (
 func TestSignalExitCode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	request := &Request{Arguments: []string{"sh", "-c", "kill -TERM $$"}}
+	request := &Request{Arguments: []string{"sh", "-c", "kill -TERM $$"}, Directory: t.TempDir()}
 	if code, err := executeTest(t, ctx, request, nil, nil, nil); err != nil || code != 143 {
 		t.Fatalf("incorrect signal exit: %d, %v", code, err)
 	}
@@ -22,7 +22,7 @@ func TestSignalExitCode(t *testing.T) {
 
 func TestCancellationTerminatesChildren(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "survivor")
-	request := &Request{Arguments: []string{"sh", "-c", `sh -c 'sleep 1; echo survived > "$1"' sh "$1" & printf ready; wait`, "sh", marker}}
+	request := &Request{Arguments: []string{"sh", "-c", `sh -c 'sleep 1; echo survived > "$1"' sh "$1" & printf ready; wait`, "sh", marker}, Directory: t.TempDir()}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_, err := executeTest(t, ctx, request, nil, &readyWriter{ready: cancel}, nil)
@@ -39,7 +39,7 @@ func TestCancellationTerminatesChildren(t *testing.T) {
 func TestCancellationAfterParentExit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	request := &Request{Arguments: []string{"sh", "-c", "sleep 30 &"}}
+	request := &Request{Arguments: []string{"sh", "-c", "sleep 30 &"}, Directory: t.TempDir()}
 	_, err := executeTest(t, ctx, request, nil, nil, nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("incorrect cancellation error: %v", err)

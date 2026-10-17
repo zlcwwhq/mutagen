@@ -200,18 +200,35 @@ func TestExecuteCancellation(t *testing.T) {
 }
 
 func TestExecuteStartupFailures(t *testing.T) {
-	for _, failure := range []string{"missing-command", "missing-directory"} {
-		t.Run(failure, func(t *testing.T) {
+	// Failures are reported with conventional exit codes and identify their
+	// cause, rather than (for example) reporting a missing working directory
+	// as a missing executable.
+	for _, test := range []struct {
+		failure, message string
+		code             int
+	}{
+		{"missing-command", "unable to find command", 127},
+		{"missing-directory", "unable to access working directory", 126},
+		{"file-directory", "working directory is not a directory", 126},
+	} {
+		t.Run(test.failure, func(t *testing.T) {
 			request := helperRequest(t, "exit")
-			if failure == "missing-command" {
+			switch test.failure {
+			case "missing-command":
 				request.Arguments[0] = "mutagen-no-such-command"
-			} else {
+			case "missing-directory":
 				request.Directory = filepath.Join(request.Directory, "missing")
+			case "file-directory":
+				request.Directory = filepath.Join(request.Directory, "file")
+				if err := os.WriteFile(request.Directory, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if _, err := executeTest(t, ctx, request, nil, nil, nil); err == nil {
-				t.Fatal("startup failure not reported")
+			if code, err := executeTest(t, ctx, request, nil, nil, nil); err == nil || code != test.code ||
+				!strings.Contains(err.Error(), test.message) {
+				t.Fatalf("incorrect startup failure: %d, %v", code, err)
 			}
 		})
 	}
