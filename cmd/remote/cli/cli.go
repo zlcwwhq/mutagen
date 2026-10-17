@@ -71,11 +71,14 @@ type options struct {
 	// noFlush indicates that the session should not be synchronized before
 	// and after the command.
 	noFlush bool
+	// diff indicates that local and remote copies of the paths specified by
+	// arguments (or of conflicting files) should be compared.
+	diff bool
 	// help indicates that usage information was requested.
 	help bool
 	// version indicates that version information was requested.
 	version bool
-	// arguments are the command and its arguments.
+	// arguments are the command and its arguments, or the paths to compare.
 	arguments []string
 	// flags is the parsed flag set, used to print usage information.
 	flags *pflag.FlagSet
@@ -97,6 +100,7 @@ func parse(arguments []string) (*options, error) {
 	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the opposite endpoint's remote prologue")
 	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize the session before and after the command")
 	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
+	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
 	flags.BoolVarP(&result.help, "help", "h", false, "Show help information")
 	flags.BoolVar(&result.version, "version", false, "Show version information")
 	if err := flags.Parse(arguments); err != nil {
@@ -112,7 +116,9 @@ func parse(arguments []string) (*options, error) {
 		return nil, errors.New("timeout must not be negative")
 	} else if result.flush && result.noFlush {
 		return nil, errors.New("--flush and --no-flush are mutually exclusive")
-	} else if !result.help && !result.version && !result.flush && len(result.arguments) == 0 {
+	} else if result.diff && (result.flush || result.noFlush) {
+		return nil, errors.New("--diff can't be combined with --flush or --no-flush")
+	} else if !result.help && !result.version && !result.flush && !result.diff && len(result.arguments) == 0 {
 		return nil, errors.New("no command specified")
 	}
 	return result, nil
@@ -142,7 +148,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// prologue applies, are determined by the session root once the route is
 	// located.
 	var request *remote.Request
-	if len(options.arguments) > 0 {
+	if !options.diff && len(options.arguments) > 0 {
 		environment, err := loadEnvironment(options.environmentFiles, options.environment)
 		if err != nil {
 			return fail(err)
@@ -205,30 +211,54 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return fail(fmt.Errorf("unable to determine working directory: %w", err))
 	}
 
-	// synchronize forces a synchronization cycle for the session, reporting
-	// whether the session was located.
-	synchronize := func() (bool, error) {
-		connection, _, err := remote.Dial(ctx, directory, options.session, remote.OperationFlush)
+	// synchronize forces a synchronization cycle for the session and warns
+	// about content that couldn't be synchronized, omitting warnings issued by
+	// previous cycles. It returns the target if the session was located, along
+	// with the report.
+	var reports *reporter
+	synchronize := func() (*remote.Target, *remote.Report, error) {
+		connection, target, err := remote.Dial(ctx, directory, options.session, remote.OperationFlush)
 		if err != nil {
-			return false, err
+			return nil, nil, err
 		}
-		return true, remote.Flush(ctx, connection)
+		report, err := remote.Flush(ctx, connection)
+		if err != nil {
+			return target, nil, err
+		} else if reports == nil {
+			reports = newReporter(stderr, target)
+		}
+		reports.print(report)
+		return target, report, nil
 	}
 
 	// Synchronize local changes before the command. Failure to locate the
 	// session is fatal, since it would also prevent running the command, but
 	// failure to synchronize isn't, since the command may still be useful.
+	var target *remote.Target
+	var report *remote.Report
 	if !options.noFlush {
-		located, err := synchronize()
+		target, report, err = synchronize()
 		if interruptedCode, ok := interrupted("synchronizing"); ok {
 			return interruptedCode
-		} else if err != nil && (!located || request == nil) {
+		} else if err != nil && (target == nil || request == nil) {
 			return fail(err)
 		} else if err != nil {
 			warn("unable to synchronize before the command, which may see outdated files: %v", err)
 		}
 	}
-	if request == nil {
+
+	// Compare copies if requested.
+	if options.diff {
+		differ, err := compare(ctx, directory, options.session, target, report, options.arguments, stdout, stderr)
+		if interruptedCode, ok := interrupted("comparing"); ok {
+			return interruptedCode
+		} else if err != nil {
+			return fail(err)
+		} else if differ {
+			return 1
+		}
+		return 0
+	} else if request == nil {
 		return 0
 	}
 
@@ -258,7 +288,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// its exit status takes precedence over failure to do so (including
 	// timeouts), but not over signals.
 	if !options.noFlush {
-		if _, err := synchronize(); err != nil {
+		if _, _, err := synchronize(); err != nil {
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				err = fmt.Errorf("timed out after %v", options.timeout)
 			} else if interruptedCode, ok := interrupted("synchronizing"); ok {

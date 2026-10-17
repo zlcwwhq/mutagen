@@ -14,10 +14,10 @@ import (
 // maximumMessageSize bounds command metadata independently of streamed I/O.
 const maximumMessageSize = 1024 * 1024
 
-// Request describes a single command. Arguments are passed directly to the
-// executable, without shell interpretation. Environment entries override the
-// executing process's inherited environment, with later entries taking
-// precedence.
+// Request describes a single command, or a request for a file. Arguments are
+// passed directly to the executable, without shell interpretation. Environment
+// entries override the executing process's inherited environment, with later
+// entries taking precedence.
 type Request struct {
 	// Arguments contains the executable name followed by its arguments.
 	Arguments []string
@@ -35,12 +35,30 @@ type Request struct {
 	// submission directory lies inside the submitting root (and thus Path
 	// identifies the corresponding directory), regardless of Directory.
 	Prologue bool
+	// File is the slash-separated path, relative to the target root, of an
+	// entry to read (see ReadEntry) instead of running a command. Requests for
+	// files specify no arguments. A dot refers to the root itself.
+	File string
+}
+
+// validRelativePath determines whether a slash-separated path lies inside the
+// root that it's relative to.
+func validRelativePath(value string) bool {
+	return !path.IsAbs(value) && path.Clean(value) == value && value != ".." &&
+		!strings.HasPrefix(value, "../") && !strings.Contains(value, "\\")
 }
 
 // EnsureValid checks that command metadata can be represented losslessly by
 // the protocol and passed to the operating system.
 func (r *Request) EnsureValid() error {
-	if r == nil || len(r.Arguments) == 0 || r.Arguments[0] == "" {
+	if r != nil && r.File != "" {
+		if len(r.Arguments) > 0 {
+			return errors.New("file requests must not specify a command")
+		} else if !utf8.ValidString(r.File) || strings.IndexByte(r.File, 0) >= 0 || !validRelativePath(r.File) {
+			return errors.New("requested file path must be relative to the synchronization root")
+		}
+		return nil
+	} else if r == nil || len(r.Arguments) == 0 || r.Arguments[0] == "" {
 		return errors.New("no command specified")
 	}
 	for _, value := range append(append([]string{r.Path, r.Directory}, r.Arguments...), r.Environment...) {
@@ -55,8 +73,7 @@ func (r *Request) EnsureValid() error {
 	}
 	// The relative path is computed by the submitting endpoint and must stay
 	// inside the target root. Explicit directory overrides are not restricted.
-	if r.Path != "" && (path.IsAbs(r.Path) || path.Clean(r.Path) != r.Path ||
-		r.Path == ".." || strings.HasPrefix(r.Path, "../") || strings.Contains(r.Path, "\\")) {
+	if r.Path != "" && !validRelativePath(r.Path) {
 		return errors.New("working directory path must be relative to the synchronization root")
 	}
 	return nil
@@ -80,13 +97,22 @@ type submission struct {
 	Operation Operation
 }
 
-// status reports whether a command route reached an executing endpoint, or
-// whether a flush completed. It is written by the executing endpoint (or, for
-// flushes, the daemon) on success or by any intermediate hop that is unable to
-// establish the route.
+// status reports whether a command route reached an executing endpoint. It is
+// written by the executing endpoint on success or by any intermediate hop that
+// is unable to establish the route.
 type status struct {
 	// Error is the routing error, if any.
 	Error string
+}
+
+// flushResponse reports the outcome of a flush. Hops that are unable to reach
+// the daemon send a status instead, which decodes compatibly.
+type flushResponse struct {
+	// Error is the flush or routing error, if any.
+	Error string
+	// Report describes content that the session couldn't synchronize. It's
+	// non-nil if and only if the flush succeeded.
+	Report *Report `json:",omitempty"`
 }
 
 // result distinguishes command exit status from execution infrastructure errors.
@@ -95,6 +121,9 @@ type result struct {
 	ExitCode int
 	// Error is the execution infrastructure error, if any.
 	Error string
+	// Entry is the requested entry for file requests, excluding its data,
+	// which is sent as output.
+	Entry *Entry `json:",omitempty"`
 }
 
 // writeMessage writes bounded, length-prefixed command metadata.

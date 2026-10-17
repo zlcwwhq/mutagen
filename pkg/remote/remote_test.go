@@ -3,6 +3,7 @@ package remote
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -261,6 +262,94 @@ func TestInvalidRequests(t *testing.T) {
 	for _, path := range []string{"", "a", "a/b", "..a/b"} {
 		if err := (&Request{Arguments: []string{"echo"}, Path: path}).EnsureValid(); err != nil {
 			t.Fatalf("valid path %q rejected: %v", path, err)
+		}
+	}
+
+	// File requests must name a path inside the root, without a command.
+	for _, path := range []string{"..", "../sibling", "/absolute", "a/../b", "a/", "a\\b", "a\x00"} {
+		if (&Request{File: path}).EnsureValid() == nil {
+			t.Fatalf("invalid file path %q accepted", path)
+		}
+	}
+	if (&Request{File: "a", Arguments: []string{"echo"}}).EnsureValid() == nil {
+		t.Fatal("file request with a command accepted")
+	} else if err := (&Request{File: "a/b"}).EnsureValid(); err != nil {
+		t.Fatal("valid file request rejected:", err)
+	}
+}
+
+func TestFetch(t *testing.T) {
+	root := t.TempDir()
+	large := bytes.Repeat([]byte("x"), MaximumComparedFileSize+1)
+	for name, contents := range map[string][]byte{"file": []byte("a\nb"), "empty": nil, "large": large} {
+		if err := os.WriteFile(filepath.Join(root, name), contents, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkdirs(t, filepath.Join(root, "directory"))
+	digest := func(data []byte) string {
+		return fmt.Sprintf("%x", sha256.Sum256(data))
+	}
+	expected := map[string]*Entry{
+		"":           {Kind: EntryDirectory},
+		".":          {Kind: EntryDirectory},
+		"file":       {Kind: EntryFile, Size: 3, Digest: digest([]byte("a\nb")), Data: []byte("a\nb")},
+		"empty":      {Kind: EntryFile, Digest: digest(nil)},
+		"large":      {Kind: EntryFile, Size: int64(len(large)), Digest: digest(large)},
+		"directory":  {Kind: EntryDirectory},
+		"missing":    {Kind: EntryMissing},
+		"file/child": {Kind: EntryMissing},
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.WriteFile(filepath.Join(root, "executable"), []byte("#!/bin/sh\n"), 0700); err != nil {
+			t.Fatal(err)
+		} else if err := os.Symlink("file", filepath.Join(root, "link")); err != nil {
+			t.Fatal(err)
+		}
+		expected["executable"] = &Entry{Kind: EntryFile, Size: 10, Executable: true, Digest: digest([]byte("#!/bin/sh\n")), Data: []byte("#!/bin/sh\n")}
+		expected["link"] = &Entry{Kind: EntrySymbolicLink, Target: "file"}
+	}
+
+	// Entries are read identically on both endpoints, with file contents
+	// included only up to the comparison limit.
+	for name, entry := range expected {
+		client, server := net.Pipe()
+		go Serve(context.Background(), server, root, "")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		fetched, err := Fetch(ctx, client, name)
+		cancel()
+		local, localErr := ReadEntry(context.Background(), filepath.Join(root, name))
+		if err != nil || localErr != nil {
+			t.Fatalf("unable to read %s: %v, %v", name, err, localErr)
+		}
+		metadata := *entry
+		metadata.Data = nil
+		for _, actual := range []*Entry{fetched, local} {
+			actualMetadata := *actual
+			actualMetadata.Data = nil
+			if !bytes.Equal(actual.Data, entry.Data) || !reflect.DeepEqual(actualMetadata, metadata) {
+				t.Errorf("%s read incorrectly: %+v", name, actual)
+			}
+		}
+	}
+}
+
+func TestFetchFileRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "file")
+	contents := []byte("root file\n")
+	if err := os.WriteFile(root, contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"", "."} {
+		client, server := net.Pipe()
+		go Serve(context.Background(), server, root, "")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		entry, err := Fetch(ctx, client, path)
+		cancel()
+		if err != nil {
+			t.Fatal("unable to fetch root:", err)
+		} else if entry.Kind != EntryFile || !bytes.Equal(entry.Data, contents) {
+			t.Fatalf("incorrect root contents: %+v", entry)
 		}
 	}
 }

@@ -1,10 +1,12 @@
 package remote
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/mutagen-io/mutagen/pkg/multiplexing"
 )
@@ -26,19 +28,30 @@ func commandMultiplexerConfiguration() *multiplexing.Configuration {
 // remote command. The caller must unblock a blocking stdin reader after return
 // if it needs to reclaim the input forwarding goroutine.
 func Execute(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	response, err := execute(ctx, connection, request, stdin, stdout, stderr)
+	if err != nil {
+		return 0, err
+	} else if response.Error != "" {
+		return response.ExitCode, errors.New(response.Error)
+	}
+	return response.ExitCode, nil
+}
+
+// execute implements Execute, returning the result sent by the executor.
+func execute(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer) (*result, error) {
 	// Wait for the route to reach an executing endpoint. Any hop that cannot
 	// establish the route reports why instead of simply disconnecting.
 	stopRoute := context.AfterFunc(ctx, func() { connection.Close() })
 	var route status
 	err := readMessage(connection, &route)
 	if !stopRoute() {
-		return 0, ctx.Err()
+		return nil, ctx.Err()
 	} else if err != nil {
 		connection.Close()
-		return 0, fmt.Errorf("unable to receive route status: %w", err)
+		return nil, fmt.Errorf("unable to receive route status: %w", err)
 	} else if route.Error != "" {
 		connection.Close()
-		return 0, errors.New(route.Error)
+		return nil, errors.New(route.Error)
 	}
 
 	// Keep control and all three standard streams independent so that blocked
@@ -51,13 +64,13 @@ func Execute(ctx context.Context, connection io.ReadWriteCloser, request *Reques
 	for i := range streams {
 		stream, err := mux.OpenStream(ctx)
 		if err != nil {
-			return 0, fmt.Errorf("unable to open command stream: %w", err)
+			return nil, fmt.Errorf("unable to open command stream: %w", err)
 		}
 		streams[i] = stream
 	}
 	control, input, output, errorOutput := streams[0], streams[1], streams[2], streams[3]
 	if err := writeMessage(control, request); err != nil {
-		return 0, fmt.Errorf("unable to send command: %w", err)
+		return nil, fmt.Errorf("unable to send command: %w", err)
 	}
 
 	// Forward input without waiting for EOF before collecting the exit status.
@@ -97,49 +110,72 @@ func Execute(ctx context.Context, connection io.ReadWriteCloser, request *Reques
 		select {
 		case forwardingErrors[i] = <-outputErrors:
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 	select {
 	case err := <-inputErrors:
-		return 0, fmt.Errorf("unable to read command input: %w", err)
+		return nil, fmt.Errorf("unable to read command input: %w", err)
 	default:
 	}
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return nil, err
 	} else if forwardingError := errors.Join(forwardingErrors[:]...); forwardingError != nil {
-		return 0, fmt.Errorf("unable to forward command output: %w", forwardingError)
+		return nil, fmt.Errorf("unable to forward command output: %w", forwardingError)
 	} else if responseErr != nil {
-		return 0, fmt.Errorf("unable to receive command result: %w", responseErr)
+		return nil, fmt.Errorf("unable to receive command result: %w", responseErr)
 	}
 	if _, err := control.Write([]byte{0}); err != nil {
-		return 0, fmt.Errorf("unable to acknowledge command result: %w", err)
+		return nil, fmt.Errorf("unable to acknowledge command result: %w", err)
 	}
 	// The multiplexer buffers writes. Keep it alive until the server receives
 	// the acknowledgement and closes the connection.
 	<-mux.Closed()
-	if response.Error != "" {
-		return response.ExitCode, errors.New(response.Error)
-	}
-	return response.ExitCode, nil
+	return &response, nil
 }
 
 // Flush waits for the synchronization cycle requested by a flush submission (see
-// Dial) to complete. It owns and closes the connection. Cancellation abandons
-// the wait, but not the synchronization cycle.
-func Flush(ctx context.Context, connection io.ReadWriteCloser) error {
+// Dial) to complete and returns a report of content that the session couldn't
+// synchronize. It owns and closes the connection. Cancellation abandons the
+// wait, but not the synchronization cycle.
+func Flush(ctx context.Context, connection io.ReadWriteCloser) (*Report, error) {
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
-	var response status
+	var response flushResponse
 	err := readMessage(connection, &response)
 	if !stop() {
-		return ctx.Err()
+		return nil, ctx.Err()
 	} else if err != nil {
-		return fmt.Errorf("unable to receive synchronization status: %w", err)
+		return nil, fmt.Errorf("unable to receive synchronization status: %w", err)
 	} else if response.Error != "" {
-		return errors.New(response.Error)
+		return nil, errors.New(response.Error)
+	} else if response.Report == nil {
+		return nil, errors.New("no synchronization report received")
 	}
-	return nil
+	return response.Report, nil
+}
+
+// Fetch reads the entry at a slash-separated path, relative to the opposite
+// endpoint's synchronization root, over an established route (see Dial). It
+// owns and closes the connection. An empty path refers to the root itself.
+func Fetch(ctx context.Context, connection io.ReadWriteCloser, path string) (*Entry, error) {
+	if path == "" {
+		path = "."
+	}
+	var data bytes.Buffer
+	response, err := execute(ctx, connection, &Request{File: path}, strings.NewReader(""), &data, io.Discard)
+	if err != nil {
+		return nil, err
+	} else if response.Error != "" {
+		return nil, errors.New(response.Error)
+	} else if response.Entry == nil {
+		return nil, errors.New("no entry received")
+	}
+	entry := response.Entry
+	if data.Len() > 0 {
+		entry.Data = data.Bytes()
+	}
+	return entry, nil
 }
 
 // inputReader distinguishes failed source reads from normal remote input closure.

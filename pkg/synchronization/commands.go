@@ -10,6 +10,7 @@ import (
 
 	"github.com/mutagen-io/mutagen/pkg/logging"
 	"github.com/mutagen-io/mutagen/pkg/remote"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	urlpkg "github.com/mutagen-io/mutagen/pkg/url"
 )
 
@@ -46,6 +47,8 @@ type commandRelay struct {
 	logger *logging.Logger
 	// flushRequests is the synchronization loop's flush request channel.
 	flushRequests chan chan error
+	// report reports content that the session couldn't synchronize.
+	report func() *remote.Report
 	// channelsLock guards channels.
 	channelsLock sync.Mutex
 	// channels holds the connected alpha and beta channels (or nil).
@@ -79,7 +82,11 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 	// rather than using flush, whose lifecycle lock may be held by an operation
 	// waiting for the relay to stop. The request channel is fixed while the
 	// synchronization loop runs.
-	relay := &commandRelay{logger: c.logger.Sublogger("commands"), flushRequests: c.flushRequests}
+	relay := &commandRelay{
+		logger:        c.logger.Sublogger("commands"),
+		flushRequests: c.flushRequests,
+		report:        c.remoteReport,
+	}
 
 	// Each endpoint submits commands if and only if its opposite executes.
 	// Prologues are endpoint-specific, since they're interpreted on the
@@ -184,7 +191,15 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		return
 	} else if operation == remote.OperationFlush {
 		r.logger.Debug("Forcing synchronization cycle for submission")
-		remote.Respond(submission, r.flush(ctx))
+		stop := context.AfterFunc(ctx, func() { submission.Close() })
+		defer stop()
+		var report *remote.Report
+		if err = r.flush(ctx); err == nil {
+			report = r.report()
+		}
+		if err := remote.RespondToFlush(submission, report, err); err != nil {
+			r.logger.Debug("Unable to send synchronization report:", err)
+		}
 		return
 	}
 	r.channelsLock.Lock()
@@ -218,5 +233,94 @@ func (r *commandRelay) flush(ctx context.Context) error {
 		return err
 	case <-ctx.Done():
 		return errFlushTerminated
+	}
+}
+
+// remoteReport reports the content that the session couldn't synchronize in
+// its last synchronization cycle, sorted and truncated as for session listings.
+func (c *controller) remoteReport() *remote.Report {
+	// Conflicts and problems are immutable and their lists are replaced rather
+	// than modified, so copying the lists yields a consistent snapshot.
+	c.stateLock.Lock()
+	conflicts := core.CopyConflicts(c.state.Conflicts)
+	problems := []struct {
+		alpha    bool
+		problems []*core.Problem
+		maximum  int
+	}{
+		{true, core.CopyProblems(c.state.AlphaState.ScanProblems), maximumListScanProblems},
+		{true, core.CopyProblems(c.state.AlphaState.TransitionProblems), maximumListTransitionProblems},
+		{false, core.CopyProblems(c.state.BetaState.ScanProblems), maximumListScanProblems},
+		{false, core.CopyProblems(c.state.BetaState.TransitionProblems), maximumListTransitionProblems},
+	}
+	c.stateLock.UnlockWithoutNotify()
+
+	// Convert conflicts.
+	report := &remote.Report{}
+	core.SortConflicts(conflicts)
+	if len(conflicts) > maximumListConflicts {
+		report.ExcludedConflicts = uint64(len(conflicts) - maximumListConflicts)
+		conflicts = conflicts[:maximumListConflicts]
+	}
+	for _, conflict := range conflicts {
+		report.Conflicts = append(report.Conflicts, remote.Conflict{
+			Root:  conflict.Root,
+			Alpha: remoteChanges(conflict.AlphaChanges),
+			Beta:  remoteChanges(conflict.BetaChanges),
+		})
+	}
+
+	// Convert problems.
+	for _, list := range problems {
+		core.SortProblems(list.problems)
+		if len(list.problems) > list.maximum {
+			report.ExcludedProblems += uint64(len(list.problems) - list.maximum)
+			list.problems = list.problems[:list.maximum]
+		}
+		for _, problem := range list.problems {
+			report.Problems = append(report.Problems, remote.Problem{
+				Alpha: list.alpha,
+				Path:  problem.Path,
+				Error: problem.Error,
+			})
+		}
+	}
+	return report
+}
+
+// remoteChanges converts changes for remote reports.
+func remoteChanges(changes []*core.Change) []remote.Change {
+	result := make([]remote.Change, len(changes))
+	for c, change := range changes {
+		result[c] = remote.Change{
+			Path: change.Path,
+			Old:  describeRemoteEntry(change.Old),
+			New:  describeRemoteEntry(change.New),
+		}
+	}
+	return result
+}
+
+// describeRemoteEntry describes the kind of an entry for remote reports.
+func describeRemoteEntry(entry *core.Entry) string {
+	if entry == nil {
+		return ""
+	}
+	switch entry.Kind {
+	case core.EntryKind_Directory:
+		return "directory"
+	case core.EntryKind_File:
+		if entry.Executable {
+			return "executable file"
+		}
+		return "file"
+	case core.EntryKind_SymbolicLink:
+		return "symbolic link"
+	case core.EntryKind_Untracked:
+		return "untracked content"
+	case core.EntryKind_Problematic:
+		return fmt.Sprintf("problematic content (%s)", entry.Problem)
+	default:
+		return "unknown content"
 	}
 }
