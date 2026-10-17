@@ -9,7 +9,7 @@ on:
       - master
       - 'release-branch-*'
     tags:
-      - 'v*'
+      - 'v*-zlcwwhq.*'
   pull_request:
   workflow_dispatch:
 
@@ -26,6 +26,19 @@ concurrency:
 
 # Define the workflow jobs.
 jobs:
+  version:
+    name: Release Version Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: '1.26.2'
+      - run: go test ./scripts/ci/releaseversion
+      - name: Validate release tag
+        if: github.ref_type == 'tag'
+        run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME"
   verification:
     name: Commit Verification
     runs-on: ubuntu-latest
@@ -44,6 +57,7 @@ jobs:
           # Perform verification.
           scripts/ci/verify_commits.sh
   macos:
+    needs: version
     name: macOS
     runs-on: macos-15
     timeout-minutes: 90
@@ -54,40 +68,28 @@ jobs:
           go-version: '1.26.2'
       - name: "Install sha256sum"
         run: brew install coreutils
+      - name: Set release version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME" -write
       - run: scripts/ci/setup_go.sh
       - run: scripts/ci/setup_ssh.sh
       - run: scripts/ci/setup_partitions_darwin.sh
       - run: scripts/ci/analyze.sh
       - run: scripts/ci/test.sh
       - run: scripts/ci/build.sh
-        env:
-          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
-          MACOS_CODESIGN_CERTIFICATE_AND_KEY: ${{ secrets.MACOS_CODESIGN_CERTIFICATE_AND_KEY }}
-          MACOS_CODESIGN_CERTIFICATE_AND_KEY_PASSWORD: ${{ secrets.MACOS_CODESIGN_CERTIFICATE_AND_KEY_PASSWORD }}
-      - run: scripts/ci/notarize.sh
-        if: github.ref_type == 'tag'
-        env:
-          MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
-          MACOS_NOTARIZE_APP_SPECIFIC_PASSWORD: ${{ secrets.MACOS_NOTARIZE_APP_SPECIFIC_PASSWORD }}
-          MACOS_NOTARIZE_TEAM_ID: ${{ secrets.MACOS_NOTARIZE_TEAM_ID }}
       - run: scripts/ci/sha256sum.sh
-      - uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
-        id: import_gpg
         if: github.ref_type == 'tag'
-        with:
-          gpg_private_key: ${{ secrets.GPG_SIGNING_KEY }}
-          passphrase: ${{ secrets.GPG_SIGNING_KEY_PASSWORD }}
-      - run: scripts/ci/sha256sign.sh
-        if: github.ref_type == 'tag'
-        env:
-          SHA256_GPG_SIGNING_IDENTITY: ${{ steps.import_gpg.outputs.email }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: github.ref_type == 'tag'
         with:
           name: bundles
           path: build/release/*
-          retention-days: 2
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
   linux:
+    needs: version
     name: Linux
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -100,6 +102,10 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: ${{ matrix.goversion }}
+      - name: Set release version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME" -write
       - run: scripts/ci/setup_go.sh
       - run: scripts/ci/setup_ssh.sh
       - run: scripts/ci/setup_docker.sh
@@ -108,6 +114,7 @@ jobs:
       - run: scripts/ci/test_386.sh
       - run: scripts/ci/build.sh
   windows:
+    needs: version
     name: Windows
     runs-on: windows-latest
     timeout-minutes: 60
@@ -116,6 +123,10 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: '1.26.2'
+      - name: Set release version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME" -write
       - run: scripts/ci/setup_go.sh
         shell: bash
       - run: scripts/ci/setup_docker.sh
@@ -140,57 +151,11 @@ jobs:
         shell: bash
       - run: scripts/ci/build.sh
         shell: bash
-  sidecar:
-    name: Sidecar
-    runs-on: ubuntu-latest
-    needs: [macos, linux, windows]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
-        with:
-          go-version: '1.26.2'
-      - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
-      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
-        if: github.ref_type == 'tag' && github.repository == 'mutagen-io/mutagen'
-        with:
-          username: ${{ secrets.SIDECAR_DEPLOYMENT_USER }}
-          password: ${{ secrets.SIDECAR_DEPLOYMENT_TOKEN }}
-      - name: "Determine sidecar tag"
-        id: tag
-        run: echo "tag=$(go run scripts/ci/sidecar_tag.go)" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
-        with:
-          file: images/sidecar/linux/Dockerfile
-          target: mit
-          tags: ${{ steps.tag.outputs.tag }}
-          push: ${{ github.ref_type == 'tag' && github.repository == 'mutagen-io/mutagen' }}
-          platforms: |
-            linux/386
-            linux/amd64
-            linux/arm/v6
-            linux/arm/v7
-            linux/arm64/v8
-            linux/ppc64le
-      - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
-        with:
-          file: images/sidecar/linux/Dockerfile
-          target: sspl
-          tags: ${{ steps.tag.outputs.tag }}-sspl
-          push: ${{ github.ref_type == 'tag' && github.repository == 'mutagen-io/mutagen' }}
-          platforms: |
-            linux/386
-            linux/amd64
-            linux/arm/v6
-            linux/arm/v7
-            linux/arm64/v8
-            linux/ppc64le
   release:
     name: Release
     runs-on: ubuntu-latest
     if: github.ref_type == 'tag'
-    needs: [macos, linux, windows, sidecar]
+    needs: [macos, linux, windows]
     permissions:
       contents: write
     timeout-minutes: 10
@@ -199,8 +164,21 @@ jobs:
         with:
           name: bundles
           path: bundles
-      - uses: alexellis/upload-assets@13926a61cdb2cb35f5fdef1c06b8b591523236d3 # 0.4.1
+      - name: Create draft release and upload bundles
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          asset_paths: '["bundles/*"]'
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Verify archive integrity before uploading. A draft keeps partially
+          # uploaded assets out of published releases if the upload fails.
+          (cd bundles && sha256sum --check SHA256SUMS)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            if [[ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" != "true" ]]; then
+              echo "Refusing to replace assets on a published release" >&2
+              exit 1
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" bundles/* --clobber
