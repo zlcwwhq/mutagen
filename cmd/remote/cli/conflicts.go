@@ -14,11 +14,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/pflag"
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/filesystem/locking"
+	"github.com/mutagen-io/mutagen/pkg/platform/terminal"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 )
 
@@ -26,64 +28,98 @@ const (
 	// workspacesDirectoryName is the name of the Mutagen data subdirectory
 	// containing conflict workspaces.
 	workspacesDirectoryName = "conflicts"
-	// metadataName, localName, remoteName, and mergedName are the names of the
-	// files in a workspace.
-	metadataName, localName, remoteName, mergedName = "workspace.json", "local", "remote", "merged"
+	// backupsDirectoryName is the name of the workspaces subdirectory that
+	// keeps the workspaces of resolved and discarded conflicts.
+	backupsDirectoryName = "backups"
+	// backupRetention is how long the workspaces of resolved and discarded
+	// conflicts are kept, so that the original copies can be recovered if a
+	// resolution turns out to be wrong.
+	backupRetention = 7 * 24 * time.Hour
+	// stagingPrefix is the name prefix of the directories in which checkouts
+	// prepare workspaces.
+	stagingPrefix = ".checkout-"
+	// stagingRetention is the age after which a staging directory is assumed
+	// to have been left by an interrupted checkout.
+	stagingRetention = 24 * time.Hour
+	// metadataName, localName, remoteName, baseName, and mergedName are the
+	// names of the files in a workspace.
+	metadataName, localName, remoteName, baseName, mergedName = "workspace.json", "local", "remote", "base", "merged"
+	// sideLocal and sideRemote identify the copies of a conflict.
+	sideLocal, sideRemote = "local", "remote"
 )
+
+// errReported indicates that conflict operations failed for some paths, whose
+// errors have been printed.
+var errReported = errors.New("conflict operations failed")
+
+// errDirectoryConflict indicates that a conflict requires manual resolution.
+var errDirectoryConflict = errors.New("conflicts involving directories aren't supported; resolve this conflict manually")
 
 // conflictOptions are the options for conflict resolution, which is separate
 // from command execution and its flush policy.
 type conflictOptions struct {
 	// conflicts indicates that conflicts should be listed.
 	conflicts bool
-	// checkout, apply, and discard are the local paths of conflicting files
-	// for the corresponding operations.
-	checkout, apply, discard string
+	// checkout, apply, and discard indicate the operation to perform on the
+	// conflicting paths specified as arguments.
+	checkout, apply, discard bool
 	// take selects an original copy, local or remote, as the result.
 	take string
 	// delete selects deletion of both copies as the result.
 	delete bool
 	// executable explicitly specifies the result's executability.
 	executable string
+	// base is a candidate for the copies' common ancestor.
+	base string
 	// json requests JSON output.
 	json bool
 }
 
 // active indicates whether a conflict operation was requested.
 func (o *conflictOptions) active() bool {
-	return o.conflicts || o.checkout != "" || o.apply != "" || o.discard != ""
+	return o.conflicts || o.checkout || o.apply || o.discard
 }
 
 // register registers conflict options.
 func (o *conflictOptions) register(flags *pflag.FlagSet) {
-	flags.BoolVar(&o.conflicts, "conflicts", false, "Synchronize, then list all conflicts and whether remote can resolve them")
-	flags.StringVar(&o.checkout, "conflict-checkout", "", "Download both copies of the conflicting file at `PATH` into a workspace for merging")
-	flags.StringVar(&o.apply, "conflict-apply", "", "Write the merged file for `PATH` to both copies and verify that the conflict is resolved")
-	flags.StringVar(&o.discard, "conflict-discard", "", "Remove the workspace for `PATH` without changing either copy")
-	flags.StringVar(&o.take, "take", "", "With --conflict-apply, use the original `SIDE` (local or remote) instead of the merged file")
+	flags.BoolVar(&o.conflicts, "conflicts", false, "Synchronize, then list all conflicts, how remote can resolve them, and unfinished resolutions")
+	flags.BoolVar(&o.checkout, "conflict-checkout", false, "Download both copies of each conflicting path given as an argument into a workspace for resolution")
+	flags.BoolVar(&o.apply, "conflict-apply", false, "Apply the resolution of each path given as an argument to both copies and verify it")
+	flags.BoolVar(&o.discard, "conflict-discard", false, "Set aside the workspace of each path given as an argument without changing either copy")
+	flags.StringVar(&o.take, "take", "", "With --conflict-apply, take the original `SIDE` (local or remote) instead of the merged file")
 	flags.BoolVar(&o.delete, "delete", false, "With --conflict-apply, delete both copies instead")
 	flags.StringVar(&o.executable, "executable", "", "With --conflict-apply, set whether the result is executable (`BOOL`: true or false)")
-	flags.BoolVar(&o.json, "json", false, "Print the result of a conflict operation as JSON")
+	flags.StringVar(&o.base, "base", "", "With --conflict-checkout of one path, merge using `FILE` as the copies' common ancestor, if it's verified to be")
+	flags.BoolVar(&o.json, "json", false, "Print the results of conflict operations as JSON")
 }
 
 // validateConflicts checks the combination of conflict options.
 func (o *options) validateConflicts() error {
 	modes := 0
-	for _, enabled := range []bool{o.conflicts, o.checkout != "", o.apply != "", o.discard != ""} {
+	for _, enabled := range []bool{o.conflicts, o.checkout, o.apply, o.discard} {
 		if enabled {
 			modes++
 		}
 	}
+	paths := o.checkout || o.apply || o.discard
 	if modes > 1 {
 		return errors.New("--conflicts, --conflict-checkout, --conflict-apply, and --conflict-discard are mutually exclusive")
-	} else if modes == 1 && (o.flush || o.noFlush || o.diff || len(o.arguments) != 0 || o.directory != "" ||
+	} else if modes == 1 && (o.flush || o.noFlush || o.diff || o.directory != "" ||
 		len(o.environment) != 0 || len(o.environmentFiles) != 0 || o.noPrologue) {
 		return errors.New("conflict operations can't be combined with commands or command options")
+	} else if o.conflicts && len(o.arguments) != 0 {
+		return errors.New("--conflicts doesn't accept arguments")
+	} else if paths && len(o.arguments) == 0 {
+		return errors.New("no conflicting paths specified")
+	} else if paths && slices.ContainsFunc(o.arguments, func(argument string) bool { return strings.HasPrefix(argument, "-") }) {
+		return errors.New("options must precede paths (prefix paths starting with - with ./)")
 	} else if o.json && modes == 0 {
 		return errors.New("--json requires a conflict operation")
-	} else if o.apply == "" && (o.take != "" || o.delete || o.executable != "") {
+	} else if !o.apply && (o.take != "" || o.delete || o.executable != "") {
 		return errors.New("--take, --delete, and --executable require --conflict-apply")
-	} else if o.take != "" && o.take != "local" && o.take != "remote" {
+	} else if o.base != "" && (!o.checkout || len(o.arguments) != 1) {
+		return errors.New("--base requires --conflict-checkout of a single path")
+	} else if o.take != "" && o.take != sideLocal && o.take != sideRemote {
 		return errors.New("--take must be local or remote")
 	} else if o.delete && (o.take != "" || o.executable != "") {
 		return errors.New("--delete can't be combined with --take or --executable")
@@ -95,23 +131,33 @@ func (o *options) validateConflicts() error {
 
 // workspace is a checked-out conflict. Workspaces are stored in the Mutagen
 // data directory on the submitting endpoint's system, outside of the
-// synchronization root, and identified by the local file's path.
+// synchronization root, and identified by the local path of the conflict root.
 type workspace struct {
 	// Session is the session identifier.
 	Session string
 	// Alpha indicates whether the local copy is alpha's.
 	Alpha bool
 	// Path is the slash-separated conflict root relative to the
-	// synchronization root.
+	// synchronization root, which is empty for the root itself.
 	Path string
 	// Token labels conflict markers in the merged file.
 	Token string
-	// Local and Remote describe the checked-out copies.
+	// Local and Remote describe the checked-out copies (see remote.Snapshot).
 	Local, Remote *remote.Entry
+	// Take lists the copies that can be taken, for conflicts other than
+	// between two files.
+	Take []string `json:",omitempty"`
+	// BaseSource describes where the copies' common ancestor in the
+	// workspace was found, if it was.
+	BaseSource string `json:",omitempty"`
 	// Applied describes the file results that apply has written (or may have
 	// written) to either copy, which retries may supersede, since they're the
 	// workspace's own, even if the merged file has changed since.
 	Applied []*remote.Entry `json:",omitempty"`
+	// Removing is the copy that apply has deleted (or may have deleted) to
+	// take the other, for conflicts other than between two files. Retries
+	// don't delete the copy that synchronization then propagates in its place.
+	Removing string `json:",omitempty"`
 	// directory is the workspace directory.
 	directory string
 }
@@ -119,6 +165,29 @@ type workspace struct {
 // file returns the path of a file in the workspace.
 func (w *workspace) file(name string) string {
 	return filepath.Join(w.directory, name)
+}
+
+// files indicates whether both copies are regular files, which can be merged.
+func (w *workspace) files() bool {
+	return w.Local.Kind == remote.EntryFile && w.Remote.Kind == remote.EntryFile
+}
+
+// hasDirectory indicates whether either checked-out copy is a directory.
+func (w *workspace) hasDirectory() bool {
+	return w.Local.Kind == remote.EntryDirectory || w.Remote.Kind == remote.EntryDirectory
+}
+
+// takable determines whether a copy can be taken.
+func (w *workspace) takable(side string) bool {
+	return w.files() || slices.Contains(w.Take, side)
+}
+
+// opposite returns the other side of a conflict.
+func opposite(side string) string {
+	if side == sideLocal {
+		return sideRemote
+	}
+	return sideLocal
 }
 
 // workspaceDirectory computes the workspaces directory and the directory of
@@ -154,7 +223,7 @@ func lockWorkspace(local string) (func(), error) {
 		return nil, fmt.Errorf("unable to lock workspace: %w", err)
 	} else if err := locker.Lock(false); err != nil {
 		locker.Close()
-		return nil, fmt.Errorf("another conflict operation on this file is in progress: %w", err)
+		return nil, fmt.Errorf("another conflict operation on this path is in progress: %w", err)
 	}
 	return func() {
 		locker.Unlock()
@@ -183,13 +252,9 @@ func (w *workspace) save() error {
 	return os.Rename(file.Name(), w.file(metadataName))
 }
 
-// loadWorkspace loads the workspace for a local path, failing with an error
+// readWorkspace reads the workspace in a directory, failing with an error
 // wrapping os.ErrNotExist if there's none.
-func loadWorkspace(local string) (*workspace, error) {
-	_, directory, err := workspaceDirectory(local)
-	if err != nil {
-		return nil, err
-	}
+func readWorkspace(directory string) (*workspace, error) {
 	data, err := os.ReadFile(filepath.Join(directory, metadataName))
 	if err != nil {
 		return nil, err
@@ -207,19 +272,116 @@ func loadWorkspace(local string) (*workspace, error) {
 	return w, nil
 }
 
+// loadWorkspace loads the workspace for a local path, failing with an error
+// wrapping os.ErrNotExist if there's none.
+func loadWorkspace(local string) (*workspace, error) {
+	_, directory, err := workspaceDirectory(local)
+	if err != nil {
+		return nil, err
+	}
+	return readWorkspace(directory)
+}
+
 // matches determines whether a workspace was checked out through a target.
 func (w *workspace) matches(target *remote.Target, path string) bool {
 	return w.Session == target.Session && w.Alpha == target.Alpha && w.Path == path
 }
 
+// retire moves a workspace whose conflict was resolved or discarded into the
+// backups directory, where it's kept for backupRetention (see
+// pruneWorkspaces), and returns its new location. Backups are named by the
+// time at which they were made, followed by the workspace's name and, if
+// another backup of the workspace was made at the same time, a counter.
+func (w *workspace) retire() (string, error) {
+	base, err := filesystem.Mutagen(true, workspacesDirectoryName, backupsDirectoryName)
+	if err != nil {
+		return "", err
+	}
+	name := fmt.Sprintf("%d-%s", time.Now().UnixNano(), filepath.Base(w.directory))
+	for attempt := 1; ; attempt++ {
+		destination := filepath.Join(base, name)
+		if attempt > 1 {
+			destination += fmt.Sprintf("-%d", attempt)
+		}
+		// Backups aren't empty, so renaming fails rather than replace one.
+		if err := os.Rename(w.directory, destination); err == nil {
+			w.directory = destination
+			return destination, nil
+		} else if _, statErr := os.Lstat(destination); statErr != nil || attempt == 10 {
+			return "", err
+		}
+	}
+}
+
+// pruneWorkspaces removes retired workspaces older than backupRetention and
+// staging directories left by interrupted checkouts. Failures are ignored,
+// since pruning only reclaims space.
+func pruneWorkspaces() {
+	base, err := filesystem.Mutagen(false, workspacesDirectoryName)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	backups := filepath.Join(base, backupsDirectoryName)
+	if entries, err := os.ReadDir(backups); err == nil {
+		for _, entry := range entries {
+			prefix, _, _ := strings.Cut(entry.Name(), "-")
+			if nanoseconds, err := strconv.ParseInt(prefix, 10, 64); err == nil && now.Sub(time.Unix(0, nanoseconds)) > backupRetention {
+				os.RemoveAll(filepath.Join(backups, entry.Name()))
+			}
+		}
+	}
+	if entries, err := os.ReadDir(base); err == nil {
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), stagingPrefix) {
+				continue
+			} else if info, err := entry.Info(); err == nil && now.Sub(info.ModTime()) > stagingRetention {
+				os.RemoveAll(filepath.Join(base, entry.Name()))
+			}
+		}
+	}
+}
+
+// sessionWorkspaces lists the paths of the workspaces checked out through a
+// target. Unreadable workspaces are skipped, since the listing is advisory.
+func sessionWorkspaces(target *remote.Target) map[string]bool {
+	paths := make(map[string]bool)
+	base, err := filesystem.Mutagen(false, workspacesDirectoryName)
+	if err != nil {
+		return paths
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return paths
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == backupsDirectoryName || strings.HasPrefix(entry.Name(), stagingPrefix) {
+			continue
+		} else if w, err := readWorkspace(filepath.Join(base, entry.Name())); err == nil && w.Session == target.Session && w.Alpha == target.Alpha {
+			paths[w.Path] = true
+		}
+	}
+	return paths
+}
+
 // listConflicts synchronizes the session and lists all of its conflicts.
-func listConflicts(ctx context.Context, directory, session string) ([]remote.ConflictRoot, *remote.Target, error) {
+func listConflicts(ctx context.Context, directory, session string) (*remote.Listing, *remote.Target, error) {
 	connection, target, err := remote.Dial(ctx, directory, session, remote.OperationConflicts)
 	if err != nil {
 		return nil, nil, err
 	}
-	conflicts, err := remote.ListConflicts(ctx, connection)
-	return conflicts, target, err
+	listing, err := remote.ListConflicts(ctx, connection)
+	return listing, target, err
+}
+
+// findConflict returns the listed conflict at a path, if any.
+func findConflict(listing *remote.Listing, path string) *remote.ConflictRoot {
+	for c := range listing.Conflicts {
+		if listing.Conflicts[c].Path == path {
+			return &listing.Conflicts[c]
+		}
+	}
+	return nil
 }
 
 // dialOpposite opens a route to the opposite endpoint, which must be the one
@@ -287,6 +449,9 @@ func (w *digestWriter) Write(data []byte) (int, error) {
 	return w.Hash.Write(data)
 }
 
+// errCorruptCopy indicates that a copy wasn't received as it was read.
+var errCorruptCopy = errors.New("the copy was received incompletely or corrupted; check out again")
+
 // writeCopy creates a private file with a copy written by a function that
 // returns the copy's entry, as read at its source, and verifies that the data
 // written has the entry's contents, so that merges aren't based on data
@@ -302,122 +467,340 @@ func writeCopy(path string, copy func(io.Writer) (*remote.Entry, error)) (*remot
 		return nil, err
 	} else if entry.Kind == remote.EntryFile &&
 		(written.size != entry.Size || fmt.Sprintf("%x", written.Sum(nil)) != entry.Digest) {
-		return nil, errors.New("the copy was received incompletely or corrupted; check out again")
+		return nil, errCorruptCopy
 	}
 	return entry, nil
 }
 
-// runConflicts performs a conflict operation.
-func runConflicts(ctx context.Context, directory string, o *options, output io.Writer) error {
+// extractCopy extracts an archive of a copy, written by a function that
+// returns the copy's snapshot as read at its source, to a path, and verifies
+// that the archive describes the snapshot, so that resolutions aren't based on
+// data corrupted in transit.
+func extractCopy(ctx context.Context, path string, archive func(io.Writer) (*remote.Entry, error)) (*remote.Entry, error) {
+	reader, writer := io.Pipe()
+	type extraction struct {
+		entry *remote.Entry
+		err   error
+	}
+	extracted := make(chan extraction, 1)
+	go func() {
+		entry, err := remote.ExtractArchive(ctx, reader, path)
+		if err != nil {
+			reader.CloseWithError(err)
+		} else {
+			reader.Close()
+		}
+		extracted <- extraction{entry, err}
+	}()
+	entry, err := archive(writer)
+	writer.CloseWithError(err)
+	result := <-extracted
+	if err != nil {
+		return nil, err
+	} else if result.err != nil {
+		return nil, fmt.Errorf("unable to extract the copy: %w", result.err)
+	} else if !remote.SameContents(entry, result.entry) || entry.Executable != result.entry.Executable {
+		return nil, errCorruptCopy
+	}
+	return entry, nil
+}
+
+// outcome is the outcome of a conflict operation on a path. Its exported
+// fields are printed as JSON, and its lines as text.
+type outcome struct {
+	// Path is the path as specified.
+	Path string
+	// Error describes why the operation failed, if it did.
+	Error string `json:",omitempty"`
+	// Local, Remote, Base, and Merged are the paths of a workspace's copies,
+	// the copies' common ancestor (if found), and the merged file.
+	Local  string `json:",omitempty"`
+	Remote string `json:",omitempty"`
+	Base   string `json:",omitempty"`
+	Merged string `json:",omitempty"`
+	// Files indicates whether both copies are files, which can be merged.
+	Files bool `json:",omitempty"`
+	// Binary indicates that the copies are binary files, for which no merged
+	// file was created.
+	Binary bool `json:",omitempty"`
+	// Regions is the number of conflicting regions marked in the merged file.
+	Regions int `json:",omitempty"`
+	// Take lists the copies that apply can take.
+	Take []string `json:",omitempty"`
+	// Pending indicates that a workspace's conflict is no longer listed.
+	Pending bool `json:",omitempty"`
+	// Resolved indicates that apply resolved the conflict.
+	Resolved bool `json:",omitempty"`
+	// Discarded indicates that discard set the workspace aside.
+	Discarded bool `json:",omitempty"`
+	// Backup is the location where a resolved or discarded workspace is kept.
+	Backup string `json:",omitempty"`
+	// lines are the lines printed as text.
+	lines []string
+}
+
+// printer prints the outcomes of conflict operations on paths, as text or as
+// one line of JSON per path, and prints failures as errors.
+type printer struct {
+	// output is the output for outcomes.
+	output io.Writer
+	// errors is the output for failures.
+	errors io.Writer
+	// json indicates whether outcomes are printed as JSON.
+	json bool
+	// headings indicates whether text outcomes are preceded by their paths,
+	// which distinguishes them when operating on several paths.
+	headings bool
+	// failed records whether any operation failed.
+	failed bool
+}
+
+// print prints the outcome of an operation on a path.
+func (p *printer) print(path string, result *outcome, err error) {
+	if err != nil {
+		p.failed = true
+		fmt.Fprintf(p.errors, "remote: %s: %v\n", terminal.NeutralizeControlCharacters(path), err)
+		result = &outcome{Path: path, Error: err.Error()}
+		if !p.json {
+			return
+		}
+	}
+	if p.json {
+		json.NewEncoder(p.output).Encode(result)
+		return
+	}
+	indentation := ""
+	if p.headings {
+		fmt.Fprintf(p.output, "%s:\n", terminal.NeutralizeControlCharacters(path))
+		indentation = "  "
+	}
+	for _, line := range result.lines {
+		fmt.Fprintln(p.output, indentation+line)
+	}
+}
+
+// retentionNote describes where a retired workspace is kept.
+func retentionNote(backup string) string {
+	return fmt.Sprintf("The workspace, with the original copies, is kept in %s for %d days.", backup, int(backupRetention.Hours()/24))
+}
+
+// runConflicts performs a conflict operation. Failures for individual paths
+// are printed as they occur and reported with errReported, while other errors
+// are returned.
+func runConflicts(ctx context.Context, directory string, o *options, output, errorOutput io.Writer) error {
+	pruneWorkspaces()
 	if o.conflicts {
 		return printConflicts(ctx, directory, o, output)
 	}
-	argument := o.checkout + o.apply + o.discard
-	local, err := filepath.Abs(argument)
-	if err != nil {
-		return fmt.Errorf("unable to locate %s: %w", argument, err)
+	p := &printer{output: output, errors: errorOutput, json: o.json, headings: len(o.arguments) > 1}
+	var err error
+	if o.checkout {
+		err = checkoutAll(ctx, directory, o, p)
+	} else if o.apply {
+		err = applyAll(ctx, directory, o, p)
+	} else {
+		for _, argument := range o.arguments {
+			result, err := discard(argument)
+			p.print(argument, result, err)
+		}
 	}
-	unlock, err := lockWorkspace(local)
 	if err != nil {
 		return err
+	} else if p.failed {
+		return errReported
 	}
-	defer unlock()
-	if o.checkout != "" {
-		return checkout(ctx, directory, o, local, output)
-	} else if o.apply != "" {
-		return apply(ctx, directory, o, local, output)
-	}
-	w, err := loadWorkspace(local)
-	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%s isn't checked out", argument)
-	} else if err != nil {
-		return err
-	} else if err := os.RemoveAll(w.directory); err != nil {
-		return fmt.Errorf("unable to remove workspace: %w", err)
-	} else if o.json {
-		return json.NewEncoder(output).Encode(map[string]bool{"Discarded": true})
-	}
-	_, err = fmt.Fprintln(output, "Discarded the workspace; neither copy changed.")
-	return err
+	return nil
 }
 
-// printConflicts lists conflicts. Paths are local paths, which are relative to
-// the working directory if it's inside the root, as checkout expects.
+// listedConflict is a conflict as listed by --conflicts --json, with local
+// paths and copies.
+type listedConflict struct {
+	// Path is the local path of the conflict root.
+	Path string
+	// Resolvable indicates whether remote can resolve the conflict.
+	Resolvable bool
+	// Files indicates whether both copies are files, which can be merged.
+	Files bool `json:",omitempty"`
+	// Take lists the copies that can be taken.
+	Take []string `json:",omitempty"`
+	// CheckedOut indicates whether a workspace exists for the conflict.
+	CheckedOut bool `json:",omitempty"`
+}
+
+// pendingResolution is an unfinished resolution as listed by --conflicts
+// --json, whose conflict is no longer listed. It's finished by applying again
+// or set aside by discarding it.
+type pendingResolution struct {
+	// Path is the local path of the conflict root.
+	Path string
+}
+
+// localSides converts which endpoints' copies of a conflict can be taken to
+// local and remote copies.
+func localSides(conflict *remote.ConflictRoot, target *remote.Target) []string {
+	local, opposite := conflict.AlphaTakable, conflict.BetaTakable
+	if !target.Alpha {
+		local, opposite = opposite, local
+	}
+	var sides []string
+	if local {
+		sides = append(sides, sideLocal)
+	}
+	if opposite {
+		sides = append(sides, sideRemote)
+	}
+	return sides
+}
+
+// printConflicts lists conflicts and unfinished resolutions, whose conflicts
+// may no longer be listed if synchronization propagated one copy over a
+// partially applied resolution. Paths are local paths, which are relative to
+// the working directory if it's inside the root, as other operations expect.
 func printConflicts(ctx context.Context, directory string, o *options, output io.Writer) error {
-	conflicts, target, err := listConflicts(ctx, directory, o.session)
+	listing, target, err := listConflicts(ctx, directory, o.session)
 	if err != nil {
 		return err
 	}
 	l := newLocator(target)
-	if o.json {
-		listing := struct{ Conflicts []remote.ConflictRoot }{make([]remote.ConflictRoot, len(conflicts))}
-		for c, conflict := range conflicts {
-			listing.Conflicts[c] = remote.ConflictRoot{Path: l.local(conflict.Path), Resolvable: conflict.Resolvable}
+	workspaces := sessionWorkspaces(target)
+	conflicts := make([]listedConflict, len(listing.Conflicts))
+	for c := range listing.Conflicts {
+		conflict := &listing.Conflicts[c]
+		conflicts[c] = listedConflict{
+			Path: l.local(conflict.Path), Resolvable: conflict.Resolvable(), Files: conflict.Files,
+			Take: localSides(conflict, target), CheckedOut: workspaces[conflict.Path],
 		}
-		return json.NewEncoder(output).Encode(&listing)
-	} else if len(conflicts) == 0 {
+		delete(workspaces, conflict.Path)
+	}
+	var pending []string
+	for path := range workspaces {
+		pending = append(pending, path)
+	}
+	slices.Sort(pending)
+	if o.json {
+		listed := struct {
+			Conflicts []listedConflict
+			Pending   []pendingResolution
+		}{Conflicts: conflicts, Pending: make([]pendingResolution, len(pending))}
+		for p, path := range pending {
+			listed.Pending[p] = pendingResolution{Path: l.local(path)}
+		}
+		return json.NewEncoder(output).Encode(&listed)
+	} else if len(conflicts) == 0 && len(pending) == 0 {
 		_, err := fmt.Fprintln(output, "No conflicts.")
 		return err
 	}
-	for _, conflict := range conflicts {
-		line := l.display(conflict.Path)
+	for c, conflict := range conflicts {
+		line := l.display(listing.Conflicts[c].Path)
 		if !conflict.Resolvable {
-			line += " (not a conflict between two files, so remote can't resolve it)"
+			line += " (remote can't resolve it, since it involves a directory, the synchronization root, or content that can't be synchronized or read)"
+		} else if !conflict.Files {
+			line += fmt.Sprintf(" (not two files, so it can only be resolved with --take %s)", strings.Join(conflict.Take, " or --take "))
+		}
+		if conflict.CheckedOut {
+			line += " (checked out)"
 		}
 		if _, err := fmt.Fprintln(output, line); err != nil {
 			return err
 		}
 	}
+	if len(pending) > 0 {
+		fmt.Fprintln(output, "Checked out, but no longer listed as conflicts (apply again to finish resolving, or discard):")
+		for _, path := range pending {
+			if _, err := fmt.Fprintln(output, "  "+l.display(path)); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
-// checkout downloads both copies of a conflicting file into its workspace. An
-// existing workspace is reused, preserving edits to its merged file.
-func checkout(ctx context.Context, directory string, o *options, local string, output io.Writer) error {
-	conflicts, target, err := listConflicts(ctx, directory, o.session)
+// checkoutAll checks out the specified conflicts after listing them.
+func checkoutAll(ctx context.Context, directory string, o *options, p *printer) error {
+	listing, target, err := listConflicts(ctx, directory, o.session)
 	if err != nil {
 		return err
 	}
+	for _, argument := range o.arguments {
+		result, err := checkout(ctx, directory, o, listing, target, argument)
+		p.print(argument, result, err)
+	}
+	return nil
+}
+
+// checkout downloads both copies of a conflict into its workspace. An existing
+// workspace is reused, preserving edits to its merged file, even if its
+// conflict is no longer listed.
+func checkout(ctx context.Context, directory string, o *options, listing *remote.Listing, target *remote.Target, argument string) (*outcome, error) {
+	local, err := filepath.Abs(argument)
+	if err != nil {
+		return nil, fmt.Errorf("unable to locate it: %w", err)
+	}
+	unlock, err := lockWorkspace(local)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	path, err := newLocator(target).resolve(local)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var conflict *remote.ConflictRoot
-	for c := range conflicts {
-		if conflicts[c].Path == path {
-			conflict = &conflicts[c]
-		}
-	}
-	if conflict == nil {
-		return fmt.Errorf("%s isn't a conflict root (see remote --conflicts)", o.checkout)
-	} else if !conflict.Resolvable {
-		return fmt.Errorf("%s isn't a conflict between two files, so remote can't resolve it", o.checkout)
-	}
+	conflict := findConflict(listing, path)
 	if w, err := loadWorkspace(local); err == nil {
 		if !w.matches(target, path) {
-			return errors.New("an unrelated workspace exists for this path; discard it first")
+			return nil, errors.New("an unrelated workspace exists for this path; discard it first")
+		} else if w.hasDirectory() {
+			return nil, errDirectoryConflict
 		}
-		return printWorkspace(output, w, o.json)
+		return describe(w, argument, conflict == nil)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+		return nil, err
+	} else if conflict == nil {
+		return nil, errors.New("isn't a conflict root (see remote --conflicts)")
+	} else if !conflict.Resolvable() {
+		return nil, errors.New("isn't a conflict that remote can resolve (see remote --conflicts)")
+	} else if o.base != "" && !conflict.Files {
+		return nil, errors.New("--base requires a conflict between two files")
 	}
 	base, final, err := workspaceDirectory(local)
 	if err != nil {
-		return err
+		return nil, err
 	} else if err := outside(base, target.Root); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Prepare the workspace in a temporary directory and move it into place
 	// once complete, so that interrupted checkouts leave no workspace.
-	staging, err := os.MkdirTemp(base, ".checkout-")
+	staging, err := os.MkdirTemp(base, stagingPrefix)
 	if err != nil {
-		return fmt.Errorf("unable to create workspace: %w", err)
+		return nil, fmt.Errorf("unable to create workspace: %w", err)
 	}
 	defer os.RemoveAll(staging)
 	w := &workspace{Session: target.Session, Alpha: target.Alpha, Path: path, Token: rand.Text()[:8], directory: staging}
+	if conflict.Files {
+		err = checkoutFiles(ctx, directory, o, conflict, target, local, w)
+	} else {
+		w.Take = localSides(conflict, target)
+		err = checkoutEntries(ctx, directory, o, target, w)
+	}
+	if err != nil {
+		return nil, err
+	} else if err := w.save(); err != nil {
+		return nil, fmt.Errorf("unable to save workspace: %w", err)
+	} else if err := os.Rename(staging, final); err != nil {
+		return nil, fmt.Errorf("unable to save workspace: %w", err)
+	}
+	w.directory = final
+	return describe(w, argument, false)
+}
+
+// checkoutFiles downloads both copies of a conflict between two files into a
+// workspace, along with their common ancestor, if it can be found, and
+// prepares the merged file.
+func checkoutFiles(ctx context.Context, directory string, o *options, conflict *remote.ConflictRoot, target *remote.Target, local string, w *workspace) error {
+	var err error
 	w.Local, err = writeCopy(w.file(localName), func(file io.Writer) (*remote.Entry, error) {
-		return remote.CopyFile(ctx, target.Root, path, file)
+		return remote.CopyFile(ctx, target.Root, w.Path, file)
 	})
 	if err != nil {
 		return fmt.Errorf("unable to copy the local copy: %w", err)
@@ -427,7 +810,7 @@ func checkout(ctx context.Context, directory string, o *options, local string, o
 		if err != nil {
 			return nil, err
 		}
-		return remote.Copy(ctx, connection, path, file)
+		return remote.Copy(ctx, connection, w.Path, file)
 	})
 	if err != nil {
 		return fmt.Errorf("unable to download the remote copy: %w", err)
@@ -435,52 +818,120 @@ func checkout(ctx context.Context, directory string, o *options, local string, o
 		return errors.New("the copies are no longer both files; list conflicts again")
 	} else if remote.SameFile(w.Local, w.Remote) {
 		return errors.New("the copies are now identical; list conflicts again")
+	} else if w.BaseSource, err = findBase(ctx, conflict, local, o.base, w.file(baseName)); err != nil {
+		return err
 	} else if err := prepareMerged(w); err != nil {
 		return fmt.Errorf("unable to create merged file: %w", err)
-	}
-	if err := w.save(); err != nil {
-		return fmt.Errorf("unable to save workspace: %w", err)
-	} else if err := os.Rename(staging, final); err != nil {
-		return fmt.Errorf("unable to save workspace: %w", err)
-	}
-	w.directory = final
-	return printWorkspace(output, w, o.json)
-}
-
-// printWorkspace prints the files of a workspace.
-func printWorkspace(output io.Writer, w *workspace, jsonOutput bool) error {
-	_, err := os.Lstat(w.file(mergedName))
-	binary := errors.Is(err, os.ErrNotExist)
-	if jsonOutput {
-		return json.NewEncoder(output).Encode(&struct {
-			Local, Remote, Merged string
-			Binary                bool
-		}{w.file(localName), w.file(remoteName), w.file(mergedName), binary})
-	}
-	fmt.Fprintf(output, "Local:  %s\nRemote: %s\nMerged: %s\n", w.file(localName), w.file(remoteName), w.file(mergedName))
-	if binary {
-		fmt.Fprintln(output, "The copies are binary, so no merged file was created: create it, or use --take.")
-	} else if w.Local.Executable != w.Remote.Executable {
-		fmt.Fprintln(output, "The copies differ in executability: specify --executable or --take when applying.")
-	}
-	if !binary && w.Local.Digest != w.Remote.Digest {
-		if note := unterminatedNote(w); note != "" {
-			fmt.Fprintln(output, note)
-		}
 	}
 	return nil
 }
 
-// resolution determines the result entry of a resolution and the workspace
-// file providing its contents (for a file result).
+// checkoutEntries downloads both copies of a conflict other than between two
+// files into a workspace.
+func checkoutEntries(ctx context.Context, directory string, o *options, target *remote.Target, w *workspace) error {
+	var err error
+	w.Local, err = extractCopy(ctx, w.file(localName), func(output io.Writer) (*remote.Entry, error) {
+		return remote.ArchiveEntry(ctx, target.Root, w.Path, output)
+	})
+	if err != nil {
+		return fmt.Errorf("unable to copy the local copy: %w", err)
+	}
+	w.Remote, err = extractCopy(ctx, w.file(remoteName), func(output io.Writer) (*remote.Entry, error) {
+		connection, err := dialOpposite(ctx, directory, o.session, target)
+		if err != nil {
+			return nil, err
+		}
+		return remote.Archive(ctx, connection, w.Path, output)
+	})
+	if err != nil {
+		return fmt.Errorf("unable to download the remote copy: %w", err)
+	} else if w.hasDirectory() {
+		return errDirectoryConflict
+	} else if w.files() {
+		return errors.New("the copies are now both files; list conflicts again")
+	}
+	return nil
+}
+
+// describeKind describes the kind of a copy.
+func describeKind(entry *remote.Entry) string {
+	if entry.Kind == remote.EntryMissing {
+		return "missing"
+	}
+	return entry.Kind
+}
+
+// describe describes a workspace for its checkout.
+func describe(w *workspace, argument string, pending bool) (*outcome, error) {
+	result := &outcome{Path: argument, Local: w.file(localName), Remote: w.file(remoteName), Files: w.files(), Take: w.Take, Pending: pending}
+	note := func(format string, arguments ...any) {
+		result.lines = append(result.lines, fmt.Sprintf(format, arguments...))
+	}
+	if !w.files() {
+		note("Local:  %s (%s)", result.Local, describeKind(w.Local))
+		note("Remote: %s (%s)", result.Remote, describeKind(w.Remote))
+		if pending {
+			note("The conflict is no longer listed: apply again to finish resolving it, or discard the workspace.")
+		}
+		var options []string
+		for _, side := range w.Take {
+			options = append(options, fmt.Sprintf("--take %s deletes the %s copy", side, opposite(side)))
+		}
+		note("The copies aren't both files, so they can't be merged. Apply with %s, so that synchronization propagates the copy taken.", strings.Join(options, ", or "))
+		return result, nil
+	}
+	result.Merged = w.file(mergedName)
+	if w.BaseSource != "" {
+		result.Base = w.file(baseName)
+	}
+	note("Local:  %s", result.Local)
+	note("Remote: %s", result.Remote)
+	if result.Base != "" {
+		note("Base:   %s (%s)", result.Base, w.BaseSource)
+	}
+	note("Merged: %s", result.Merged)
+	if pending {
+		note("The conflict is no longer listed: apply again to finish resolving it, or discard the workspace.")
+	}
+	if _, err := os.Lstat(result.Merged); errors.Is(err, os.ErrNotExist) {
+		result.Binary = true
+		note("The copies are binary, so no merged file was created: create it, or use --take.")
+	} else if w.Local.Digest != w.Remote.Digest {
+		regions, err := countMarkers(result.Merged, markersFor(w.Token).local)
+		if err != nil {
+			return nil, err
+		}
+		result.Regions = regions
+		if result.Base == "" {
+			note("No common ancestor was found, so every region where the copies differ is marked (%d), and neither side's additions or deletions are known to be newer.", regions)
+		} else if regions == 0 {
+			note("Both copies' changes since their common ancestor were merged without overlapping: review the merged file, then apply it.")
+		} else {
+			note("%d regions changed differently on each side since their common ancestor are marked with the local, base, and remote versions.", regions)
+		}
+		if unterminated := unterminatedNote(w); unterminated != "" {
+			note("%s", unterminated)
+		}
+	}
+	if w.Local.Executable != w.Remote.Executable {
+		note("The copies differ in executability: specify --executable or --take when applying.")
+	}
+	return result, nil
+}
+
+// resolution determines the result entry of a resolution between two files and
+// the workspace file providing its contents (for a file result).
 func resolution(ctx context.Context, w *workspace, o *options) (*remote.Entry, string, error) {
 	if o.delete {
+		if w.Path == "" {
+			return nil, "", errors.New("the synchronization root can't be deleted")
+		}
 		return &remote.Entry{Kind: remote.EntryMissing}, "", nil
 	}
 	source, selected := w.file(mergedName), (*remote.Entry)(nil)
-	if o.take == "local" {
+	if o.take == sideLocal {
 		source, selected = w.file(localName), w.Local
-	} else if o.take == "remote" {
+	} else if o.take == sideRemote {
 		source, selected = w.file(remoteName), w.Remote
 	}
 	result, err := remote.ReadEntry(ctx, source)
@@ -519,25 +970,120 @@ func overlaps(a, b string) bool {
 	return a == b || a == "" || b == "" || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
 
-// apply writes a resolution to both copies and then verifies that
-// synchronization resolved the conflict. Synchronization doesn't pause between
-// the writes, and it may propagate the remaining original copy over a partially
-// applied result (such as a deletion, or a result matching the copies' common
-// ancestor), removing the conflict without resolving it. Thus, each copy is
-// replaced if it matches either checked-out copy or a previously applied result
-// (or already matches the result), so that failures can be retried whether or
-// not the conflict is still listed, and with a different result.
-func apply(ctx context.Context, directory string, o *options, local string, output io.Writer) error {
+// staleHint adds advice to an error caused by a copy that changed since it
+// was checked out.
+func staleHint(err error) error {
+	if errors.Is(err, remote.ErrStale) {
+		return fmt.Errorf("%w; discard the workspace and check out again", err)
+	}
+	return err
+}
+
+// application is a resolution whose copies have been updated, pending
+// verification once synchronized.
+type application struct {
+	// argument is the path as specified.
+	argument string
+	// w is the workspace.
+	w *workspace
+	// result is the result of a resolution between two files.
+	result *remote.Entry
+	// target is the session's target.
+	target *remote.Target
+	// locator maps paths for display.
+	locator *locator
+}
+
+// applyAll applies the resolutions of the specified conflicts and then
+// verifies them, synchronizing once. Workspaces remain locked until verified.
+func applyAll(ctx context.Context, directory string, o *options, p *printer) error {
+	var unlocks []func()
+	defer func() {
+		for _, unlock := range unlocks {
+			unlock()
+		}
+	}()
+	var applications []*application
+	for _, argument := range o.arguments {
+		a, unlock, err := apply(ctx, directory, o, argument)
+		if unlock != nil {
+			unlocks = append(unlocks, unlock)
+		}
+		if err != nil {
+			p.print(argument, nil, err)
+		} else {
+			applications = append(applications, a)
+		}
+	}
+	if len(applications) == 0 {
+		return nil
+	}
+	listing, _, listErr := listConflicts(ctx, directory, o.session)
+	for _, a := range applications {
+		if listErr != nil {
+			p.print(a.argument, nil, fmt.Errorf("updated the copies, but unable to verify synchronization (retry to verify): %w", listErr))
+			continue
+		}
+		result, err := a.verify(ctx, directory, o, listing)
+		p.print(a.argument, result, err)
+	}
+	return nil
+}
+
+// apply writes the resolution of a conflict to the copies. It returns a
+// function that unlocks the workspace, if it was locked. Synchronization
+// doesn't pause meanwhile, and it may propagate the remaining original copy
+// over a partially applied resolution (such as a deletion, or a result
+// matching the copies' common ancestor), removing the conflict without
+// resolving it, so failures can be retried whether or not the conflict is
+// still listed.
+func apply(ctx context.Context, directory string, o *options, argument string) (*application, func(), error) {
+	local, err := filepath.Abs(argument)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to locate it: %w", err)
+	}
+	unlock, err := lockWorkspace(local)
+	if err != nil {
+		return nil, nil, err
+	}
 	w, err := loadWorkspace(local)
 	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%s isn't checked out (see remote --conflict-checkout)", o.apply)
+		return nil, unlock, errors.New("isn't checked out (see remote --conflict-checkout)")
 	} else if err != nil {
-		return err
+		return nil, unlock, err
+	} else if w.hasDirectory() {
+		return nil, unlock, errDirectoryConflict
 	}
+	connection, target, err := remote.Dial(ctx, directory, o.session, remote.OperationExecute)
+	if err != nil {
+		return nil, unlock, err
+	}
+	a := &application{argument: argument, w: w, target: target, locator: newLocator(target)}
+	if path, err := a.locator.resolve(local); err != nil || !w.matches(target, path) {
+		connection.Close()
+		return nil, unlock, errors.New("the workspace was checked out through a different session or endpoint")
+	}
+	if w.files() {
+		err = a.writeResult(ctx, o, connection)
+	} else {
+		err = a.takeCopy(ctx, o, connection)
+	}
+	return a, unlock, err
+}
+
+// writeResult writes the result of a resolution between two files to both
+// copies, using a connection to the opposite endpoint. Each copy is replaced if
+// it matches either checked-out copy or a previously applied result (or
+// already matches the result), so that failures can be retried, even with a
+// different result.
+func (a *application) writeResult(ctx context.Context, o *options, connection io.ReadWriteCloser) error {
+	w := a.w
 	result, source, err := resolution(ctx, w, o)
 	if err != nil {
+		connection.Close()
 		return err
 	}
+	a.result = result
 	open := func() (io.ReadCloser, error) {
 		if source == "" {
 			return io.NopCloser(strings.NewReader("")), nil
@@ -546,22 +1092,13 @@ func apply(ctx context.Context, directory string, o *options, local string, outp
 	}
 
 	// Update the remote copy, then the local copy.
-	connection, target, err := remote.Dial(ctx, directory, o.session, remote.OperationExecute)
-	if err != nil {
-		return err
-	}
-	l := newLocator(target)
-	if path, err := l.resolve(local); err != nil || !w.matches(target, path) {
-		connection.Close()
-		return errors.New("the workspace was checked out through a different session or endpoint")
-	}
 	expected := append([]*remote.Entry{w.Local, w.Remote}, w.Applied...)
 	replacement := &remote.Replacement{Path: w.Path, Expected: expected, Result: result}
 	// Check the local copy first, so that one edited since checkout (such as
 	// instead of the merged file) doesn't leave only the remote copy updated.
-	if err := remote.CheckFile(ctx, target.Root, replacement); err != nil {
+	if err := remote.CheckFile(ctx, a.target.Root, replacement); err != nil {
 		connection.Close()
-		return fmt.Errorf("unable to update the local copy: %w", err)
+		return fmt.Errorf("unable to update the local copy: %w", staleHint(err))
 	}
 	// Record a file result before writing it, since either write may succeed
 	// even if apply fails, so that retries recognize it.
@@ -582,53 +1119,190 @@ func apply(ctx context.Context, directory string, o *options, local string, outp
 	err = remote.Replace(ctx, connection, replacement, input)
 	input.Close()
 	if err != nil {
-		return fmt.Errorf("unable to update the remote copy: %w", err)
+		return fmt.Errorf("unable to update the remote copy: %w", staleHint(err))
 	}
 	if input, err = open(); err != nil {
 		return err
 	}
-	err = remote.ReplaceFile(ctx, target.Root, replacement, input)
+	err = remote.ReplaceFile(ctx, a.target.Root, replacement, input)
 	input.Close()
 	if err != nil {
-		return fmt.Errorf("updated the remote copy, but unable to update the local copy: %w", err)
+		return fmt.Errorf("updated the remote copy, but unable to update the local copy: %w", staleHint(err))
 	}
+	return nil
+}
 
-	// Verify that synchronization resolved the conflict. No conflict may
-	// involve the file, including one at an ancestor or a descendant that a
-	// concurrent change created, and both copies must have the result.
-	unverified := func(err error) error {
-		return fmt.Errorf("updated both copies, but unable to verify synchronization (retry to verify): %w", err)
+// takeCopy resolves a conflict other than between two files by deleting the
+// copy that isn't taken, using a connection to the opposite endpoint, so that
+// synchronization propagates the copy taken. The deleted copy must match its
+// checked-out snapshot, while the copy taken may have been edited, such as to
+// incorporate the other copy's changes. Once a deletion has been attempted,
+// retries skip it if the copy no longer matches, since synchronization may
+// have propagated the taken copy in its place.
+func (a *application) takeCopy(ctx context.Context, o *options, connection io.ReadWriteCloser) error {
+	w := a.w
+	if o.take == "" || o.executable != "" {
+		connection.Close()
+		return errors.New("the copies aren't both files, so they can only be resolved with --take local or --take remote")
+	} else if !w.takable(o.take) {
+		connection.Close()
+		return fmt.Errorf("the %s copy can't be taken for this conflict (see remote --conflicts)", o.take)
 	}
-	conflicts, _, err := listConflicts(ctx, directory, o.session)
+	// The taken copy may be edited after checkout, but it must not have
+	// become a directory. The other copy's replacement checks its kind before
+	// deleting it. Fetch owns the connection when taking the remote copy;
+	// only the local copy needs to be deleted in that case.
+	var taken *remote.Entry
+	var err error
+	if o.take == sideLocal {
+		taken, err = remote.ReadEntry(ctx, filepath.Join(a.target.Root, filepath.FromSlash(w.Path)))
+	} else {
+		taken, err = remote.Fetch(ctx, connection, w.Path)
+	}
 	if err != nil {
-		return unverified(err)
+		connection.Close()
+		return fmt.Errorf("unable to read the %s copy: %w", o.take, err)
+	} else if taken.Kind == remote.EntryDirectory {
+		connection.Close()
+		return errDirectoryConflict
 	}
-	for _, conflict := range conflicts {
-		if overlaps(conflict.Path, w.Path) {
-			return fmt.Errorf("updated both copies, but %s conflicts again, so something changed meanwhile; discard the workspace and list conflicts again", l.display(conflict.Path))
+	deleted, entry := sideRemote, w.Remote
+	if o.take == sideRemote {
+		deleted, entry = sideLocal, w.Local
+	}
+	if w.Removing != "" && w.Removing != deleted {
+		connection.Close()
+		return fmt.Errorf("a previous apply took the %[1]s copy; apply with --take %[1]s to finish, or discard the workspace", opposite(w.Removing))
+	} else if entry.Kind == remote.EntryMissing || remote.SameContents(taken, entry) {
+		// There's nothing to delete, which leaves both copies missing, or the
+		// taken copy was edited to match the other one. Synchronization may
+		// then already consider the copies to agree, in which case it would
+		// propagate the other copy's deletion to the taken copy.
+		connection.Close()
+		w.Removing = deleted
+		return nil
+	}
+	retrying := w.Removing != ""
+	if !retrying {
+		w.Removing = deleted
+		if err := w.save(); err != nil {
+			connection.Close()
+			return fmt.Errorf("unable to save workspace: %w", err)
 		}
 	}
-	localEntry, err := remote.ReadEntry(ctx, filepath.Join(target.Root, filepath.FromSlash(w.Path)))
+	replacement := &remote.Replacement{Path: w.Path, Expected: []*remote.Entry{entry}, Result: &remote.Entry{Kind: remote.EntryMissing}}
+	if deleted == sideLocal {
+		connection.Close()
+		err = remote.ReplaceFile(ctx, a.target.Root, replacement, strings.NewReader(""))
+	} else {
+		err = remote.Replace(ctx, connection, replacement, strings.NewReader(""))
+	}
+	if errors.Is(err, remote.ErrStale) && retrying {
+		return nil
+	} else if errors.Is(err, remote.ErrStale) {
+		// Nothing was deleted, so retries mustn't skip the deletion.
+		w.Removing = ""
+		w.save()
+	}
 	if err != nil {
-		return unverified(err)
+		return fmt.Errorf("unable to delete the %s copy: %w", deleted, staleHint(err))
 	}
-	opposite, err := dialOpposite(ctx, directory, o.session, target)
+	return nil
+}
+
+// consistent determines whether both copies of a resolved conflict other than
+// between two files have the same kind and, for files and symbolic links, the
+// same contents. Directories' contents aren't compared, since they may contain
+// ignored content, so synchronization problems are checked instead.
+func consistent(a, b *remote.Entry) bool {
+	if a.Kind != b.Kind {
+		return false
+	} else if a.Kind == remote.EntryFile || a.Kind == remote.EntrySymbolicLink {
+		return remote.SameContents(a, b)
+	}
+	return true
+}
+
+// verify verifies that synchronization resolved a conflict, using a listing
+// made after the resolution was applied, and sets its workspace aside. No
+// conflict may involve the conflict root, including one at an ancestor or a
+// descendant that a concurrent change created, and both copies must have the
+// result.
+func (a *application) verify(ctx context.Context, directory string, o *options, listing *remote.Listing) (*outcome, error) {
+	w := a.w
+	unverified := func(err error) error {
+		return fmt.Errorf("updated the copies, but unable to verify synchronization (retry to verify): %w", err)
+	}
+	for _, conflict := range listing.Conflicts {
+		if overlaps(conflict.Path, w.Path) {
+			return nil, fmt.Errorf("updated the copies, but %s conflicts again, so something changed meanwhile; discard the workspace and list conflicts again", a.locator.display(conflict.Path))
+		}
+	}
+	localEntry, err := remote.ReadEntry(ctx, filepath.Join(a.target.Root, filepath.FromSlash(w.Path)))
 	if err != nil {
-		return unverified(err)
+		return nil, unverified(err)
 	}
-	remoteEntry, err := remote.Fetch(ctx, opposite, w.Path)
+	connection, err := dialOpposite(ctx, directory, o.session, a.target)
 	if err != nil {
-		return unverified(err)
+		return nil, unverified(err)
 	}
-	// Executability isn't compared, since not every filesystem preserves it.
-	if !remote.SameContents(localEntry, result) || !remote.SameContents(remoteEntry, result) {
-		return errors.New("updated both copies, but after synchronizing they don't both have the result; retry to apply it again")
+	remoteEntry, err := remote.Fetch(ctx, connection, w.Path)
+	if err != nil {
+		return nil, unverified(err)
 	}
-	if err := os.RemoveAll(w.directory); err != nil {
-		return fmt.Errorf("resolved, but unable to remove workspace: %w", err)
-	} else if o.json {
-		return json.NewEncoder(output).Encode(map[string]bool{"Resolved": true})
+	var resolved string
+	if w.files() {
+		// Executability isn't compared, since not every filesystem preserves
+		// it.
+		if !remote.SameContents(localEntry, a.result) || !remote.SameContents(remoteEntry, a.result) {
+			return nil, errors.New("updated both copies, but after synchronizing they don't both have the result; retry to apply it again")
+		}
+		resolved = "Resolved; both copies now match the result."
+	} else {
+		for _, problem := range listing.Problems {
+			if overlaps(problem.Path, w.Path) {
+				side := sideRemote
+				if problem.Alpha == a.target.Alpha {
+					side = sideLocal
+				}
+				return nil, fmt.Errorf("deleted the %s copy, but synchronizing %s failed on the %s endpoint: %s; fix that, then retry",
+					w.Removing, a.locator.display(problem.Path), side, problem.Error)
+			}
+		}
+		if !consistent(localEntry, remoteEntry) {
+			return nil, fmt.Errorf("deleted the %s copy, but after synchronizing the copies don't match; retry to verify", w.Removing)
+		}
+		resolved = fmt.Sprintf("Resolved; the %s copy was taken.", opposite(w.Removing))
 	}
-	_, err = fmt.Fprintln(output, "Resolved; both copies now match the result.")
-	return err
+	backup, err := w.retire()
+	if err != nil {
+		return nil, fmt.Errorf("resolved, but unable to set the workspace aside: %w", err)
+	}
+	return &outcome{Path: a.argument, Resolved: true, Backup: backup, lines: []string{resolved, retentionNote(backup)}}, nil
+}
+
+// discard sets a workspace aside without changing either copy.
+func discard(argument string) (*outcome, error) {
+	local, err := filepath.Abs(argument)
+	if err != nil {
+		return nil, fmt.Errorf("unable to locate it: %w", err)
+	}
+	unlock, err := lockWorkspace(local)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	w, err := loadWorkspace(local)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, errors.New("isn't checked out")
+	} else if err != nil {
+		return nil, err
+	}
+	backup, err := w.retire()
+	if err != nil {
+		return nil, fmt.Errorf("unable to set the workspace aside: %w", err)
+	}
+	return &outcome{Path: argument, Discarded: true, Backup: backup, lines: []string{
+		"Discarded the workspace without changing either copy.", retentionNote(backup),
+	}}, nil
 }

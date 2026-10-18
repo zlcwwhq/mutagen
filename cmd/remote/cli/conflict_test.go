@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,24 +16,74 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/remote"
 )
 
+func TestDirectoryWorkspaceRejected(t *testing.T) {
+	// Existing workspaces must not bypass the rejection of directory
+	// conflicts, even when their conflict is no longer listed.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	for _, localDirectory := range []bool{false, true} {
+		t.Run(fmt.Sprintf("localDirectory=%t", localDirectory), func(t *testing.T) {
+			root := t.TempDir()
+			local := filepath.Join(root, "conflict")
+			_, directory, err := workspaceDirectory(local)
+			if err != nil {
+				t.Fatal(err)
+			} else if err := os.Mkdir(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			w := &workspace{
+				Session: "session", Path: "conflict", directory: directory,
+				Local: &remote.Entry{Kind: remote.EntryFile}, Remote: &remote.Entry{Kind: remote.EntryDirectory},
+				Take: []string{sideLocal, sideRemote},
+			}
+			if localDirectory {
+				w.Local, w.Remote = w.Remote, w.Local
+			}
+			if err := w.save(); err != nil {
+				t.Fatal(err)
+			}
+			target := &remote.Target{Session: "session", Root: root}
+			if _, err := checkout(ctx, root, &options{}, &remote.Listing{}, target, local); !errors.Is(err, errDirectoryConflict) {
+				t.Fatal("directory workspace reused:", err)
+			}
+			for _, side := range []string{sideLocal, sideRemote} {
+				o := &options{conflictOptions: conflictOptions{take: side}}
+				_, unlock, err := apply(ctx, root, o, local)
+				if unlock != nil {
+					unlock()
+				}
+				if !errors.Is(err, errDirectoryConflict) {
+					t.Fatal("directory workspace not rejected before dialing:", err)
+				}
+			}
+			if _, err := discard(local); err != nil {
+				t.Fatal("directory workspace can't be discarded:", err)
+			}
+		})
+	}
+}
+
 func TestConflictOptions(t *testing.T) {
 	for _, args := range [][]string{
 		{"--conflicts", "--json"},
-		{"--conflict-checkout", "a b", "--json"},
-		{"--conflict-apply", "file", "--take", "remote"},
-		{"--conflict-apply", "file", "--executable", "false"},
-		{"--conflict-apply", "file", "--delete"},
-		{"--conflict-discard", "file"},
+		{"--conflict-checkout", "--json", "a b"},
+		{"--conflict-checkout", "--base", "base", "file"},
+		{"--conflict-apply", "--take", "remote", "file", "other"},
+		{"--conflict-apply", "--executable", "false", "file"},
+		{"--conflict-apply", "--delete", "file"},
+		{"--conflict-discard", "file", "./-file"},
 	} {
 		if _, err := parse(args); err != nil {
 			t.Fatalf("%v: %v", args, err)
 		}
 	}
 	for _, args := range [][]string{
-		{"--conflicts", "--diff"}, {"--conflicts", "echo"}, {"--conflict-checkout", "file", "--no-flush"},
-		{"--take", "remote", "echo"}, {"--conflict-apply", "file", "--take", "alpha"},
-		{"--conflict-apply", "file", "--delete", "--take", "local"},
-		{"--conflict-apply", "file", "--conflict-discard", "file"}, {"--json", "echo"},
+		{"--conflicts", "--diff"}, {"--conflicts", "echo"}, {"--conflict-checkout", "--no-flush", "file"},
+		{"--take", "remote", "echo"}, {"--conflict-apply", "--take", "alpha", "file"},
+		{"--conflict-apply", "--delete", "--take", "local", "file"},
+		{"--conflict-apply", "--conflict-discard", "file"}, {"--json", "echo"},
+		{"--conflict-checkout"}, {"--conflict-apply", "file", "--take", "local"},
+		{"--conflict-checkout", "--base", "base", "file", "other"}, {"--conflict-apply", "--base", "base", "file"},
 	} {
 		if _, err := parse(args); err == nil {
 			t.Fatalf("accepted %v", args)
@@ -41,28 +92,66 @@ func TestConflictOptions(t *testing.T) {
 }
 
 func TestMarkedMerge(t *testing.T) {
+	markers := markersFor("test")
 	for _, pair := range [][2]string{{"same\na\nend\n", "same\nb\nend\n"}, {"", "add"}, {"a", ""}, {"a", "b"}, {"same\n", "same\n"}} {
-		merged := markedMerge([]byte(pair[0]), []byte(pair[1]), "test")
+		merged := markedMerge([]byte(pair[0]), []byte(pair[1]), markers)
 		if pair[0] == pair[1] {
 			if merged != pair[0] {
 				t.Fatal("equal contents changed")
 			}
 			continue
 		}
-		for _, marker := range markerLines("test") {
+		for _, marker := range []string{markers.local, markers.separator, markers.remote} {
 			if !strings.Contains(merged, marker) {
 				t.Fatal("missing marker")
 			}
+		}
+		if strings.Contains(merged, markers.base) {
+			t.Fatal("base marked without a base")
 		}
 		if strings.HasPrefix(pair[0], "same\n") && !strings.HasPrefix(merged, "same\n") {
 			t.Fatal("shared prefix lost")
 		}
 	}
 	path := filepath.Join(t.TempDir(), "merged")
-	for _, marker := range markerLines("token") {
+	for _, marker := range markers.all() {
 		os.WriteFile(path, []byte(strings.Repeat("a", 65530)+marker+"tail"), 0600)
-		if found, err := containsMarkers(path, "token"); err != nil || !found {
+		if found, err := containsMarkers(path, "test"); err != nil || !found {
 			t.Fatalf("marker crossing read boundary missed: %v", err)
+		}
+	}
+
+	// Markers are counted once, including when they cross read boundaries.
+	data := strings.Repeat(markers.local+"\n", 3) + strings.Repeat("a", 65536-3*len(markers.local+"\n")-5) + markers.local + "\n"
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	} else if count, err := countMarkers(path, markers.local); err != nil || count != 4 {
+		t.Fatalf("counted %d markers: %v", count, err)
+	}
+}
+
+func TestMergeThreeWay(t *testing.T) {
+	markers := markersFor("test")
+	lines := func(values ...string) []byte {
+		return []byte(strings.Join(values, "\n") + "\n")
+	}
+	base := lines("1", "2", "3", "4", "5")
+	for _, test := range []struct {
+		description           string
+		local, remote, merged []byte
+		regions               int
+	}{
+		{"separate changes", lines("1", "two", "3", "4", "5"), lines("1", "2", "3", "4", "five"), lines("1", "two", "3", "4", "five"), 0},
+		{"addition and deletion", lines("0", "1", "2", "3", "4", "5"), lines("1", "2", "4", "5"), lines("0", "1", "2", "4", "5"), 0},
+		{"identical changes", lines("1", "2", "three", "4", "5"), lines("1", "2", "three", "4", "5"), lines("1", "2", "three", "4", "5"), 0},
+		{"one side unchanged", base, lines("1", "2", "3", "4"), lines("1", "2", "3", "4"), 0},
+		{"overlapping changes", lines("1", "2", "local", "4", "5"), lines("1", "2", "remote", "4", "5"), []byte(
+			"1\n2\n" + markers.local + "\nlocal\n" + markers.base + "\n3\n" + markers.separator + "\nremote\n" + markers.remote + "\n4\n5\n"), 1},
+		{"insertions at the same place", lines("1", "2", "3", "4", "5", "local"), lines("1", "2", "3", "4", "5", "remote"), []byte(
+			"1\n2\n3\n4\n5\n" + markers.local + "\nlocal\n" + markers.base + "\n" + markers.separator + "\nremote\n" + markers.remote + "\n"), 1},
+	} {
+		if merged, regions := mergeThreeWay(base, test.local, test.remote, markers); merged != string(test.merged) || regions != test.regions {
+			t.Fatalf("%s: merged into %q with %d regions", test.description, merged, regions)
 		}
 	}
 }
@@ -85,7 +174,20 @@ func TestConflictOverlap(t *testing.T) {
 // newTestWorkspace creates a workspace with the specified copies.
 func newTestWorkspace(t *testing.T, local, opposite string) *workspace {
 	t.Helper()
-	w := &workspace{Token: "token", directory: t.TempDir()}
+	w := &workspace{Path: "file", Token: "token", directory: t.TempDir()}
+	return newTestWorkspaceWithBase(t, w, local, opposite, "")
+}
+
+// newTestWorkspaceWithBase prepares a workspace with the specified copies and,
+// if specified, base.
+func newTestWorkspaceWithBase(t *testing.T, w *workspace, local, opposite, base string) *workspace {
+	t.Helper()
+	if base != "" {
+		w.BaseSource = "test"
+		if err := os.WriteFile(w.file(baseName), []byte(base), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, copy := range []struct {
 		name, data string
 		entry      **remote.Entry
@@ -263,13 +365,15 @@ func TestUnterminatedCopies(t *testing.T) {
 		{"local", "remote", "Neither copy ends with a newline"},
 		{"local\n", "remote\n", ""},
 	} {
-		var output strings.Builder
-		if err := printWorkspace(&output, newTestWorkspace(t, test.local, test.remote), false); err != nil {
+		result, err := describe(newTestWorkspace(t, test.local, test.remote), "file", false)
+		if err != nil {
 			t.Fatal(err)
-		} else if test.note == "" && strings.Contains(output.String(), "newline") {
-			t.Fatalf("%q and %q noted: %s", test.local, test.remote, output.String())
-		} else if !strings.Contains(output.String(), test.note) {
-			t.Fatalf("%q and %q not noted: %s", test.local, test.remote, output.String())
+		}
+		output := strings.Join(result.lines, "\n")
+		if test.note == "" && strings.Contains(output, "newline") {
+			t.Fatalf("%q and %q noted: %s", test.local, test.remote, output)
+		} else if !strings.Contains(output, test.note) {
+			t.Fatalf("%q and %q not noted: %s", test.local, test.remote, output)
 		}
 	}
 }

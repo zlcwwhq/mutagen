@@ -88,3 +88,40 @@ func TestRemoteReport(t *testing.T) {
 		t.Fatalf("non-empty report: %+v", report)
 	}
 }
+
+func TestRemoteDirectoryConflicts(t *testing.T) {
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	changed := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{2}}
+	directory := &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"child": file}}
+	modified := &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"child": changed}}
+	wrap := func(entry *core.Entry) *core.Entry {
+		if entry == nil {
+			return &core.Entry{Kind: core.EntryKind_Directory}
+		}
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"conflict": entry}}
+	}
+	for _, mode := range []core.SynchronizationMode{
+		core.SynchronizationMode_SynchronizationModeTwoWaySafe,
+		core.SynchronizationMode_SynchronizationModeOneWaySafe,
+	} {
+		for _, modifiedDirectory := range []bool{false, true} {
+			for _, directoryOnAlpha := range []bool{false, true} {
+				t.Run(fmt.Sprintf("mode=%d/modified=%t/alpha=%t", mode, modifiedDirectory, directoryOnAlpha), func(t *testing.T) {
+					ancestor, alpha, beta := (*core.Entry)(nil), directory, file
+					if modifiedDirectory {
+						ancestor, alpha = directory, modified
+					}
+					if !directoryOnAlpha {
+						alpha, beta = beta, alpha
+					}
+					_, _, _, conflicts := core.Reconcile(wrap(ancestor), wrap(alpha), wrap(beta), mode)
+					if len(conflicts) != 1 {
+						t.Fatalf("unexpected conflicts: %+v", conflicts)
+					} else if root := resolution(conflicts[0], mode, "sha1"); root.Path != "conflict" || root.Resolvable() {
+						t.Fatalf("directory conflict reported as resolvable: %+v", root)
+					}
+				})
+			}
+		}
+	}
+}

@@ -11,3 +11,8 @@ import (
 func renameNoReplace(_ *os.Root, _, _ string) error {
 	return errors.ErrUnsupported
 }
+
+// exchange isn't supported on this platform.
+func exchange(_ *os.Root, _, _ string) error {
+	return errors.ErrUnsupported
+}

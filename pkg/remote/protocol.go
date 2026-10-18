@@ -41,10 +41,14 @@ type Request struct {
 	File string
 	// Copy is the slash-separated path, relative to the target root, of a
 	// regular file whose complete contents are sent as output (see CopyFile)
-	// instead of running a command.
+	// instead of running a command. A dot refers to the root itself.
 	Copy string
-	// Replace requests replacement of a file by contents read from input (see
-	// ReplaceFile) instead of running a command.
+	// Archive is the slash-separated path, relative to the target root, of an
+	// entry whose archive is sent as output (see ArchiveEntry) instead of
+	// running a command. It must not refer to the root itself.
+	Archive string `json:",omitempty"`
+	// Replace requests replacement or deletion of an entry, with contents read
+	// from input (see ReplaceFile), instead of running a command.
 	Replace *Replacement `json:",omitempty"`
 }
 
@@ -58,15 +62,23 @@ func validRelativePath(value string) bool {
 // EnsureValid checks that command metadata can be represented losslessly by
 // the protocol and passed to the operating system.
 func (r *Request) EnsureValid() error {
-	if r != nil && (r.Copy != "" || r.Replace != nil) {
-		path := r.Copy
-		if r.Replace != nil {
-			path = r.Replace.Path
+	if r != nil && (r.Copy != "" || r.Archive != "" || r.Replace != nil) {
+		operations, path := 0, ""
+		if r.Copy != "" {
+			operations, path = operations+1, r.Copy
 		}
-		if len(r.Arguments) > 0 || r.File != "" || (r.Copy != "" && r.Replace != nil) {
+		if r.Archive != "" {
+			operations, path = operations+1, r.Archive
+		}
+		if r.Replace != nil {
+			operations, path = operations+1, r.Replace.Path
+		}
+		if len(r.Arguments) > 0 || r.File != "" || operations > 1 {
 			return errors.New("file operations must not specify a command or another operation")
-		} else if path == "" || path == "." || !utf8.ValidString(path) || strings.IndexByte(path, 0) >= 0 || !validRelativePath(path) {
-			return errors.New("file operation path must be relative to, and not the same as, the synchronization root")
+		} else if path == "" || !utf8.ValidString(path) || strings.IndexByte(path, 0) >= 0 || !validRelativePath(path) {
+			return errors.New("file operation path must be relative to the synchronization root")
+		} else if path == "." && r.Archive != "" {
+			return errors.New("the synchronization root can't be archived")
 		}
 		return nil
 	} else if r != nil && r.File != "" {
@@ -145,6 +157,9 @@ type result struct {
 	// Entry is the requested entry for file requests, excluding its data,
 	// which is sent as output.
 	Entry *Entry `json:",omitempty"`
+	// Stale indicates that a replacement failed because the entry changed
+	// since it was checked out (see ErrStale).
+	Stale bool `json:",omitempty"`
 }
 
 // writeMessage writes bounded, length-prefixed command metadata.

@@ -104,9 +104,15 @@ func run(ctx context.Context, root, prologue string, request *Request, stdin io.
 			return result{Error: fmt.Sprintf("unable to copy %s: %v", request.Copy, err)}
 		}
 		return result{Entry: entry}
+	} else if request.Archive != "" {
+		entry, err := ArchiveEntry(ctx, root, request.Archive, stdout)
+		if err != nil {
+			return result{Error: fmt.Sprintf("unable to archive %s: %v", request.Archive, err)}
+		}
+		return result{Entry: entry}
 	} else if request.Replace != nil {
 		if err := ReplaceFile(ctx, root, request.Replace, stdin); err != nil {
-			return result{Error: fmt.Sprintf("unable to replace %s: %v", request.Replace.Path, err)}
+			return result{Error: fmt.Sprintf("unable to replace %s: %v", request.Replace.Path, err), Stale: errors.Is(err, ErrStale)}
 		}
 		return result{}
 	}

@@ -38,10 +38,10 @@ const usage = `Usage: remote [options] <command> [<args>...]
        remote --flush [options]
        remote --diff [options] [<path>...]
        remote --conflicts [--json]
-       remote --conflict-checkout <path> [--json]
-       remote --conflict-apply <path> [--take local|remote | --delete]
-              [--executable true|false] [--json]
-       remote --conflict-discard <path> [--json]
+       remote --conflict-checkout [--base <file>] [--json] <path>...
+       remote --conflict-apply [--take local|remote | --delete]
+              [--executable true|false] [--json] <path>...
+       remote --conflict-discard [--json] <path>...
 
 Run a command on the opposite endpoint of the Mutagen synchronization session
 whose root contains the current directory, in the corresponding directory
@@ -73,24 +73,35 @@ Notes:
     (- local, + remote). For a single-file session, use --session from outside
     its root. Large conflict reports may omit changes and say how many;
     specify paths to compare omitted files. --timeout also covers file reads.
-  - Conflicts between two files can be resolved in two-way-safe sessions.
-    remote --conflicts synchronizes and lists every conflict. Then
-    --conflict-checkout downloads both complete copies of a file into a
-    workspace (in the Mutagen data directory) and prints the paths of its
-    local, remote, and merged files. The merged file marks the regions where
-    the copies differ, without a common base version; binary copies get no
-    merged file. Edit or create the merged file, then --conflict-apply writes
-    it (or the copy chosen by --take, or deletion with --delete) to both
-    copies, synchronizes, and removes the workspace once both copies have the
-    result and no conflict involves the file. Checking out again keeps an
-    existing workspace and its edits.
-  - Apply only replaces a copy that matches one of the checked-out copies
+  - Conflicts can be resolved in two-way-safe and one-way-safe sessions.
+    remote --conflicts synchronizes, lists every conflict and how it can be
+    resolved, and lists unfinished resolutions. Conflict operations accept
+    several paths, with options before them.
+  - --conflict-checkout downloads both complete copies into a workspace (in
+    the Mutagen data directory) and prints their paths. For two files, it also
+    looks for their common ancestor (the file that both endpoints last agreed
+    on) in Git's HEAD commit and index, or in the file given with --base,
+    verified by its digest. With it, the merged file contains both sides'
+    changes, and marks only regions changed differently on each side, showing
+    the local, base, and remote versions; without it, every region where the
+    copies differ is marked. Binary copies get no merged file. Checking out
+    again keeps an existing workspace and its edits. Conflicts involving
+    directories require manual resolution; checkout and apply reject them.
+  - For two files, --conflict-apply writes the merged file (or the copy chosen
+    by --take, or deletion with --delete) to both copies. For other conflicts
+    (such as a symbolic link and a file), only --take is possible: it deletes
+    the other copy, so that synchronization propagates the copy taken, which
+    may be edited first. Apply then synchronizes and checks that both copies
+    match and no conflict involves the path. The workspace, with the original
+    copies, is then kept for 7 days in case the resolution was wrong, as is one
+    that --conflict-discard sets aside without changing either copy.
+  - Apply only replaces or deletes a copy that matches a checked-out copy
     (synchronization may copy one over the other) or a result that it applied
-    before, so it fails if either copy was edited since checkout; then use
-    --conflict-discard and check out again. Other failures can be retried, even
-    if the conflict is no longer listed or the merged file was edited since.
+    before, so it fails if either copy was edited since checkout; then discard
+    the workspace and check out again. Other failures can be retried, even if
+    the conflict is no longer listed or the merged file was edited since.
     Copies differing in executability need --executable or --take. A conflict
-    operation fails while another one on the same file is running.
+    operation fails while another one on the same path is running.
   - No terminal is allocated, so interactive programs don't work.
   - If the opposite endpoint has a remote prologue, then /bin/sh sources it
     before each command submitted from inside the root (even with --cwd).
@@ -277,11 +288,12 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	if options.active() {
-		err := runConflicts(ctx, directory, options, stdout)
+		err := runConflicts(ctx, directory, options, stdout, stderr)
 		if code, ok := interrupted("resolving conflicts"); ok {
 			return code
-		}
-		if err != nil {
+		} else if errors.Is(err, errReported) {
+			return failureExitCode
+		} else if err != nil {
 			return fail(err)
 		}
 		return 0

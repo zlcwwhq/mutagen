@@ -28,9 +28,9 @@ wrong:
 - **Remote changes come back.** Files that the command creates, rewrites, or
   deletes in the synced tree change locally too. A file modified on both sides
   becomes a conflict and stops synchronizing (`remote` warns about it, and in
-  two-way-safe sessions `remote --conflicts` lists every conflict), so edit
-  sources locally, let remote commands write only outputs, and avoid mutating
-  `git` commands remotely.
+  two-way-safe and one-way-safe sessions `remote --conflicts` lists every
+  conflict), so edit sources locally, let remote commands write only outputs,
+  and avoid mutating `git` commands remotely.
 - **No terminal.** Use non-interactive flags, set `--timeout` for anything that
   might hang, and detach long jobs with all output redirected (otherwise
   `remote` waits for them):
@@ -44,9 +44,11 @@ environment (such as an inactive conda environment), read
 
 ## Resolving conflicts
 
-In two-way-safe sessions (the default), use the
+In two-way-safe (the default) and one-way-safe sessions, use the
 [conflict workflow](references/conflicts.md) to download both copies of a
-conflicting file, merge them locally, and apply the result to both sides.
-Use `remote --conflicts` rather than flush warnings as the complete list.
-Preserve both sides' intent when it is clear, and ask the user when it's
-ambiguous.
+conflict, merge them locally, and apply the result to both sides. Use
+`remote --conflicts` rather than flush warnings as the complete list, including
+resolutions left unfinished. Preserve both sides' intent when it is clear, and
+ask the user when it's ambiguous, especially without a common ancestor.
+Conflicts involving directories require manual resolution; checkout and apply
+reject them, including existing workspaces. Report these to the user.

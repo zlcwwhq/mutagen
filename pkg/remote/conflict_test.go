@@ -73,7 +73,7 @@ func TestCopyAndReplace(t *testing.T) {
 	if err := replace([]*Entry{entry}, result, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := replace([]*Entry{entry, other}, &Entry{Kind: EntryMissing}, ""); err == nil || !strings.Contains(err.Error(), "changed since") {
+	if err := replace([]*Entry{entry, other}, &Entry{Kind: EntryMissing}, ""); !errors.Is(err, ErrStale) || !strings.Contains(err.Error(), "changed since") {
 		t.Fatalf("stale deletion accepted: %v", err)
 	}
 	if err := replace(nil, &Entry{Kind: EntryMissing}, ""); err == nil || !strings.Contains(err.Error(), "invalid") {
@@ -129,9 +129,25 @@ func TestReplaceIgnoresUnpreservedExecutability(t *testing.T) {
 	}
 }
 
+// withoutExchanges runs a test with and without support for exchanging files,
+// which replacements otherwise use where supported.
+func withoutExchanges(t *testing.T, test func(t *testing.T)) {
+	t.Run("exchanges", test)
+	t.Run("no exchanges", func(t *testing.T) {
+		exchangeFiles = func(*os.Root, string, string) error { return errors.ErrUnsupported }
+		defer func() { exchangeFiles = exchange }()
+		test(t)
+	})
+}
+
 func TestSupersedeKeepsConcurrentSaves(t *testing.T) {
+	withoutExchanges(t, testSupersedeKeepsConcurrentSaves)
+}
+
+func testSupersedeKeepsConcurrentSaves(t *testing.T) {
 	// A file saved after the last check but before it's replaced or deleted
 	// must survive, rather than be overwritten silently.
+	ctx := context.Background()
 	for name, save := range map[string]func(path string) error{
 		"rename": func(path string) error {
 			if err := os.WriteFile(path+".new", []byte("saved\n"), 0600); err != nil {
@@ -142,35 +158,64 @@ func TestSupersedeKeepsConcurrentSaves(t *testing.T) {
 		"in place": func(path string) error {
 			return os.WriteFile(path, []byte("saved\n"), 0600)
 		},
+		// A write that preserves the size and modification time isn't
+		// visible in file information, but contents are verified.
+		"in place with unchanged information": func(path string) error {
+			info, err := os.Stat(path)
+			if err != nil {
+				return err
+			} else if err := os.WriteFile(path, []byte("0riginal\n"), 0600); err != nil {
+				return err
+			}
+			return os.Chtimes(path, info.ModTime(), info.ModTime())
+		},
 	} {
-		for _, staged := range []string{".mutagen-temporary-staged", ""} {
+		for _, stage := range []bool{true, false} {
 			directory := t.TempDir()
 			path := filepath.Join(directory, "file")
 			if err := os.WriteFile(path, []byte("original\n"), 0600); err != nil {
 				t.Fatal(err)
-			} else if staged != "" {
-				if err := os.WriteFile(filepath.Join(directory, staged), []byte("result\n"), 0600); err != nil {
-					t.Fatal(err)
-				}
 			}
 			root, err := os.OpenRoot(directory)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer root.Close()
-			checked, err := root.Lstat("file")
+			checked, err := snapshot(ctx, root, "file", nil)
 			if err != nil {
 				t.Fatal(err)
+			}
+			var staged *stagedFile
+			if stage {
+				staged = &stagedFile{name: temporaryName("file", roleStaged)}
+				if err := os.WriteFile(filepath.Join(directory, staged.name), []byte("result\n"), 0600); err != nil {
+					t.Fatal(err)
+				} else if staged.info, err = root.Lstat(staged.name); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := save(path); err != nil {
 				t.Fatal(err)
 			}
-			if err := supersede(root, "file", checked, staged); !errors.Is(err, errStale) {
-				t.Fatalf("%s save (staged %q) not detected: %v", name, staged, err)
-			} else if data, _ := os.ReadFile(path); string(data) != "saved\n" {
-				t.Fatalf("%s save (staged %q) lost", name, staged)
-			} else if entries, _ := os.ReadDir(directory); len(entries) != 1+min(len(staged), 1) {
-				t.Fatalf("%s save (staged %q) left files behind: %v", name, staged, entries)
+			saved, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A staged file is left for the caller to remove.
+			files := 1
+			if stage {
+				files = 2
+			}
+			if err := supersede(ctx, root, "file", checked, staged, false); !errors.Is(err, ErrStale) {
+				t.Fatalf("%s save (staged %t) not detected: %v", name, stage, err)
+			} else if data, _ := os.ReadFile(path); !bytes.Equal(data, saved) {
+				t.Fatalf("%s save (staged %t) lost", name, stage)
+			} else if entries, _ := os.ReadDir(directory); len(entries) != files {
+				t.Fatalf("%s save (staged %t) left files behind: %v", name, stage, entries)
+			} else if stage {
+				if data, _ := os.ReadFile(filepath.Join(directory, staged.name)); string(data) != "result\n" {
+					t.Fatalf("%s save (staged %t) changed the staged file", name, stage)
+				}
 			}
 		}
 	}
@@ -205,9 +250,24 @@ func TestSupersedeKeepsConcurrentSaves(t *testing.T) {
 	} else if data, _ := os.ReadFile(filepath.Join(directory, "placed")); string(data) != "from\n" {
 		t.Fatal("file not renamed")
 	}
+
+	// Exchanges swap files atomically.
+	if err := exchange(root, "placed", "to"); errors.Is(err, errors.ErrUnsupported) {
+		t.Log("exchanging files unsupported")
+	} else if err != nil {
+		t.Fatal("unable to exchange files:", err)
+	} else if data, _ := os.ReadFile(filepath.Join(directory, "to")); string(data) != "from\n" {
+		t.Fatal("files not exchanged")
+	} else if data, _ := os.ReadFile(filepath.Join(directory, "placed")); string(data) != "to\n" {
+		t.Fatal("files not exchanged")
+	}
 }
 
 func TestReplaceCompletedConcurrently(t *testing.T) {
+	withoutExchanges(t, testReplaceCompletedConcurrently)
+}
+
+func testReplaceCompletedConcurrently(t *testing.T) {
 	// Synchronization may propagate the result after the last check but before
 	// the file is replaced or deleted, which completes the replacement rather
 	// than making it stale.
@@ -217,23 +277,22 @@ func TestReplaceCompletedConcurrently(t *testing.T) {
 	for _, result := range []*Entry{merged, {Kind: EntryMissing}} {
 		directory := t.TempDir()
 		path := filepath.Join(directory, "file")
-		staged := ""
 		if err := os.WriteFile(path, []byte("original\n"), 0600); err != nil {
 			t.Fatal(err)
-		} else if result.Kind == EntryFile {
-			staged = ".mutagen-temporary-staged"
-			if err := os.WriteFile(filepath.Join(directory, staged), []byte("merged\n"), 0600); err != nil {
-				t.Fatal(err)
-			}
 		}
 		root, err := os.OpenRoot(directory)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer root.Close()
-		checked, err := root.Lstat("file")
-		if err != nil {
-			t.Fatal(err)
+		var staged *stagedFile
+		if result.Kind == EntryFile {
+			staged = &stagedFile{name: temporaryName("file", roleStaged)}
+			if err := os.WriteFile(filepath.Join(directory, staged.name), []byte("merged\n"), 0600); err != nil {
+				t.Fatal(err)
+			} else if staged.info, err = root.Lstat(staged.name); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if result.Kind == EntryMissing {
 			err = os.Remove(path)
@@ -244,11 +303,19 @@ func TestReplaceCompletedConcurrently(t *testing.T) {
 			t.Fatal(err)
 		}
 		replacement := &Replacement{Path: "file", Expected: []*Entry{original}, Result: result}
-		if err := replacement.replace(ctx, root, "file", checked, staged); err != nil {
+		if err := replacement.replace(ctx, root, "file", original, staged, false); err != nil {
 			t.Fatalf("propagated %s result treated as stale: %v", result.Kind, err)
 		} else if current, err := ReadEntry(ctx, path); err != nil || !SameFile(current, result) {
 			t.Fatalf("propagated %s result not kept: %v", result.Kind, err)
-		} else if entries, _ := os.ReadDir(directory); len(entries) != 2*min(len(staged), 1) {
+		}
+		if staged != nil {
+			staged.remove(root)
+		}
+		files := 0
+		if result.Kind == EntryFile {
+			files = 1
+		}
+		if entries, _ := os.ReadDir(directory); len(entries) != files {
 			t.Fatalf("propagated %s result left files behind: %v", result.Kind, entries)
 		}
 	}
@@ -321,7 +388,7 @@ func TestFileOperationConfinement(t *testing.T) {
 		}
 	}
 	for _, request := range []*Request{
-		{Copy: "."}, {Copy: "../file"}, {Replace: &Replacement{}},
+		{Archive: "."}, {Copy: "../file"}, {Replace: &Replacement{}}, {Copy: "file", Archive: "file"},
 		{Copy: "file", Arguments: []string{"echo"}}, {Copy: "file", File: "file"},
 	} {
 		if request.EnsureValid() == nil {
