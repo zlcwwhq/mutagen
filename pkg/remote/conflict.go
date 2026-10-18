@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -218,6 +219,11 @@ func (r *Replacement) supersedes(current *Entry) bool {
 	})
 }
 
+// executabilityPreserved indicates whether replacements can set executability.
+// Files on Windows are never read as executable, so a file with the result's
+// contents is all that a replacement can achieve there.
+const executabilityPreserved = runtime.GOOS != "windows"
+
 // check reads the entry that a replacement replaces and determines whether the
 // replacement is complete or may supersede it, in which case it returns the
 // entry as read. It fails with ErrStale if neither is the case.
@@ -232,7 +238,7 @@ func (r *Replacement) check(ctx context.Context, root *os.Root, path string) (bo
 	current, err := snapshot(ctx, root, path, nil)
 	if err != nil {
 		return false, nil, err
-	} else if SameFile(current, r.Result) {
+	} else if SameFile(current, r.Result) || (!executabilityPreserved && SameContents(current, r.Result)) {
 		return true, nil, nil
 	} else if !r.supersedes(current) {
 		return false, nil, ErrStale

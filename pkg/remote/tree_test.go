@@ -73,17 +73,23 @@ func TestSnapshotArchiveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for description, change := range map[string]func() error{
-		"modified file": func() error { return os.WriteFile(filepath.Join(root, "dir", "a"), []byte("A\n"), 0600) },
-		"new file":      func() error { return os.WriteFile(filepath.Join(root, "dir", "empty", "c"), nil, 0600) },
-		"executability": func() error { return os.Chmod(filepath.Join(root, "dir", "sub", "b"), 0600) },
-		"removed fifo": func() error {
+	// Where FIFOs aren't supported, the empty directory is removed instead, so
+	// the new file is created elsewhere.
+	for _, test := range []struct {
+		description string
+		change      func() error
+	}{
+		{"modified file", func() error { return os.WriteFile(filepath.Join(root, "dir", "a"), []byte("A\n"), 0600) }},
+		{"executability", func() error { return os.Chmod(filepath.Join(root, "dir", "sub", "b"), 0600) }},
+		{"removed fifo", func() error {
 			if !fifo {
 				return os.Remove(filepath.Join(root, "dir", "empty"))
 			}
 			return os.Remove(filepath.Join(root, "dir", "fifo"))
-		},
+		}},
+		{"new file", func() error { return os.WriteFile(filepath.Join(root, "dir", "sub", "c"), nil, 0600) }},
 	} {
+		description, change := test.description, test.change
 		if runtime.GOOS == "windows" && description == "executability" {
 			continue
 		}
@@ -154,7 +160,14 @@ func TestDeleteVerifiedEntries(t *testing.T) {
 	// An unchanged directory is deleted completely, as is a symbolic link.
 	if snapshot, err = Snapshot(ctx, root, "dir"); err != nil {
 		t.Fatal(err)
-	} else if err := deletion("dir", snapshot); err != nil {
+	} else if err := deletion("dir", snapshot); errors.Is(err, errors.ErrUnsupported) {
+		// Directories can't be hard linked, so deleting them requires renaming
+		// without replacement, which isn't supported everywhere.
+		t.Log("deleting directories unsupported:", err)
+		if _, err := os.Stat(filepath.Join(root, "dir", "sub", "c")); err != nil {
+			t.Fatal("directory modified despite failure:", err)
+		}
+	} else if err != nil {
 		t.Fatal(err)
 	} else if entries, _ := os.ReadDir(root); len(entries) != 1 {
 		t.Fatal("directory not deleted completely:", entries)
