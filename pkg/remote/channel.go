@@ -45,10 +45,10 @@ type Endpoint struct {
 	// Execute indicates whether the endpoint executes commands submitted from
 	// the opposite endpoint.
 	Execute bool
-	// Prologue is the path of a shell script that the endpoint sources before
-	// executing commands that request it, if any. Absolute and home-relative
-	// paths are interpreted on the endpoint's system, while other paths are
-	// resolved against Root.
+	// Prologue is the default shell script sourced before commands that request
+	// it, unless a workspace override exists. Absolute and home-relative paths
+	// are interpreted on the endpoint's system, while other paths are resolved
+	// against Root.
 	Prologue string
 }
 
@@ -71,6 +71,8 @@ type Channel interface {
 type localChannel struct {
 	// root is the normalized synchronization root.
 	root string
+	// alpha indicates whether this is the alpha endpoint.
+	alpha bool
 	// execute indicates whether the endpoint executes commands.
 	execute bool
 	// prologue is the resolved prologue path, if any.
@@ -105,6 +107,7 @@ func NewLocalChannel(logger *logging.Logger, endpoint *Endpoint) (Channel, error
 	ctx, cancel := context.WithCancel(context.Background())
 	channel := &localChannel{
 		root:     root,
+		alpha:    endpoint.Alpha,
 		execute:  endpoint.Execute,
 		prologue: prologue,
 		ctx:      ctx,
@@ -144,7 +147,7 @@ func (c *localChannel) Open(_ context.Context) (io.ReadWriteCloser, error) {
 	c.tasks.Add(1)
 	go func() {
 		defer c.tasks.Done()
-		Serve(c.ctx, server, c.root, c.prologue)
+		Serve(c.ctx, server, c.root, c.prologue, c.alpha)
 	}()
 	return client, nil
 }
@@ -457,7 +460,7 @@ func ServeChannel(ctx context.Context, logger *logging.Logger, stream io.ReadWri
 			defer tasks.Done()
 			if !endpoint.Execute {
 				Reject(stream, errExecutionDisabled)
-			} else if err := Serve(ctx, stream, root, prologue); err != nil {
+			} else if err := Serve(ctx, stream, root, prologue, endpoint.Alpha); err != nil {
 				logger.Debug("Command route failed:", err)
 			}
 		}()

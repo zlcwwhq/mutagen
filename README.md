@@ -107,6 +107,10 @@ directory). `-e NAME=VALUE` sets a variable, `-e NAME` forwards a local one, and
 `--env-file` loads literal `NAME=VALUE` lines. Otherwise, commands inherit the
 environment of the agent (or, on the daemon's system, of the daemon).
 
+Every command receives `MUTAGEN_REMOTE_ENDPOINT=alpha` or `beta`, identifying
+the endpoint where it executes. This value overrides inherited values and
+those submitted with `-e` or `--env-file`, including when prologues are skipped.
+
 The `remotePrologue` configuration parameter (or the `--remote-prologue` flag of
 `mutagen sync create`) names a POSIX shell script that the executing endpoint
 sources before each command, such as one that activates a conda environment.
@@ -133,13 +137,47 @@ eval "$("$HOME/miniconda3/bin/conda" shell.posix hook)"
 conda activate "${CONDA_ENV:-base}"
 ```
 
+To configure initialization directly in the workspace, create
+`.remote-prologue.sh` at the synchronization root. The executing endpoint checks
+for this file before each command and uses it instead of its configured
+`remotePrologue`. The script needs no executable permission. Edits take effect
+without restarting the session, an empty file performs no initialization, and
+deleting the file restores the configured default. Only the root is checked;
+scripts in subdirectories or the directory specified by `--cwd` aren't used.
+
+The same file can configure both endpoints using `MUTAGEN_REMOTE_ENDPOINT`:
+
+```sh
+# .remote-prologue.sh at the synchronization root (sourced by /bin/sh)
+case "$MUTAGEN_REMOTE_ENDPOINT" in
+  alpha)
+    . "$HOME/venvs/local/bin/activate"
+    ;;
+  beta)
+    eval "$("$HOME/miniconda3/bin/conda" shell.posix hook)"
+    conda activate "${CONDA_ENV:-gpu}"
+    ;;
+esac
+```
+
+For example, `remote pytest` submitted on alpha selects the beta branch. Shared
+initialization can go outside the `case`. A branch that does nothing still
+replaces the configured prologue; scripts aren't automatically combined.
+The override follows normal synchronization rules: the default flush before a
+command transfers local edits, but ignored files, synchronization failures, or
+`--no-flush` can leave the executing endpoint using an older copy or its
+configured default.
+
 The prologue applies to commands submitted from inside the session root,
 including those using `--cwd`, unless `--no-prologue` is specified; commands
-submitted from outside the root with `--session` don't use it. It sees variables
+submitted from outside the root with `--session` don't use it. These rules apply
+to both workspace overrides and configured prologues. It sees variables
 set with `-e` and `--env-file`, and the command is located (using the `PATH` it
 sets) only after it has been sourced, so `remote -e CONDA_ENV=test pytest` works
-even if `pytest` exists only in that environment. If the prologue fails or exits
-the shell, then the command isn't run and `remote` exits with status 126.
+even if `pytest` exists only in that environment. If the prologue can't be
+loaded, fails, or exits the shell, then the command isn't run and `remote`
+exits with status 126. An invalid override doesn't fall back to the configured
+script; use `--no-prologue` to run commands while repairing it.
 Prologues aren't supported on Windows endpoints.
 
 Options must precede the command, and arguments are passed without shell

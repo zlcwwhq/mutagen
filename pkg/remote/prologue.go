@@ -14,6 +14,9 @@ import (
 // prologueShell is the shell that sources prologues.
 const prologueShell = "/bin/sh"
 
+// workspacePrologueName is the root-level override for a configured prologue.
+const workspacePrologueName = ".remote-prologue.sh"
+
 // prologueScript sources the prologue specified by its first argument and then
 // replaces itself with the command specified by its remaining arguments, so the
 // command's arguments still aren't subject to shell interpretation and its exit
@@ -42,7 +45,7 @@ exec "$@"`
 // resolvePrologue computes the path of an endpoint's prologue on this system.
 // Absolute and home-relative paths are normalized, while other paths are
 // resolved against the normalized synchronization root. An empty path
-// indicates that the endpoint has no prologue.
+// indicates that the endpoint has no configured prologue.
 func resolvePrologue(root, prologue string) (string, error) {
 	if prologue == "" {
 		return "", nil
@@ -50,6 +53,19 @@ func resolvePrologue(root, prologue string) (string, error) {
 		return filesystem.Normalize(prologue)
 	}
 	return filepath.Join(root, prologue), nil
+}
+
+// selectPrologue checks for a workspace override on each command, falling back
+// to the resolved configured prologue only if no override exists. Lstat keeps
+// a dangling symbolic link from silently falling back to the configured script.
+func selectPrologue(root, prologue string) (string, error) {
+	override := filepath.Join(root, workspacePrologueName)
+	if _, err := os.Lstat(override); os.IsNotExist(err) {
+		return prologue, nil
+	} else if err != nil {
+		return "", fmt.Errorf("unable to access prologue: %w", err)
+	}
+	return override, nil
 }
 
 // prologueArguments wraps command arguments so that the specified resolved

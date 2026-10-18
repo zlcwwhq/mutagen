@@ -144,6 +144,40 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 		}
 	}
 
+	// A workspace override synchronizes before execution, selects the target
+	// endpoint's branch, and replaces both endpoint-specific defaults.
+	override := filepath.Join(alphaRoot, ".remote-prologue.sh")
+	script := "case \"$MUTAGEN_REMOTE_ENDPOINT\" in\nalpha) export REMOTE_PROLOGUE=workspace-alpha;;\nbeta) export REMOTE_PROLOGUE=workspace-beta;;\nesac\n"
+	if err := os.WriteFile(override, []byte(script), 0600); err != nil {
+		t.Fatal(err)
+	}
+	environmentFile := filepath.Join(directory, "environment")
+	if err := os.WriteFile(environmentFile, []byte("MUTAGEN_REMOTE_ENDPOINT=from-file\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		from, expected string
+		options        []string
+	}{
+		{filepath.Join(alphaRoot, "sub"), "beta:workspace-beta", nil},
+		{betaRoot, "alpha:workspace-alpha", nil},
+		{alphaRoot, "beta:workspace-beta", []string{"--cwd", directory}},
+		{alphaRoot, "beta:skipped", []string{"--no-prologue", "-e", "REMOTE_PROLOGUE=skipped"}},
+		{alphaRoot, "beta:workspace-beta", []string{"--env-file", environmentFile, "-e", "MUTAGEN_REMOTE_ENDPOINT=from-flag"}},
+	} {
+		arguments := append(test.options, "sh", "-c", `printf '%s:%s' "$MUTAGEN_REMOTE_ENDPOINT" "$REMOTE_PROLOGUE"`)
+		if code, output, errorOutput := runRemote(t, test.from, arguments...); code != 0 || output != test.expected {
+			t.Fatalf("workspace prologue from %s with %v failed: %d, %q, %q", test.from, test.options, code, output, errorOutput)
+		}
+	}
+	// Removing the override restores the configured default after the next
+	// automatic flush, without restarting the session or its command channels.
+	if err := os.Remove(override); err != nil {
+		t.Fatal(err)
+	} else if code, output, errorOutput := runRemote(t, alphaRoot, "sh", "-c", `printf %s "$REMOTE_PROLOGUE"`); code != 0 || output != "beta" {
+		t.Fatalf("configured prologue not restored: %d, %q, %q", code, output, errorOutput)
+	}
+
 	// Exit codes are propagated.
 	if _, code, err := runRemoteCommand(alphaRoot, "sh", "-c", "exit 7"); err != nil || code != 7 {
 		t.Fatalf("incorrect exit status: %d, %v", code, err)
@@ -267,6 +301,34 @@ func createRemoteDiffSession(t *testing.T, alphaRoot, betaRoot string) string {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return sessionID
+}
+
+func TestRemoteWorkspacePrologueOutsideRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("prologues require a POSIX shell")
+	}
+	directory := t.TempDir()
+	alphaRoot, betaRoot := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta")
+	if err := os.Mkdir(alphaRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Only beta executes, so --session identifies a unique route even when
+	// invoked outside both roots. An invalid override must then be ignored,
+	// regardless of whether --cwd points back into the executing root.
+	sessionID := createRemoteDiffSession(t, alphaRoot, betaRoot)
+	if err := os.WriteFile(filepath.Join(alphaRoot, ".remote-prologue.sh"), []byte("exit 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, cwd := range []string{directory, betaRoot} {
+		code, output, errorOutput := runRemote(t, directory, "--session", sessionID, "--cwd", cwd,
+			"sh", "-c", `printf %s "$MUTAGEN_REMOTE_ENDPOINT"`)
+		if code != 0 || output != "beta" {
+			t.Fatalf("outside submission sourced override: %d, %q, %q", code, output, errorOutput)
+		}
+	}
+	if code, _, errorOutput := runRemote(t, alphaRoot, "true"); code != 126 {
+		t.Fatalf("inside submission didn't source override: %d, %q", code, errorOutput)
+	}
 }
 
 func TestRemoteDiffFileRoot(t *testing.T) {

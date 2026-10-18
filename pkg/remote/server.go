@@ -16,10 +16,12 @@ import (
 
 // Serve executes one command (or answers one file request) received over a
 // routed connection, resolving its working directory against the specified
-// normalized synchronization root and sourcing the specified resolved prologue
-// (if non-empty) first if the command requests it. It owns and closes the
-// connection and cancels the command if the client disconnects.
-func Serve(ctx context.Context, connection io.ReadWriteCloser, root, prologue string) error {
+// normalized synchronization root. If the command requests a prologue, then it
+// sources the workspace override or, if absent, the specified resolved prologue
+// (if non-empty). The alpha flag identifies the executing endpoint for the
+// command's environment. Serve owns and closes the connection and cancels the
+// command if the client disconnects.
+func Serve(ctx context.Context, connection io.ReadWriteCloser, root, prologue string, alpha bool) error {
 	// Report that the route has reached an executing endpoint.
 	if err := writeMessage(connection, &status{}); err != nil {
 		connection.Close()
@@ -54,7 +56,7 @@ func Serve(ctx context.Context, connection io.ReadWriteCloser, root, prologue st
 	if err := readMessage(control, &request); err != nil {
 		return fmt.Errorf("unable to receive command: %w", err)
 	}
-	response := run(ctx, root, prologue, &request, input, output, errorOutput)
+	response := run(ctx, root, prologue, alpha, &request, input, output, errorOutput)
 	input.Close()
 	output.CloseWrite()
 	errorOutput.CloseWrite()
@@ -93,7 +95,7 @@ func sendEntry(ctx context.Context, root, path string, output io.Writer) result 
 
 // run prepares and executes a command without interpreting its arguments, or
 // performs a requested file operation.
-func run(ctx context.Context, root, prologue string, request *Request, stdin io.Reader, stdout, stderr io.Writer) result {
+func run(ctx context.Context, root, prologue string, alpha bool, request *Request, stdin io.Reader, stdout, stderr io.Writer) result {
 	if err := request.EnsureValid(); err != nil {
 		return result{Error: err.Error()}
 	} else if request.File != "" {
@@ -128,6 +130,24 @@ func run(ctx context.Context, root, prologue string, request *Request, stdin io.
 	} else if !info.IsDir() {
 		return result{ExitCode: 126, Error: fmt.Sprintf("working directory is not a directory: %s", directory)}
 	}
+
+	// The executing endpoint supplies its identity after all user-provided
+	// variables, including when no prologue is requested or configured.
+	endpoint := "beta"
+	if alpha {
+		endpoint = "alpha"
+	}
+	environment := append([]string(nil), request.Environment...)
+	environment = append(environment, "MUTAGEN_REMOTE_ENDPOINT="+endpoint)
+
+	// Discover workspace overrides at execution time so edits take effect
+	// without reconnecting the channel. Disabled prologues aren't inspected.
+	if request.Prologue {
+		if prologue, err = selectPrologue(root, prologue); err != nil {
+			return result{ExitCode: 126, Error: err.Error()}
+		}
+	}
+
 	// A prologue may change PATH, so the prologue's shell locates the command
 	// once the prologue has been sourced.
 	arguments := request.Arguments
@@ -137,13 +157,13 @@ func run(ctx context.Context, root, prologue string, request *Request, stdin io.
 			return result{ExitCode: 126, Error: err.Error()}
 		}
 		path = arguments[0]
-	} else if path, err = lookPath(arguments[0], directory, append(os.Environ(), request.Environment...)); err != nil {
+	} else if path, err = lookPath(arguments[0], directory, append(os.Environ(), environment...)); err != nil {
 		return result{ExitCode: 127, Error: fmt.Sprintf("unable to find command: %v", err)}
 	}
 	command := exec.CommandContext(ctx, path, arguments[1:]...)
 	command.Args[0] = arguments[0]
 	command.Dir = directory
-	command.Env = append(command.Environ(), request.Environment...)
+	command.Env = append(command.Environ(), environment...)
 	configureProcess(command)
 
 	// Own the output pipes so that cancellation can interrupt draining even

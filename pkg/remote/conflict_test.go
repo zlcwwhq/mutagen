@@ -24,11 +24,15 @@ func TestCopyAndReplace(t *testing.T) {
 	if err := os.WriteFile(path, original, 0640); err != nil {
 		t.Fatal(err)
 	}
+	// File operations must remain available even with an invalid override.
+	if err := os.Mkdir(filepath.Join(root, workspacePrologueName), 0700); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	route := func() net.Conn {
 		client, server := net.Pipe()
-		go Serve(ctx, server, root, "")
+		go Serve(ctx, server, root, "", false)
 		return client
 	}
 
@@ -64,7 +68,7 @@ func TestCopyAndReplace(t *testing.T) {
 		t.Fatal(err)
 	} else if info, err := os.Stat(path); err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0750) {
 		t.Fatalf("permissions not preserved apart from executability: %v", err)
-	} else if entries, _ := os.ReadDir(root); len(entries) != 1 {
+	} else if entries, _ := os.ReadDir(root); len(entries) != 2 {
 		t.Fatal("replacement left files behind:", entries)
 	}
 
