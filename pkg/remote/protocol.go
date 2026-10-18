@@ -17,7 +17,8 @@ const maximumMessageSize = 1024 * 1024
 // Request describes a single command, or a request for a file. Arguments are
 // passed directly to the executable, without shell interpretation. Environment
 // entries override the executing process's inherited environment, with later
-// entries taking precedence.
+// entries taking precedence. The executor sets MUTAGEN_REMOTE_ENDPOINT after
+// these entries to identify itself as alpha or beta.
 type Request struct {
 	// Arguments contains the executable name followed by its arguments.
 	Arguments []string
@@ -30,9 +31,9 @@ type Request struct {
 	// home-relative values are interpreted on the target system, while other
 	// values are resolved against the directory specified by Path.
 	Directory string
-	// Prologue indicates whether the executing endpoint's prologue, if any,
-	// should be sourced before the command. Submitters request it when the
-	// submission directory lies inside the submitting root (and thus Path
+	// Prologue indicates whether the executing endpoint's workspace override or
+	// configured prologue, if any, should be sourced. Submitters request it when
+	// the submission directory lies inside the submitting root (and thus Path
 	// identifies the corresponding directory), regardless of Directory.
 	Prologue bool
 	// File is the slash-separated path, relative to the target root, of an

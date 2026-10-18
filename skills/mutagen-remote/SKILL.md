@@ -30,6 +30,13 @@ wrong:
   becomes a conflict and stops synchronizing (`remote` warns about it, and
   `remote --diff` shows both versions), so edit sources locally, let remote
   commands write only outputs, and avoid mutating `git` commands remotely.
+- **Environment setup can live in the workspace.** For repeated activation,
+  create or edit `.remote-prologue.sh` at the sync root, preserving existing
+  setup. It replaces the session's configured prologue and synchronizes like
+  other files. Use `MUTAGEN_REMOTE_ENDPOINT` (`alpha` or `beta`, the executing
+  side) for different environments on each endpoint. See the
+  [environment setup guidance](references/troubleshooting.md#commands-missing-from-the-remote-environment)
+  for diagnosis, examples, and validation.
 - **No terminal.** Use non-interactive flags, set `--timeout` for anything that
   might hang, and detach long jobs with all output redirected (otherwise
   `remote` waits for them):

@@ -274,7 +274,7 @@ func TestAgentChannel(t *testing.T) {
 			return
 		}
 		execution, server := net.Pipe()
-		go Serve(context.Background(), server, opposite, "")
+		go Serve(context.Background(), server, opposite, "", false)
 		Splice(submission, execution)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

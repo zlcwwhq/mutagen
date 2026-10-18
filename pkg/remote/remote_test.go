@@ -37,6 +37,8 @@ func TestRemoteHelper(t *testing.T) {
 		fmt.Fprint(os.Stderr, "separate error output")
 	case "copy":
 		io.Copy(os.Stdout, os.Stdin)
+	case "endpoint":
+		fmt.Fprint(os.Stdout, os.Getenv("MUTAGEN_REMOTE_ENDPOINT"))
 	case "large":
 		for i := 0; i < 64; i++ {
 			os.Stdout.Write(bytes.Repeat([]byte{0, 255, 'x'}, 4096))
@@ -80,7 +82,7 @@ func executeInRootTest(t *testing.T, ctx context.Context, root, prologue string,
 	t.Helper()
 	client, server := net.Pipe()
 	served := make(chan error, 1)
-	go func() { served <- Serve(context.Background(), server, root, prologue) }()
+	go func() { served <- Serve(context.Background(), server, root, prologue, false) }()
 	if input == nil {
 		input = strings.NewReader("")
 	}
@@ -314,7 +316,7 @@ func TestFetch(t *testing.T) {
 	// included only up to the comparison limit.
 	for name, entry := range expected {
 		client, server := net.Pipe()
-		go Serve(context.Background(), server, root, "")
+		go Serve(context.Background(), server, root, "", false)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		fetched, err := Fetch(ctx, client, name)
 		cancel()
@@ -342,7 +344,7 @@ func TestFetchFileRoot(t *testing.T) {
 	}
 	for _, path := range []string{"", "."} {
 		client, server := net.Pipe()
-		go Serve(context.Background(), server, root, "")
+		go Serve(context.Background(), server, root, "", false)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		entry, err := Fetch(ctx, client, path)
 		cancel()

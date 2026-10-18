@@ -66,8 +66,20 @@ Notes:
     its root. Large conflict reports may omit changes and say how many;
     specify paths to compare omitted files. --timeout also covers file reads.
   - No terminal is allocated, so interactive programs don't work.
-  - If the opposite endpoint has a remote prologue, then /bin/sh sources it
-    before each command submitted from inside the root (even with --cwd).
+  - /bin/sh sources .remote-prologue.sh in the executing endpoint's sync root
+    if it exists, otherwise that endpoint's configured remotePrologue, before
+    commands submitted from inside the root (even with --cwd). --no-prologue
+    skips both. The workspace script replaces the configured script; an empty
+    file does nothing, and deleting it restores the configured default. Edits
+    take effect on the next command that sees them, without a session restart.
+    The file follows normal sync rules; ignored files, failed flushes, and
+    --no-flush can leave the executing copy outdated. Scripts must use POSIX
+    shell syntax and need no executable permission. Failure prevents execution
+    (status 126); prologues aren't supported on Windows.
+  - Commands and prologues receive MUTAGEN_REMOTE_ENDPOINT=alpha or beta,
+    identifying the executing endpoint. Use it to branch in a shared script.
+    This overrides inherited values and those passed with -e or --env-file,
+    even with --no-prologue or when submitting from outside the root.
 
 Exit status is the command's own, or:
   255  not routed (no connected session with remote commands, or ambiguous),
@@ -128,7 +140,7 @@ func parse(arguments []string) (*options, error) {
 	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set `NAME[=VALUE]`, where a bare NAME forwards the local value (repeatable)")
 	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read literal NAME=VALUE lines from `FILE` (repeatable)")
 	flags.DurationVar(&result.timeout, "timeout", 0, "Exit after `DURATION`, such as 30s or 10m, killing the command if it's running")
-	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the opposite endpoint's remote prologue")
+	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the workspace or configured remote prologue")
 	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize the session before and after the command")
 	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
 	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
