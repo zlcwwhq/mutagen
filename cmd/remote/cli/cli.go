@@ -91,7 +91,10 @@ Notes:
     by --take, or deletion with --delete) to both copies. For other conflicts
     (such as a symbolic link and a file), only --take is possible: it deletes
     the other copy, so that synchronization propagates the copy taken, which
-    may be edited first. Apply then synchronizes and checks that both copies
+    may be edited first. It synchronizes before deleting, and deletes nothing
+    if the copy taken was deleted or synchronization replaced it (as it does
+    one changed back to what both copies last agreed on), since both copies
+    would then be lost. Apply then synchronizes and checks that both copies
     match and no conflict involves the path. The workspace, with the original
     copies, is then kept for 7 days in case the resolution was wrong, as is one
     that --conflict-discard sets aside without changing either copy.

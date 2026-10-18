@@ -570,3 +570,70 @@ func TestRemoteConflictTakeMatchingCopy(t *testing.T) {
 		})
 	}
 }
+
+// createTakeConflict creates a conflict between a symbolic link on the local
+// endpoint (alpha) and a modified file on the remote one, from a file that
+// both endpoints agreed on, and checks it out.
+func createTakeConflict(t *testing.T) ([2]string, *conflictCommands) {
+	t.Helper()
+	roots := createConflictSession(t, true, core.SynchronizationMode_SynchronizationModeTwoWaySafe)
+	writeFile(t, filepath.Join(roots[0], "file"), "base\n")
+	if _, err := flushRemote(roots[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(roots[0], "file")); err != nil {
+		t.Fatal(err)
+	} else if err := os.Symlink("target", filepath.Join(roots[0], "file")); err != nil {
+		t.Skip("symbolic links unavailable:", err)
+	}
+	writeFile(t, filepath.Join(roots[1], "file"), "remote\n")
+	c := &conflictCommands{t: t, directory: roots[0]}
+	c.checkout("file")
+	return roots, c
+}
+
+func TestRemoteConflictTakeDeletedOrRevertedCopy(t *testing.T) {
+	// Deleting the other copy only makes synchronization propagate the copy
+	// taken if that copy has changed since the copies last agreed. If it was
+	// deleted or changed back, synchronization would propagate the deletion
+	// to it instead, so applying must not delete the other copy.
+	for _, change := range []string{"deleted", "reverted"} {
+		t.Run(change, func(t *testing.T) {
+			roots, c := createTakeConflict(t)
+			if err := os.Remove(filepath.Join(roots[0], "file")); err != nil {
+				t.Fatal(err)
+			}
+			expected := "no longer exists"
+			if change == "reverted" {
+				writeFile(t, filepath.Join(roots[0], "file"), "base\n")
+				expected = "changed while synchronizing"
+			}
+			c.fail(expected, "--conflict-apply", "--take", "local", "file")
+			if readFile(filepath.Join(roots[1], "file")) != "remote\n" {
+				t.Fatal("remote copy deleted")
+			} else if change == "reverted" && readFile(filepath.Join(roots[0], "file")) != "remote\n" {
+				t.Fatal("reverted copy not replaced by synchronization")
+			}
+		})
+	}
+}
+
+func TestRemoteConflictTakeResolvedMeanwhile(t *testing.T) {
+	// A conflict that synchronization resolved in favor of the copy taken,
+	// such as because the other copy was deleted, is verified without
+	// deleting anything.
+	roots, c := createTakeConflict(t)
+	if err := os.Remove(filepath.Join(roots[1], "file")); err != nil {
+		t.Fatal(err)
+	} else if _, err := flushRemote(roots[0]); err != nil {
+		t.Fatal(err)
+	}
+	if outcome := c.outcomes("--conflict-apply", "--take", "local", "file")[0]; !outcome.Resolved {
+		t.Fatalf("not resolved: %+v", outcome)
+	}
+	for _, root := range roots {
+		if target, err := os.Readlink(filepath.Join(root, "file")); err != nil || target != "target" {
+			t.Fatalf("symbolic link not taken: %q: %v", target, err)
+		}
+	}
+}

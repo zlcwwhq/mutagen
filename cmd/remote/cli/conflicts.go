@@ -988,6 +988,9 @@ type application struct {
 	w *workspace
 	// result is the result of a resolution between two files.
 	result *remote.Entry
+	// taken is the copy taken by a resolution of another conflict, as read
+	// before the listing that confirms that it can be taken (see takeCopy).
+	taken *remote.Entry
 	// target is the session's target.
 	target *remote.Target
 	// locator maps paths for display.
@@ -995,7 +998,8 @@ type application struct {
 }
 
 // applyAll applies the resolutions of the specified conflicts and then
-// verifies them, synchronizing once. Workspaces remain locked until verified.
+// verifies them, synchronizing once, and once more before taking copies (see
+// takeCopy). Workspaces remain locked until verified.
 func applyAll(ctx context.Context, directory string, o *options, p *printer) error {
 	var unlocks []func()
 	defer func() {
@@ -1014,6 +1018,26 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 		} else {
 			applications = append(applications, a)
 		}
+	}
+	if slices.ContainsFunc(applications, func(a *application) bool { return a.taken != nil }) {
+		listing, _, listErr := listConflicts(ctx, directory, o.session)
+		remaining := applications[:0]
+		for _, a := range applications {
+			if a.taken != nil {
+				err := listErr
+				if err != nil {
+					err = fmt.Errorf("unable to synchronize before taking the %s copy: %w", o.take, err)
+				} else {
+					err = a.takeCopy(ctx, directory, o, listing)
+				}
+				if err != nil {
+					p.print(a.argument, nil, err)
+					continue
+				}
+			}
+			remaining = append(remaining, a)
+		}
+		applications = remaining
 	}
 	if len(applications) == 0 {
 		return nil
@@ -1066,7 +1090,8 @@ func apply(ctx context.Context, directory string, o *options, argument string) (
 	if w.files() {
 		err = a.writeResult(ctx, o, connection)
 	} else {
-		err = a.takeCopy(ctx, o, connection)
+		connection.Close()
+		err = a.prepareTake(ctx, directory, o)
 	}
 	return a, unlock, err
 }
@@ -1132,68 +1157,100 @@ func (a *application) writeResult(ctx context.Context, o *options, connection io
 	return nil
 }
 
-// takeCopy resolves a conflict other than between two files by deleting the
-// copy that isn't taken, using a connection to the opposite endpoint, so that
-// synchronization propagates the copy taken. The deleted copy must match its
-// checked-out snapshot, while the copy taken may have been edited, such as to
-// incorporate the other copy's changes. Once a deletion has been attempted,
-// retries skip it if the copy no longer matches, since synchronization may
-// have propagated the taken copy in its place.
-func (a *application) takeCopy(ctx context.Context, o *options, connection io.ReadWriteCloser) error {
+// prepareTake checks a resolution of a conflict other than between two files,
+// which takes one copy, and reads the copy to take before the listing that
+// confirms that it can be taken (see takeCopy).
+func (a *application) prepareTake(ctx context.Context, directory string, o *options) error {
 	w := a.w
 	if o.take == "" || o.executable != "" {
-		connection.Close()
 		return errors.New("the copies aren't both files, so they can only be resolved with --take local or --take remote")
 	} else if !w.takable(o.take) {
-		connection.Close()
 		return fmt.Errorf("the %s copy can't be taken for this conflict (see remote --conflicts)", o.take)
+	} else if w.Removing != "" && w.Removing != opposite(o.take) {
+		return fmt.Errorf("a previous apply took the %[1]s copy; apply with --take %[1]s to finish, or discard the workspace", opposite(w.Removing))
 	}
-	// The taken copy may be edited after checkout, but it must not have
-	// become a directory. The other copy's replacement checks its kind before
-	// deleting it. Fetch owns the connection when taking the remote copy;
-	// only the local copy needs to be deleted in that case.
+	var err error
+	a.taken, err = a.readTaken(ctx, directory, o)
+	return err
+}
+
+// readTaken reads the copy to take. It may have been edited since checkout,
+// but it must not have become a directory, nor have been deleted, since
+// synchronization would then propagate the other copy's deletion to it.
+func (a *application) readTaken(ctx context.Context, directory string, o *options) (*remote.Entry, error) {
 	var taken *remote.Entry
 	var err error
 	if o.take == sideLocal {
-		taken, err = remote.ReadEntry(ctx, filepath.Join(a.target.Root, filepath.FromSlash(w.Path)))
+		taken, err = remote.ReadEntry(ctx, filepath.Join(a.target.Root, filepath.FromSlash(a.w.Path)))
 	} else {
-		taken, err = remote.Fetch(ctx, connection, w.Path)
+		var connection io.ReadWriteCloser
+		if connection, err = dialOpposite(ctx, directory, o.session, a.target); err == nil {
+			taken, err = remote.Fetch(ctx, connection, a.w.Path)
+		}
 	}
 	if err != nil {
-		connection.Close()
-		return fmt.Errorf("unable to read the %s copy: %w", o.take, err)
+		return nil, fmt.Errorf("unable to read the %s copy: %w", o.take, err)
 	} else if taken.Kind == remote.EntryDirectory {
-		connection.Close()
-		return errDirectoryConflict
+		return nil, errDirectoryConflict
+	} else if taken.Kind == remote.EntryMissing {
+		return nil, fmt.Errorf("the %s copy no longer exists, so deleting the other copy would delete both; restore it, or discard the workspace", o.take)
+	}
+	taken.Data = nil
+	return taken, nil
+}
+
+// takeCopy resolves a conflict other than between two files by deleting the
+// copy that isn't taken, so that synchronization propagates the copy taken,
+// using a listing made after the copy taken was read (see prepareTake). The
+// deleted copy must match its checked-out snapshot, while the copy taken may
+// have been edited, such as to incorporate the other copy's changes.
+//
+// Synchronization only propagates the copy taken over the deletion if that
+// copy can be synchronized and has changed since the copies last agreed.
+// Otherwise, such as if it was changed back, synchronization propagates the
+// deletion to it instead, leaving neither copy. The listing confirms both
+// conditions if it lists the conflict with that copy takable, as long as the
+// copy is unchanged when read again, so that the listing's synchronization
+// cycle saw it as read. If the conflict is no longer listed, nothing is
+// deleted, and verification determines whether the copies already match,
+// such as because synchronization propagated the copy taken over a deletion
+// by a previous attempt. Once a deletion has been attempted, retries also skip
+// it if the copy no longer matches.
+func (a *application) takeCopy(ctx context.Context, directory string, o *options, listing *remote.Listing) error {
+	w := a.w
+	taken, err := a.readTaken(ctx, directory, o)
+	if err != nil {
+		return err
+	} else if !remote.SameContents(taken, a.taken) || taken.Executable != a.taken.Executable {
+		return fmt.Errorf("the %s copy changed while synchronizing (synchronization replaces a copy changed back to what both copies last agreed on); check it, then retry", o.take)
 	}
 	deleted, entry := sideRemote, w.Remote
 	if o.take == sideRemote {
 		deleted, entry = sideLocal, w.Local
 	}
-	if w.Removing != "" && w.Removing != deleted {
-		connection.Close()
-		return fmt.Errorf("a previous apply took the %[1]s copy; apply with --take %[1]s to finish, or discard the workspace", opposite(w.Removing))
-	} else if entry.Kind == remote.EntryMissing || remote.SameContents(taken, entry) {
-		// There's nothing to delete, which leaves both copies missing, or the
-		// taken copy was edited to match the other one. Synchronization may
-		// then already consider the copies to agree, in which case it would
-		// propagate the other copy's deletion to the taken copy.
-		connection.Close()
+	conflict := findConflict(listing, w.Path)
+	if entry.Kind == remote.EntryMissing || remote.SameContents(taken, entry) || conflict == nil {
+		// There's nothing to delete, the taken copy was edited to match the
+		// other one (in which case synchronization may already consider the
+		// copies to agree and would propagate the other copy's deletion to the
+		// taken copy), or the conflict is no longer listed.
 		w.Removing = deleted
 		return nil
+	} else if !slices.Contains(localSides(conflict, a.target), o.take) {
+		return fmt.Errorf("the %s copy can no longer be taken (see remote --conflicts)", o.take)
 	}
 	retrying := w.Removing != ""
 	if !retrying {
 		w.Removing = deleted
 		if err := w.save(); err != nil {
-			connection.Close()
 			return fmt.Errorf("unable to save workspace: %w", err)
 		}
 	}
 	replacement := &remote.Replacement{Path: w.Path, Expected: []*remote.Entry{entry}, Result: &remote.Entry{Kind: remote.EntryMissing}}
 	if deleted == sideLocal {
-		connection.Close()
 		err = remote.ReplaceFile(ctx, a.target.Root, replacement, strings.NewReader(""))
+	} else if connection, dialErr := dialOpposite(ctx, directory, o.session, a.target); dialErr != nil {
+		err = dialErr
 	} else {
 		err = remote.Replace(ctx, connection, replacement, strings.NewReader(""))
 	}
@@ -1210,10 +1267,11 @@ func (a *application) takeCopy(ctx context.Context, o *options, connection io.Re
 	return nil
 }
 
-// consistent determines whether both copies of a resolved conflict other than
-// between two files have the same kind and, for files and symbolic links, the
-// same contents. Directories' contents aren't compared, since they may contain
-// ignored content, so synchronization problems are checked instead.
+// consistent determines whether a copy of a resolved conflict other than
+// between two files matches the copy taken: whether they have the same kind
+// and, for files and symbolic links, the same contents. Directories' contents
+// aren't compared, since they may contain ignored content, so synchronization
+// problems are checked instead.
 func consistent(a, b *remote.Entry) bool {
 	if a.Kind != b.Kind {
 		return false
@@ -1269,8 +1327,10 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 					w.Removing, a.locator.display(problem.Path), side, problem.Error)
 			}
 		}
-		if !consistent(localEntry, remoteEntry) {
-			return nil, fmt.Errorf("deleted the %s copy, but after synchronizing the copies don't match; retry to verify", w.Removing)
+		// Both copies must match the copy taken, rather than only each other,
+		// since both are missing if synchronization propagated the deletion.
+		if !consistent(localEntry, a.taken) || !consistent(remoteEntry, a.taken) {
+			return nil, fmt.Errorf("after synchronizing, the copies don't both match the %s copy taken; retry to verify", opposite(w.Removing))
 		}
 		resolved = fmt.Sprintf("Resolved; the %s copy was taken.", opposite(w.Removing))
 	}

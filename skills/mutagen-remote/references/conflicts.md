@@ -49,16 +49,21 @@ one-way-safe synchronization mode. For conflicts that it can't resolve, see
    For other supported conflicts (such as a symbolic link on one side and a
    file on the other), there's nothing to merge: decide which copy to keep.
    To keep content from both, edit the copy you'll keep in the synced tree first
-   (the other copy remains in the workspace).
+   (the other copy remains in the workspace). Don't delete that copy or change
+   it back to what both sides last agreed on (such as with `git checkout`):
+   synchronization then replaces it with the other copy, and apply refuses to
+   take it.
 4. Run `remote --conflict-apply <path>...`. For two files, it writes `Merged`
    to both copies; `--take local` or `--take remote` uses an original copy
    unchanged instead, and `--delete` deletes both copies. If the copies differ
    in executability, add `--executable true` or `--executable false` (or use
    `--take`). For other conflicts, `--take local` or `--take remote` is
-   required: it deletes the other copy, and synchronization propagates the
-   copy taken. Apply then synchronizes and sets the workspace aside once both
-   copies match and no conflict involves the path, keeping it for 7 days (the
-   output says where) in case the resolution turns out to be wrong.
+   required: it synchronizes, deletes the other copy, and synchronization
+   propagates the copy taken. If the copy to take no longer exists or changed
+   while synchronizing, apply deletes nothing; check that copy, then list
+   conflicts again. Apply then synchronizes and sets the workspace aside once
+   both copies match and no conflict involves the path, keeping it for 7 days
+   (the output says where) in case the resolution turns out to be wrong.
 5. Run the project's relevant checks.
 
 If apply reports that a copy changed since checkout, it didn't change that copy
