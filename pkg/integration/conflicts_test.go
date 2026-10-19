@@ -215,9 +215,18 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 			}
 			c.fail("isn't checked out", "--conflict-apply", "large")
 
-			// With their common ancestor, both copies' changes are merged.
+			// With their common ancestor, both copies' changes are merged. An
+			// existing workspace isn't merged again with it, which would
+			// replace its edits, so it must be discarded first.
 			base := filepath.Join(t.TempDir(), "base")
 			writeFile(t, base, "1\n2\n3\n4\n5\n")
+			w = c.checkout("merge")
+			writeFile(t, w.Merged, "edited\n")
+			c.fail("discard the workspace first", "--conflict-checkout", "--base", base, "merge")
+			if readFile(w.Merged) != "edited\n" {
+				t.Fatal("checkout with --base changed an existing workspace")
+			}
+			c.invoke("--conflict-discard", "merge")
 			c.fail("isn't the copies' common ancestor", "--conflict-checkout", "--base", filepath.Join(local, "merge"), "merge")
 			if w := c.outcomes("--conflict-checkout", "--base", base, "merge")[0]; w.Base == "" || w.Regions != 0 || readFile(w.Merged) != "1\nlocal\n3\nremote\n5\n" {
 				t.Fatalf("copies not merged with their common ancestor: %+v", w)

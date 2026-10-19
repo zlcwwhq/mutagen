@@ -19,7 +19,8 @@ one-way-safe synchronization mode. For conflicts that it can't resolve, see
 2. Run `remote --conflict-checkout <path>...`. For each path, it prints the
    paths of the files in a workspace outside the synced tree: `Local` and
    `Remote` (both complete copies) and, for two files, `Merged` and, if found,
-   `Base`. Checking out again prints the same workspace and keeps your edits.
+   `Base`. Checking out again prints the same workspace and keeps your edits
+   (with `--base`, it fails instead; discard the workspace first).
    If checkout says that the copies changed since conflicts were listed (such
    as by an edit while it ran), check out again.
 3. For two files, edit `Merged`. Conflicting regions are enclosed in markers:

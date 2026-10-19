@@ -777,7 +777,8 @@ func checkoutAll(ctx context.Context, directory string, o *options, p *printer) 
 
 // checkout downloads both copies of a conflict into its workspace. An existing
 // workspace is reused, preserving edits to its merged file, even if its
-// conflict is no longer listed.
+// conflict is no longer listed, but not with a specified common ancestor,
+// which only a new workspace's merged file can be based on.
 func checkout(ctx context.Context, directory string, o *options, listing *remote.Listing, target *remote.Target, argument string) (*outcome, error) {
 	local, err := filepath.Abs(argument)
 	if err != nil {
@@ -798,6 +799,10 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 			return nil, errors.New("an unrelated workspace exists for this path; discard it first")
 		} else if w.hasDirectory() {
 			return nil, errDirectoryConflict
+		} else if o.base != "" {
+			// The merged file may have been edited, and merging with another
+			// ancestor would replace it.
+			return nil, errors.New("is already checked out, so --base can't be used; discard the workspace first (which changes neither copy), then check out again with --base")
 		}
 		return describe(w, argument, conflict == nil)
 	} else if !errors.Is(err, os.ErrNotExist) {
