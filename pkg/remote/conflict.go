@@ -714,8 +714,9 @@ func (r *Replacement) replace(ctx context.Context, root *os.Root, path string, c
 // including one written concurrently, is left as is (and input isn't
 // necessarily read). New contents are staged and verified next to the entry and
 // then take its place (see supersede), keeping its permissions apart from
-// executability. Files left by interrupted replacements are removed first (see
-// cleanUp). The root itself can be replaced if it's a file, but not deleted.
+// executability and, as far as permitted, its owner and group (see
+// preserveOwnership). Files left by interrupted replacements are removed first
+// (see cleanUp). The root itself can be replaced if it's a file, but not deleted.
 // Stale replacements fail with ErrStale, and those that leave an entry at a
 // temporary name, such as a file saved while the entry was being replaced,
 // fail with an error matching ErrLeft instead.
@@ -759,6 +760,11 @@ func ReplaceFile(ctx context.Context, directory string, replacement *Replacement
 	size, err := io.Copy(io.MultiWriter(file, hasher), &entryReader{ctx: ctx, reader: io.LimitReader(input, result.Size+1)})
 	if err == nil && (size != result.Size || fmt.Sprintf("%x", hasher.Sum(nil)) != result.Digest) {
 		err = errors.New("replacement contents are incomplete or corrupt")
+	}
+	// Ownership is changed before permissions, since changing it may clear
+	// permission bits.
+	if err == nil {
+		err = preserveOwnership(file, info)
 	}
 	if err == nil {
 		err = file.Chmod(mode)
