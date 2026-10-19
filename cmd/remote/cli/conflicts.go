@@ -1193,6 +1193,14 @@ func (a *application) writeResult(ctx context.Context, o *options, connection io
 // prepareTake checks a resolution of a conflict other than between two files,
 // which takes one copy, and reads the copy to take before the listing that
 // confirms that it can be taken (see takeCopy).
+//
+// Synchronization replaces a copy changed back to what both copies last
+// agreed on with the other copy, which may happen before apply runs, so a copy
+// to take that matches the other copy as checked out, but not its own, is
+// refused. Taking it would keep the other copy, while the copy to take as
+// checked out remains only in the workspace. A copy edited to match the other
+// copy is indistinguishable, but the copies then agree, and discarding the
+// workspace is all that remains to do.
 func (a *application) prepareTake(ctx context.Context, directory string, o *options) error {
 	w := a.w
 	if o.take == "" || o.executable != "" {
@@ -1202,9 +1210,20 @@ func (a *application) prepareTake(ctx context.Context, directory string, o *opti
 	} else if w.Removing != "" && w.Removing != opposite(o.take) {
 		return fmt.Errorf("a previous apply took the %[1]s copy; apply with --take %[1]s to finish, or discard the workspace", opposite(w.Removing))
 	}
-	var err error
-	a.taken, err = a.readTaken(ctx, directory, o)
-	return err
+	taken, err := a.readTaken(ctx, directory, o)
+	if err != nil {
+		return err
+	}
+	checkedOut, other, name := w.Local, w.Remote, localName
+	if o.take == sideRemote {
+		checkedOut, other, name = w.Remote, w.Local, remoteName
+	}
+	if consistent(taken, other) && !consistent(taken, checkedOut) {
+		return fmt.Errorf("the %[1]s copy now matches the %[2]s copy as checked out, as it does once synchronization replaces a copy changed back to what both copies last agreed on, so nothing was deleted; to keep the %[1]s copy as checked out, restore it from %[3]s, which synchronization then propagates; either way, discard the workspace",
+			o.take, opposite(o.take), w.file(name))
+	}
+	a.taken = taken
+	return nil
 }
 
 // readTaken reads the copy to take. It may have been edited since checkout,
@@ -1263,10 +1282,11 @@ func (a *application) takeCopy(ctx context.Context, directory string, o *options
 	}
 	conflict := findConflict(listing, w.Path)
 	if entry.Kind == remote.EntryMissing || remote.SameContents(taken, entry) || conflict == nil {
-		// There's nothing to delete, the taken copy was edited to match the
-		// other one (in which case synchronization may already consider the
-		// copies to agree and would propagate the other copy's deletion to the
-		// taken copy), or the conflict is no longer listed.
+		// There's nothing to delete, the taken copy matches the other one (in
+		// which case synchronization may already consider the copies to agree
+		// and would propagate the other copy's deletion to the taken copy,
+		// although prepareTake refuses such copies unless they also match
+		// their own checked-out copy), or the conflict is no longer listed.
 		w.Removing = deleted
 		return nil
 	} else if !slices.Contains(localSides(conflict, a.target), o.take) {

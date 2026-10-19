@@ -237,16 +237,19 @@ Conflicts involving directories require manual resolution: checkout and apply
 reject them, including apply through an existing workspace. Other
 conflicts, such as a symbolic link on one endpoint and a file on the other, can
 only be resolved with `--take`, which deletes the other copy so that
-synchronization propagates the copy taken (which may be edited first). Apply
-synchronizes before deleting the other copy, and deletes nothing if the copy
-taken was deleted or synchronization replaced it, as it does a copy changed
-back to what both copies last agreed on, since synchronization would then
-propagate the deletion to it instead. In one-way-safe sessions, only alpha's
-copy can be taken this way. Conflicts at the root of a single-file session can
-be resolved like other files, with `--session` from outside the root, on
-filesystems that can exchange files atomically, but conflicts involving
-directories or content that can't be synchronized or read must be resolved
-manually.
+synchronization propagates the copy taken (which may be edited first, but not
+to match the other copy). Apply synchronizes before deleting the other copy,
+and fails without deleting anything if the copy taken was deleted, since
+synchronization would then propagate the deletion to it instead, or if it now
+matches the other copy as checked out, as it does once synchronization
+replaces a copy changed back to what both copies last agreed on, since taking
+it would keep the other copy. To keep such a copy, restore it from the
+workspace, which synchronization then propagates, and discard the workspace.
+In one-way-safe sessions, only alpha's copy can be taken this way. Conflicts at
+the root of a single-file session can be resolved like other files, with
+`--session` from outside the root, on filesystems that can exchange files
+atomically, but conflicts involving directories or content that can't be
+synchronized or read must be resolved manually.
 
 Apply replaces or deletes each copy only if it matches a checked-out copy, then
 flushes and checks that no conflict involves the path and that both copies

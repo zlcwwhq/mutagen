@@ -525,7 +525,10 @@ func TestRemoteConflictCopyBecomesDirectory(t *testing.T) {
 func TestRemoteConflictTakeMatchingCopy(t *testing.T) {
 	// A taken copy edited to match the other one makes synchronization
 	// consider the copies to agree, so deleting the other copy would delete
-	// both. Applying must then leave both copies in place.
+	// both. It's indistinguishable from a copy that synchronization replaced
+	// with the other one (see TestRemoteConflictTakeReplacedCopy), so applying
+	// must refuse and leave both copies in place, and the workspace can then
+	// be discarded.
 	for _, take := range []string{"local", "remote"} {
 		t.Run(take, func(t *testing.T) {
 			roots := createConflictSession(t, true, core.SynchronizationMode_SynchronizationModeTwoWaySafe)
@@ -555,9 +558,8 @@ func TestRemoteConflictTakeMatchingCopy(t *testing.T) {
 			if listing := c.list(); len(listing.Conflicts) != 0 {
 				t.Fatalf("matching copies still conflict: %+v", listing.Conflicts)
 			}
-			if outcome := c.outcomes("--conflict-apply", "--take", take, "file")[0]; !outcome.Resolved {
-				t.Fatalf("not resolved: %+v", outcome)
-			}
+			c.fail("now matches the", "--conflict-apply", "--take", take, "file")
+			c.invoke("--conflict-discard", "file")
 			for _, root := range roots {
 				if take == "remote" {
 					if readFile(filepath.Join(root, "file")) != "local\n" {
@@ -616,6 +618,49 @@ func TestRemoteConflictTakeDeletedOrRevertedCopy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRemoteConflictTakeReplacedCopy(t *testing.T) {
+	// A copy changed back to what both copies last agreed on is replaced by
+	// synchronization with the other copy, possibly before apply runs. Taking
+	// it would keep the other copy, so applying must refuse rather than report
+	// the copy as taken, without deleting anything or setting the workspace
+	// aside. Restoring the copy from the workspace keeps it.
+	roots, c := createTakeConflict(t)
+	local := filepath.Join(roots[0], "file")
+	if err := os.Remove(local); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, local, "base\n")
+	if _, err := flushRemote(roots[0]); err != nil {
+		t.Fatal(err)
+	} else if readFile(local) != "remote\n" {
+		t.Fatal("reverted copy not replaced by synchronization")
+	}
+	c.fail("now matches the remote copy", "--conflict-apply", "--take", "local", "file")
+	if readFile(filepath.Join(roots[1], "file")) != "remote\n" || readFile(local) != "remote\n" {
+		t.Fatal("copies changed despite refusal")
+	}
+	w := c.checkout("file")
+	if !w.Pending {
+		t.Fatalf("workspace set aside: %+v", w)
+	}
+	target, err := os.Readlink(w.Local)
+	if err != nil {
+		t.Fatal("checked-out copy not kept:", err)
+	} else if err := os.Remove(local); err != nil {
+		t.Fatal(err)
+	} else if err := os.Symlink(target, local); err != nil {
+		t.Fatal(err)
+	} else if _, err := flushRemote(roots[0]); err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range roots {
+		if target, err := os.Readlink(filepath.Join(root, "file")); err != nil || target != "target" {
+			t.Fatalf("restored copy not propagated: %q: %v", target, err)
+		}
+	}
+	c.invoke("--conflict-discard", "file")
 }
 
 func TestRemoteConflictTakeResolvedMeanwhile(t *testing.T) {
