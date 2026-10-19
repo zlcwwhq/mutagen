@@ -191,7 +191,7 @@ func testSupersedeKeepsConcurrentSaves(t *testing.T) {
 			}
 			var staged *stagedFile
 			if stage {
-				staged = &stagedFile{name: temporaryName("file", roleStaged)}
+				staged = &stagedFile{name: temporaryName("file", roleStaged), result: contentsEntry("result\n")}
 				if err := os.WriteFile(filepath.Join(directory, staged.name), []byte("result\n"), 0600); err != nil {
 					t.Fatal(err)
 				} else if staged.info, err = root.Lstat(staged.name); err != nil {
@@ -291,7 +291,7 @@ func testReplaceCompletedConcurrently(t *testing.T) {
 		defer root.Close()
 		var staged *stagedFile
 		if result.Kind == EntryFile {
-			staged = &stagedFile{name: temporaryName("file", roleStaged)}
+			staged = &stagedFile{name: temporaryName("file", roleStaged), result: result}
 			if err := os.WriteFile(filepath.Join(directory, staged.name), []byte("merged\n"), 0600); err != nil {
 				t.Fatal(err)
 			} else if staged.info, err = root.Lstat(staged.name); err != nil {
@@ -322,6 +322,161 @@ func testReplaceCompletedConcurrently(t *testing.T) {
 		if entries, _ := os.ReadDir(directory); len(entries) != files {
 			t.Fatalf("propagated %s result left files behind: %v", result.Kind, entries)
 		}
+	}
+}
+
+// contentsEntry describes a file with the specified contents.
+func contentsEntry(contents string) *Entry {
+	return &Entry{Kind: EntryFile, Size: int64(len(contents)), Digest: fmt.Sprintf("%x", sha256.Sum256([]byte(contents)))}
+}
+
+// requireExchanges skips a test unless files can be exchanged.
+func requireExchanges(t *testing.T) {
+	t.Helper()
+	directory := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		if err := os.WriteFile(filepath.Join(directory, name), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := exchange(root, "a", "b"); errors.Is(err, errors.ErrUnsupported) {
+		t.Skip("exchanging files unsupported")
+	} else if err != nil {
+		t.Fatal("unable to exchange files:", err)
+	}
+}
+
+func TestReplaceKeepsFilesSavedWhileExchanged(t *testing.T) {
+	// While the staged result is exchanged into the path, before a changed copy
+	// is exchanged back, it may be written in place, such as by an editor that
+	// saves without renaming. That content must survive at the staged file's
+	// name, which the failure names, rather than be removed with the staged file
+	// or reused as the result, whatever synchronization placed at the path
+	// before the exchange: the result itself, the other checked-out copy, or
+	// unrelated content. Retries must keep it too.
+	requireExchanges(t)
+	defer func() { exchangeFiles = exchange }()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	replacement := &Replacement{
+		Path:     "file",
+		Expected: []*Entry{contentsEntry("original\n"), contentsEntry("remote\n")},
+		Result:   contentsEntry("merged\n"),
+	}
+	staged := temporaryName("file", roleStaged)
+	for _, placed := range []string{"merged\n", "remote\n", "unrelated\n"} {
+		for _, remotely := range []bool{false, true} {
+			description := fmt.Sprintf("%q placed (remotely %t)", placed, remotely)
+			directory := t.TempDir()
+			path := filepath.Join(directory, "file")
+			if err := os.WriteFile(path, []byte("original\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			exchangeFiles = func(root *os.Root, a, b string) error {
+				calls++
+				if calls == 1 {
+					if err := os.WriteFile(path+".new", []byte(placed), 0600); err != nil {
+						return err
+					} else if err := os.Rename(path+".new", path); err != nil {
+						return err
+					}
+				} else if calls == 2 {
+					if err := os.WriteFile(path, []byte("saved\n"), 0600); err != nil {
+						return err
+					}
+				}
+				return exchange(root, a, b)
+			}
+			var err error
+			if remotely {
+				client, server := net.Pipe()
+				go Serve(ctx, server, directory, "", false)
+				err = Replace(ctx, client, replacement, strings.NewReader("merged\n"))
+			} else {
+				err = ReplaceFile(ctx, directory, replacement, strings.NewReader("merged\n"))
+			}
+			if !errors.Is(err, ErrLeft) || errors.Is(err, ErrStale) || !strings.Contains(err.Error(), filepath.ToSlash(staged)) {
+				t.Fatalf("%s: file saved meanwhile not reported: %v", description, err)
+			} else if data, _ := os.ReadFile(filepath.Join(directory, staged)); string(data) != "saved\n" {
+				t.Fatalf("%s: file saved meanwhile lost: %q", description, data)
+			} else if data, _ := os.ReadFile(path); string(data) != placed {
+				t.Fatalf("%s: placed file not restored: %q", description, data)
+			} else if entries, _ := os.ReadDir(directory); len(entries) != 2 {
+				t.Fatalf("%s: unexpected files: %v", description, entries)
+			}
+			if err := ReplaceFile(ctx, directory, replacement, strings.NewReader("merged\n")); err == nil ||
+				!strings.Contains(err.Error(), "isn't a copy that it would replace") {
+				t.Fatalf("%s: retry didn't report the file saved meanwhile: %v", description, err)
+			} else if data, _ := os.ReadFile(filepath.Join(directory, staged)); string(data) != "saved\n" {
+				t.Fatalf("%s: retry lost the file saved meanwhile: %q", description, data)
+			}
+		}
+	}
+}
+
+func TestReplaceLeftEntriesArentStale(t *testing.T) {
+	// Failures that leave an entry at a temporary name must say where it is and
+	// mustn't match ErrStale, even if a stale copy caused them, since callers
+	// treat stale replacements as having changed nothing.
+	ctx := context.Background()
+	check := func(description string, err error, left string) {
+		t.Helper()
+		if !errors.Is(err, ErrLeft) || errors.Is(err, ErrStale) || !strings.Contains(err.Error(), filepath.ToSlash(left)) {
+			t.Fatalf("%s: entry left at %s not reported: %v", description, left, err)
+		}
+	}
+
+	// A copy moved aside can't be moved back over an entry saved meanwhile.
+	directory := t.TempDir()
+	aside := temporaryName("file", roleAside)
+	for name, data := range map[string]string{aside: "changed\n", "file": "saved\n"} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	check("restoring", restore(root, aside, "file", ErrStale), aside)
+	if data, _ := os.ReadFile(filepath.Join(directory, aside)); string(data) != "changed\n" {
+		t.Fatal("copy moved aside lost")
+	} else if data, _ := os.ReadFile(filepath.Join(directory, "file")); string(data) != "saved\n" {
+		t.Fatal("entry saved meanwhile replaced")
+	}
+
+	// Neither can a changed copy that was exchanged with the staged file if
+	// exchanging them back fails.
+	requireExchanges(t)
+	defer func() { exchangeFiles = exchange }()
+	directory = t.TempDir()
+	path := filepath.Join(directory, "file")
+	if err := os.WriteFile(path, []byte("original\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	exchangeFiles = func(root *os.Root, a, b string) error {
+		calls++
+		if calls == 1 {
+			if err := os.WriteFile(path, []byte("changed\n"), 0600); err != nil {
+				return err
+			}
+			return exchange(root, a, b)
+		}
+		return errors.New("injected failure")
+	}
+	replacement := &Replacement{Path: "file", Expected: []*Entry{contentsEntry("original\n")}, Result: contentsEntry("merged\n")}
+	staged := temporaryName("file", roleStaged)
+	check("exchanging back", ReplaceFile(ctx, directory, replacement, strings.NewReader("merged\n")), staged)
+	if data, _ := os.ReadFile(filepath.Join(directory, staged)); string(data) != "changed\n" {
+		t.Fatalf("changed copy lost: %q", data)
 	}
 }
 

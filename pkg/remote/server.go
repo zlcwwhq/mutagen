@@ -114,7 +114,11 @@ func run(ctx context.Context, root, prologue string, alpha bool, request *Reques
 		return result{Entry: entry}
 	} else if request.Replace != nil {
 		if err := ReplaceFile(ctx, root, request.Replace, stdin); err != nil {
-			return result{Error: fmt.Sprintf("unable to replace %s: %v", request.Replace.Path, err), Stale: errors.Is(err, ErrStale)}
+			return result{
+				Error: fmt.Sprintf("unable to replace %s: %v", request.Replace.Path, err),
+				Stale: errors.Is(err, ErrStale),
+				Left:  errors.Is(err, ErrLeft),
+			}
 		}
 		return result{}
 	}

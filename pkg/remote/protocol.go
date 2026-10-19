@@ -161,6 +161,9 @@ type result struct {
 	// Stale indicates that a replacement failed because the entry changed
 	// since it was checked out (see ErrStale).
 	Stale bool `json:",omitempty"`
+	// Left indicates that a replacement failed and left an entry at a
+	// temporary name (see ErrLeft).
+	Left bool `json:",omitempty"`
 }
 
 // writeMessage writes bounded, length-prefixed command metadata.

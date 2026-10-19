@@ -148,6 +148,14 @@ type Replacement struct {
 // ErrStale indicates that a replacement would overwrite unseen changes.
 var ErrStale = errors.New("the copy changed since it was checked out")
 
+// ErrLeft indicates that a replacement failed and left an entry at a temporary
+// name next to its path, which synchronization ignores, such as a copy that
+// couldn't be moved back or a file saved while it was being replaced. Its
+// errors say where the entry is. They don't match ErrStale, even if a stale
+// copy caused the failure, since the entry may be the only copy of content
+// saved meanwhile, which callers mustn't consider superseded.
+var ErrLeft = errors.New("an entry was left at a temporary name")
+
 // staleError is a stale replacement reported by the opposite endpoint, which
 // matches ErrStale.
 type staleError struct {
@@ -160,6 +168,21 @@ func (e *staleError) Error() string {
 
 func (e *staleError) Is(target error) bool {
 	return target == ErrStale
+}
+
+// leftError is a failed replacement that left an entry at a temporary name,
+// which matches ErrLeft. The error that caused the failure is only described,
+// so that a stale copy causing it doesn't make it match ErrStale.
+type leftError struct {
+	message string
+}
+
+func (e *leftError) Error() string {
+	return e.message
+}
+
+func (e *leftError) Is(target error) bool {
+	return target == ErrLeft
 }
 
 // maximumSupersedeAttempts bounds the attempts to supersede an entry that's
@@ -505,18 +528,43 @@ func placeable(root *os.Root, path string, directory bool) error {
 // filesystems that don't support exchanges.
 var exchangeFiles = exchange
 
-// stagedFile is a replacement's staged result.
+// stagedFile is a replacement's staged result. While it's exchanged into the
+// path, it may be written in place (such as by an editor that saves without
+// renaming), so once it's exchanged back, it's only reused or removed if it
+// still holds nothing but the result (see verifyExchanged), and it's otherwise
+// kept.
 type stagedFile struct {
 	// name is the file's name.
 	name string
 	// info identifies the file.
 	info os.FileInfo
+	// result describes the file's contents, which are the replacement's result.
+	result *Entry
+	// kept indicates that the file may hold content saved while it was at the
+	// path, so it mustn't be removed or reused.
+	kept bool
 }
 
-// remove removes the staged file, unless its name refers to another file,
-// such as one exchanged with it (see verifyExchanged).
+// intact determines whether the staged file's name still refers to the staged
+// file and the file still holds nothing but the result, which identifying the
+// file doesn't establish.
+func (s *stagedFile) intact(ctx context.Context, root *os.Root) (bool, error) {
+	if info, err := root.Lstat(s.name); err != nil || !os.SameFile(info, s.info) {
+		return false, err
+	}
+	current, err := snapshot(ctx, root, s.name, nil)
+	if err != nil {
+		return false, err
+	}
+	return SameContents(current, s.result), nil
+}
+
+// remove removes the staged file, unless it's kept or its name refers to
+// another file, such as one exchanged with it (see verifyExchanged).
 func (s *stagedFile) remove(root *os.Root) {
-	if info, err := root.Lstat(s.name); err == nil && os.SameFile(info, s.info) {
+	if s.kept {
+		return
+	} else if info, err := root.Lstat(s.name); err == nil && os.SameFile(info, s.info) {
 		root.Remove(s.name)
 	}
 }
@@ -587,7 +635,11 @@ func supersede(ctx context.Context, root *os.Root, path string, checked *Entry, 
 // verifyExchanged completes a replacement whose staged file was exchanged with
 // the checked file, which now has the staged file's name, by verifying and
 // removing the checked file. If it changed, it's exchanged back, and the staged
-// file is left for the caller to remove.
+// file is left for the caller to reuse or remove once it's verified to be
+// intact: while it was at the path, it may have been written in place, or
+// another file may have been saved over it, either of which holds content
+// saved meanwhile. Such a file is kept at the staged file's name, and the
+// replacement fails with an error matching ErrLeft that says where it is.
 func verifyExchanged(ctx context.Context, root *os.Root, path string, checked *Entry, staged *stagedFile) error {
 	captured, err := snapshot(ctx, root, staged.name, nil)
 	if err == nil && SameContents(captured, checked) {
@@ -596,23 +648,31 @@ func verifyExchanged(ctx context.Context, root *os.Root, path string, checked *E
 		err = ErrStale
 	}
 	if exchangeErr := exchangeFiles(root, staged.name, path); exchangeErr != nil {
-		return fmt.Errorf("%w; the copy was moved to %s and couldn't be moved back: %v", err, filepath.ToSlash(staged.name), exchangeErr)
+		return &leftError{fmt.Sprintf("%v; the copy was moved to %s and couldn't be moved back: %v",
+			err, filepath.ToSlash(staged.name), exchangeErr)}
 	}
 	// The staged file's name now refers to whatever was at the path, which is
 	// the staged file unless another file was saved there meanwhile.
-	if info, statErr := root.Lstat(staged.name); statErr != nil || !os.SameFile(info, staged.info) {
-		return fmt.Errorf("%w; a file saved while it was being replaced was moved to %s", err, filepath.ToSlash(staged.name))
+	if intact, verifyErr := staged.intact(ctx, root); verifyErr != nil {
+		staged.kept = true
+		return &leftError{fmt.Sprintf("%v; a file that may have been saved while it was being replaced was moved to %s and couldn't be verified: %v",
+			err, filepath.ToSlash(staged.name), verifyErr)}
+	} else if !intact {
+		staged.kept = true
+		return &leftError{fmt.Sprintf("%v; a file saved while it was being replaced was moved to %s",
+			err, filepath.ToSlash(staged.name))}
 	}
 	return err
 }
 
 // restore moves an entry that was moved aside back to its path and returns the
 // error that prevented its replacement. If an entry was saved at the path
-// meanwhile, it's left in place, and the error says where the other one is.
+// meanwhile, it's left in place, and the replacement fails with an error
+// matching ErrLeft that says where the other one is.
 func restore(root *os.Root, aside, path string, err error) error {
 	if restoreErr := place(root, aside, path); restoreErr != nil {
-		return fmt.Errorf("%w; the copy was moved aside to %s and couldn't be moved back: %v",
-			err, filepath.ToSlash(aside), restoreErr)
+		return &leftError{fmt.Sprintf("%v; the copy was moved aside to %s and couldn't be moved back: %v",
+			err, filepath.ToSlash(aside), restoreErr)}
 	}
 	return err
 }
@@ -622,8 +682,9 @@ func restore(root *os.Root, aside, path string, err error) error {
 // the result or another expected entry meanwhile, which fails the replacement
 // as stale, so the entry is checked again: the replacement is complete if it
 // has the result, and is attempted again if the new entry may be superseded.
-// Entries left elsewhere are reported regardless, since their errors only wrap
-// ErrStale.
+// Failures that leave entries elsewhere are reported regardless, since they
+// fail with ErrLeft rather than ErrStale, which also keeps a staged file that
+// may hold content saved meanwhile from being reused.
 func (r *Replacement) replace(ctx context.Context, root *os.Root, path string, checked *Entry, staged *stagedFile, isRoot bool) error {
 	for attempt := 1; ; attempt++ {
 		err := supersede(ctx, root, path, checked, staged, isRoot)
@@ -648,6 +709,9 @@ func (r *Replacement) replace(ctx context.Context, root *os.Root, path string, c
 // then take its place (see supersede), keeping its permissions apart from
 // executability. Files left by interrupted replacements are removed first (see
 // cleanUp). The root itself can be replaced if it's a file, but not deleted.
+// Stale replacements fail with ErrStale, and those that leave an entry at a
+// temporary name, such as a file saved while the entry was being replaced,
+// fail with an error matching ErrLeft instead.
 func ReplaceFile(ctx context.Context, directory string, replacement *Replacement, input io.Reader) error {
 	if err := replacement.ensureValid(); err != nil {
 		return err
@@ -679,7 +743,7 @@ func ReplaceFile(ctx context.Context, directory string, replacement *Replacement
 	if result.Executable {
 		mode |= (mode & 0444) >> 2
 	}
-	staged := &stagedFile{name: temporaryName(path, roleStaged)}
+	staged := &stagedFile{name: temporaryName(path, roleStaged), result: result}
 	file, err := root.OpenFile(staged.name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
@@ -723,10 +787,12 @@ func requestPath(path string) string {
 }
 
 // responseError converts an error reported by the executor, preserving whether
-// a replacement was stale.
+// a replacement was stale or left an entry at a temporary name.
 func responseError(response *result) error {
 	if response.Stale {
 		return &staleError{response.Error}
+	} else if response.Left {
+		return &leftError{response.Error}
 	}
 	return errors.New(response.Error)
 }
@@ -767,7 +833,8 @@ func Archive(ctx context.Context, connection io.ReadWriteCloser, path string, ou
 // Replace performs a replacement (see ReplaceFile) on the opposite endpoint
 // over an established route (see Dial), sending input as the new contents. It
 // owns and closes the connection. Stale replacements fail with an error
-// matching ErrStale.
+// matching ErrStale, and those that left an entry at a temporary name with one
+// matching ErrLeft.
 func Replace(ctx context.Context, connection io.ReadWriteCloser, replacement *Replacement, input io.Reader) error {
 	replacement = &Replacement{Path: requestPath(replacement.Path), Expected: replacement.Expected, Result: replacement.Result}
 	response, err := execute(ctx, connection, &Request{Replace: replacement}, input, io.Discard, io.Discard)
