@@ -33,14 +33,21 @@ type ConflictRoot struct {
 	// the taken copy.
 	AlphaTakable bool `json:",omitempty"`
 	BetaTakable  bool `json:",omitempty"`
+	// AlphaDigest and BetaDigest are the hexadecimal digests of alpha's and
+	// beta's files, for conflicts between two files, as the synchronization
+	// cycle that listed the conflict saw them. Copies downloaded afterward are
+	// compared with them, since synchronization may have moved on to newer
+	// copies with another common ancestor (see BaseDigest) meanwhile.
+	AlphaDigest string `json:",omitempty"`
+	BetaDigest  string `json:",omitempty"`
 	// BaseDigest is the hexadecimal digest of the file at the conflict root
 	// when the endpoints last agreed, if there was one, which identifies the
-	// copies' common ancestor. Mutagen doesn't retain its contents, but they
-	// can be found by comparing digests (see BaseAlgorithm).
+	// copies' common ancestor as of the same cycle. Mutagen doesn't retain its
+	// contents, but they can be found by comparing digests.
 	BaseDigest string `json:",omitempty"`
-	// BaseAlgorithm is the session's hashing algorithm, which computed
-	// BaseDigest, in its textual form.
-	BaseAlgorithm string `json:",omitempty"`
+	// Algorithm is the session's hashing algorithm, which computed the digests
+	// of conflicts between two files, in its textual form.
+	Algorithm string `json:",omitempty"`
 }
 
 // Resolvable indicates whether remote can resolve a conflict in some way.

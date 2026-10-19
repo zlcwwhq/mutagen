@@ -329,9 +329,9 @@ func (c *controller) remoteReport() *remote.Report {
 
 // remoteConflicts lists all of the session's conflicts and problems as of its
 // last synchronization cycle for resolution, determining how remote can
-// resolve each conflict in the specified synchronization mode. The digest of a
-// conflicting file's common ancestor is reported with the textual name of the
-// session's hashing algorithm.
+// resolve each conflict in the specified synchronization mode. The digests of
+// conflicting files and of their common ancestor are reported with the textual
+// name of the session's hashing algorithm.
 func (c *controller) remoteConflicts(mode core.SynchronizationMode, algorithm string) *remote.Listing {
 	// Conflicts and problems are immutable and their lists are replaced rather
 	// than modified, so the lists can be read once the lock is released.
@@ -366,7 +366,8 @@ func (c *controller) remoteConflicts(mode core.SynchronizationMode, algorithm st
 // Conflicts between regular files consist of a single change at the conflict
 // root on each side, and remote can write any result to both endpoints, which
 // synchronization then considers to agree. Their changes' old entries are the
-// common ancestor.
+// common ancestor, and their new entries are the copies, whose digests bind
+// the ancestor to the copies that it's the ancestor of.
 //
 // Conflicts involving directories require manual resolution. For other
 // conflicts, deleting one endpoint's copy makes synchronization propagate the
@@ -394,8 +395,11 @@ func resolution(conflict *core.Conflict, mode core.SynchronizationMode, algorith
 	}
 	if files {
 		root.Files, root.AlphaTakable, root.BetaTakable = true, true, true
+		root.Algorithm = algorithm
+		root.AlphaDigest = fmt.Sprintf("%x", conflict.AlphaChanges[0].New.Digest)
+		root.BetaDigest = fmt.Sprintf("%x", conflict.BetaChanges[0].New.Digest)
 		if base := conflict.AlphaChanges[0].Old; base != nil && base.Kind == core.EntryKind_File {
-			root.BaseDigest, root.BaseAlgorithm = fmt.Sprintf("%x", base.Digest), algorithm
+			root.BaseDigest = fmt.Sprintf("%x", base.Digest)
 		}
 		return root
 	} else if conflict.Root == "" || directory {

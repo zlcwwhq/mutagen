@@ -84,9 +84,11 @@ Notes:
     verified by its digest. With it, the merged file contains both sides'
     changes, and marks only regions changed differently on each side, showing
     the local, base, and remote versions; without it, every region where the
-    copies differ is marked. Binary copies get no merged file. Checking out
-    again keeps an existing workspace and its edits. Conflicts involving
-    directories require manual resolution; checkout and apply reject them.
+    copies differ is marked. Binary copies get no merged file. Checkout fails
+    if the copies changed since they were listed (the ancestor might not be
+    theirs); check out again. Checking out again keeps an existing workspace
+    and its edits. Conflicts involving directories require manual resolution;
+    checkout and apply reject them.
   - For two files, --conflict-apply writes the merged file (or the copy chosen
     by --take, or deletion with --delete) to both copies. For other conflicts
     (such as a symbolic link and a file), only --take is possible: it deletes

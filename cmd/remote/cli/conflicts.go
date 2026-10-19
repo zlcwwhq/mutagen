@@ -778,7 +778,15 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 	defer os.RemoveAll(staging)
 	w := &workspace{Session: target.Session, Alpha: target.Alpha, Path: path, Token: rand.Text()[:8], directory: staging}
 	if conflict.Files {
-		err = checkoutFiles(ctx, directory, o, conflict, target, local, w)
+		err = checkoutFiles(ctx, conflict, local, o.base, w, func(output io.Writer) (*remote.Entry, error) {
+			return remote.CopyFile(ctx, target.Root, path, output)
+		}, func(output io.Writer) (*remote.Entry, error) {
+			connection, err := dialOpposite(ctx, directory, o.session, target)
+			if err != nil {
+				return nil, err
+			}
+			return remote.Copy(ctx, connection, path, output)
+		})
 	} else {
 		w.Take = localSides(conflict, target)
 		err = checkoutEntries(ctx, directory, o, target, w)
@@ -794,31 +802,56 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 	return describe(w, argument, false)
 }
 
+// errCopiesChanged indicates that the copies downloaded for a checkout aren't
+// the ones that the conflict listing reported, so that the listed common
+// ancestor might not be theirs.
+var errCopiesChanged = errors.New("the copies changed since conflicts were listed; check out again")
+
+// copier writes a copy of a conflicting entry to output and returns the entry
+// as read at its source.
+type copier func(output io.Writer) (*remote.Entry, error)
+
 // checkoutFiles downloads both copies of a conflict between two files into a
-// workspace, along with their common ancestor, if it can be found, and
-// prepares the merged file.
-func checkoutFiles(ctx context.Context, directory string, o *options, conflict *remote.ConflictRoot, target *remote.Target, local string, w *workspace) error {
-	var err error
-	w.Local, err = writeCopy(w.file(localName), func(file io.Writer) (*remote.Entry, error) {
-		return remote.CopyFile(ctx, target.Root, w.Path, file)
-	})
-	if err != nil {
-		return fmt.Errorf("unable to copy the local copy: %w", err)
+// workspace using functions that copy the local and remote copies, along with
+// their common ancestor, if it can be found, and prepares the merged file.
+//
+// The listed common ancestor is that of the listed copies, but synchronization
+// doesn't pause meanwhile: copies that came to agree and then changed again
+// have another ancestor, and merging them with the listed one would silently
+// revert the changes that it doesn't contain. The copies are thus hashed with
+// the session's hashing algorithm as they're downloaded and must be the listed
+// ones. If they can't be compared, such as because this build doesn't support
+// the algorithm, no ancestor can be verified either (see findBase).
+func checkoutFiles(ctx context.Context, conflict *remote.ConflictRoot, local, explicitBase string, w *workspace, copyLocal, copyRemote copier) error {
+	algorithm, unverifiable := listedAlgorithm(conflict)
+	var hashers [2]hash.Hash
+	if unverifiable == nil {
+		hashers = [2]hash.Hash{algorithm.Factory()(), algorithm.Factory()()}
 	}
-	w.Remote, err = writeCopy(w.file(remoteName), func(file io.Writer) (*remote.Entry, error) {
-		connection, err := dialOpposite(ctx, directory, o.session, target)
-		if err != nil {
-			return nil, err
-		}
-		return remote.Copy(ctx, connection, w.Path, file)
-	})
-	if err != nil {
+	download := func(name string, source copier, hasher hash.Hash) (*remote.Entry, error) {
+		return writeCopy(w.file(name), func(file io.Writer) (*remote.Entry, error) {
+			if hasher != nil {
+				file = io.MultiWriter(file, hasher)
+			}
+			return source(file)
+		})
+	}
+	listed := [2]string{conflict.AlphaDigest, conflict.BetaDigest}
+	if !w.Alpha {
+		listed[0], listed[1] = listed[1], listed[0]
+	}
+	var err error
+	if w.Local, err = download(localName, copyLocal, hashers[0]); err != nil {
+		return fmt.Errorf("unable to copy the local copy: %w", err)
+	} else if w.Remote, err = download(remoteName, copyRemote, hashers[1]); err != nil {
 		return fmt.Errorf("unable to download the remote copy: %w", err)
 	} else if w.Local.Kind != remote.EntryFile || w.Remote.Kind != remote.EntryFile {
 		return errors.New("the copies are no longer both files; list conflicts again")
 	} else if remote.SameFile(w.Local, w.Remote) {
 		return errors.New("the copies are now identical; list conflicts again")
-	} else if w.BaseSource, err = findBase(ctx, conflict, local, o.base, w.file(baseName)); err != nil {
+	} else if unverifiable == nil && (fmt.Sprintf("%x", hashers[0].Sum(nil)) != listed[0] || fmt.Sprintf("%x", hashers[1].Sum(nil)) != listed[1]) {
+		return errCopiesChanged
+	} else if w.BaseSource, err = findBase(ctx, conflict, local, explicitBase, w.file(baseName)); err != nil {
 		return err
 	} else if err := prepareMerged(w); err != nil {
 		return fmt.Errorf("unable to create merged file: %w", err)

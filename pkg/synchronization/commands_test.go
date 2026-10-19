@@ -89,6 +89,45 @@ func TestRemoteReport(t *testing.T) {
 	}
 }
 
+func TestRemoteFileConflictDigests(t *testing.T) {
+	// Conflicts between two files report both copies' digests, with their
+	// common ancestor's digest if they have one, so that checkouts can verify
+	// that they download the listed copies. Other conflicts report none.
+	file := func(digest byte) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_File, Digest: []byte{digest}}
+	}
+	link := &core.Entry{Kind: core.EntryKind_SymbolicLink, Target: "target"}
+	wrap := func(entry *core.Entry) *core.Entry {
+		if entry == nil {
+			return &core.Entry{Kind: core.EntryKind_Directory}
+		}
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"conflict": entry}}
+	}
+	for _, mode := range []core.SynchronizationMode{
+		core.SynchronizationMode_SynchronizationModeTwoWaySafe,
+		core.SynchronizationMode_SynchronizationModeOneWaySafe,
+	} {
+		for _, test := range []struct {
+			ancestor, alpha, beta *core.Entry
+			expected              remote.ConflictRoot
+		}{
+			{file(1), file(2), file(3), remote.ConflictRoot{AlphaDigest: "02", BetaDigest: "03", BaseDigest: "01", Algorithm: "sha1"}},
+			{nil, file(2), file(3), remote.ConflictRoot{AlphaDigest: "02", BetaDigest: "03", Algorithm: "sha1"}},
+			{file(1), link, file(3), remote.ConflictRoot{}},
+		} {
+			_, _, _, conflicts := core.Reconcile(wrap(test.ancestor), wrap(test.alpha), wrap(test.beta), mode)
+			if len(conflicts) != 1 {
+				t.Fatalf("unexpected conflicts: %+v", conflicts)
+			}
+			root := resolution(conflicts[0], mode, "sha1")
+			if root.AlphaDigest != test.expected.AlphaDigest || root.BetaDigest != test.expected.BetaDigest ||
+				root.BaseDigest != test.expected.BaseDigest || root.Algorithm != test.expected.Algorithm {
+				t.Fatalf("mode %d: unexpected digests for %+v: %+v", mode, conflicts[0], root)
+			}
+		}
+	}
+}
+
 func TestRemoteDirectoryConflicts(t *testing.T) {
 	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
 	changed := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{2}}

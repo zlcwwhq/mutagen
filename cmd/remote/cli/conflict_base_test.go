@@ -3,7 +3,10 @@ package cli
 import (
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,7 +46,10 @@ func TestFindBase(t *testing.T) {
 	if err := os.WriteFile(local, []byte("local\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	conflict := &remote.ConflictRoot{Path: "file", Files: true, BaseDigest: fmt.Sprintf("%x", sha1.Sum([]byte("base\n"))), BaseAlgorithm: "sha1"}
+	conflict := &remote.ConflictRoot{
+		Path: "file", Files: true, Algorithm: "sha1", BaseDigest: fmt.Sprintf("%x", sha1.Sum([]byte("base\n"))),
+		AlphaDigest: fmt.Sprintf("%x", sha1.Sum([]byte("local\n"))), BetaDigest: fmt.Sprintf("%x", sha1.Sum([]byte("remote\n"))),
+	}
 	candidate := filepath.Join(t.TempDir(), "candidate")
 	find := func(explicit string) (string, string, error) {
 		t.Helper()
@@ -64,6 +70,20 @@ func TestFindBase(t *testing.T) {
 	}
 	if source, _, err := find(""); err != nil || source != "" {
 		t.Fatalf("base found without candidates: %q: %v", source, err)
+	}
+
+	// Without the copies' digests, or with an unsupported algorithm, copies
+	// can't be bound to the listing, so no ancestor is used.
+	for _, unbound := range []remote.ConflictRoot{
+		{Path: "file", Files: true, Algorithm: "sha1", BaseDigest: conflict.BaseDigest},
+		{Path: "file", Files: true, Algorithm: "unknown", BaseDigest: conflict.BaseDigest, AlphaDigest: conflict.AlphaDigest, BetaDigest: conflict.BetaDigest},
+	} {
+		destination := filepath.Join(t.TempDir(), "base")
+		if _, err := findBase(ctx, &unbound, local, candidate, destination); err == nil || !strings.Contains(err.Error(), "can't be verified") {
+			t.Fatalf("unbound base accepted: %+v: %v", unbound, err)
+		} else if source, err := findBase(ctx, &unbound, local, "", destination); err != nil || source != "" {
+			t.Fatalf("unbound base found: %+v: %q: %v", unbound, source, err)
+		}
 	}
 
 	// Without one, versions in Git are verified.
@@ -96,6 +116,73 @@ func TestFindBase(t *testing.T) {
 	conflict.BaseDigest = fmt.Sprintf("%x", sha1.Sum([]byte("unknown\n")))
 	if source, _, err := find(""); err != nil || source != "" {
 		t.Fatalf("unverified base found: %q: %v", source, err)
+	}
+}
+
+func TestCheckoutBindsCopiesToListing(t *testing.T) {
+	// The listed common ancestor is that of the listed copies. Copies that
+	// changed after the listing (here, after they came to agree on "a\n" and
+	// changed again) must not be merged with it: since the remote change
+	// restores a line of the stale ancestor, the merge would take the local
+	// copy without marking anything, silently reverting the remote change.
+	ctx := context.Background()
+	digest := func(data string) string { return fmt.Sprintf("%x", sha1.Sum([]byte(data))) }
+	base := filepath.Join(t.TempDir(), "base")
+	if err := os.WriteFile(base, []byte("a\nb\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	listing := &remote.ConflictRoot{
+		Path: "file", Files: true, Algorithm: "sha1", BaseDigest: digest("a\nb\n"),
+		AlphaDigest: digest("a\nb\nalpha\n"), BetaDigest: digest("beta\na\nb\n"),
+	}
+	serve := func(data string) copier {
+		return func(output io.Writer) (*remote.Entry, error) {
+			_, err := io.WriteString(output, data)
+			return &remote.Entry{Kind: remote.EntryFile, Size: int64(len(data)), Digest: fmt.Sprintf("%x", sha256.Sum256([]byte(data)))}, err
+		}
+	}
+	for _, alpha := range []bool{true, false} {
+		t.Run(fmt.Sprintf("alpha=%t", alpha), func(t *testing.T) {
+			checkout := func(listing *remote.ConflictRoot, explicit, alphaCopy, betaCopy string) (*workspace, error) {
+				w := &workspace{Path: "file", Alpha: alpha, Token: "token", directory: t.TempDir()}
+				local, opposite := serve(alphaCopy), serve(betaCopy)
+				if !alpha {
+					local, opposite = opposite, local
+				}
+				return w, checkoutFiles(ctx, listing, filepath.Join(t.TempDir(), "file"), explicit, w, local, opposite)
+			}
+
+			// The listed copies are merged with their ancestor.
+			if w, err := checkout(listing, base, "a\nb\nalpha\n", "beta\na\nb\n"); err != nil || w.BaseSource == "" {
+				t.Fatalf("listed copies not merged with their ancestor: %v", err)
+			} else if data, err := os.ReadFile(w.file(mergedName)); err != nil || string(data) != "beta\na\nb\nalpha\n" {
+				t.Fatalf("listed copies merged incorrectly: %q: %v", data, err)
+			}
+
+			// Other copies, including the listed ones exchanged, are rejected
+			// before an ancestor is used, whether found or specified.
+			for _, explicit := range []string{base, ""} {
+				for _, copies := range [][2]string{{"a\nx\n", "a\nb\n"}, {"a\nb\nalpha\n", "a\nb\n"}, {"beta\na\nb\n", "a\nb\nalpha\n"}} {
+					if w, err := checkout(listing, explicit, copies[0], copies[1]); !errors.Is(err, errCopiesChanged) {
+						t.Fatalf("changed copies %q accepted: %v", copies, err)
+					} else if _, err := os.Lstat(w.file(mergedName)); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("changed copies %q merged: %v", copies, err)
+					}
+				}
+			}
+
+			// If the algorithm isn't supported, copies can't be compared with
+			// the listed ones, and they're merged without an ancestor.
+			unsupported := *listing
+			unsupported.Algorithm = "unknown"
+			if _, err := checkout(&unsupported, base, "a\nx\n", "a\nb\n"); err == nil || !strings.Contains(err.Error(), "can't be verified") {
+				t.Fatalf("specified ancestor used for unverifiable copies: %v", err)
+			} else if w, err := checkout(&unsupported, "", "a\nx\n", "a\nb\n"); err != nil || w.BaseSource != "" {
+				t.Fatalf("unverifiable copies not merged without an ancestor: %q: %v", w.BaseSource, err)
+			} else if regions, err := countMarkers(w.file(mergedName), markersFor("token").local); err != nil || regions != 1 {
+				t.Fatalf("unverifiable copies' differences not marked: %d: %v", regions, err)
+			}
+		})
 	}
 }
 

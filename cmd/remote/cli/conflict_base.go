@@ -36,14 +36,32 @@ func gitCandidate(ctx context.Context, git, local, revision, source string) base
 	}}
 }
 
+// listedAlgorithm returns the session's hashing algorithm, which computed the
+// digests listed for a conflict between two files. It fails if this build
+// doesn't support the algorithm, or if the listing doesn't include the copies'
+// digests, since downloaded copies can then not be verified to be the listed
+// ones, and the listed common ancestor might not be theirs.
+func listedAlgorithm(conflict *remote.ConflictRoot) (hashing.Algorithm, error) {
+	var algorithm hashing.Algorithm
+	if conflict.AlphaDigest == "" || conflict.BetaDigest == "" {
+		return algorithm, errors.New("the conflict listing doesn't identify the copies")
+	} else if err := algorithm.UnmarshalText([]byte(conflict.Algorithm)); err != nil || algorithm.IsDefault() ||
+		algorithm.SupportStatus() != hashing.AlgorithmSupportStatusSupported {
+		return algorithm, fmt.Errorf("the session's hashing algorithm (%s) isn't supported", conflict.Algorithm)
+	}
+	return algorithm, nil
+}
+
 // findBase looks for the common ancestor of two conflicting files: the file
 // that both endpoints had at the conflict root when they last agreed, which the
 // conflict identifies by its digest. Mutagen doesn't retain its contents, so
 // candidates are verified against the digest: an explicitly specified file, or
 // otherwise the versions of the local file in Git's HEAD commit and index. It
 // writes a verified candidate to a path and returns a description of its
-// source, or an empty string if none was found. Only an explicitly specified
-// candidate that can't be verified is an error.
+// source, or an empty string if none was found. The copies must have been
+// verified to be the listed ones (see listedAlgorithm), whose ancestor the
+// digest identifies. Only an explicitly specified candidate that can't be
+// verified is an error.
 func findBase(ctx context.Context, conflict *remote.ConflictRoot, local, explicit, path string) (string, error) {
 	if conflict.BaseDigest == "" {
 		if explicit != "" {
@@ -51,11 +69,10 @@ func findBase(ctx context.Context, conflict *remote.ConflictRoot, local, explici
 		}
 		return "", nil
 	}
-	var algorithm hashing.Algorithm
-	if err := algorithm.UnmarshalText([]byte(conflict.BaseAlgorithm)); err != nil || algorithm.IsDefault() ||
-		algorithm.SupportStatus() != hashing.AlgorithmSupportStatusSupported {
+	algorithm, err := listedAlgorithm(conflict)
+	if err != nil {
 		if explicit != "" {
-			return "", fmt.Errorf("the session's hashing algorithm (%s) isn't supported, so --base can't be verified", conflict.BaseAlgorithm)
+			return "", fmt.Errorf("%w, so --base can't be verified", err)
 		}
 		return "", nil
 	}

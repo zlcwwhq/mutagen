@@ -225,8 +225,10 @@ Git's `HEAD` commit and index (read with `git cat-file`), or a file given with
 `--base`. With the ancestor, the `merged` file contains both sides' changes and
 marks only regions changed differently on each side, showing the local, base,
 and remote versions in Git's `diff3` style; without it, every region where the
-copies differ is marked. Binary copies get no merged file. Checking out again
-keeps an existing workspace and its edits.
+copies differ is marked. Binary copies get no merged file. Since synchronization
+continues meanwhile, checkout verifies that it downloaded the copies that it
+listed, whose ancestor it knows, and otherwise fails; check out again. Checking
+out again keeps an existing workspace and its edits.
 
 For two files, apply writes the merged file to both copies, or an original copy
 (`--take local` or `--take remote`), or deletes both copies (`--delete`);
