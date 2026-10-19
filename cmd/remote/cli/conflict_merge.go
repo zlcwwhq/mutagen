@@ -244,13 +244,202 @@ func markedMerge(a, b []byte, markers conflictMarkers) string {
 	return output.String()
 }
 
-// matchLines maps each line of base to the line of other that a minimal edit
-// script leaves it unchanged as, or to -1 if it's changed. Matches increase
-// monotonically.
-func matchLines(base, other []string) []int {
+// maximumAnchoringDepth bounds the recursion of anchoredEdits, which bounds its
+// cost for inputs whose lines only become unique in ever smaller ranges.
+const maximumAnchoringDepth = 16
+
+// longestIncreasing returns the indices of a longest strictly increasing
+// subsequence of values, using patience sorting: piles[p] is the index of the
+// value ending the best subsequence of length p+1 found so far, which is the
+// smallest such value.
+func longestIncreasing(values []int) []int {
+	var piles []int
+	previous := make([]int, len(values))
+	for v, value := range values {
+		p, _ := slices.BinarySearchFunc(piles, value, func(pile, value int) int {
+			return values[pile] - value
+		})
+		previous[v] = -1
+		if p > 0 {
+			previous[v] = piles[p-1]
+		}
+		if p == len(piles) {
+			piles = append(piles, v)
+		} else {
+			piles[p] = v
+		}
+	}
+	result := make([]int, len(piles))
+	if len(piles) > 0 {
+		for v, p := piles[len(piles)-1], len(piles)-1; v >= 0; v, p = previous[v], p-1 {
+			result[p] = v
+		}
+	}
+	return result
+}
+
+// anchoredEdits computes edit scripts transforming base into local and into
+// remote for a three-way merge. Both leave the lines that occur exactly once in
+// each of the three versions unchanged, as long as they appear in the same
+// order in all of them (keeping a longest such sequence), as patience diff
+// does for two versions, and recurse into the lines between them, where other
+// lines may occur once. Where there are no such lines, they're minimal (see
+// diffLines). They aren't necessarily minimal overall, which merges don't
+// require, since they compare the regions between unchanged lines by their
+// contents.
+//
+// Minimal scripts are often ambiguous: one may keep a line unchanged by
+// matching it with an equal line across a unique one, such as a delimiter,
+// deleting and inserting that one instead, as if the line had moved, while
+// another, equally short, keeps the delimiter. Scripts computed separately for
+// each side may resolve such ambiguities differently, depending on the changes
+// elsewhere, and a merge would then see a change made identically on both
+// sides as different changes, and apply it twice, or apply a deletion to a
+// line that one side inserted. Lines that are unique in all three versions are
+// matched the same way in both scripts, regardless of the changes around them,
+// and they divide the versions into the same ranges for both sides. (Lines
+// unique in base and in one side only, such as a line that the other side
+// duplicated, would be matched differently in the other side's script.)
+func anchoredEdits(base, local, remote []string, depth int) ([]edit, []edit) {
+	if depth >= maximumAnchoringDepth {
+		return diffLines(base, local), diffLines(base, remote)
+	}
+	type occurrences struct {
+		base, local, remote int
+		// at holds the positions in local and remote.
+		at [2]int
+	}
+	counts := make(map[string]*occurrences, len(base))
+	for _, line := range base {
+		if c := counts[line]; c != nil {
+			c.base++
+		} else {
+			counts[line] = &occurrences{base: 1}
+		}
+	}
+	for side, lines := range [][]string{local, remote} {
+		for j, line := range lines {
+			if c := counts[line]; c != nil {
+				if side == 0 {
+					c.local++
+				} else {
+					c.remote++
+				}
+				c.at[side] = j
+			}
+		}
+	}
+
+	// Find unique lines in the same order in all three versions. A longest
+	// such sequence is approximated by a longest sequence in the same order in
+	// base and one side, and of those, a longest sequence in the same order in
+	// the other side too, starting with whichever side yields more. (Lines
+	// that moved differently on each side may otherwise displace others, which
+	// are then ordered differently in the other side.)
+	var candidates [][3]int
+	for i, line := range base {
+		if c := counts[line]; c.base == 1 && c.local == 1 && c.remote == 1 {
+			candidates = append(candidates, [3]int{i, c.at[0], c.at[1]})
+		}
+	}
+	ordered := func(candidates [][3]int, side int) [][3]int {
+		positions := make([]int, len(candidates))
+		for c, candidate := range candidates {
+			positions[c] = candidate[side]
+		}
+		var result [][3]int
+		for _, c := range longestIncreasing(positions) {
+			result = append(result, candidates[c])
+		}
+		return result
+	}
+	anchors := ordered(ordered(candidates, 1), 2)
+	if alternative := ordered(ordered(candidates, 2), 1); len(alternative) > len(anchors) {
+		anchors = alternative
+	}
+	if len(anchors) == 0 {
+		return diffLines(base, local), diffLines(base, remote)
+	}
+
+	// Compute the scripts between the anchors.
+	var localScript, remoteScript []edit
+	i, j, k := 0, 0, 0
+	for _, anchor := range append(anchors, [3]int{len(base), len(local), len(remote)}) {
+		localGap, remoteGap := anchoredEdits(base[i:anchor[0]], local[j:anchor[1]], remote[k:anchor[2]], depth+1)
+		localScript, remoteScript = append(localScript, localGap...), append(remoteScript, remoteGap...)
+		if anchor[0] < len(base) {
+			localScript = append(localScript, edit{' ', base[anchor[0]]})
+			remoteScript = append(remoteScript, edit{' ', base[anchor[0]]})
+		}
+		i, j, k = anchor[0]+1, anchor[1]+1, anchor[2]+1
+	}
+	return localScript, remoteScript
+}
+
+// embedLeftmost determines which lines of a sequence are changed if a
+// subsequence of it, its unchanged lines, is matched as early as possible.
+func embedLeftmost(lines, unchanged []string) []bool {
+	changed := make([]bool, len(lines))
+	k := 0
+	for i, line := range lines {
+		if k < len(unchanged) && line == unchanged[k] {
+			k++
+		} else {
+			changed[i] = true
+		}
+	}
+	return changed
+}
+
+// canonicalEdits returns an edit script transforming base into other that
+// leaves lines with the same contents unchanged as a script does, but
+// positions every changed line canonically. A change adjacent to equal lines,
+// such as a line inserted next to an equal line, has several equivalent
+// positions, and scripts computed for different versions may choose different
+// ones, depending on the changes elsewhere (diffLines, for example, keeps
+// unchanged leading and trailing lines first). A three-way merge compares two
+// scripts' positions, so it would see an identical change made on both sides
+// at different positions as two changes, and apply it twice, without marking a
+// conflict. The unchanged lines are thus matched as early as possible in both
+// base and other, which moves each changed line as late as possible and
+// depends only on the lines around it, while leaving the unchanged lines'
+// contents, and thus their correspondence, as they were. (Git moves runs of
+// changes as late as possible too, but additionally prefers positions where
+// deletions and insertions are adjacent, which depends on the other changes in
+// the script, and thus differs between the sides.)
+func canonicalEdits(base, other []string, script []edit) []edit {
+	var unchanged []string
+	for _, e := range script {
+		if e.operation == ' ' {
+			unchanged = append(unchanged, e.line)
+		}
+	}
+	baseChanged, otherChanged := embedLeftmost(base, unchanged), embedLeftmost(other, unchanged)
+
+	// Rebuild the script, pairing the unchanged lines in order.
+	script = make([]edit, 0, len(script))
+	for i, j := 0, 0; i < len(base) || j < len(other); {
+		if i < len(base) && baseChanged[i] {
+			script = append(script, edit{'-', base[i]})
+			i++
+		} else if j < len(other) && otherChanged[j] {
+			script = append(script, edit{'+', other[j]})
+			j++
+		} else {
+			script = append(script, edit{' ', base[i]})
+			i, j = i+1, j+1
+		}
+	}
+	return script
+}
+
+// matchLines maps each line of base to the line of the other version that an
+// edit script transforming base into it leaves the line unchanged as, or to -1
+// if it's changed. Matches increase monotonically.
+func matchLines(base []string, script []edit) []int {
 	matches := make([]int, len(base))
 	i, j := 0, 0
-	for _, edit := range diffLines(base, other) {
+	for _, edit := range script {
 		switch edit.operation {
 		case ' ':
 			matches[i] = j
@@ -271,9 +460,18 @@ func matchLines(base, other []string) []int {
 // them, and either version if both changed them identically. Regions changed
 // differently on each side are marked, showing all three versions. It returns
 // the merged text and the number of marked regions.
+//
+// A merge is only as good as each side's alignment with the ancestor: a change
+// that both sides made identically must be aligned identically, since it would
+// otherwise be seen as two changes and applied twice (or, for a deletion,
+// delete more than either side did) without marking a conflict. The edit
+// scripts are thus anchored at the same lines (see anchoredEdits), and their
+// changes are positioned canonically (see canonicalEdits).
 func mergeThreeWay(base, local, remote []byte, markers conflictMarkers) (string, int) {
 	b, l, r := splitLines(base), splitLines(local), splitLines(remote)
-	localMatches, remoteMatches := matchLines(b, l), matchLines(b, r)
+	localScript, remoteScript := anchoredEdits(b, l, r, 0)
+	localMatches := matchLines(b, canonicalEdits(b, l, localScript))
+	remoteMatches := matchLines(b, canonicalEdits(b, r, remoteScript))
 	var output strings.Builder
 	regions := 0
 	i, j, k := 0, 0, 0
