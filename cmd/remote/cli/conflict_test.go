@@ -48,7 +48,10 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 			}
 			for _, side := range []string{sideLocal, sideRemote} {
 				o := &options{conflictOptions: conflictOptions{take: side}}
-				_, unlock, err := apply(ctx, root, o, local)
+				_, unlock, err := apply(ctx, root, o, local, func() (*remote.Listing, error) {
+					t.Fatal("conflicts listed for a directory workspace")
+					return nil, nil
+				})
 				if unlock != nil {
 					unlock()
 				}
@@ -286,6 +289,27 @@ func TestWorkspaceMetadata(t *testing.T) {
 		t.Fatal(err)
 	} else if _, err := loadWorkspace(local); err == nil {
 		t.Fatal("invalid applied result accepted")
+	}
+
+	// Each kind of resolution records that it was applied before changing a
+	// copy.
+	for _, applied := range []*workspace{
+		{Applied: []*remote.Entry{file}},
+		{Deleted: true},
+		{Removing: sideRemote},
+	} {
+		w := &workspace{Path: "file", Local: file, Remote: file, Applied: applied.Applied, Deleted: applied.Deleted, Removing: applied.Removing, directory: directory}
+		if w.save() != nil {
+			t.Fatal("unable to save workspace")
+		} else if loaded, err := loadWorkspace(local); err != nil || !loaded.applied() {
+			t.Fatalf("applied resolution not recorded: %+v: %v", applied, err)
+		}
+	}
+	w = &workspace{Path: "file", Local: file, Remote: file, directory: directory}
+	if err := w.save(); err != nil {
+		t.Fatal(err)
+	} else if loaded, err := loadWorkspace(local); err != nil || loaded.applied() {
+		t.Fatalf("unapplied workspace considered applied: %v", err)
 	}
 }
 

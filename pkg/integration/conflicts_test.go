@@ -48,16 +48,19 @@ type conflictListing struct {
 		Take       []string
 		CheckedOut bool
 	}
-	Pending []struct{ Path string }
+	Pending []struct {
+		Path    string
+		Applied bool
+	}
 }
 
 // conflictOutcome is a line of JSON output of other conflict operations.
 type conflictOutcome struct {
-	Path, Error, Local, Remote, Base, Merged string
-	Files, Binary, Pending, Resolved         bool
-	Regions                                  int
-	Take                                     []string
-	Backup                                   string
+	Path, Error, Local, Remote, Base, Merged  string
+	Files, Binary, Pending, Applied, Resolved bool
+	Regions                                   int
+	Take                                      []string
+	Backup                                    string
 }
 
 // conflictCommands runs conflict operations in a directory.
@@ -147,7 +150,7 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 			read := func(root, name string) string {
 				return readFile(filepath.Join(root, name))
 			}
-			for _, name := range []string{"text", "partial", "deleted", "edited", "large"} {
+			for _, name := range []string{"text", "resolved", "edited", "large"} {
 				write(roots[0], name, "base\n")
 			}
 			write(roots[0], "merge", "1\n2\n3\n4\n5\n")
@@ -158,8 +161,7 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 			}
 			for side, root := range roots {
 				write(root, "text", fmt.Sprintf("shared\nside%d\n", side))
-				write(root, "partial", fmt.Sprintf("side%d\n", side))
-				write(root, "deleted", fmt.Sprintf("side%d\n", side))
+				write(root, "resolved", fmt.Sprintf("side%d\n", side))
 				write(root, "edited", fmt.Sprintf("side%d\n", side))
 				write(root, "large", strings.Repeat(fmt.Sprintf("side%d data\n", side), 150000))
 			}
@@ -187,7 +189,7 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 					t.Fatalf("unexpected resolution: %+v", conflict)
 				}
 			}
-			if !slices.Equal(paths, []string{"deleted", "edited", "large", "merge", "partial", "text", "type"}) {
+			if !slices.Equal(paths, []string{"edited", "large", "merge", "resolved", "text", "type"}) {
 				t.Fatal("unexpected conflicts:", paths)
 			}
 
@@ -225,41 +227,30 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 				t.Fatal("merge not applied")
 			}
 
-			// A partially applied resolution remains a conflict, and applying
-			// again completes it.
-			c.checkout("partial")
-			write(opposite, "partial", read(local, "partial"))
+			// A conflict resolved some other way, such as by copying one copy
+			// over the other, is no longer listed. With nothing applied, its
+			// workspace is listed as such, and apply refuses it without
+			// changing either copy, since it would replace that resolution.
+			// Partially applied resolutions are retried elsewhere (see
+			// TestRemoteConflictRetryDeletion).
+			c.checkout("resolved")
+			resolved := read(local, "resolved")
+			write(opposite, "resolved", resolved)
 			if _, err := flushRemote(local); err != nil {
 				t.Fatal(err)
 			}
-			c.invoke("--conflict-apply", "--take", "local", "partial")
-			if read(opposite, "partial") != read(local, "partial") {
-				t.Fatal("partial resolution not completed")
+			if listing := c.list(); len(listing.Pending) != 1 || listing.Pending[0].Path != "resolved" || listing.Pending[0].Applied {
+				t.Fatalf("workspace with nothing applied not listed: %+v", listing.Pending)
+			} else if w := c.checkout("resolved"); !w.Pending || w.Applied {
+				t.Fatalf("workspace with nothing applied not described: %+v", w)
+			} else if !strings.Contains(c.invoke("--conflicts"), "with nothing applied") {
+				t.Fatal("workspace with nothing applied not listed as text")
 			}
-
-			// Synchronization may revert a partially applied resolution, such
-			// as a deletion, which it overrides with the local copy, removing
-			// the conflict. The resolution is still listed as pending, and
-			// applying again completes it.
-			c.checkout("deleted")
-			if err := os.Remove(filepath.Join(opposite, "deleted")); err != nil {
-				t.Fatal(err)
-			} else if _, err := flushRemote(local); err != nil {
-				t.Fatal(err)
-			} else if read(opposite, "deleted") != read(local, "deleted") {
-				t.Fatal("partial deletion not reverted")
+			c.fail("resolved some other way", "--conflict-apply", "--take", "remote", "resolved")
+			if read(local, "resolved") != resolved || read(opposite, "resolved") != resolved {
+				t.Fatal("resolution replaced")
 			}
-			if listing := c.list(); len(listing.Pending) != 1 || listing.Pending[0].Path != "deleted" {
-				t.Fatalf("pending resolution not listed: %+v", listing.Pending)
-			} else if !c.checkout("deleted").Pending {
-				t.Fatal("pending resolution not described")
-			}
-			c.invoke("--conflict-apply", "--delete", "deleted")
-			for _, root := range roots {
-				if _, err := os.Lstat(filepath.Join(root, "deleted")); !os.IsNotExist(err) {
-					t.Fatal("copies not deleted:", err)
-				}
-			}
+			c.invoke("--conflict-discard", "resolved")
 
 			// Unresolved markers and changed copies are rejected.
 			c.checkout("text")
@@ -346,6 +337,62 @@ func TestRemoteConflictRetryWithChangedResult(t *testing.T) {
 	for _, root := range roots {
 		if data := readFile(filepath.Join(root, path)); data != "second\n" {
 			t.Fatalf("result not applied: %q", data)
+		}
+	}
+}
+
+func TestRemoteConflictRetryDeletion(t *testing.T) {
+	// The local copy is made undeletable by its parent's permissions, which
+	// neither Windows nor the root user observe.
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip()
+	}
+	roots := createConflictSession(t, true, core.SynchronizationMode_SynchronizationModeTwoWaySafe)
+	local, opposite := roots[0], roots[1]
+	path := filepath.Join("sub", "file")
+	for _, root := range roots {
+		if err := os.Mkdir(filepath.Join(root, "sub"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(local, path), "base\n")
+	if _, err := flushRemote(local); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(local, path), "local\n")
+	writeFile(t, filepath.Join(opposite, path), "remote\n")
+	c := &conflictCommands{t: t, directory: local}
+	c.checkout(path)
+
+	// Apply fails after deleting only the remote copy.
+	if err := os.Chmod(filepath.Join(local, "sub"), 0500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(filepath.Join(local, "sub"), 0700)
+	c.fail("updated the remote copy", "--conflict-apply", "--delete", path)
+	if err := os.Chmod(filepath.Join(local, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Synchronization propagates the local copy over the partial deletion,
+	// which removes the conflict. The resolution is listed as unfinished, and
+	// applying again completes it.
+	if _, err := flushRemote(local); err != nil {
+		t.Fatal(err)
+	} else if readFile(filepath.Join(opposite, path)) != "local\n" {
+		t.Fatal("partial deletion not reverted")
+	}
+	if listing := c.list(); len(listing.Conflicts) != 0 || len(listing.Pending) != 1 || listing.Pending[0].Path != path || !listing.Pending[0].Applied {
+		t.Fatalf("unfinished resolution not listed: %+v", listing)
+	} else if w := c.checkout(path); !w.Pending || !w.Applied {
+		t.Fatalf("unfinished resolution not described: %+v", w)
+	} else if !strings.Contains(c.invoke("--conflicts"), "Applied, but no longer listed") {
+		t.Fatal("unfinished resolution not listed as text")
+	}
+	c.invoke("--conflict-apply", "--delete", path)
+	for _, root := range roots {
+		if _, err := os.Lstat(filepath.Join(root, path)); !os.IsNotExist(err) {
+			t.Fatal("copies not deleted:", err)
 		}
 	}
 }
@@ -664,21 +711,21 @@ func TestRemoteConflictTakeReplacedCopy(t *testing.T) {
 }
 
 func TestRemoteConflictTakeResolvedMeanwhile(t *testing.T) {
-	// A conflict that synchronization resolved in favor of the copy taken,
-	// such as because the other copy was deleted, is verified without
-	// deleting anything.
+	// A conflict that was resolved some other way, such as by deleting the
+	// other copy, which synchronization then replaces with the copy taken, is
+	// no longer listed. With nothing applied, apply refuses it without
+	// deleting anything, and its workspace is discarded instead.
 	roots, c := createTakeConflict(t)
 	if err := os.Remove(filepath.Join(roots[1], "file")); err != nil {
 		t.Fatal(err)
 	} else if _, err := flushRemote(roots[0]); err != nil {
 		t.Fatal(err)
 	}
-	if outcome := c.outcomes("--conflict-apply", "--take", "local", "file")[0]; !outcome.Resolved {
-		t.Fatalf("not resolved: %+v", outcome)
-	}
+	c.fail("resolved some other way", "--conflict-apply", "--take", "local", "file")
 	for _, root := range roots {
 		if target, err := os.Readlink(filepath.Join(root, "file")); err != nil || target != "target" {
-			t.Fatalf("symbolic link not taken: %q: %v", target, err)
+			t.Fatalf("symbolic link not kept: %q: %v", target, err)
 		}
 	}
+	c.invoke("--conflict-discard", "file")
 }

@@ -55,7 +55,8 @@ In two-way-safe (the default) and one-way-safe sessions, use the
 [conflict workflow](references/conflicts.md) to download both copies of a
 conflict, merge them locally, and apply the result to both sides. Use
 `remote --conflicts` rather than flush warnings as the complete list, including
-resolutions left unfinished. Preserve both sides' intent when it is clear, and
-ask the user when it's ambiguous, especially without a common ancestor.
+resolutions left unfinished and workspaces to discard. Preserve both sides'
+intent when it is clear, and ask the user when it's ambiguous, especially
+without a common ancestor.
 Conflicts involving directories require manual resolution; checkout and apply
 reject them, including existing workspaces. Report these to the user.

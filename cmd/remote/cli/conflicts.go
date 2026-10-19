@@ -55,6 +55,10 @@ var errReported = errors.New("conflict operations failed")
 // errDirectoryConflict indicates that a conflict requires manual resolution.
 var errDirectoryConflict = errors.New("conflicts involving directories aren't supported; resolve this conflict manually")
 
+// errResolvedOtherwise indicates that apply refused a workspace with nothing
+// applied whose conflict is no longer listed (see workspace.applied).
+var errResolvedOtherwise = errors.New("is no longer listed as a conflict, and nothing was applied, so it was resolved some other way; apply changed neither copy: check them, then discard the workspace")
+
 // conflictOptions are the options for conflict resolution, which is separate
 // from command execution and its flush policy.
 type conflictOptions struct {
@@ -154,6 +158,9 @@ type workspace struct {
 	// written) to either copy, which retries may supersede, since they're the
 	// workspace's own, even if the merged file has changed since.
 	Applied []*remote.Entry `json:",omitempty"`
+	// Deleted indicates that apply has deleted (or may have deleted) either
+	// copy of a conflict between two files, as the resolution's result.
+	Deleted bool `json:",omitempty"`
 	// Removing is the copy that apply has deleted (or may have deleted) to
 	// take the other, for conflicts other than between two files. Retries
 	// don't delete the copy that synchronization then propagates in its place.
@@ -165,6 +172,17 @@ type workspace struct {
 // file returns the path of a file in the workspace.
 func (w *workspace) file(name string) string {
 	return filepath.Join(w.directory, name)
+}
+
+// applied indicates whether apply has changed (or may have changed) either
+// copy, which it records before doing so. The resolution is then unfinished
+// until verified, even if its conflict is no longer listed, since
+// synchronization may have propagated the remaining original copy over it.
+// Otherwise, a conflict that's no longer listed was resolved some other way,
+// such as by editing or deleting a copy, and apply refuses to replace that
+// resolution.
+func (w *workspace) applied() bool {
+	return len(w.Applied) > 0 || w.Deleted || w.Removing != ""
 }
 
 // files indicates whether both copies are regular files, which can be merged.
@@ -342,26 +360,27 @@ func pruneWorkspaces() {
 	}
 }
 
-// sessionWorkspaces lists the paths of the workspaces checked out through a
-// target. Unreadable workspaces are skipped, since the listing is advisory.
-func sessionWorkspaces(target *remote.Target) map[string]bool {
-	paths := make(map[string]bool)
+// sessionWorkspaces lists the workspaces checked out through a target by
+// their paths. Unreadable workspaces are skipped, since the listing is
+// advisory.
+func sessionWorkspaces(target *remote.Target) map[string]*workspace {
+	workspaces := make(map[string]*workspace)
 	base, err := filesystem.Mutagen(false, workspacesDirectoryName)
 	if err != nil {
-		return paths
+		return workspaces
 	}
 	entries, err := os.ReadDir(base)
 	if err != nil {
-		return paths
+		return workspaces
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() || entry.Name() == backupsDirectoryName || strings.HasPrefix(entry.Name(), stagingPrefix) {
 			continue
 		} else if w, err := readWorkspace(filepath.Join(base, entry.Name())); err == nil && w.Session == target.Session && w.Alpha == target.Alpha {
-			paths[w.Path] = true
+			workspaces[w.Path] = w
 		}
 	}
-	return paths
+	return workspaces
 }
 
 // listConflicts synchronizes the session and lists all of its conflicts.
@@ -529,6 +548,11 @@ type outcome struct {
 	Take []string `json:",omitempty"`
 	// Pending indicates that a workspace's conflict is no longer listed.
 	Pending bool `json:",omitempty"`
+	// Applied indicates that apply has changed (or may have changed) either
+	// copy through the workspace, so that its resolution is unfinished until
+	// verified. A pending workspace with nothing applied was resolved some
+	// other way, and apply refuses it.
+	Applied bool `json:",omitempty"`
 	// Resolved indicates that apply resolved the conflict.
 	Resolved bool `json:",omitempty"`
 	// Discarded indicates that discard set the workspace aside.
@@ -627,12 +651,17 @@ type listedConflict struct {
 	CheckedOut bool `json:",omitempty"`
 }
 
-// pendingResolution is an unfinished resolution as listed by --conflicts
-// --json, whose conflict is no longer listed. It's finished by applying again
-// or set aside by discarding it.
+// pendingResolution is a workspace as listed by --conflicts --json whose
+// conflict is no longer listed. If something was applied, its resolution is
+// unfinished, and it's finished by applying again or set aside by discarding
+// it. Otherwise, the conflict was resolved some other way, apply refuses it,
+// and it's set aside by discarding it.
 type pendingResolution struct {
 	// Path is the local path of the conflict root.
 	Path string
+	// Applied indicates whether apply has changed (or may have changed) either
+	// copy through the workspace (see workspace.applied).
+	Applied bool `json:",omitempty"`
 }
 
 // localSides converts which endpoints' copies of a conflict can be taken to
@@ -652,10 +681,12 @@ func localSides(conflict *remote.ConflictRoot, target *remote.Target) []string {
 	return sides
 }
 
-// printConflicts lists conflicts and unfinished resolutions, whose conflicts
-// may no longer be listed if synchronization propagated one copy over a
-// partially applied resolution. Paths are local paths, which are relative to
-// the working directory if it's inside the root, as other operations expect.
+// printConflicts lists conflicts and the workspaces whose conflicts are no
+// longer listed: unfinished resolutions, whose conflicts may no longer be
+// listed if synchronization propagated one copy over a partially applied
+// resolution, and workspaces with nothing applied, whose conflicts were
+// resolved some other way. Paths are local paths, which are relative to the
+// working directory if it's inside the root, as other operations expect.
 func printConflicts(ctx context.Context, directory string, o *options, output io.Writer) error {
 	listing, target, err := listConflicts(ctx, directory, o.session)
 	if err != nil {
@@ -668,22 +699,29 @@ func printConflicts(ctx context.Context, directory string, o *options, output io
 		conflict := &listing.Conflicts[c]
 		conflicts[c] = listedConflict{
 			Path: l.local(conflict.Path), Resolvable: conflict.Resolvable(), Files: conflict.Files,
-			Take: localSides(conflict, target), CheckedOut: workspaces[conflict.Path],
+			Take: localSides(conflict, target), CheckedOut: workspaces[conflict.Path] != nil,
 		}
 		delete(workspaces, conflict.Path)
 	}
-	var pending []string
+	var pending, unfinished, unapplied []string
 	for path := range workspaces {
 		pending = append(pending, path)
 	}
 	slices.Sort(pending)
+	for _, path := range pending {
+		if workspaces[path].applied() {
+			unfinished = append(unfinished, path)
+		} else {
+			unapplied = append(unapplied, path)
+		}
+	}
 	if o.json {
 		listed := struct {
 			Conflicts []listedConflict
 			Pending   []pendingResolution
 		}{Conflicts: conflicts, Pending: make([]pendingResolution, len(pending))}
 		for p, path := range pending {
-			listed.Pending[p] = pendingResolution{Path: l.local(path)}
+			listed.Pending[p] = pendingResolution{Path: l.local(path), Applied: workspaces[path].applied()}
 		}
 		return json.NewEncoder(output).Encode(&listed)
 	} else if len(conflicts) == 0 && len(pending) == 0 {
@@ -704,9 +742,18 @@ func printConflicts(ctx context.Context, directory string, o *options, output io
 			return err
 		}
 	}
-	if len(pending) > 0 {
-		fmt.Fprintln(output, "Checked out, but no longer listed as conflicts (apply again to finish resolving, or discard):")
-		for _, path := range pending {
+	for _, section := range []struct {
+		heading string
+		paths   []string
+	}{
+		{"Applied, but no longer listed as conflicts (apply again to finish resolving, or discard):", unfinished},
+		{"Checked out, but no longer listed as conflicts, with nothing applied (resolved some other way; discard, which changes neither copy):", unapplied},
+	} {
+		if len(section.paths) == 0 {
+			continue
+		}
+		fmt.Fprintln(output, section.heading)
+		for _, path := range section.paths {
 			if _, err := fmt.Fprintln(output, "  "+l.display(path)); err != nil {
 				return err
 			}
@@ -894,9 +941,18 @@ func describeKind(entry *remote.Entry) string {
 	return entry.Kind
 }
 
+// pendingNote describes what remains to do for a workspace whose conflict is
+// no longer listed.
+func pendingNote(w *workspace) string {
+	if w.applied() {
+		return "The conflict is no longer listed: apply again to finish resolving it, or discard the workspace."
+	}
+	return "The conflict is no longer listed, and nothing was applied, so it was resolved some other way: discard the workspace, which changes neither copy (apply refuses it)."
+}
+
 // describe describes a workspace for its checkout.
 func describe(w *workspace, argument string, pending bool) (*outcome, error) {
-	result := &outcome{Path: argument, Local: w.file(localName), Remote: w.file(remoteName), Files: w.files(), Take: w.Take, Pending: pending}
+	result := &outcome{Path: argument, Local: w.file(localName), Remote: w.file(remoteName), Files: w.files(), Take: w.Take, Pending: pending, Applied: w.applied()}
 	note := func(format string, arguments ...any) {
 		result.lines = append(result.lines, fmt.Sprintf(format, arguments...))
 	}
@@ -904,7 +960,7 @@ func describe(w *workspace, argument string, pending bool) (*outcome, error) {
 		note("Local:  %s (%s)", result.Local, describeKind(w.Local))
 		note("Remote: %s (%s)", result.Remote, describeKind(w.Remote))
 		if pending {
-			note("The conflict is no longer listed: apply again to finish resolving it, or discard the workspace.")
+			note("%s", pendingNote(w))
 		}
 		var options []string
 		for _, side := range w.Take {
@@ -1031,8 +1087,9 @@ type application struct {
 }
 
 // applyAll applies the resolutions of the specified conflicts and then
-// verifies them, synchronizing once, and once more before taking copies (see
-// takeCopy). Workspaces remain locked until verified.
+// verifies them, synchronizing once, once more before writing results through
+// workspaces with nothing applied (see apply), and once more before taking
+// copies (see takeCopy). Workspaces remain locked until verified.
 func applyAll(ctx context.Context, directory string, o *options, p *printer) error {
 	var unlocks []func()
 	defer func() {
@@ -1040,9 +1097,22 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 			unlock()
 		}
 	}()
+	// Results aren't written through workspaces with nothing applied whose
+	// conflicts are no longer listed (see workspace.applied), which requires a
+	// listing before writing them. It's made at most once, when first needed,
+	// and isn't needed to finish resolutions applied before, nor to take
+	// copies, which uses the listing that confirms that they can be taken.
+	var preliminary *remote.Listing
+	var preliminaryErr error
+	listed := func() (*remote.Listing, error) {
+		if preliminary == nil && preliminaryErr == nil {
+			preliminary, _, preliminaryErr = listConflicts(ctx, directory, o.session)
+		}
+		return preliminary, preliminaryErr
+	}
 	var applications []*application
 	for _, argument := range o.arguments {
-		a, unlock, err := apply(ctx, directory, o, argument)
+		a, unlock, err := apply(ctx, directory, o, argument, listed)
 		if unlock != nil {
 			unlocks = append(unlocks, unlock)
 		}
@@ -1093,8 +1163,10 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 // over a partially applied resolution (such as a deletion, or a result
 // matching the copies' common ancestor), removing the conflict without
 // resolving it, so failures can be retried whether or not the conflict is
-// still listed.
-func apply(ctx context.Context, directory string, o *options, argument string) (*application, func(), error) {
+// still listed. Workspaces with nothing applied are refused if their conflicts
+// are no longer listed, using a listing obtained from listed (see
+// workspace.applied).
+func apply(ctx context.Context, directory string, o *options, argument string, listed func() (*remote.Listing, error)) (*application, func(), error) {
 	local, err := filepath.Abs(argument)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to locate it: %w", err)
@@ -1119,6 +1191,15 @@ func apply(ctx context.Context, directory string, o *options, argument string) (
 	if path, err := a.locator.resolve(local); err != nil || !w.matches(target, path) {
 		connection.Close()
 		return nil, unlock, errors.New("the workspace was checked out through a different session or endpoint")
+	}
+	if w.files() && !w.applied() {
+		if listing, err := listed(); err != nil {
+			connection.Close()
+			return nil, unlock, fmt.Errorf("unable to synchronize before applying: %w", err)
+		} else if findConflict(listing, w.Path) == nil {
+			connection.Close()
+			return nil, unlock, errResolvedOtherwise
+		}
 	}
 	if w.files() {
 		err = a.writeResult(ctx, o, connection)
@@ -1159,11 +1240,21 @@ func (a *application) writeResult(ctx context.Context, o *options, connection io
 		return fmt.Errorf("unable to update the local copy: %w", staleHint(err))
 	}
 	// Record a file result before writing it, since either write may succeed
-	// even if apply fails, so that retries recognize it.
+	// even if apply fails, so that retries recognize it. Record a deletion
+	// too, so that retries finish it even once synchronization has propagated
+	// the remaining copy over it, which removes the conflict (see
+	// workspace.applied).
+	recorded := true
 	if result.Kind == remote.EntryFile && !slices.ContainsFunc(w.Applied, func(applied *remote.Entry) bool {
 		return remote.SameContents(applied, result)
 	}) {
 		w.Applied = append(w.Applied, result)
+	} else if result.Kind == remote.EntryMissing && !w.Deleted {
+		w.Deleted = true
+	} else {
+		recorded = false
+	}
+	if recorded {
 		if err := w.save(); err != nil {
 			connection.Close()
 			return fmt.Errorf("unable to save workspace: %w", err)
@@ -1264,10 +1355,11 @@ func (a *application) readTaken(ctx context.Context, directory string, o *option
 // conditions if it lists the conflict with that copy takable, as long as the
 // copy is unchanged when read again, so that the listing's synchronization
 // cycle saw it as read. If the conflict is no longer listed, nothing is
-// deleted, and verification determines whether the copies already match,
-// such as because synchronization propagated the copy taken over a deletion
-// by a previous attempt. Once a deletion has been attempted, retries also skip
-// it if the copy no longer matches.
+// deleted, and the resolution is refused if nothing was applied (see
+// workspace.applied), while verification otherwise determines whether the
+// copies already match, such as because synchronization propagated the copy
+// taken over a deletion by a previous attempt. Once a deletion has been
+// attempted, retries also skip it if the copy no longer matches.
 func (a *application) takeCopy(ctx context.Context, directory string, o *options, listing *remote.Listing) error {
 	w := a.w
 	taken, err := a.readTaken(ctx, directory, o)
@@ -1276,11 +1368,14 @@ func (a *application) takeCopy(ctx context.Context, directory string, o *options
 	} else if !remote.SameContents(taken, a.taken) || taken.Executable != a.taken.Executable {
 		return fmt.Errorf("the %s copy changed while synchronizing (synchronization replaces a copy changed back to what both copies last agreed on); check it, then retry", o.take)
 	}
+	conflict := findConflict(listing, w.Path)
+	if conflict == nil && !w.applied() {
+		return errResolvedOtherwise
+	}
 	deleted, entry := sideRemote, w.Remote
 	if o.take == sideRemote {
 		deleted, entry = sideLocal, w.Local
 	}
-	conflict := findConflict(listing, w.Path)
 	if entry.Kind == remote.EntryMissing || remote.SameContents(taken, entry) || conflict == nil {
 		// There's nothing to delete, the taken copy matches the other one (in
 		// which case synchronization may already consider the copies to agree

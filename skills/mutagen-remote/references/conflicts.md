@@ -9,8 +9,13 @@ one-way-safe synchronization mode. For conflicts that it can't resolve, see
    paths relative to the current directory. Conflicts that aren't between two
    files say which copies `--take` can keep. Lines marked as something remote
    can't resolve need the manual approach. Conflicts involving directories
-   are rejected by checkout and apply; report these to the user. Resolutions
-   left unfinished are listed at the end: finish supported ones first (step 4).
+   are rejected by checkout and apply; report these to the user. Workspaces
+   whose conflicts are no longer listed come at the end. Finish resolutions
+   that were applied but left unfinished first (step 4). Workspaces with
+   nothing applied belong to conflicts that were resolved some other way (by
+   the user, or by synchronization replacing a copy changed back to what both
+   sides last agreed on): apply refuses them, so check that the copies are
+   what the user wants, then discard them.
 2. Run `remote --conflict-checkout <path>...`. For each path, it prints the
    paths of the files in a workspace outside the synced tree: `Local` and
    `Remote` (both complete copies) and, for two files, `Merged` and, if found,
@@ -81,7 +86,10 @@ one original over a partially applied result, which removes the conflict
 without applying your result. A copy that already has the result is left
 alone, a copy with a result applied before is replaced, and the workspace
 remains until both copies match. A retry restores an original moved aside by
-an interrupted replacement if its path is still missing. Existing workspaces
+an interrupted replacement if its path is still missing. If nothing was
+applied and the conflict is no longer listed, apply refuses without changing
+either copy, since the conflict was resolved some other way: discard the
+workspace (its copies remain in the backup). Existing workspaces
 involving directories can only be discarded, not applied. A conflict operation
 on a path fails while another one on it is in progress, without changing
 anything.
@@ -90,7 +98,9 @@ Conflict operations accept several paths, with options before them, so that
 many conflicts can be resolved the same way at once, such as
 `remote --conflict-apply --take local <path>...` after checking them out.
 `--json` prints results as JSON: the listing as `{"Conflicts": [{"Path",
-"Resolvable", "Files", "Take", "CheckedOut"}], "Pending": [{"Path"}]}`, and
-other operations as one line per path, such as a checkout's `{"Path", "Local",
-"Remote", "Base", "Merged", "Files", "Binary", "Regions", "Take", "Pending"}`
-or an `"Error"` for a path that failed.
+"Resolvable", "Files", "Take", "CheckedOut"}], "Pending": [{"Path",
+"Applied"}]}`, where `Pending` lists workspaces whose conflicts are no longer
+listed and `Applied` marks unfinished resolutions (the others are to be
+discarded), and other operations as one line per path, such as a checkout's
+`{"Path", "Local", "Remote", "Base", "Merged", "Files", "Binary", "Regions",
+"Take", "Pending", "Applied"}` or an `"Error"` for a path that failed.

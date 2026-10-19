@@ -75,7 +75,9 @@ Notes:
     specify paths to compare omitted files. --timeout also covers file reads.
   - Conflicts can be resolved in two-way-safe and one-way-safe sessions.
     remote --conflicts synchronizes, lists every conflict and how it can be
-    resolved, and lists unfinished resolutions. Conflict operations accept
+    resolved, and lists workspaces whose conflicts are no longer listed:
+    unfinished resolutions, and workspaces with nothing applied, whose
+    conflicts were resolved some other way. Conflict operations accept
     several paths, with options before them.
   - --conflict-checkout downloads both complete copies into a workspace (in
     the Mutagen data directory) and prints their paths. For two files, it also
@@ -105,9 +107,12 @@ Notes:
     (synchronization may copy one over the other) or a result that it applied
     before, so it fails if either copy was edited since checkout; then discard
     the workspace and check out again. Other failures can be retried, even if
-    the conflict is no longer listed or the merged file was edited since.
-    Copies differing in executability need --executable or --take. A conflict
-    operation fails while another one on the same path is running.
+    the conflict is no longer listed or the merged file was edited since. If
+    nothing was applied and the conflict is no longer listed, apply refuses
+    without changing either copy, since it was resolved some other way;
+    discard the workspace. Copies differing in executability need
+    --executable or --take. A conflict operation fails while another one on
+    the same path is running.
   - No terminal is allocated, so interactive programs don't work.
   - /bin/sh sources .remote-prologue.sh in the executing endpoint's sync root
     if it exists, otherwise that endpoint's configured remotePrologue, before

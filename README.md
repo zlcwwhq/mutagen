@@ -264,8 +264,12 @@ edited since checkout, apply fails without changing it; discard the workspace
 and check out again. Any other failed apply can be retried, even if the
 conflict is no longer listed (`remote --conflicts` lists such unfinished
 resolutions) or the merged file was edited since, and copies that already match
-the result are left as they are. If a replacement was interrupted after moving
-the original aside, a retry restores it to the missing path before proceeding.
+the result are left as they are. A workspace through which nothing was applied,
+however, belongs to a conflict that was resolved some other way once it's no
+longer listed: `remote --conflicts` lists it separately, and apply refuses it
+without changing either copy, rather than replace that resolution, so discard
+it. If a replacement was interrupted after moving the original aside, a retry
+restores it to the missing path before proceeding.
 Workspaces of resolved and discarded conflicts are kept for 7 days, so that
 the original copies can be recovered.
 

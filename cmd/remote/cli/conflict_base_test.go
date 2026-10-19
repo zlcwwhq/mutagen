@@ -199,8 +199,8 @@ func TestRetireAndPrune(t *testing.T) {
 	w := &workspace{Session: "session", Path: "file", Local: file, Remote: file, directory: directory}
 	if err := w.save(); err != nil {
 		t.Fatal(err)
-	} else if paths := sessionWorkspaces(&remote.Target{Session: "session"}); !paths["file"] {
-		t.Fatal("workspace not listed")
+	} else if paths := sessionWorkspaces(&remote.Target{Session: "session"}); paths["file"] == nil || paths["file"].applied() {
+		t.Fatal("workspace not listed as checked out with nothing applied")
 	} else if paths := sessionWorkspaces(&remote.Target{Session: "session", Alpha: true}); len(paths) != 0 {
 		t.Fatal("workspace of another endpoint listed")
 	}
