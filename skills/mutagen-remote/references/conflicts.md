@@ -106,23 +106,32 @@ on a path fails while another one on it is in progress on the same side,
 without changing anything.
 
 If a conflicting path changed after checkout anyway (by you, the user, or a
-tool on either side), the synchronized files remain authoritative, and
-discarding is always safe: it changes neither copy and keeps the workspace,
-whose location it prints. Run `remote --conflicts`, then:
+tool on either side), first find and stop whatever changed it, such as an
+editor, a watcher or formatter, a remote job, or a `git` command, or it will
+change again. The synchronized files remain authoritative, and discarding is
+always safe: it changes neither copy and keeps the workspace, whose location it
+prints (`Backup` with `--json`). Run `remote --conflicts`, then:
 
 - If the conflict is still listed (flagged as changed, or apply reported that a
   copy changed or that the path conflicts again), discard, check out again, and
-  merge the new copies, reusing the decisions in the discarded workspace's
-  `merged` file. If apply also said that it updated the remote copy, that copy
-  has your result, and the new conflict is between it and the changed local
-  copy.
-- If the conflict is no longer listed and nothing was applied, the change may
-  have ended it: reverting or deleting one copy, for example, lets
+  merge the new copies. Diffing the discarded workspace's `local` or `remote`
+  with the new copy shows what changed, and its `merged` file has your earlier
+  decisions to reuse. If apply also said that it updated the remote copy, that
+  copy has your result, and the new conflict is between it and the changed
+  local copy.
+- If the conflict is no longer listed, and either nothing was applied or
+  applying an unfinished resolution again reports that a copy changed, the
+  change ended the conflict: reverting or deleting one copy, for example, lets
   synchronization copy the other one over it, so that side's changes now exist
-  only in the workspace. Discard, compare the discarded workspace's `local` and
-  `remote` with the current file, and restore anything lost by editing the file
-  normally (it's no longer a conflict). Ask the user when the intended content
-  is unclear.
+  only in the workspace. Checking out again fails, since nothing conflicts.
+  Discard, then compare the current file with the discarded workspace's
+  `local` and `remote`. If it matches one of them, the other side's changes
+  were overwritten, and a complete `merged` file is the result to restore. If
+  it matches neither, someone wrote a new version: compare it with both and
+  with `merged`. Restore anything lost by editing the file normally (it's no
+  longer a conflict), then run `remote --flush`. Leave it as it is if the user
+  resolved the conflict this way on purpose, and ask the user when the
+  intended content is unclear.
 - Changes made while apply was writing a copy may have been overwritten without
   an error, and can't be recovered.
 - If checkout or apply says that it's unable to read the workspace, discard it.

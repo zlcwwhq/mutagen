@@ -84,12 +84,13 @@ Notes:
     either endpoint, and leave them unchanged until apply finishes; changing
     them meanwhile isn't supported. Apply fails without writing a copy that
     changed before it ran, but can overwrite changes made while it runs. If
-    they change anyway, discard the workspace and check out again. A change
-    that ends the conflict (such as reverting or deleting one copy, so that
-    synchronization copies the other over it) may leave one side's changes
-    only in the workspace, which discard keeps. Each conflict is checked out
-    once, through one endpoint, which alone can apply or discard it: checking
-    it out again, through either endpoint, fails until then.
+    they change anyway, stop whatever changed them, then discard the
+    workspace and check out again. A change that ends the conflict (such as
+    reverting or deleting one copy, so that synchronization copies the other
+    over it) may leave one side's changes only in the workspace, which
+    discard keeps. Each conflict is checked out once, through one endpoint,
+    which alone can apply or discard it: checking it out again, through
+    either endpoint, fails until then.
   - --conflict-checkout downloads both complete copies into a workspace (in
     the Mutagen data directory) and prints their paths. For two files, it also
     looks for their common ancestor (the file that both endpoints last agreed
