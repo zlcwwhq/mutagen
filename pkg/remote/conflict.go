@@ -56,12 +56,16 @@ func (c *ConflictRoot) Resolvable() bool {
 }
 
 // Listing is a complete listing of a session's conflicts and problems as of a
-// synchronization cycle.
+// synchronization cycle, along with its checkouts.
 type Listing struct {
 	// Conflicts are the conflicts, sorted by root path.
 	Conflicts []ConflictRoot
 	// Problems are the problems that the endpoints encountered.
 	Problems []Problem
+	// Checkouts are the session's checkouts, sorted by path, which may include
+	// paths that are no longer conflict roots, such as those of unfinished
+	// resolutions.
+	Checkouts []Checkout
 }
 
 // conflictsMessage is a message of a conflict listing, which consists of one
@@ -75,14 +79,16 @@ type conflictsMessage struct {
 	Conflict *ConflictRoot `json:",omitempty"`
 	// Problem is the listed problem, if any.
 	Problem *Problem `json:",omitempty"`
+	// Checkout is the listed checkout, if any.
+	Checkout *Checkout `json:",omitempty"`
 	// Done indicates the end of a complete listing.
 	Done bool `json:",omitempty"`
 }
 
 // RespondWithConflicts sends the outcome of a conflicts submission and closes
-// the connection. Conflicts and problems are sent in separate messages, so the
-// listing isn't bounded by the message size limit. It returns any error
-// encountered sending the response.
+// the connection. Conflicts, problems, and checkouts are sent in separate
+// messages, so the listing isn't bounded by the message size limit. It returns
+// any error encountered sending the response.
 func RespondWithConflicts(connection io.ReadWriteCloser, listing *Listing, err error) error {
 	defer connection.Close()
 	if err != nil {
@@ -99,6 +105,11 @@ func RespondWithConflicts(connection io.ReadWriteCloser, listing *Listing, err e
 			return err
 		}
 	}
+	for c := range listing.Checkouts {
+		if err := writeMessage(writer, &conflictsMessage{Checkout: &listing.Checkouts[c]}); err != nil {
+			return err
+		}
+	}
 	if err := writeMessage(writer, &conflictsMessage{Done: true}); err != nil {
 		return err
 	}
@@ -106,8 +117,8 @@ func RespondWithConflicts(connection io.ReadWriteCloser, listing *Listing, err e
 }
 
 // ListConflicts waits for the synchronization cycle requested by a conflicts
-// submission (see Dial) to complete and returns the session's conflicts and
-// problems. It owns and closes the connection.
+// submission (see Dial) to complete and returns the session's conflicts,
+// problems, and checkouts. It owns and closes the connection.
 func ListConflicts(ctx context.Context, connection io.ReadWriteCloser) (*Listing, error) {
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
@@ -129,6 +140,8 @@ func ListConflicts(ctx context.Context, connection io.ReadWriteCloser) (*Listing
 			listing.Conflicts = append(listing.Conflicts, *message.Conflict)
 		} else if message.Problem != nil {
 			listing.Problems = append(listing.Problems, *message.Problem)
+		} else if message.Checkout != nil {
+			listing.Checkouts = append(listing.Checkouts, *message.Checkout)
 		} else {
 			return nil, errors.New("invalid conflict listing")
 		}

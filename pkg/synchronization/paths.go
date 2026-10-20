@@ -33,3 +33,16 @@ func pathForArchive(session string) (string, error) {
 	// Success.
 	return filepath.Join(archivesDirectoryPath, session), nil
 }
+
+// pathForCheckouts computes the path to the serialized conflict checkouts for
+// the given session identifier.
+func pathForCheckouts(session string) (string, error) {
+	// Compute/create the checkouts directory.
+	checkoutsDirectoryPath, err := filesystem.Mutagen(true, filesystem.MutagenSynchronizationCheckoutsDirectoryName)
+	if err != nil {
+		return "", fmt.Errorf("unable to compute/create checkouts directory: %w", err)
+	}
+
+	// Success.
+	return filepath.Join(checkoutsDirectoryPath, session), nil
+}

@@ -24,13 +24,13 @@ func TestThreeWayWorkspace(t *testing.T) {
 		"1\nlocal\n3\n4\n", "1\n2\n3\nremote\n", "1\n2\n3\n4\n")
 	if data, err := os.ReadFile(w.file(mergedName)); err != nil || string(data) != "1\nlocal\n3\nremote\n" {
 		t.Fatalf("copies not merged: %q: %v", data, err)
-	} else if result, err := describe(w, "file", false); err != nil || result.Regions != 0 || result.Base != w.file(baseName) {
+	} else if result, err := describe(w, "file"); err != nil || result.Regions != 0 || result.Base != w.file(baseName) {
 		t.Fatalf("clean merge not described: %+v: %v", result, err)
 	} else if _, _, err := resolution(context.Background(), w, &options{}); err != nil {
 		t.Fatal("clean merge not applicable:", err)
 	}
 	w = newTestWorkspaceWithBase(t, &workspace{Path: "file", Token: "token", directory: t.TempDir()}, "local\n", "remote\n", "base\n")
-	if result, err := describe(w, "file", false); err != nil || result.Regions != 1 {
+	if result, err := describe(w, "file"); err != nil || result.Regions != 1 {
 		t.Fatalf("conflicting region not described: %+v: %v", result, err)
 	} else if data, _ := os.ReadFile(w.file(mergedName)); !strings.Contains(string(data), markersFor("token").base+"\nbase\n") {
 		t.Fatalf("base version not marked: %q", data)

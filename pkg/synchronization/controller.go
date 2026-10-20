@@ -92,6 +92,9 @@ type controller struct {
 	flushRequests chan chan error
 	// done will be closed by the current synchronization loop when it exits.
 	done chan struct{}
+	// checkoutsLock serializes access to the session's conflict checkouts,
+	// which are stored on disk (see claimCheckout).
+	checkoutsLock sync.Mutex
 }
 
 // newSession creates a new session and corresponding controller.
@@ -618,10 +621,13 @@ func (c *controller) halt(_ context.Context, mode controllerHaltMode, prompter s
 		// Wipe the session information from disk.
 		sessionRemoveErr := os.Remove(c.sessionPath)
 		archiveRemoveErr := os.Remove(c.archivePath)
+		checkoutsRemoveErr := c.removeCheckouts()
 		if sessionRemoveErr != nil {
 			return fmt.Errorf("unable to remove session from disk: %w", sessionRemoveErr)
 		} else if archiveRemoveErr != nil {
 			return fmt.Errorf("unable to remove archive from disk: %w", archiveRemoveErr)
+		} else if checkoutsRemoveErr != nil {
+			return fmt.Errorf("unable to remove conflict checkouts from disk: %w", checkoutsRemoveErr)
 		}
 	} else {
 		panic("invalid halt mode specified")

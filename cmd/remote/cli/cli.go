@@ -74,18 +74,19 @@ Notes:
     its root. Large conflict reports may omit changes and say how many;
     specify paths to compare omitted files. --timeout also covers file reads.
   - Conflicts can be resolved in two-way-safe and one-way-safe sessions.
-    remote --conflicts synchronizes, lists every conflict and how it can be
-    resolved, and lists workspaces whose conflicts are no longer listed:
-    unfinished resolutions, and workspaces with nothing applied, whose
-    conflicts were resolved some other way. Conflict operations accept
-    several paths, with options before them.
+    remote --conflicts synchronizes, lists every conflict, how it can be
+    resolved, and through which endpoint it's checked out, flags checked-out
+    copies that changed since checkout, and lists workspaces whose conflicts
+    are no longer listed: unfinished resolutions, and workspaces with nothing
+    applied, whose conflicts were resolved some other way. Conflict operations
+    accept several paths, with options before them.
   - Before checking out, stop anything that writes the conflicting paths on
     either endpoint, and leave them unchanged until apply finishes; changing
     them meanwhile isn't supported. Apply fails without writing a copy that
     changed before it ran, but can overwrite changes made while it runs.
-    Resolve each conflict from one endpoint only: workspaces are kept on the
-    system that checked them out, and conflict operations only exclude each
-    other there.
+    Each conflict is checked out once, through one endpoint, which alone can
+    apply or discard it: checking it out again, through either endpoint,
+    fails until then.
   - --conflict-checkout downloads both complete copies into a workspace (in
     the Mutagen data directory) and prints their paths. For two files, it also
     looks for their common ancestor (the file that both endpoints last agreed
@@ -95,9 +96,9 @@ Notes:
     the local, base, and remote versions; without it, every region where the
     copies differ is marked. Binary copies get no merged file. Checkout fails
     if the copies changed since they were listed (the ancestor might not be
-    theirs); check out again. Checking out again keeps an existing workspace
-    and its edits, so --base requires discarding it first. Conflicts involving
-    directories require manual resolution; checkout and apply reject them.
+    theirs); check out again. To check out with --base after checking out
+    without it, discard the workspace first. Conflicts involving directories
+    require manual resolution; checkout and apply reject them.
   - For two files, --conflict-apply writes the merged file (or the copy chosen
     by --take, or deletion with --delete) to both copies. For other conflicts
     (such as a symbolic link and a file), only --take is possible: it writes
@@ -105,7 +106,10 @@ Notes:
     synchronizes and checks that both copies match and no conflict or problem
     involves the path. The workspace, with the original copies, is then kept
     for 7 days in case the resolution was wrong, as is one that
-    --conflict-discard sets aside without changing either copy.
+    --conflict-discard sets aside without changing either copy. Both release
+    the checkout, so the conflict can be checked out again; --conflicts also
+    releases checkouts whose workspaces are missing, such as after an
+    interrupted checkout.
   - Apply only replaces or deletes a copy that matches a checked-out copy
     (synchronization may copy one over the other), which the workspace keeps,
     or a result that it applied before, so it fails if either copy changed

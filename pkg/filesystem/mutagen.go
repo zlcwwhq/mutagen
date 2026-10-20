@@ -51,6 +51,11 @@ const (
 	// directory.
 	MutagenSynchronizationStagingDirectoryName = "staging"
 
+	// MutagenSynchronizationCheckoutsDirectoryName is the name of the
+	// synchronization conflict checkout storage directory within the Mutagen
+	// data directory.
+	MutagenSynchronizationCheckoutsDirectoryName = "checkouts"
+
 	// MutagenForwardingDirectoryName is the name of the forwarding data
 	// directory within the Mutagen data directory.
 	MutagenForwardingDirectoryName = "forwarding"

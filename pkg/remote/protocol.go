@@ -122,6 +122,12 @@ const (
 	// OperationConflicts requests a synchronization cycle followed by a
 	// complete listing of the session's conflicts (see ListConflicts).
 	OperationConflicts
+	// OperationClaim requests that the daemon record a checkout of a conflict
+	// by the submitting endpoint (see ClaimCheckout).
+	OperationClaim
+	// OperationRelease requests that the daemon remove a checkout held by the
+	// submitting endpoint (see ReleaseCheckout).
+	OperationRelease
 )
 
 // submission is the header of each submission, written by the submitting

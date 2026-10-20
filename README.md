@@ -227,19 +227,29 @@ marks only regions changed differently on each side, showing the local, base,
 and remote versions in Git's `diff3` style; without it, every region where the
 copies differ is marked. Binary copies get no merged file. Since synchronization
 continues meanwhile, checkout verifies that it downloaded the copies that it
-listed, whose ancestor it knows, and otherwise fails; check out again. Checking
-out again keeps an existing workspace and its edits, so checking out with
-`--base` requires discarding it first (which changes neither copy).
+listed, whose ancestor it knows, and otherwise fails; check out again. A
+conflict can't be checked out again while its workspace exists, so checking out
+with `--base` after checking out without it requires discarding the workspace
+first (which changes neither copy).
 
 Resolution assumes that the conflicting paths don't change from checkout until
 apply finishes, so before checking out, stop editors, builds, and anything else
 that might write them on either endpoint. Changing a checked-out path isn't
 supported: apply refuses copies that changed before it runs, without writing
 them, but it doesn't lock them, so changes made while it runs can be
-overwritten. Likewise, resolve each conflict from one endpoint only:
-workspaces are kept on the system that checked them out, and conflict
-operations only exclude each other on the same system, so resolutions applied
-concurrently from both endpoints can replace each other's results.
+overwritten. `remote --conflicts` flags checked-out copies that changed since
+checkout, so that their workspaces can be discarded before any merge work.
+
+Each conflict is checked out once, through one endpoint. Workspaces are kept on
+the system that checked them out, so the daemon records which endpoint checked
+out each conflict, in its data directory, until the session is terminated.
+Checking a conflict out again, through either endpoint, fails until that
+endpoint applies or discards it, which releases the checkout, and
+`remote --conflicts` says through which endpoint each conflict is checked out.
+Apply confirms the checkout before writing either copy, so a workspace whose
+conflict the opposite endpoint has checked out can only be discarded.
+`remote --conflicts` also releases checkouts whose workspaces are missing, such
+as those of interrupted checkouts, as does discarding them.
 
 For two files, apply writes the merged file to both copies, or an original copy
 (`--take local` or `--take remote`), or deletes both copies (`--delete`);
@@ -270,11 +280,10 @@ listed (`remote --conflicts` lists such unfinished resolutions) or the merged
 file was edited since, and copies that already have the result are left as they
 are. A workspace through which nothing was applied, however, belongs to a
 conflict that was resolved some other way once it's no longer listed (such as
-through a workspace checked out from the other endpoint): `remote --conflicts`
-lists it separately, and apply refuses it without changing either copy, rather
-than replace that resolution, so discard it. Workspaces of resolved and
-discarded conflicts are kept for 7 days, so that the original copies can be
-recovered.
+by editing a copy): `remote --conflicts` lists it separately, and apply refuses
+it without changing either copy, rather than replace that resolution, so
+discard it. Workspaces of resolved and discarded conflicts are kept for 7 days,
+so that the original copies can be recovered.
 
 Conflict operations accept several paths, after their options, and `--json`
 prints machine-readable results, one line per path. A conflict operation fails

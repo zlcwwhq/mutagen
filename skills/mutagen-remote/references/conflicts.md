@@ -10,26 +10,32 @@ until apply finishes: before checking out, stop anything that writes them on
 either side, such as editors, watchers, and remote jobs, and don't edit,
 delete, or restore them (with `git checkout`, for example) in the meantime.
 Edit the files in the workspace instead. Apply refuses copies that changed
-before it runs, but it can overwrite changes made while it runs. Resolve each
-conflict from one side only: workspaces are kept on the side that checked them
-out, and the check that refuses a concurrent conflict operation on a path
-doesn't cover operations started on the other side.
+before it runs, but it can overwrite changes made while it runs. Each conflict
+is checked out once, through one side, which alone can apply or discard it:
+checking it out again, from either side, fails until then.
 
 1. Run `remote --conflicts`. It synchronizes and lists every conflict, with
    paths relative to the current directory. Conflicts that aren't between two
    files say which copies `--take` can keep. Lines marked as something remote
    can't resolve need the manual approach. Conflicts involving directories
-   are rejected by checkout and apply; report these to the user. Workspaces
-   whose conflicts are no longer listed come at the end. Finish resolutions
-   that were applied but left unfinished first (step 4). Workspaces with
-   nothing applied belong to conflicts that were resolved some other way, such
-   as by the user or from the other side: apply refuses them, so check that
-   the copies are what the user wants, then discard them.
+   are rejected by checkout and apply; report these to the user. Conflicts
+   checked out through the other side belong to whoever checked them out
+   there: leave them alone, and ask the user if they seem abandoned. A
+   conflict checked out here whose copy changed since checkout must be
+   discarded and checked out again. Workspaces whose conflicts are no longer
+   listed come at the end. Finish resolutions that were applied but left
+   unfinished first (step 4). Workspaces with nothing applied belong to
+   conflicts that were resolved some other way, such as by the user: apply
+   refuses them, so check that the copies are what the user wants, then
+   discard them. Paths still checked out through the other side, though no
+   longer listed as conflicts, may be unfinished resolutions: leave them
+   unchanged.
 2. Run `remote --conflict-checkout <path>...`. For each path, it prints the
    paths of the files in a workspace outside the synced tree: `Local` and
    `Remote` (both complete copies) and, for two files, `Merged` and, if found,
-   `Base`. Checking out again prints the same workspace and keeps your edits
-   (with `--base`, it fails instead; discard the workspace first).
+   `Base`. Each conflict can only be checked out once: checking out again
+   fails, printing the existing workspace's location and what to do with it,
+   and so does checking out a conflict that the other side checked out.
    If checkout says that the copies changed since conflicts were listed (such
    as by an edit while it ran), check out again.
 3. For two files, edit `Merged`. Conflicting regions are enclosed in markers:
@@ -93,17 +99,29 @@ copies but couldn't verify the resolution: fix the problem if you can (or
 report it to the user), then retry. If nothing was applied and the conflict is
 no longer listed, apply refuses without changing either copy, since the
 conflict was resolved some other way: discard the workspace (its copies remain
-in the backup). Existing workspaces involving directories can only be
-discarded, not applied. A conflict operation on a path fails while another one
-on it is in progress on the same side, without changing anything.
+in the backup). If apply says that the conflict is checked out through the
+other side, that side resolves it: discard this workspace. Existing workspaces
+involving directories can only be discarded, not applied. A conflict operation
+on a path fails while another one on it is in progress on the same side,
+without changing anything.
+
+Applying and discarding release the checkout, so that either side can check
+the conflict out again. If discard reports that it couldn't release the
+checkout (for example, while the session is disconnected), discard again
+later; `remote --conflicts` also releases checkouts whose workspaces are
+missing, such as those of interrupted checkouts.
 
 Conflict operations accept several paths, with options before them, so that
 many conflicts can be resolved the same way at once, such as
 `remote --conflict-apply --take local <path>...` after checking them out.
 `--json` prints results as JSON: the listing as `{"Conflicts": [{"Path",
-"Resolvable", "Files", "Take", "CheckedOut"}], "Pending": [{"Path",
-"Applied"}]}`, where `Pending` lists workspaces whose conflicts are no longer
-listed and `Applied` marks unfinished resolutions (the others are to be
-discarded), and other operations as one line per path, such as a checkout's
+"Resolvable", "Files", "Take", "CheckedOut", "Changed"}], "Pending": [{"Path",
+"Applied"}], "RemotePending": [<path>...]}`, where `CheckedOut` is `"local"`
+or `"remote"` (checked out through the other side) for checked-out conflicts,
+`Changed` marks local checkouts whose copies changed since checkout, `Pending`
+lists workspaces whose conflicts are no longer listed, `Applied` marks
+unfinished resolutions (the others are to be discarded), and `RemotePending`
+lists paths no longer listed as conflicts that the other side has still
+checked out. Other operations print one line per path, such as a checkout's
 `{"Path", "Local", "Remote", "Base", "Merged", "Files", "Binary", "Regions",
-"Take", "Pending", "Applied"}` or an `"Error"` for a path that failed.
+"Take"}` or an `"Error"` for a path that failed.

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/integration/protocols/netpipe"
 	"github.com/mutagen-io/mutagen/pkg/selection"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
@@ -53,21 +54,23 @@ type conflictListing struct {
 		Resolvable bool
 		Files      bool
 		Take       []string
-		CheckedOut bool
+		CheckedOut string
+		Changed    bool
 	}
 	Pending []struct {
 		Path    string
 		Applied bool
 	}
+	RemotePending []string
 }
 
 // conflictOutcome is a line of JSON output of other conflict operations.
 type conflictOutcome struct {
-	Path, Error, Local, Remote, Base, Merged  string
-	Files, Binary, Pending, Applied, Resolved bool
-	Regions                                   int
-	Take                                      []string
-	Backup                                    string
+	Path, Error, Local, Remote, Base, Merged string
+	Files, Binary, Resolved, Discarded       bool
+	Regions                                  int
+	Take                                     []string
+	Backup                                   string
 }
 
 // conflictCommands runs conflict operations in a directory.
@@ -200,9 +203,9 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 				t.Fatal("unexpected conflicts:", paths)
 			}
 
-			// Large copies are downloaded completely, repeated checkouts
-			// preserve edits, and applying resolves the conflict and keeps
-			// the original copies.
+			// Large copies are downloaded completely, checking out again is
+			// refused without changing the workspace, and applying resolves
+			// the conflict and keeps the original copies.
 			w := c.checkout("large")
 			for _, path := range []string{w.Local, w.Remote} {
 				if info, err := os.Stat(path); err != nil || info.Size() <= 1024*1024 {
@@ -210,7 +213,7 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 				}
 			}
 			writeFile(t, w.Merged, "merged\n")
-			c.checkout("large")
+			c.fail("is already checked out", "--conflict-checkout", "large")
 			if readFile(w.Merged) != "merged\n" {
 				t.Fatal("repeated checkout overwrote edits")
 			}
@@ -229,7 +232,7 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 			writeFile(t, base, "1\n2\n3\n4\n5\n")
 			w = c.checkout("merge")
 			writeFile(t, w.Merged, "edited\n")
-			c.fail("discard the workspace first", "--conflict-checkout", "--base", base, "merge")
+			c.fail("discard the workspace (which changes neither copy) to check out again", "--conflict-checkout", "--base", base, "merge")
 			if readFile(w.Merged) != "edited\n" {
 				t.Fatal("checkout with --base changed an existing workspace")
 			}
@@ -257,21 +260,30 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 			}
 			if listing := c.list(); len(listing.Pending) != 1 || listing.Pending[0].Path != "resolved" || listing.Pending[0].Applied {
 				t.Fatalf("workspace with nothing applied not listed: %+v", listing.Pending)
-			} else if w := c.checkout("resolved"); !w.Pending || w.Applied {
-				t.Fatalf("workspace with nothing applied not described: %+v", w)
 			} else if !strings.Contains(c.invoke("--conflicts"), "with nothing applied") {
 				t.Fatal("workspace with nothing applied not listed as text")
 			}
+			c.fail("resolved some other way", "--conflict-checkout", "resolved")
 			c.fail("resolved some other way", "--conflict-apply", "--take", "remote", "resolved")
 			if read(local, "resolved") != resolved || read(opposite, "resolved") != resolved {
 				t.Fatal("resolution replaced")
 			}
 			c.invoke("--conflict-discard", "resolved")
 
-			// Unresolved markers and changed copies are rejected.
+			// Unresolved markers and changed copies are rejected. Listings
+			// report copies changed since checkout.
 			c.checkout("text")
 			c.fail("conflict markers", "--conflict-apply", "text")
 			write(opposite, "text", "concurrent edit\n")
+			for _, conflict := range c.list().Conflicts {
+				if (conflict.Path == "text") != conflict.Changed || (conflict.Path == "text" && conflict.CheckedOut != "local") {
+					t.Fatalf("unexpected change reported: %+v", conflict)
+				}
+			}
+			if !strings.Contains(c.invoke("--conflicts"), "text (checked out, but the remote copy changed since") {
+				t.Fatal("changed copy not listed as text")
+			}
+			c.fail("the remote copy changed since checkout", "--conflict-checkout", "text")
 			c.fail("changed since", "--conflict-apply", "--take", "local", "text")
 			if read(opposite, "text") != "concurrent edit\n" {
 				t.Fatal("concurrent edit overwritten")
@@ -302,51 +314,162 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 			}
 			listing = c.list()
 			for _, conflict := range listing.Conflicts {
-				if conflict.CheckedOut {
+				if conflict.CheckedOut != "" || conflict.Changed {
 					t.Fatalf("unexpected conflict: %+v", conflict)
 				}
 			}
-			if len(listing.Pending) != 0 {
-				t.Fatalf("unexpected pending resolutions: %+v", listing.Pending)
+			if len(listing.Pending) != 0 || len(listing.RemotePending) != 0 {
+				t.Fatalf("unexpected pending resolutions: %+v", listing)
 			}
 		})
 	}
 }
 
-func TestRemoteConflictTwoResolvers(t *testing.T) {
-	// Workspaces are kept on the system that checked them out, so a conflict
-	// can be checked out from both endpoints, which conflict operations on
-	// one system can't detect. Once it's resolved through one workspace, the
-	// other has nothing applied and its conflict is no longer listed, so apply
-	// refuses it, even with a result that accepts the copies, which are both
-	// one of its checked-out copies.
+// createBothSidedConflicts creates a session that submits remote commands from
+// both endpoints, with conflicts between two files at the specified paths, and
+// returns conflict commands for alpha and beta.
+func createBothSidedConflicts(t *testing.T, paths ...string) (*conflictCommands, *conflictCommands, [2]string) {
+	t.Helper()
 	roots := createConflictSessionWithCommands(t, synchronization.RemoteCommandMode_RemoteCommandModeBoth,
 		core.SynchronizationMode_SynchronizationModeTwoWaySafe)
-	writeFile(t, filepath.Join(roots[0], "file"), "base\n")
+	for _, path := range paths {
+		writeFile(t, filepath.Join(roots[0], path), "base\n")
+	}
 	if _, err := flushRemote(roots[0]); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(roots[0], "file"), "alpha\n")
-	writeFile(t, filepath.Join(roots[1], "file"), "beta\n")
-	alpha := &conflictCommands{t: t, directory: roots[0]}
-	beta := &conflictCommands{t: t, directory: roots[1]}
+	for _, path := range paths {
+		writeFile(t, filepath.Join(roots[0], path), "alpha\n")
+		writeFile(t, filepath.Join(roots[1], path), "beta\n")
+	}
+	return &conflictCommands{t: t, directory: roots[0]}, &conflictCommands{t: t, directory: roots[1]}, roots
+}
+
+func TestRemoteConflictSingleCheckout(t *testing.T) {
+	// Workspaces are kept on the system that checked them out, but the daemon
+	// records which endpoint checked out each conflict, so a conflict is
+	// checked out through a single endpoint at a time, which alone can apply
+	// or discard it, and only once.
+	alpha, beta, roots := createBothSidedConflicts(t, "file")
 	alpha.checkout("file")
+	alpha.fail("is already checked out", "--conflict-checkout", "file")
+	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "file")
+	beta.fail("isn't checked out", "--conflict-discard", "file")
+	if listing := alpha.list(); len(listing.Conflicts) != 1 || listing.Conflicts[0].CheckedOut != "local" {
+		t.Fatalf("local checkout not listed: %+v", listing)
+	} else if listing := beta.list(); len(listing.Conflicts) != 1 || listing.Conflicts[0].CheckedOut != "remote" {
+		t.Fatalf("opposite checkout not listed: %+v", listing)
+	} else if !strings.Contains(beta.invoke("--conflicts"), "file (checked out through the opposite endpoint") {
+		t.Fatal("opposite checkout not listed as text")
+	}
+
+	// Discarding releases the checkout, so that the opposite endpoint can
+	// check the conflict out, and applying releases it once resolved.
+	alpha.invoke("--conflict-discard", "file")
 	beta.checkout("file")
-	if applied := alpha.outcomes("--conflict-apply", "--take", "local", "file")[0]; !applied.Resolved {
+	alpha.fail("checked out through the opposite endpoint", "--conflict-checkout", "file")
+	if applied := beta.outcomes("--conflict-apply", "--take", "local", "file")[0]; !applied.Resolved {
 		t.Fatalf("conflict not resolved: %+v", applied)
 	}
-	for _, args := range [][]string{{"--delete"}, {"--take", "local"}, {"--take", "remote"}} {
-		beta.fail("resolved some other way", append(append([]string{"--conflict-apply"}, args...), "file")...)
-		for _, root := range roots {
-			if data := readFile(filepath.Join(root, "file")); data != "alpha\n" {
-				t.Fatalf("%v replaced the resolution: %q", args, data)
-			}
+	for _, root := range roots {
+		if data := readFile(filepath.Join(root, "file")); data != "beta\n" {
+			t.Fatalf("resolution not applied: %q", data)
 		}
 	}
-	if listing := beta.list(); len(listing.Conflicts) != 0 || len(listing.Pending) != 1 || listing.Pending[0].Applied {
-		t.Fatalf("stale workspace not listed: %+v", listing)
+	for _, c := range []*conflictCommands{alpha, beta} {
+		if listing := c.list(); len(listing.Conflicts) != 0 || len(listing.Pending) != 0 || len(listing.RemotePending) != 0 {
+			t.Fatalf("resolved conflict still listed: %+v", listing)
+		}
 	}
-	beta.invoke("--conflict-discard", "file")
+}
+
+func TestRemoteConflictCheckoutOwnership(t *testing.T) {
+	// Apply claims the checkout before writing either copy, so a workspace
+	// whose checkout the opposite endpoint holds, such as one checked out
+	// after the daemon lost the session's checkouts, can't resolve the
+	// conflict, and the opposite endpoint's resolution isn't replaced.
+	alpha, beta, roots := createBothSidedConflicts(t, "file")
+	alpha.checkout("file")
+	directory, err := filesystem.Mutagen(false, filesystem.MutagenSynchronizationCheckoutsDirectoryName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkouts, err := filepath.Glob(filepath.Join(directory, "*"))
+	if err != nil || len(checkouts) != 1 {
+		t.Fatalf("unexpected checkouts: %v, %v", checkouts, err)
+	} else if err := os.Remove(checkouts[0]); err != nil {
+		t.Fatal(err)
+	}
+	beta.checkout("file")
+	alpha.fail("checked out through the opposite endpoint", "--conflict-apply", "--take", "local", "file")
+	if readFile(filepath.Join(roots[0], "file")) != "alpha\n" || readFile(filepath.Join(roots[1], "file")) != "beta\n" {
+		t.Fatal("copies changed by an apply without the checkout")
+	} else if listing := alpha.list(); len(listing.Conflicts) != 1 || listing.Conflicts[0].CheckedOut != "remote" {
+		t.Fatalf("opposite checkout doesn't prevail over a local workspace: %+v", listing)
+	}
+	beta.invoke("--conflict-apply", "--take", "remote", "file")
+	alpha.invoke("--conflict-discard", "file")
+	for _, root := range roots {
+		if data := readFile(filepath.Join(root, "file")); data != "alpha\n" {
+			t.Fatalf("resolution not applied: %q", data)
+		}
+	}
+}
+
+func TestRemoteConflictAbandonedCheckout(t *testing.T) {
+	// A checkout whose workspace is missing, such as one left by an
+	// interrupted checkout, keeps the opposite endpoint from checking the
+	// conflict out until listing conflicts or discarding releases it, or until
+	// it's checked out again through its endpoint.
+	alpha, beta, _ := createBothSidedConflicts(t, "listed", "discarded", "reused")
+	for _, path := range []string{"listed", "discarded", "reused"} {
+		w := alpha.checkout(path)
+		if err := os.RemoveAll(filepath.Dir(w.Local)); err != nil {
+			t.Fatal(err)
+		}
+		beta.fail("checked out through the opposite endpoint", "--conflict-checkout", path)
+	}
+	alpha.checkout("reused")
+	if discarded := alpha.outcomes("--conflict-discard", "discarded")[0]; !discarded.Discarded || discarded.Backup != "" {
+		t.Fatalf("checkout without a workspace not released: %+v", discarded)
+	}
+	alpha.fail("isn't checked out", "--conflict-discard", "discarded")
+	for _, conflict := range alpha.list().Conflicts {
+		if (conflict.Path == "reused") != (conflict.CheckedOut == "local") {
+			t.Fatalf("abandoned checkout listed: %+v", conflict)
+		}
+	}
+	beta.checkout("listed")
+	beta.checkout("discarded")
+	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "reused")
+}
+
+func TestRemoteConflictStaleApplyForgotten(t *testing.T) {
+	// An apply that fails because the remote copy changed since checkout
+	// writes neither copy, so its workspace isn't taken for an unfinished
+	// resolution once the conflict is resolved some other way, and apply then
+	// refuses it.
+	roots := createConflictSession(t, true, core.SynchronizationMode_SynchronizationModeTwoWaySafe)
+	local, opposite := filepath.Join(roots[0], "file"), filepath.Join(roots[1], "file")
+	writeFile(t, local, "base\n")
+	if _, err := flushRemote(roots[0]); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, local, "local\n")
+	writeFile(t, opposite, "remote\n")
+	c := &conflictCommands{t: t, directory: roots[0]}
+	c.checkout("file")
+	writeFile(t, opposite, "edited\n")
+	c.fail("changed since", "--conflict-apply", "--take", "local", "file")
+	writeFile(t, local, "edited\n")
+	if listing := c.list(); len(listing.Conflicts) != 0 || len(listing.Pending) != 1 || listing.Pending[0].Applied {
+		t.Fatalf("stale apply taken for an unfinished resolution: %+v", listing)
+	}
+	c.fail("resolved some other way", "--conflict-apply", "--take", "local", "file")
+	if readFile(local) != "edited\n" || readFile(opposite) != "edited\n" {
+		t.Fatal("resolution replaced")
+	}
+	c.invoke("--conflict-discard", "file")
 }
 
 func TestRemoteConflictRetryWithChangedResult(t *testing.T) {
@@ -436,11 +559,10 @@ func TestRemoteConflictRetryDeletion(t *testing.T) {
 	}
 	if listing := c.list(); len(listing.Conflicts) != 0 || len(listing.Pending) != 1 || listing.Pending[0].Path != path || !listing.Pending[0].Applied {
 		t.Fatalf("unfinished resolution not listed: %+v", listing)
-	} else if w := c.checkout(path); !w.Pending || !w.Applied {
-		t.Fatalf("unfinished resolution not described: %+v", w)
 	} else if !strings.Contains(c.invoke("--conflicts"), "Applied, but no longer listed") {
 		t.Fatal("unfinished resolution not listed as text")
 	}
+	c.fail("apply again to finish resolving it", "--conflict-checkout", path)
 	c.invoke("--conflict-apply", "--delete", path)
 	for _, root := range roots {
 		if _, err := os.Lstat(filepath.Join(root, path)); !os.IsNotExist(err) {

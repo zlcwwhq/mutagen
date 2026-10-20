@@ -59,7 +59,11 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 					t.Fatal("directory workspace not rejected before dialing:", err)
 				}
 			}
-			if _, err := discard(local); err != nil {
+			// Without a daemon, the workspace is set aside, but its checkout
+			// can't be released, which is reported.
+			if _, err := discard(ctx, root, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
+				t.Fatal("unreleased checkout not reported:", err)
+			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("directory workspace can't be discarded:", err)
 			}
 		})
@@ -170,6 +174,81 @@ func TestConflictOverlap(t *testing.T) {
 	for _, path := range []string{"sub/other", "sub/file2", "su", "other/sub/file"} {
 		if overlaps(path, "sub/file") {
 			t.Fatalf("%q overlaps", path)
+		}
+	}
+}
+
+func TestChangedSinceCheckout(t *testing.T) {
+	// Listings identify copies changed since checkout by their digests, which
+	// are listed for alpha and beta and checked out as local and remote.
+	file := &remote.Entry{Kind: remote.EntryFile}
+	listing := func(alpha, beta string) *remote.ConflictRoot {
+		return &remote.ConflictRoot{Files: true, AlphaDigest: alpha, BetaDigest: beta}
+	}
+	for _, alpha := range []bool{true, false} {
+		w := &workspace{Alpha: alpha, Local: file, Remote: file, ListedLocal: "local", ListedRemote: "remote"}
+		swap := func(local, opposite string) *remote.ConflictRoot {
+			if !alpha {
+				return listing(opposite, local)
+			}
+			return listing(local, opposite)
+		}
+		for _, test := range []struct {
+			conflict *remote.ConflictRoot
+			expected string
+		}{
+			{swap("local", "remote"), ""},
+			{swap("edited", "remote"), "local copy"},
+			{swap("local", "edited"), "remote copy"},
+			{swap("edited", "edited"), "local and remote copies"},
+			{&remote.ConflictRoot{AlphaTakable: true}, "copies"},
+		} {
+			if changed := w.changedSince(test.conflict); changed != test.expected {
+				t.Fatalf("alpha=%t: %+v: expected %q, got %q", alpha, test.conflict, test.expected, changed)
+			}
+		}
+	}
+
+	// Nothing is reported once something was applied, which changes the copies
+	// itself, or without the digests of verified copies.
+	w := &workspace{Alpha: true, Local: file, Remote: file, ListedLocal: "local", ListedRemote: "remote", Applied: []*remote.Entry{file}}
+	if changed := w.changedSince(listing("edited", "edited")); changed != "" {
+		t.Fatal("change reported after apply:", changed)
+	}
+	w = &workspace{Alpha: true, Local: file, Remote: file}
+	if changed := w.changedSince(listing("edited", "edited")); changed != "" {
+		t.Fatal("change reported without verified digests:", changed)
+	}
+}
+
+func TestCheckedOutAgain(t *testing.T) {
+	// A conflict with a workspace can't be checked out again, and the error
+	// says what to do with the workspace.
+	file := &remote.Entry{Kind: remote.EntryFile}
+	target := &remote.Target{Session: "session", Alpha: true}
+	listed := &remote.ConflictRoot{Path: "file", Files: true, AlphaDigest: "local", BetaDigest: "remote"}
+	changed := &remote.ConflictRoot{Path: "file", Files: true, AlphaDigest: "local", BetaDigest: "edited"}
+	w := func(applied bool) *workspace {
+		w := &workspace{Session: "session", Alpha: true, Path: "file", Local: file, Remote: file, ListedLocal: "local", ListedRemote: "remote", directory: "workspace"}
+		if applied {
+			w.Applied = []*remote.Entry{file}
+		}
+		return w
+	}
+	for _, test := range []struct {
+		w        *workspace
+		conflict *remote.ConflictRoot
+		expected string
+	}{
+		{w(false), listed, "is already checked out in workspace: apply it"},
+		{w(false), changed, "the remote copy changed since checkout: discard the workspace"},
+		{w(false), nil, "resolved some other way"},
+		{w(true), nil, "apply again to finish resolving it"},
+		{&workspace{Session: "other", Alpha: true, Path: "file", Local: file, Remote: file}, listed, "an unrelated workspace exists"},
+		{&workspace{Session: "session", Alpha: true, Path: "file", Local: file, Remote: &remote.Entry{Kind: remote.EntryDirectory}}, listed, "aren't supported"},
+	} {
+		if err := checkedOut(test.w, test.conflict, target, "file"); err == nil || !strings.Contains(err.Error(), test.expected) {
+			t.Fatalf("expected %q, got %v", test.expected, err)
 		}
 	}
 }
@@ -453,7 +532,7 @@ func TestUnterminatedCopies(t *testing.T) {
 		{"local", "remote", "Neither copy ends with a newline"},
 		{"local\n", "remote\n", ""},
 	} {
-		result, err := describe(newTestWorkspace(t, test.local, test.remote), "file", false)
+		result, err := describe(newTestWorkspace(t, test.local, test.remote), "file")
 		if err != nil {
 			t.Fatal(err)
 		}
