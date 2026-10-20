@@ -240,6 +240,22 @@ them, but it doesn't lock them, so changes made while it runs can be
 overwritten. `remote --conflicts` flags checked-out copies that changed since
 checkout, so that their workspaces can be discarded before any merge work.
 
+If a checked-out path changes anyway, the synchronized copies remain
+authoritative, and discarding the workspace is always safe, since it changes
+neither copy and keeps the workspace. A conflict that's still listed, such as
+one flagged as changed, or one that apply reports as changed or conflicting
+again, is resolved by discarding its workspace and checking it out again; if
+apply already updated the remote copy, the new conflict is between that result
+and the changed local copy, and the discarded workspace's merged file still
+has the earlier merge. A change can also end the conflict by itself, such as by
+making the copies identical, or by reverting or deleting one copy so that
+synchronization copies the other over it. The overwritten side's changes then
+remain only in the workspace: after discarding it, compare its `local` and
+`remote` files with the current file, and restore what's needed by editing the
+file, which is no longer a conflict. Changes made while apply writes a copy
+can't be recovered. A workspace that can't be read, such as one whose metadata
+was modified, can only be discarded, which sets it aside as well.
+
 Each conflict is checked out once, through one endpoint. Workspaces are kept on
 the system that checked them out, so the daemon records which endpoint checked
 out each conflict, in its data directory, until the session is terminated.

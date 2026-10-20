@@ -57,9 +57,11 @@ conflict, merge them locally, and apply the result to both sides. Use
 `remote --conflicts` rather than flush warnings as the complete list, including
 resolutions left unfinished and workspaces to discard. From checkout until
 apply finishes, leave the conflicting paths unchanged on both sides and edit
-only the workspace. A conflict is checked out once, through one side, which
-alone can apply or discard it: leave conflicts checked out through the other
-side to it, and don't edit their paths.
+only the workspace; if they changed anyway, follow the workflow's recovery
+steps, since one side's changes may then exist only in the workspace. A
+conflict is checked out once, through one side, which alone can apply or
+discard it: leave conflicts checked out through the other side to it, and
+don't edit their paths.
 Preserve both sides' intent when it is clear, and ask the user when it's
 ambiguous, especially without a common ancestor.
 Conflicts involving directories require manual resolution; checkout and apply

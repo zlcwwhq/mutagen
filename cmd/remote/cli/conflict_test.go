@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 )
 
@@ -65,6 +66,62 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 				t.Fatal("unreleased checkout not reported:", err)
 			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("directory workspace can't be discarded:", err)
+			}
+		})
+	}
+}
+
+func TestUnreadableWorkspaceDiscarded(t *testing.T) {
+	// Workspaces that can't be read, such as those whose metadata was modified
+	// or removed, can be neither checked out again nor applied, so errors point
+	// to discarding them, which sets them aside regardless.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing=%t", missing), func(t *testing.T) {
+			root := t.TempDir()
+			local := filepath.Join(root, "conflict")
+			_, directory, err := workspaceDirectory(local)
+			if err != nil {
+				t.Fatal(err)
+			} else if err := os.Mkdir(directory, 0700); err != nil {
+				t.Fatal(err)
+			} else if err := os.WriteFile(filepath.Join(directory, localName), []byte("local\n"), 0600); err != nil {
+				t.Fatal(err)
+			} else if !missing {
+				if err := os.WriteFile(filepath.Join(directory, metadataName), []byte("{"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reported := func(err error) bool {
+				return err != nil && strings.Contains(err.Error(), directory) && strings.Contains(err.Error(), "discard it")
+			}
+			target := &remote.Target{Session: "session", Root: root}
+			if _, err := checkout(ctx, root, &options{}, &remote.Listing{}, target, local); !reported(err) {
+				t.Fatal("unreadable workspace not reported by checkout:", err)
+			}
+			_, unlock, err := apply(ctx, root, &options{}, local, func() (*remote.Listing, error) {
+				t.Fatal("conflicts listed for an unreadable workspace")
+				return nil, nil
+			})
+			if unlock != nil {
+				unlock()
+			}
+			if !reported(err) {
+				t.Fatal("unreadable workspace not reported by apply:", err)
+			}
+			// Without a daemon, the workspace is set aside, but its checkout
+			// can't be released, which is reported.
+			if _, err := discard(ctx, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
+				t.Fatal("unreleased checkout not reported:", err)
+			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("unreadable workspace not set aside:", err)
+			}
+			backups, err := filesystem.Mutagen(false, workspacesDirectoryName, backupsDirectoryName)
+			if err != nil {
+				t.Fatal(err)
+			} else if kept, _ := filepath.Glob(filepath.Join(backups, "*-"+filepath.Base(directory), localName)); len(kept) != 1 {
+				t.Fatal("unreadable workspace not kept:", kept)
 			}
 		})
 	}

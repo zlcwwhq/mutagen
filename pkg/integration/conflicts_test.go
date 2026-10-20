@@ -444,6 +444,36 @@ func TestRemoteConflictAbandonedCheckout(t *testing.T) {
 	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "reused")
 }
 
+func TestRemoteConflictUnreadableWorkspace(t *testing.T) {
+	// A workspace that can't be read, such as one whose metadata was modified
+	// or removed, can be neither applied nor checked out again, and listing
+	// conflicts doesn't release its checkout, which keeps the opposite endpoint
+	// from checking the conflict out, so discarding sets it aside regardless.
+	alpha, beta, _ := createBothSidedConflicts(t, "invalid", "missing")
+	for _, path := range []string{"invalid", "missing"} {
+		metadata := filepath.Join(filepath.Dir(alpha.checkout(path).Local), "workspace.json")
+		if path == "invalid" {
+			writeFile(t, metadata, "{")
+		} else if err := os.Remove(metadata); err != nil {
+			t.Fatal(err)
+		}
+		alpha.fail("discard it", "--conflict-apply", "--take", "local", path)
+		alpha.fail("discard it", "--conflict-checkout", path)
+		for _, conflict := range alpha.list().Conflicts {
+			if conflict.Path == path && conflict.CheckedOut != "local" {
+				t.Fatalf("checkout of an unreadable workspace released: %+v", conflict)
+			}
+		}
+		beta.fail("checked out through the opposite endpoint", "--conflict-checkout", path)
+		if discarded := alpha.outcomes("--conflict-discard", path)[0]; !discarded.Discarded || discarded.Backup == "" {
+			t.Fatalf("unreadable workspace not discarded: %+v", discarded)
+		} else if readFile(filepath.Join(discarded.Backup, "local")) != "alpha\n" {
+			t.Fatal("unreadable workspace not kept")
+		}
+		beta.checkout(path)
+	}
+}
+
 func TestRemoteConflictDiscardFromOutside(t *testing.T) {
 	// Discarding locates the endpoint by the conflict root rather than the
 	// working directory, so that it releases the checkout from outside both

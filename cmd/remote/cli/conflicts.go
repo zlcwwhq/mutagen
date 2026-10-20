@@ -318,14 +318,41 @@ func readWorkspace(directory string) (*workspace, error) {
 	return w, nil
 }
 
+// unreadableWorkspace indicates that the workspace for a local path exists but
+// can't be read, such as because its metadata was modified or removed. Neither
+// checkout nor apply can use it, so it can only be discarded (see discard).
+type unreadableWorkspace struct {
+	// directory is the workspace directory.
+	directory string
+	// err describes why it can't be read.
+	err error
+}
+
+func (e *unreadableWorkspace) Error() string {
+	return fmt.Sprintf("unable to read the workspace in %s (%v); discard it, which changes neither copy", e.directory, e.err)
+}
+
 // loadWorkspace loads the workspace for a local path, failing with an error
-// wrapping os.ErrNotExist if there's none.
+// wrapping os.ErrNotExist if there's none, or with an unreadableWorkspace if
+// it can't be read. A workspace directory without metadata is unreadable
+// rather than missing, since checkouts create workspaces complete, and a new
+// checkout couldn't replace it.
 func loadWorkspace(local string) (*workspace, error) {
 	_, directory, err := workspaceDirectory(local)
 	if err != nil {
 		return nil, err
 	}
-	return readWorkspace(directory)
+	w, err := readWorkspace(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		if _, statErr := os.Lstat(directory); statErr != nil {
+			return nil, err
+		}
+		err = errors.New("missing metadata")
+	}
+	if err != nil {
+		return nil, &unreadableWorkspace{directory: directory, err: err}
+	}
+	return w, nil
 }
 
 // matches determines whether a workspace was checked out through a target.
@@ -490,7 +517,8 @@ func release(ctx context.Context, directory, session string, target *remote.Targ
 // that failed, so that the opposite endpoint can check them out, and returns
 // the remaining checkouts. Checkouts of paths with an operation in progress,
 // such as a checkout that hasn't created its workspace yet, are kept, as are
-// those that can't be released, since the listing is advisory.
+// those whose workspaces can't be read, which discarding releases, and those
+// that can't be released, since the listing is advisory.
 func releaseAbandoned(ctx context.Context, directory string, target *remote.Target, checkouts []remote.Checkout, workspaces map[string]*workspace) []remote.Checkout {
 	var remaining []remote.Checkout
 	for _, checkout := range checkouts {
@@ -1550,7 +1578,8 @@ func releaseAt(ctx context.Context, local, session string, w *workspace) (bool, 
 // discard sets a workspace aside without changing either copy and releases its
 // checkout, so that the conflict can be checked out again, through either
 // endpoint. A checkout without a workspace, such as one left by an interrupted
-// checkout or by a discard whose release failed, is released as well.
+// checkout or by a discard whose release failed, is released as well, as is
+// one whose workspace can't be read, which is set aside regardless.
 func discard(ctx context.Context, o *options, argument string) (*outcome, error) {
 	local, err := filepath.Abs(argument)
 	if err != nil {
@@ -1562,6 +1591,7 @@ func discard(ctx context.Context, o *options, argument string) (*outcome, error)
 	}
 	defer unlock()
 	w, err := loadWorkspace(local)
+	var unreadable *unreadableWorkspace
 	if errors.Is(err, os.ErrNotExist) {
 		if held, err := releaseAt(ctx, local, o.session, nil); err != nil {
 			return nil, err
@@ -1570,6 +1600,20 @@ func discard(ctx context.Context, o *options, argument string) (*outcome, error)
 		}
 		return &outcome{Path: argument, Discarded: true, lines: []string{
 			"Released the checkout, which had no workspace, without changing either copy.",
+		}}, nil
+	} else if errors.As(err, &unreadable) {
+		// An unreadable workspace would otherwise keep its conflict checked out
+		// indefinitely. Its session and endpoint are unknown, so its checkout
+		// is released like one without a workspace, as a retry would release
+		// it once the workspace is set aside.
+		backup, err := (&workspace{directory: unreadable.directory}).retire()
+		if err != nil {
+			return nil, fmt.Errorf("unable to set the workspace aside: %w", err)
+		} else if _, err := releaseAt(ctx, local, o.session, nil); err != nil {
+			return nil, fmt.Errorf("set the unreadable workspace aside without changing either copy (it's kept in %s), but unable to release its checkout, so the opposite endpoint can't check the conflict out yet: %w; discard again to release it", backup, err)
+		}
+		return &outcome{Path: argument, Discarded: true, Backup: backup, lines: []string{
+			"Set aside the workspace, which couldn't be read, without changing either copy.", retentionNote(backup),
 		}}, nil
 	} else if err != nil {
 		return nil, err
