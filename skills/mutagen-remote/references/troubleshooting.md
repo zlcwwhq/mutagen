@@ -36,14 +36,22 @@ Statuses 128+N mean that the remote command was killed by signal N.
 After each flush, `remote` warns about content that it couldn't synchronize,
 with paths relative to the current directory:
 
-- `these conflicts aren't synchronized until one side's copy is deleted`: the
-  path changed on both sides since the last synchronization, so neither copy
-  propagates. `remote --diff` shows how each conflicting file's remote copy
-  differs from the local one (`-` local, `+` remote); pass paths to compare
-  specific files instead. To resolve a conflict, put the content you want in
-  one copy (merging both sides' changes if needed), delete the other copy
-  (`rm <path>` or `remote rm <path>`), and run `remote --flush`. If it's unclear
-  which changes to keep, show the user the diff and ask.
+- `these conflicts aren't synchronized until resolved`: the path changed on
+  both sides since the last synchronization, so neither copy propagates.
+  `remote --diff` shows how the copies differ (`-` local, `+` remote). Resolve
+  conflicts with the [conflict workflow](conflicts.md). If `remote --conflicts`
+  says that the session's mode doesn't support resolution, or lists the
+  conflict as one that remote can't resolve, first check whether it involves
+  a directory. Checkout and apply reject directory conflicts, including
+  existing workspaces; preserve the copies and report the conflict to the user
+  for manual resolution. For other unsupported conflicts involving content
+  that can't be synchronized or read, fix unreadable content if you can.
+  Otherwise, copy both versions somewhere outside the synced tree first, put
+  the content you want in one copy (merging both sides' changes if needed),
+  delete the other copy (`rm <path>` or `remote rm <path>`), and run
+  `remote --flush`. Nothing checks that the deleted copy is unchanged, so do
+  this promptly. If it's unclear which changes to keep, show the user the diff
+  and ask.
 - `this content couldn't be synchronized`: the side in parentheses couldn't
   read or write the path, for example because of permissions. Fix it on that
   side if you can, or tell the user.

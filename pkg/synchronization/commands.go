@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
@@ -49,6 +50,9 @@ type commandRelay struct {
 	flushRequests chan chan error
 	// report reports content that the session couldn't synchronize.
 	report func() *remote.Report
+	// conflicts lists the session's conflicts for resolution, or is nil if
+	// the session's synchronization mode doesn't support resolution.
+	conflicts func() *remote.Listing
 	// channelsLock guards channels.
 	channelsLock sync.Mutex
 	// channels holds the connected alpha and beta channels (or nil).
@@ -86,6 +90,25 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		logger:        c.logger.Sublogger("commands"),
 		flushRequests: c.flushRequests,
 		report:        c.remoteReport,
+	}
+
+	// Resolution writes the same result to both endpoints, which is only
+	// consistent with the safe modes, since other modes resolve conflicts by
+	// giving alpha precedence.
+	synchronizationMode := c.session.Configuration.SynchronizationMode
+	if synchronizationMode.IsDefault() {
+		synchronizationMode = c.session.Version.DefaultSynchronizationMode()
+	}
+	if synchronizationMode == core.SynchronizationMode_SynchronizationModeTwoWaySafe ||
+		synchronizationMode == core.SynchronizationMode_SynchronizationModeOneWaySafe {
+		hashingAlgorithm := c.session.Configuration.HashingAlgorithm
+		if hashingAlgorithm.IsDefault() {
+			hashingAlgorithm = c.session.Version.DefaultHashingAlgorithm()
+		}
+		algorithm, _ := hashingAlgorithm.MarshalText()
+		relay.conflicts = func() *remote.Listing {
+			return c.remoteConflicts(string(algorithm))
+		}
 	}
 
 	// Each endpoint submits commands if and only if its opposite executes.
@@ -189,6 +212,20 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 	if err != nil {
 		remote.Reject(submission, err)
 		return
+	} else if operation == remote.OperationConflicts {
+		r.logger.Debug("Forcing synchronization cycle for conflict listing")
+		stop := context.AfterFunc(ctx, func() { submission.Close() })
+		defer stop()
+		var listing *remote.Listing
+		if r.conflicts == nil {
+			err = errors.New("conflict resolution requires the two-way-safe or one-way-safe synchronization mode")
+		} else if err = r.flush(ctx); err == nil {
+			listing = r.conflicts()
+		}
+		if err := remote.RespondWithConflicts(submission, listing, err); err != nil {
+			r.logger.Debug("Unable to send conflicts:", err)
+		}
+		return
 	} else if operation == remote.OperationFlush {
 		r.logger.Debug("Forcing synchronization cycle for submission")
 		stop := context.AfterFunc(ctx, func() { submission.Close() })
@@ -196,6 +233,7 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		var report *remote.Report
 		if err = r.flush(ctx); err == nil {
 			report = r.report()
+			report.Resolution = r.conflicts != nil
 		}
 		if err := remote.RespondToFlush(submission, report, err); err != nil {
 			r.logger.Debug("Unable to send synchronization report:", err)
@@ -286,6 +324,113 @@ func (c *controller) remoteReport() *remote.Report {
 		}
 	}
 	return report
+}
+
+// remoteConflicts lists all of the session's conflicts and problems as of its
+// last synchronization cycle for resolution, determining how remote can
+// resolve each conflict. The digests of conflicting files and of their common
+// ancestor are reported with the textual name of the session's hashing
+// algorithm.
+func (c *controller) remoteConflicts(algorithm string) *remote.Listing {
+	// Conflicts and problems are immutable and their lists are replaced rather
+	// than modified, so the lists can be read once the lock is released.
+	c.stateLock.Lock()
+	conflicts := slices.Clone(c.state.Conflicts)
+	problems := []struct {
+		alpha    bool
+		problems []*core.Problem
+	}{
+		{true, c.state.AlphaState.ScanProblems},
+		{true, c.state.AlphaState.TransitionProblems},
+		{false, c.state.BetaState.ScanProblems},
+		{false, c.state.BetaState.TransitionProblems},
+	}
+	c.stateLock.UnlockWithoutNotify()
+	core.SortConflicts(conflicts)
+	listing := &remote.Listing{Conflicts: make([]remote.ConflictRoot, len(conflicts))}
+	for c, conflict := range conflicts {
+		listing.Conflicts[c] = resolution(conflict, algorithm)
+	}
+	for _, list := range problems {
+		for _, problem := range list.problems {
+			listing.Problems = append(listing.Problems, remote.Problem{Alpha: list.alpha, Path: problem.Path, Error: problem.Error})
+		}
+	}
+	return listing
+}
+
+// resolution determines how remote can resolve a conflict in a safe
+// synchronization mode, in which it writes the same result to both endpoints,
+// which synchronization then considers to agree.
+//
+// Conflicts between regular files consist of a single change at the conflict
+// root on each side, and the result can be any file, such as a merge of both
+// copies. Their changes' old entries are the common ancestor, and their new
+// entries are the copies, whose digests bind the ancestor to the copies that
+// it's the ancestor of.
+//
+// Conflicts involving directories require manual resolution, as do other
+// conflicts at the root, which change its type. For other conflicts, such as
+// between a file and a symbolic link, the result is one of the copies, which
+// can't be content that can't be synchronized (such as a named pipe), and
+// replacing the other copy requires reading it.
+func resolution(conflict *core.Conflict, algorithm string) remote.ConflictRoot {
+	root := remote.ConflictRoot{Path: conflict.Root}
+	files, directory := true, false
+	for _, changes := range [][]*core.Change{conflict.AlphaChanges, conflict.BetaChanges} {
+		if len(changes) != 1 || changes[0].Path != conflict.Root ||
+			changes[0].New == nil || changes[0].New.Kind != core.EntryKind_File {
+			files = false
+		}
+		for _, change := range changes {
+			// A change below the conflict root also identifies a directory,
+			// even if no change describes the directory itself.
+			if change.Path != conflict.Root || (change.New != nil && change.New.Kind == core.EntryKind_Directory) {
+				directory = true
+			}
+		}
+	}
+	if files {
+		root.Files, root.AlphaTakable, root.BetaTakable = true, true, true
+		root.Algorithm = algorithm
+		root.AlphaDigest = fmt.Sprintf("%x", conflict.AlphaChanges[0].New.Digest)
+		root.BetaDigest = fmt.Sprintf("%x", conflict.BetaChanges[0].New.Digest)
+		if base := conflict.AlphaChanges[0].Old; base != nil && base.Kind == core.EntryKind_File {
+			root.BaseDigest = fmt.Sprintf("%x", base.Digest)
+		}
+		return root
+	} else if conflict.Root == "" || directory {
+		return root
+	}
+	alphaUnsynchronizable := containsKind(conflict.AlphaChanges, core.EntryKind_Untracked, core.EntryKind_Problematic)
+	betaUnsynchronizable := containsKind(conflict.BetaChanges, core.EntryKind_Untracked, core.EntryKind_Problematic)
+	alphaUnreadable := containsKind(conflict.AlphaChanges, core.EntryKind_Problematic)
+	betaUnreadable := containsKind(conflict.BetaChanges, core.EntryKind_Problematic)
+	root.AlphaTakable = !alphaUnsynchronizable && !betaUnreadable
+	root.BetaTakable = !betaUnsynchronizable && !alphaUnreadable
+	return root
+}
+
+// containsKind determines whether any of the new entries of a list of changes
+// contains an entry of one of the specified kinds.
+func containsKind(changes []*core.Change, kinds ...core.EntryKind) bool {
+	var contains func(*core.Entry) bool
+	contains = func(entry *core.Entry) bool {
+		if entry == nil {
+			return false
+		} else if slices.Contains(kinds, entry.Kind) {
+			return true
+		}
+		for _, content := range entry.Contents {
+			if contains(content) {
+				return true
+			}
+		}
+		return false
+	}
+	return slices.ContainsFunc(changes, func(change *core.Change) bool {
+		return contains(change.New)
+	})
 }
 
 // remoteChanges converts changes for remote reports.

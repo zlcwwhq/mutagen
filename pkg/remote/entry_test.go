@@ -5,7 +5,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -57,5 +60,51 @@ func TestReadEntryCancelled(t *testing.T) {
 	cancel()
 	if _, err := ReadEntry(ctx, filepath.Join(t.TempDir(), "missing")); !errors.Is(err, context.Canceled) {
 		t.Fatal("cancelled comparison accessed the filesystem:", err)
+	}
+}
+
+func TestSymbolicLinkTargetsSlashSeparated(t *testing.T) {
+	// Windows reads symbolic link targets with backslashes, which are
+	// represented with slashes, as synchronization represents them, so that
+	// links taken from a Windows endpoint work on POSIX endpoints. Links are
+	// created from that representation, which Go converts back.
+	if runtime.GOOS != "windows" {
+		t.Skip()
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	link := filepath.Join(root, "link")
+	if err := os.Symlink("dir/target", link); err != nil {
+		t.Skip("symbolic links unavailable:", err)
+	} else if target, err := os.Readlink(link); err != nil {
+		t.Fatal(err)
+	} else {
+		t.Logf("target read as %q", target)
+	}
+	if entry, err := ReadEntry(ctx, link); err != nil || entry.Kind != EntrySymbolicLink || entry.Target != "dir/target" {
+		t.Fatalf("link read as %+v: %v", entry, err)
+	} else if entry, err := Snapshot(ctx, root, "link"); err != nil || entry.Kind != EntrySymbolicLink || entry.Target != "dir/target" {
+		t.Fatalf("link snapshotted as %+v: %v", entry, err)
+	}
+	replacement := &Replacement{Path: "replaced", Expected: []*Entry{{Kind: EntryMissing}}, Result: &Entry{Kind: EntrySymbolicLink, Target: "dir/target"}}
+	if err := ReplaceFile(ctx, root, replacement, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	} else if entry, err := Snapshot(ctx, root, "replaced"); err != nil || !SameContents(entry, replacement.Result) {
+		t.Fatalf("link written as %+v: %v", entry, err)
+	}
+}
+
+func TestSymbolicLinkTargetsRawOnPOSIX(t *testing.T) {
+	// Backslashes are filename characters on POSIX systems, so targets read
+	// there are left as they are (and synchronization reports them as
+	// problems).
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+	root := t.TempDir()
+	if err := os.Symlink(`dir\target`, filepath.Join(root, "link")); err != nil {
+		t.Skip("symbolic links unavailable:", err)
+	} else if entry, err := Snapshot(context.Background(), root, "link"); err != nil || entry.Target != `dir\target` {
+		t.Fatalf("link snapshotted as %+v: %v", entry, err)
 	}
 }

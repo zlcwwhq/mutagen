@@ -67,11 +67,12 @@ func TestReporter(t *testing.T) {
 		},
 	}
 	report := &remote.Report{
-		Conflicts: []remote.Conflict{conflict},
-		Problems:  []remote.Problem{{Alpha: true, Path: "sub/secret", Error: "permission denied"}, {Path: "data", Error: "unreadable"}},
+		Conflicts:  []remote.Conflict{conflict},
+		Problems:   []remote.Problem{{Alpha: true, Path: "sub/secret", Error: "permission denied"}, {Path: "data", Error: "unreadable"}},
+		Resolution: true,
 	}
 	reports.print(report)
-	expected := "remote: warning: these conflicts aren't synchronized until one side's copy is deleted (see remote --diff):\n" +
+	expected := "remote: warning: these conflicts aren't synchronized until resolved (see remote --diff and remote --conflicts):\n" +
 		"remote:   out: deleted directory locally, modified file " + filepath.Join("out", "log") + " remotely, " +
 		"created symbolic link " + filepath.Join("out", "new") + " remotely, changed file to executable file " + filepath.Join("out", "run") + " remotely\n" +
 		"remote: warning: this content couldn't be synchronized:\n" +
@@ -94,7 +95,7 @@ func TestReporter(t *testing.T) {
 	})
 	report.ExcludedConflicts = 3
 	reports.print(report)
-	expected = "remote: warning: these conflicts aren't synchronized until one side's copy is deleted (see remote --diff):\n" +
+	expected = "remote: warning: these conflicts aren't synchronized until resolved (see remote --diff and remote --conflicts):\n" +
 		"remote:   a: created file locally, created file remotely\n" +
 		"remote:   ...and 3 more conflicts\n"
 	if output.String() != expected {
@@ -102,11 +103,14 @@ func TestReporter(t *testing.T) {
 	}
 
 	// Beta's perspective is the reverse, and the paths of conflicting changes
-	// are listed once each.
+	// are listed once each. Sessions that don't support resolution don't
+	// refer to it.
 	output.Reset()
 	newReporter(&output, &remote.Target{Root: t.TempDir(), Alpha: false}).print(&remote.Report{Conflicts: []remote.Conflict{conflict}})
 	if !strings.Contains(output.String(), "deleted directory remotely") {
 		t.Fatal("beta perspective not applied:", output.String())
+	} else if !strings.Contains(output.String(), "one side's copy is deleted (see remote --diff):") {
+		t.Fatal("resolution referenced without support:", output.String())
 	} else if paths := conflictPaths(report); strings.Join(paths, ",") != "sub/out,sub/out/log,sub/out/new,sub/out/run,sub/a" {
 		t.Fatal("incorrect conflict paths:", paths)
 	}

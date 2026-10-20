@@ -8,6 +8,8 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"runtime"
+	"strings"
 	"syscall"
 )
 
@@ -69,7 +71,7 @@ func ReadEntry(ctx context.Context, path string) (*Entry, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Entry{Kind: EntrySymbolicLink, Target: target}, nil
+		return &Entry{Kind: EntrySymbolicLink, Target: normalizeTarget(target)}, nil
 	case !mode.IsRegular():
 		return &Entry{Kind: EntryOther}, nil
 	}
@@ -84,6 +86,22 @@ func ReadEntry(ctx context.Context, path string) (*Entry, error) {
 	stop := context.AfterFunc(ctx, func() { file.Close() })
 	defer stop()
 	return readFileEntry(ctx, file, info.Size(), info.Mode()&0111 != 0)
+}
+
+// normalizeTarget converts a symbolic link target, as read, to the protocol's
+// representation, which separates components with slashes, like
+// synchronization does (see normalizeSymbolicLinkAndEnsurePortable in
+// pkg/synchronization/core/symbolic_link.go). Windows reads targets with
+// backslashes, which would be filename characters if a link with that target
+// were created on a POSIX endpoint, so they're converted to slashes. Targets
+// read on POSIX systems are left as they are, since backslashes are filename
+// characters there. No conversion is needed when creating links, since Go
+// converts slashes to backslashes when creating them on Windows.
+func normalizeTarget(target string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ReplaceAll(target, "\\", "/")
+	}
+	return target
 }
 
 // entryReader checks for cancellation between file reads. Wrapping the reader

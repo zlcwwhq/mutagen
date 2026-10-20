@@ -88,3 +88,117 @@ func TestRemoteReport(t *testing.T) {
 		t.Fatalf("non-empty report: %+v", report)
 	}
 }
+
+func TestRemoteFileConflictDigests(t *testing.T) {
+	// Conflicts between two files report both copies' digests, with their
+	// common ancestor's digest if they have one, so that checkouts can verify
+	// that they download the listed copies. Other conflicts report none.
+	file := func(digest byte) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_File, Digest: []byte{digest}}
+	}
+	link := &core.Entry{Kind: core.EntryKind_SymbolicLink, Target: "target"}
+	wrap := func(entry *core.Entry) *core.Entry {
+		if entry == nil {
+			return &core.Entry{Kind: core.EntryKind_Directory}
+		}
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"conflict": entry}}
+	}
+	for _, mode := range []core.SynchronizationMode{
+		core.SynchronizationMode_SynchronizationModeTwoWaySafe,
+		core.SynchronizationMode_SynchronizationModeOneWaySafe,
+	} {
+		for _, test := range []struct {
+			ancestor, alpha, beta *core.Entry
+			expected              remote.ConflictRoot
+		}{
+			{file(1), file(2), file(3), remote.ConflictRoot{AlphaDigest: "02", BetaDigest: "03", BaseDigest: "01", Algorithm: "sha1"}},
+			{nil, file(2), file(3), remote.ConflictRoot{AlphaDigest: "02", BetaDigest: "03", Algorithm: "sha1"}},
+			{file(1), link, file(3), remote.ConflictRoot{}},
+		} {
+			_, _, _, conflicts := core.Reconcile(wrap(test.ancestor), wrap(test.alpha), wrap(test.beta), mode)
+			if len(conflicts) != 1 {
+				t.Fatalf("unexpected conflicts: %+v", conflicts)
+			}
+			root := resolution(conflicts[0], "sha1")
+			if root.AlphaDigest != test.expected.AlphaDigest || root.BetaDigest != test.expected.BetaDigest ||
+				root.BaseDigest != test.expected.BaseDigest || root.Algorithm != test.expected.Algorithm {
+				t.Fatalf("mode %d: unexpected digests for %+v: %+v", mode, conflicts[0], root)
+			}
+		}
+	}
+}
+
+func TestRemoteTakableCopies(t *testing.T) {
+	// Either copy of a conflict other than between two files can be taken in
+	// both safe modes, since it's written to the other endpoint, unless it
+	// can't be synchronized.
+	file := func(digest byte) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_File, Digest: []byte{digest}}
+	}
+	link := &core.Entry{Kind: core.EntryKind_SymbolicLink, Target: "target"}
+	untracked := &core.Entry{Kind: core.EntryKind_Untracked}
+	wrap := func(entry *core.Entry) *core.Entry {
+		if entry == nil {
+			return &core.Entry{Kind: core.EntryKind_Directory}
+		}
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"conflict": entry}}
+	}
+	for _, mode := range []core.SynchronizationMode{
+		core.SynchronizationMode_SynchronizationModeTwoWaySafe,
+		core.SynchronizationMode_SynchronizationModeOneWaySafe,
+	} {
+		for _, test := range []struct {
+			ancestor, alpha, beta     *core.Entry
+			alphaTakable, betaTakable bool
+		}{
+			{file(1), link, file(3), true, true},
+			{file(1), file(3), link, true, true},
+			{nil, file(2), untracked, true, false},
+		} {
+			_, _, _, conflicts := core.Reconcile(wrap(test.ancestor), wrap(test.alpha), wrap(test.beta), mode)
+			if len(conflicts) != 1 {
+				t.Fatalf("mode %d: unexpected conflicts: %+v", mode, conflicts)
+			} else if root := resolution(conflicts[0], "sha1"); root.Files ||
+				root.AlphaTakable != test.alphaTakable || root.BetaTakable != test.betaTakable {
+				t.Fatalf("mode %d: unexpected resolution of %+v: %+v", mode, conflicts[0], root)
+			}
+		}
+	}
+}
+
+func TestRemoteDirectoryConflicts(t *testing.T) {
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	changed := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{2}}
+	directory := &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"child": file}}
+	modified := &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"child": changed}}
+	wrap := func(entry *core.Entry) *core.Entry {
+		if entry == nil {
+			return &core.Entry{Kind: core.EntryKind_Directory}
+		}
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"conflict": entry}}
+	}
+	for _, mode := range []core.SynchronizationMode{
+		core.SynchronizationMode_SynchronizationModeTwoWaySafe,
+		core.SynchronizationMode_SynchronizationModeOneWaySafe,
+	} {
+		for _, modifiedDirectory := range []bool{false, true} {
+			for _, directoryOnAlpha := range []bool{false, true} {
+				t.Run(fmt.Sprintf("mode=%d/modified=%t/alpha=%t", mode, modifiedDirectory, directoryOnAlpha), func(t *testing.T) {
+					ancestor, alpha, beta := (*core.Entry)(nil), directory, file
+					if modifiedDirectory {
+						ancestor, alpha = directory, modified
+					}
+					if !directoryOnAlpha {
+						alpha, beta = beta, alpha
+					}
+					_, _, _, conflicts := core.Reconcile(wrap(ancestor), wrap(alpha), wrap(beta), mode)
+					if len(conflicts) != 1 {
+						t.Fatalf("unexpected conflicts: %+v", conflicts)
+					} else if root := resolution(conflicts[0], "sha1"); root.Path != "conflict" || root.Resolvable() {
+						t.Fatalf("directory conflict reported as resolvable: %+v", root)
+					}
+				})
+			}
+		}
+	}
+}

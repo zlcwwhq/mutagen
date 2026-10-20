@@ -554,12 +554,12 @@ func TestReceiveSubmission(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	for _, operation := range []Operation{OperationExecute, OperationFlush} {
+	for _, operation := range []Operation{OperationExecute, OperationFlush, OperationConflicts} {
 		if received, err := receive(ctx, &submission{Operation: operation}); err != nil || received != operation {
 			t.Fatalf("operation %d received incorrectly: %d, %v", operation, received, err)
 		}
 	}
-	if _, err := receive(ctx, &submission{Operation: OperationFlush + 1}); err == nil {
+	if _, err := receive(ctx, &submission{Operation: OperationConflicts + 1}); err == nil {
 		t.Fatal("unsupported operation accepted")
 	}
 

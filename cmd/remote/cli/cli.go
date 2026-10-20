@@ -37,6 +37,11 @@ const (
 const usage = `Usage: remote [options] <command> [<args>...]
        remote --flush [options]
        remote --diff [options] [<path>...]
+       remote --conflicts [--json]
+       remote --conflict-checkout [--base <file>] [--json] <path>...
+       remote --conflict-apply [--take local|remote | --delete]
+              [--executable true|false] [--json] <path>...
+       remote --conflict-discard [--json] <path>...
 
 Run a command on the opposite endpoint of the Mutagen synchronization session
 whose root contains the current directory, in the corresponding directory
@@ -49,6 +54,9 @@ Examples:
   remote --timeout 10m make bench
   remote --flush                        (only synchronize)
   remote --diff                         (show how conflicting files differ)
+  remote --conflicts                    (list all conflicts)
+  remote --conflict-checkout app.go     (download both copies for merging)
+  remote --conflict-apply app.go        (write the merged file to both copies)
 
 Notes:
   - No remote shell interprets the arguments, and your local shell expands
@@ -58,13 +66,56 @@ Notes:
   - The session is synchronized before the command, so that it sees local
     changes, and after it, so that its changes are present locally when remote
     exits. Failure to synchronize only produces a warning, as do conflicts
-    (files modified on both endpoints, which stay unsynchronized until one
-    copy is deleted) and other content that couldn't be synchronized.
+    (files modified on both endpoints, which stay unsynchronized until
+    resolved) and other content that couldn't be synchronized.
   - remote --diff shows how the remote copies of the given paths, or of the
     conflicting files, differ from the local copies, as a unified diff
     (- local, + remote). For a single-file session, use --session from outside
     its root. Large conflict reports may omit changes and say how many;
     specify paths to compare omitted files. --timeout also covers file reads.
+  - Conflicts can be resolved in two-way-safe and one-way-safe sessions.
+    remote --conflicts synchronizes, lists every conflict and how it can be
+    resolved, and lists workspaces whose conflicts are no longer listed:
+    unfinished resolutions, and workspaces with nothing applied, whose
+    conflicts were resolved some other way. Conflict operations accept
+    several paths, with options before them.
+  - Before checking out, stop anything that writes the conflicting paths on
+    either endpoint, and leave them unchanged until apply finishes; changing
+    them meanwhile isn't supported. Apply fails without writing a copy that
+    changed before it ran, but can overwrite changes made while it runs.
+    Resolve each conflict from one endpoint only: workspaces are kept on the
+    system that checked them out, and conflict operations only exclude each
+    other there.
+  - --conflict-checkout downloads both complete copies into a workspace (in
+    the Mutagen data directory) and prints their paths. For two files, it also
+    looks for their common ancestor (the file that both endpoints last agreed
+    on) in Git's HEAD commit and index, or in the file given with --base,
+    verified by its digest. With it, the merged file contains both sides'
+    changes, and marks only regions changed differently on each side, showing
+    the local, base, and remote versions; without it, every region where the
+    copies differ is marked. Binary copies get no merged file. Checkout fails
+    if the copies changed since they were listed (the ancestor might not be
+    theirs); check out again. Checking out again keeps an existing workspace
+    and its edits, so --base requires discarding it first. Conflicts involving
+    directories require manual resolution; checkout and apply reject them.
+  - For two files, --conflict-apply writes the merged file (or the copy chosen
+    by --take, or deletion with --delete) to both copies. For other conflicts
+    (such as a symbolic link and a file), only --take is possible: it writes
+    the copy taken, as checked out, to the other endpoint. Apply then
+    synchronizes and checks that both copies match and no conflict or problem
+    involves the path. The workspace, with the original copies, is then kept
+    for 7 days in case the resolution was wrong, as is one that
+    --conflict-discard sets aside without changing either copy.
+  - Apply only replaces or deletes a copy that matches a checked-out copy
+    (synchronization may copy one over the other), which the workspace keeps,
+    or a result that it applied before, so it fails if either copy changed
+    since checkout; then discard the workspace and check out again. Other
+    failures can be retried, even if the conflict is no longer listed or the
+    merged file was edited since. If nothing was applied and the conflict is
+    no longer listed, apply refuses without changing either copy, since it
+    was resolved some other way; discard the workspace. Copies differing in
+    executability need --executable or --take. A conflict operation fails
+    while another one on the same path is running on the same system.
   - No terminal is allocated, so interactive programs don't work.
   - /bin/sh sources .remote-prologue.sh in the executing endpoint's sync root
     if it exists, otherwise that endpoint's configured remotePrologue, before
@@ -83,7 +134,7 @@ Notes:
 
 Exit status is the command's own, or:
   255  not routed (no connected session with remote commands, or ambiguous),
-       or remote --flush failed to synchronize
+       or remote --flush or a conflict operation failed
   127  command not found
   126  command couldn't be started, or the prologue failed
   124  --timeout expired before the command finished
@@ -94,6 +145,7 @@ Options:
 
 // options are the parsed command line options.
 type options struct {
+	conflictOptions
 	// session selects a session by identifier or name.
 	session string
 	// directory overrides the working directory.
@@ -144,6 +196,7 @@ func parse(arguments []string) (*options, error) {
 	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize the session before and after the command")
 	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
 	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
+	result.conflictOptions.register(flags)
 	flags.BoolVarP(&result.help, "help", "h", false, "Show this help")
 	flags.BoolVar(&result.version, "version", false, "Show version information")
 	if err := flags.Parse(arguments); err != nil {
@@ -164,8 +217,11 @@ func parse(arguments []string) (*options, error) {
 		return nil, errors.New("--flush and --no-flush are mutually exclusive")
 	} else if result.diff && (result.flush || result.noFlush) {
 		return nil, errors.New("--diff can't be combined with --flush or --no-flush")
-	} else if !result.help && !result.version && !result.flush && !result.diff && len(result.arguments) == 0 {
+	} else if !result.help && !result.version && !result.flush && !result.diff && !result.active() && len(result.arguments) == 0 {
 		return nil, errors.New("no command specified")
+	}
+	if err := result.validateConflicts(); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
@@ -194,7 +250,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// prologue applies, are determined by the session root once the route is
 	// located.
 	var request *remote.Request
-	if !options.diff && len(options.arguments) > 0 {
+	if !options.diff && !options.active() && len(options.arguments) > 0 {
 		environment, err := loadEnvironment(options.environmentFiles, options.environment)
 		if err != nil {
 			return fail(err)
@@ -255,6 +311,18 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	directory, err := os.Getwd()
 	if err != nil {
 		return fail(fmt.Errorf("unable to determine working directory: %w", err))
+	}
+
+	if options.active() {
+		err := runConflicts(ctx, directory, options, stdout, stderr)
+		if code, ok := interrupted("resolving conflicts"); ok {
+			return code
+		} else if errors.Is(err, errReported) {
+			return failureExitCode
+		} else if err != nil {
+			return fail(err)
+		}
+		return 0
 	}
 
 	// synchronize forces a synchronization cycle for the session and warns
