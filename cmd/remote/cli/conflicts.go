@@ -719,7 +719,7 @@ func runConflicts(ctx context.Context, directory string, o *options, output, err
 		err = applyAll(ctx, directory, o, p)
 	} else {
 		for _, argument := range o.arguments {
-			result, err := discard(ctx, directory, o, argument)
+			result, err := discard(ctx, o, argument)
 			p.print(argument, result, err)
 		}
 	}
@@ -1521,11 +1521,37 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 	return &outcome{Path: a.argument, Resolved: true, Backup: backup, lines: lines}, nil
 }
 
+// releaseAt releases the checkout of the conflict root at a local path, held
+// by the endpoint whose root contains it, and returns whether that endpoint
+// held one (see remote.ReleaseCheckout). The endpoint is located by the
+// conflict root's parent rather than the working directory, so that it's found
+// from outside the root, or from inside the opposite root, even if both
+// endpoints are on this system. The parent is used since the conflict root may
+// be a symbolic link, which would be resolved, or missing; a conflict at the
+// root of a single-file session is outside its parent, so it's located by the
+// session alone. If a workspace is specified, the checkout must be the one
+// that it was checked out through.
+func releaseAt(ctx context.Context, local, session string, w *workspace) (bool, error) {
+	connection, target, err := remote.Dial(ctx, filepath.Dir(local), session, remote.OperationRelease)
+	if err != nil {
+		return false, err
+	}
+	path, err := newLocator(target).resolve(local)
+	if err == nil && w != nil && !w.matches(target, path) {
+		err = errors.New("the workspace was checked out through a different session or endpoint")
+	}
+	if err != nil {
+		connection.Close()
+		return false, err
+	}
+	return remote.ReleaseCheckout(ctx, connection, path)
+}
+
 // discard sets a workspace aside without changing either copy and releases its
 // checkout, so that the conflict can be checked out again, through either
 // endpoint. A checkout without a workspace, such as one left by an interrupted
-// checkout, is released as well.
-func discard(ctx context.Context, directory string, o *options, argument string) (*outcome, error) {
+// checkout or by a discard whose release failed, is released as well.
+func discard(ctx context.Context, o *options, argument string) (*outcome, error) {
 	local, err := filepath.Abs(argument)
 	if err != nil {
 		return nil, fmt.Errorf("unable to locate it: %w", err)
@@ -1537,15 +1563,7 @@ func discard(ctx context.Context, directory string, o *options, argument string)
 	defer unlock()
 	w, err := loadWorkspace(local)
 	if errors.Is(err, os.ErrNotExist) {
-		connection, target, err := remote.Dial(ctx, directory, o.session, remote.OperationRelease)
-		if err != nil {
-			return nil, err
-		}
-		path, err := newLocator(target).resolve(local)
-		if err != nil {
-			connection.Close()
-			return nil, err
-		} else if held, err := remote.ReleaseCheckout(ctx, connection, path); err != nil {
+		if held, err := releaseAt(ctx, local, o.session, nil); err != nil {
 			return nil, err
 		} else if !held {
 			return nil, errors.New("isn't checked out")
@@ -1561,8 +1579,8 @@ func discard(ctx context.Context, directory string, o *options, argument string)
 		return nil, fmt.Errorf("unable to set the workspace aside: %w", err)
 	}
 	// The workspace's session is selected by its identifier, so that it's
-	// found even from outside its root.
-	if _, err := release(ctx, directory, w.Session, &remote.Target{Session: w.Session, Alpha: w.Alpha}, w.Path); err != nil {
+	// found even if --session wasn't specified for a single-file session.
+	if _, err := releaseAt(ctx, local, w.Session, w); err != nil {
 		return nil, fmt.Errorf("discarded the workspace without changing either copy (it's kept in %s), but unable to release its checkout, so the opposite endpoint can't check the conflict out yet: %w; discard again to release it", backup, err)
 	}
 	return &outcome{Path: argument, Discarded: true, Backup: backup, lines: []string{

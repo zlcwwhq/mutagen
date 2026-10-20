@@ -444,6 +444,34 @@ func TestRemoteConflictAbandonedCheckout(t *testing.T) {
 	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "reused")
 }
 
+func TestRemoteConflictDiscardFromOutside(t *testing.T) {
+	// Discarding locates the endpoint by the conflict root rather than the
+	// working directory, so that it releases the checkout from outside both
+	// roots, even though both endpoints are on this system, and from inside
+	// the opposite root. That includes checkouts whose workspaces are already
+	// gone, so that a discard whose release failed can be retried.
+	alpha, beta, roots := createBothSidedConflicts(t, "workspace", "missing", "opposite")
+	outside := &conflictCommands{t: t, directory: t.TempDir()}
+	for _, path := range []string{"workspace", "missing", "opposite"} {
+		w := alpha.checkout(path)
+		if path == "missing" {
+			if err := os.RemoveAll(filepath.Dir(w.Local)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if discarded := outside.outcomes("--conflict-discard", filepath.Join(roots[0], "workspace"))[0]; !discarded.Discarded || discarded.Backup == "" {
+		t.Fatalf("workspace not discarded: %+v", discarded)
+	} else if discarded := outside.outcomes("--conflict-discard", filepath.Join(roots[0], "missing"))[0]; !discarded.Discarded {
+		t.Fatalf("checkout without a workspace not released: %+v", discarded)
+	} else if discarded := beta.outcomes("--conflict-discard", filepath.Join(roots[0], "opposite"))[0]; !discarded.Discarded || discarded.Backup == "" {
+		t.Fatalf("workspace not discarded from the opposite root: %+v", discarded)
+	}
+	for _, path := range []string{"workspace", "missing", "opposite"} {
+		beta.checkout(path)
+	}
+}
+
 func TestRemoteConflictStaleApplyForgotten(t *testing.T) {
 	// An apply that fails because the remote copy changed since checkout
 	// writes neither copy, so its workspace isn't taken for an unfinished
@@ -693,6 +721,10 @@ func TestRemoteConflictFileRoot(t *testing.T) {
 	if listing := c.list(); len(listing.Conflicts) != 1 || listing.Conflicts[0].Path != alphaRoot || !listing.Conflicts[0].Files {
 		t.Fatalf("unexpected conflicts: %+v", listing.Conflicts)
 	}
+	// Discarding releases the root's checkout, though the root's parent is
+	// outside it, so that it can be checked out again.
+	c.checkout(alphaRoot)
+	c.invoke("--conflict-discard", alphaRoot)
 	w := c.checkout(alphaRoot)
 	writeFile(t, w.Merged, "merged\n")
 	c.fail("root can't be deleted", "--conflict-apply", "--delete", alphaRoot)

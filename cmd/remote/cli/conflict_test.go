@@ -61,7 +61,7 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 			}
 			// Without a daemon, the workspace is set aside, but its checkout
 			// can't be released, which is reported.
-			if _, err := discard(ctx, root, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
+			if _, err := discard(ctx, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
 				t.Fatal("unreleased checkout not reported:", err)
 			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("directory workspace can't be discarded:", err)
