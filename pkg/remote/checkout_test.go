@@ -13,36 +13,50 @@ func TestCheckoutExchange(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// The daemon receives the conflict root and reports whether the
-	// submitting endpoint held its checkout, or why it couldn't be claimed.
-	exchange := func(path string, held bool, outcome error) (string, bool, error) {
+	// The daemon receives the conflict root and token, and reports the token
+	// of the checkout that the submitting endpoint held, or why it couldn't be
+	// claimed or released.
+	type request struct{ path, token string }
+	serve := func(held string, outcome error) (net.Conn, chan request) {
 		client, server := net.Pipe()
-		received := make(chan string, 1)
+		received := make(chan request, 1)
 		go func() {
-			path, err := ReceiveCheckout(ctx, server)
+			path, token, err := ReceiveCheckout(ctx, server)
 			if err != nil {
-				RespondToCheckout(server, false, err)
-				received <- ""
+				RespondToCheckout(server, "", err)
+				received <- request{}
 				return
 			}
 			RespondToCheckout(server, held, outcome)
-			received <- path
+			received <- request{path, token}
 		}()
-		held, err := ClaimCheckout(ctx, client, path)
-		return <-received, held, err
+		return client, received
 	}
 	for _, path := range []string{"", "file", "sub/file"} {
-		if received, held, err := exchange(path, true, nil); err != nil || received != path || !held {
-			t.Fatalf("checkout of %q exchanged incorrectly: %q, %t, %v", path, received, held, err)
+		client, received := serve("previous", nil)
+		if held, err := ClaimCheckout(ctx, client, path, "token"); err != nil || !held {
+			t.Fatalf("claim of %q exchanged incorrectly: %t, %v", path, held, err)
+		} else if r := <-received; r != (request{path, "token"}) {
+			t.Fatalf("claim of %q received incorrectly: %+v", path, r)
 		}
 	}
-	if _, held, err := exchange("file", false, errors.New("is checked out elsewhere")); err == nil || err.Error() != "is checked out elsewhere" || held {
+	client, received := serve("", nil)
+	if held, err := ClaimCheckout(ctx, client, "file", "token"); err != nil || held || <-received != (request{"file", "token"}) {
+		t.Fatal("new claim exchanged incorrectly:", held, err)
+	}
+	client, received = serve("previous", nil)
+	if held, err := ReleaseCheckout(ctx, client, "file", ""); err != nil || held != "previous" || <-received != (request{"file", ""}) {
+		t.Fatal("release exchanged incorrectly:", held, err)
+	}
+	client, _ = serve("", errors.New("is checked out elsewhere"))
+	if held, err := ClaimCheckout(ctx, client, "file", "token"); err == nil || err.Error() != "is checked out elsewhere" || held {
 		t.Fatal("claim failure not reported:", held, err)
 	}
 
 	// Paths that can't be conflict roots are rejected.
 	for _, path := range []string{".", "/file", "../file", "sub/../file", "sub\\file", "a\x00b"} {
-		if _, _, err := exchange(path, true, nil); err == nil || err.Error() != "invalid conflict root" {
+		client, _ := serve("previous", nil)
+		if _, err := ClaimCheckout(ctx, client, path, "token"); err == nil || err.Error() != "invalid conflict root" {
 			t.Fatalf("invalid conflict root %q accepted: %v", path, err)
 		}
 	}
@@ -55,7 +69,7 @@ func TestCheckoutExchange(t *testing.T) {
 		readMessage(server, &request)
 		Reject(server, errors.New("beta is not connected"))
 	}()
-	if _, err := ReleaseCheckout(ctx, client, "file"); err == nil || err.Error() != "beta is not connected" {
+	if _, err := ReleaseCheckout(ctx, client, "file", "token"); err == nil || err.Error() != "beta is not connected" {
 		t.Fatal("rejection not reported:", err)
 	}
 }
@@ -66,7 +80,7 @@ func TestListingIncludesCheckouts(t *testing.T) {
 	sent := &Listing{
 		Conflicts: []ConflictRoot{{Path: "file", Files: true}},
 		Problems:  []Problem{{Path: "problem", Error: "unreadable"}},
-		Checkouts: []Checkout{{Path: "file", Alpha: true}, {Path: "unfinished"}},
+		Checkouts: []Checkout{{Path: "file", Alpha: true, Token: "token"}, {Path: "unfinished", Token: "other"}},
 	}
 	client, server := net.Pipe()
 	go RespondWithConflicts(server, sent, nil)

@@ -59,9 +59,9 @@ type commandRelay struct {
 	// in which case claim and release are nil too.
 	conflicts func() (*remote.Listing, error)
 	// claim records a checkout by alpha or beta (see claimCheckout).
-	claim func(alpha bool, path string) (bool, error)
+	claim func(alpha bool, path, token string) (string, error)
 	// release removes a checkout held by alpha or beta (see releaseCheckout).
-	release func(alpha bool, path string) (bool, error)
+	release func(alpha bool, path, token string) (string, error)
 	// channelsLock guards channels.
 	channelsLock sync.Mutex
 	// channels holds the connected alpha and beta channels (or nil).
@@ -241,14 +241,14 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		// Checkouts belong to the submitting endpoint, which is the opposite
 		// of the target.
 		alpha := target == 1
-		path, err := remote.ReceiveCheckout(ctx, submission)
-		var held bool
+		path, token, err := remote.ReceiveCheckout(ctx, submission)
+		var held string
 		if err == nil && r.claim == nil {
 			err = errResolutionUnsupported
 		} else if err == nil && operation == remote.OperationClaim {
-			held, err = r.claim(alpha, path)
+			held, err = r.claim(alpha, path, token)
 		} else if err == nil {
-			held, err = r.release(alpha, path)
+			held, err = r.release(alpha, path, token)
 		}
 		if err := remote.RespondToCheckout(submission, held, err); err != nil {
 			r.logger.Debug("Unable to send checkout status:", err)

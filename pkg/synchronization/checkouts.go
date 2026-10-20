@@ -21,6 +21,9 @@ var errCheckedOutOpposite = errors.New("is checked out through the opposite endp
 // neither checked out nor a conflict root.
 var errNotConflictRoot = errors.New("isn't a conflict root (see remote --conflicts)")
 
+// errMissingToken indicates that a checkout was claimed without a token.
+var errMissingToken = errors.New("checkout claims require a token")
+
 // compareCheckout orders checkouts by path.
 func compareCheckout(checkout remote.Checkout, path string) int {
 	return strings.Compare(checkout.Path, path)
@@ -77,26 +80,39 @@ func (c *controller) checkouts() ([]remote.Checkout, error) {
 	return c.loadCheckouts()
 }
 
-// claimCheckout records a checkout of a conflict root through an endpoint and
-// returns whether the endpoint already held it. Each conflict is checked out
-// through a single endpoint at a time, which alone can apply or discard its
-// resolution, so the claim fails if the opposite endpoint holds the checkout.
-// New checkouts are only recorded for conflict roots of the last
-// synchronization cycle, while existing ones may outlive their conflicts, such
-// as for unfinished resolutions. Checkouts are kept until released, including
-// across daemon restarts, since workspaces outlive both.
-func (c *controller) claimCheckout(alpha bool, path string) (bool, error) {
+// claimCheckout records a checkout of a conflict root through an endpoint,
+// identified by the claim's token, and returns the token of the checkout that
+// the endpoint held beforehand, if any. Each conflict is checked out through a
+// single endpoint at a time, which alone can apply or discard its resolution,
+// so the claim fails if the opposite endpoint holds the checkout. New
+// checkouts are only recorded for conflict roots of the last synchronization
+// cycle, while existing ones may outlive their conflicts, such as for
+// unfinished resolutions. Checkouts are kept until released, including across
+// daemon restarts, since workspaces outlive both.
+//
+// A claim of a checkout that the endpoint already holds replaces its token, so
+// that releases of earlier claims, which may arrive after their submitters
+// stopped waiting for them, don't remove it (see releaseCheckout).
+func (c *controller) claimCheckout(alpha bool, path, token string) (string, error) {
+	if token == "" {
+		return "", errMissingToken
+	}
 	c.checkoutsLock.Lock()
 	defer c.checkoutsLock.Unlock()
 	checkouts, err := c.loadCheckouts()
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	index, found := slices.BinarySearchFunc(checkouts, path, compareCheckout)
 	if found && checkouts[index].Alpha == alpha {
-		return true, nil
+		held := checkouts[index].Token
+		if held == token {
+			return held, nil
+		}
+		checkouts[index].Token = token
+		return held, c.saveCheckouts(checkouts)
 	} else if found {
-		return false, errCheckedOutOpposite
+		return "", errCheckedOutOpposite
 	}
 	c.stateLock.Lock()
 	listed := slices.ContainsFunc(c.state.Conflicts, func(conflict *core.Conflict) bool {
@@ -104,27 +120,35 @@ func (c *controller) claimCheckout(alpha bool, path string) (bool, error) {
 	})
 	c.stateLock.UnlockWithoutNotify()
 	if !listed {
-		return false, errNotConflictRoot
+		return "", errNotConflictRoot
 	}
-	checkouts = slices.Insert(checkouts, index, remote.Checkout{Path: path, Alpha: alpha})
-	return false, c.saveCheckouts(checkouts)
+	checkouts = slices.Insert(checkouts, index, remote.Checkout{Path: path, Alpha: alpha, Token: token})
+	return "", c.saveCheckouts(checkouts)
 }
 
-// releaseCheckout removes the checkout of a conflict root held by an endpoint,
-// if any, and returns whether it held one. A checkout held by the opposite
-// endpoint is left as it is.
-func (c *controller) releaseCheckout(alpha bool, path string) (bool, error) {
+// releaseCheckout removes the checkout of a conflict root held by an endpoint
+// if it has the specified token, and returns the token of the checkout that
+// the endpoint held, if any. A checkout held by the opposite endpoint is left
+// as it is, as is one claimed again since the token was issued, so that a
+// release that arrives after its submitter stopped waiting for it doesn't
+// remove the checkout of a later claim. Claims require a token, so a release
+// without one only reports the token.
+func (c *controller) releaseCheckout(alpha bool, path, token string) (string, error) {
 	c.checkoutsLock.Lock()
 	defer c.checkoutsLock.Unlock()
 	checkouts, err := c.loadCheckouts()
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	index, found := slices.BinarySearchFunc(checkouts, path, compareCheckout)
 	if !found || checkouts[index].Alpha != alpha {
-		return false, nil
+		return "", nil
 	}
-	return true, c.saveCheckouts(slices.Delete(checkouts, index, index+1))
+	held := checkouts[index].Token
+	if held != token {
+		return held, nil
+	}
+	return held, c.saveCheckouts(slices.Delete(checkouts, index, index+1))
 }
 
 // removeCheckouts removes the session's checkouts from disk when the session

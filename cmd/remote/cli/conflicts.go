@@ -144,7 +144,8 @@ type workspace struct {
 	// Path is the slash-separated conflict root relative to the
 	// synchronization root, which is empty for the root itself.
 	Path string
-	// Token labels conflict markers in the merged file.
+	// Token identifies the workspace's claim of its checkout (see
+	// remote.ClaimCheckout) and labels conflict markers in the merged file.
 	Token string
 	// Local and Remote describe the checked-out copies (see remote.Snapshot).
 	Local, Remote *remote.Entry
@@ -485,31 +486,61 @@ func dialOpposite(ctx context.Context, directory, session string, expected *remo
 }
 
 // claim records with the daemon that a conflict root is checked out through
-// the endpoint that the specified target identifies, failing if the opposite
-// endpoint holds its checkout (see remote.ClaimCheckout). Each conflict is
-// checked out through a single endpoint, which alone can apply or discard its
-// resolution, since workspaces are kept on the system that checked them out,
-// where the opposite endpoint can't see them.
-func claim(ctx context.Context, directory, session string, target *remote.Target, path string) error {
+// the endpoint that the specified target identifies, under a token identifying
+// the claim, failing if the opposite endpoint holds its checkout (see
+// remote.ClaimCheckout). Each conflict is checked out through a single
+// endpoint, which alone can apply or discard its resolution, since workspaces
+// are kept on the system that checked them out, where the opposite endpoint
+// can't see them.
+func claim(ctx context.Context, directory, session string, target *remote.Target, path, token string) error {
 	connection, err := dialSession(ctx, directory, session, remote.OperationClaim, target)
 	if err != nil {
 		return err
 	}
-	_, err = remote.ClaimCheckout(ctx, connection, path)
+	_, err = remote.ClaimCheckout(ctx, connection, path, token)
 	return err
 }
 
 // release removes the checkout of a conflict root held by the endpoint that
 // the specified target identifies, if any, and returns whether it held one
-// (see remote.ReleaseCheckout). Workspaces are locked while their checkouts
-// are claimed or released, so that a release doesn't remove the checkout of
-// another operation on the same system.
-func release(ctx context.Context, directory, session string, target *remote.Target, path string) (bool, error) {
+// (see releaseOver).
+func release(ctx context.Context, directory, session string, target *remote.Target, path, token string) (bool, error) {
 	connection, err := dialSession(ctx, directory, session, remote.OperationRelease, target)
 	if err != nil {
 		return false, err
 	}
-	return remote.ReleaseCheckout(ctx, connection, path)
+	return releaseOver(ctx, connection, directory, session, target, path, token)
+}
+
+// releaseOver removes the checkout of a conflict root held by the endpoint
+// that the specified target identifies, if any, over a release submission
+// through it, and returns whether it held one. Checkouts are only released
+// once the local endpoint has no workspace for the conflict root, which is
+// locked meanwhile, so any checkout that the endpoint holds is abandoned.
+//
+// Releases still name the token of the claim that they end (see
+// remote.ReleaseCheckout), starting with the specified one, which is empty if
+// it's unknown: an operation that stops waiting for a release, such as on
+// timeout, unlocks its workspace while the release may still arrive, and the
+// token keeps it from removing the checkout of a later claim, which replaces
+// the token. A claim can arrive late as well, replacing the token of an
+// abandoned checkout, so a checkout with another token is released by that
+// token. One that arrives after the release instead leaves a checkout without
+// a workspace, which listing conflicts or discarding releases.
+func releaseOver(ctx context.Context, connection io.ReadWriteCloser, directory, session string, target *remote.Target, path, token string) (bool, error) {
+	held, err := remote.ReleaseCheckout(ctx, connection, path, token)
+	if err != nil || held == "" || held == token {
+		return held != "", err
+	}
+	connection, err = dialSession(ctx, directory, session, remote.OperationRelease, target)
+	if err != nil {
+		return true, err
+	} else if current, err := remote.ReleaseCheckout(ctx, connection, path, held); err != nil {
+		return true, err
+	} else if current != "" && current != held {
+		return true, errors.New("the checkout was claimed again while it was being released")
+	}
+	return true, nil
 }
 
 // releaseAbandoned releases the checkouts held by the local endpoint that have
@@ -522,18 +553,18 @@ func release(ctx context.Context, directory, session string, target *remote.Targ
 func releaseAbandoned(ctx context.Context, directory string, target *remote.Target, checkouts []remote.Checkout, workspaces map[string]*workspace) []remote.Checkout {
 	var remaining []remote.Checkout
 	for _, checkout := range checkouts {
-		if checkout.Alpha != target.Alpha || workspaces[checkout.Path] != nil || !releaseIfAbandoned(ctx, directory, target, checkout.Path) {
+		if checkout.Alpha != target.Alpha || workspaces[checkout.Path] != nil || !releaseIfAbandoned(ctx, directory, target, checkout) {
 			remaining = append(remaining, checkout)
 		}
 	}
 	return remaining
 }
 
-// releaseIfAbandoned releases a checkout held by the local endpoint if it has
-// no workspace and no operation on its path is in progress, and returns whether
-// the local endpoint no longer holds it.
-func releaseIfAbandoned(ctx context.Context, directory string, target *remote.Target, path string) bool {
-	local := filepath.Join(target.Root, filepath.FromSlash(path))
+// releaseIfAbandoned releases a listed checkout held by the local endpoint if
+// it has no workspace and no operation on its path is in progress, and returns
+// whether the local endpoint no longer holds it.
+func releaseIfAbandoned(ctx context.Context, directory string, target *remote.Target, checkout remote.Checkout) bool {
+	local := filepath.Join(target.Root, filepath.FromSlash(checkout.Path))
 	unlock, err := lockWorkspace(local)
 	if err != nil {
 		return false
@@ -542,7 +573,7 @@ func releaseIfAbandoned(ctx context.Context, directory string, target *remote.Ta
 	if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
-	_, err = release(ctx, directory, target.Session, target, path)
+	_, err = release(ctx, directory, target.Session, target, checkout.Path, checkout.Token)
 	return err == nil
 }
 
@@ -1000,14 +1031,16 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 	// Claim the checkout before downloading the copies, so that the opposite
 	// endpoint can't check the conflict out meanwhile, and release it if
 	// checkout fails. A checkout that the local endpoint already holds without
-	// a workspace was left by an interrupted checkout and is reused.
-	if err := claim(ctx, directory, o.session, target, path); err != nil {
+	// a workspace was left by an interrupted checkout and is reused, under the
+	// workspace's token.
+	token := rand.Text()[:8]
+	if err := claim(ctx, directory, o.session, target, path, token); err != nil {
 		return nil, err
 	}
 	created := false
 	defer func() {
 		if !created {
-			release(ctx, directory, o.session, target, path)
+			release(ctx, directory, o.session, target, path, token)
 		}
 	}()
 	base, final, err := workspaceDirectory(local)
@@ -1024,7 +1057,7 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 		return nil, fmt.Errorf("unable to create workspace: %w", err)
 	}
 	defer os.RemoveAll(staging)
-	w := &workspace{Session: target.Session, Alpha: target.Alpha, Path: path, Token: rand.Text()[:8], directory: staging}
+	w := &workspace{Session: target.Session, Alpha: target.Alpha, Path: path, Token: token, directory: staging}
 	if conflict.Files {
 		err = checkoutFiles(ctx, conflict, local, o.base, w, func(output io.Writer) (*remote.Entry, error) {
 			return remote.CopyFile(ctx, target.Root, path, output)
@@ -1405,7 +1438,7 @@ func apply(ctx context.Context, directory string, o *options, argument string, l
 	// Only the endpoint holding a conflict's checkout can resolve it. A
 	// workspace whose checkout is missing claims it again, if the conflict is
 	// still listed and the opposite endpoint hasn't checked it out.
-	if err := claim(ctx, directory, o.session, target, w.Path); err != nil {
+	if err := claim(ctx, directory, o.session, target, w.Path, w.Token); err != nil {
 		connection.Close()
 		return nil, unlock, err
 	}
@@ -1543,7 +1576,7 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 	lines := []string{resolved, retentionNote(backup)}
 	// The checkout is released once the workspace is set aside. One left
 	// behind is released by the next listing (see releaseAbandoned).
-	if _, err := release(ctx, directory, o.session, a.target, w.Path); err != nil {
+	if _, err := release(ctx, directory, o.session, a.target, w.Path, w.Token); err != nil {
 		lines = append(lines, fmt.Sprintf("Unable to release the checkout (%v); remote --conflicts releases it.", err))
 	}
 	return &outcome{Path: a.argument, Resolved: true, Backup: backup, lines: lines}, nil
@@ -1557,8 +1590,10 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 // endpoints are on this system. The parent is used since the conflict root may
 // be a symbolic link, which would be resolved, or missing; a conflict at the
 // root of a single-file session is outside its parent, so it's located by the
-// session alone. If a workspace is specified, the checkout must be the one
-// that it was checked out through.
+// session alone. If a workspace is specified, which must have been set aside,
+// the checkout must be the one that it was checked out through, and it's
+// released starting with the workspace's token. Otherwise, the token is
+// unknown (see releaseOver).
 func releaseAt(ctx context.Context, local, session string, w *workspace) (bool, error) {
 	connection, target, err := remote.Dial(ctx, filepath.Dir(local), session, remote.OperationRelease)
 	if err != nil {
@@ -1572,7 +1607,11 @@ func releaseAt(ctx context.Context, local, session string, w *workspace) (bool, 
 		connection.Close()
 		return false, err
 	}
-	return remote.ReleaseCheckout(ctx, connection, path)
+	var token string
+	if w != nil {
+		token = w.Token
+	}
+	return releaseOver(ctx, connection, filepath.Dir(local), session, target, path, token)
 }
 
 // discard sets a workspace aside without changing either copy and releases its

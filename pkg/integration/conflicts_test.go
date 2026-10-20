@@ -14,6 +14,7 @@ import (
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/integration/protocols/netpipe"
+	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/selection"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
@@ -414,6 +415,36 @@ func TestRemoteConflictCheckoutOwnership(t *testing.T) {
 			t.Fatalf("resolution not applied: %q", data)
 		}
 	}
+}
+
+func TestRemoteConflictLateClaim(t *testing.T) {
+	// A claim can arrive after its submitter stopped waiting for it, such as on
+	// timeout, and replace the token of a checkout that a workspace holds.
+	// Discarding the workspace still releases the checkout, so that the
+	// opposite endpoint can check the conflict out.
+	alpha, beta, _ := createBothSidedConflicts(t, "file")
+	alpha.checkout("file")
+	directory, err := filesystem.Mutagen(false, filesystem.MutagenSynchronizationCheckoutsDirectoryName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := filepath.Glob(filepath.Join(directory, "*"))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("unexpected checkouts: %v, %v", paths, err)
+	}
+	var checkouts []remote.Checkout
+	if err := json.Unmarshal([]byte(readFile(paths[0])), &checkouts); err != nil || len(checkouts) != 1 || checkouts[0].Token == "" {
+		t.Fatalf("unexpected checkouts: %+v, %v", checkouts, err)
+	}
+	checkouts[0].Token = "late"
+	data, err := json.Marshal(checkouts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, paths[0], string(data))
+	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "file")
+	alpha.invoke("--conflict-discard", "file")
+	beta.checkout("file")
 }
 
 func TestRemoteConflictAbandonedCheckout(t *testing.T) {
