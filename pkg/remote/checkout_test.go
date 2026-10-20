@@ -34,14 +34,14 @@ func TestCheckoutExchange(t *testing.T) {
 	}
 	for _, path := range []string{"", "file", "sub/file"} {
 		client, received := serve("previous", nil)
-		if held, err := ClaimCheckout(ctx, client, path, "token"); err != nil || !held {
-			t.Fatalf("claim of %q exchanged incorrectly: %t, %v", path, held, err)
+		if held, err := ClaimCheckout(ctx, client, path, "token"); err != nil || held != "previous" {
+			t.Fatalf("claim of %q exchanged incorrectly: %q, %v", path, held, err)
 		} else if r := <-received; r != (request{path, "token"}) {
 			t.Fatalf("claim of %q received incorrectly: %+v", path, r)
 		}
 	}
 	client, received := serve("", nil)
-	if held, err := ClaimCheckout(ctx, client, "file", "token"); err != nil || held || <-received != (request{"file", "token"}) {
+	if held, err := ClaimCheckout(ctx, client, "file", "token"); err != nil || held != "" || <-received != (request{"file", "token"}) {
 		t.Fatal("new claim exchanged incorrectly:", held, err)
 	}
 	client, received = serve("previous", nil)
@@ -49,7 +49,7 @@ func TestCheckoutExchange(t *testing.T) {
 		t.Fatal("release exchanged incorrectly:", held, err)
 	}
 	client, _ = serve("", errors.New("is checked out elsewhere"))
-	if held, err := ClaimCheckout(ctx, client, "file", "token"); err == nil || err.Error() != "is checked out elsewhere" || held {
+	if held, err := ClaimCheckout(ctx, client, "file", "token"); err == nil || err.Error() != "is checked out elsewhere" || held != "" {
 		t.Fatal("claim failure not reported:", held, err)
 	}
 

@@ -109,26 +109,41 @@ func TestCheckoutClaims(t *testing.T) {
 	}
 }
 
-func TestCheckoutStaleRelease(t *testing.T) {
+func TestCheckoutStaleRequests(t *testing.T) {
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	c := newCheckoutController("file")
 
-	// A release can arrive after its submitter stopped waiting for it, such as
-	// on timeout, and the conflict was claimed again through the same
-	// endpoint, by a new checkout or an apply. That claim replaced the token,
-	// so the release leaves the checkout, which the opposite endpoint thus
-	// can't claim, until it's released by its current token.
-	if _, err := c.claimCheckout(true, "file", "old"); err != nil {
-		t.Fatal(err)
-	} else if held, err := c.claimCheckout(true, "file", "new"); err != nil || held != "old" {
-		t.Fatal("checkout not claimed again:", held, err)
+	// A claim and a release can arrive after their submitter stopped waiting
+	// for them, such as on timeout, and after the conflict was checked out
+	// again through the same endpoint. The checkout keeps the token of the
+	// claim that recorded it, so the late claim only reports it, and the late
+	// release leaves the checkout, which the opposite endpoint thus can't
+	// claim, until it's released by its token.
+	expected := []remote.Checkout{{Path: "file", Alpha: true, Token: "new"}}
+	if held, err := c.claimCheckout(true, "file", "new"); err != nil || held != "" {
+		t.Fatal("checkout not claimed:", held, err)
+	} else if held, err := c.claimCheckout(true, "file", "old"); err != nil || held != "new" {
+		t.Fatal("held checkout not reported to a late claim:", held, err)
 	} else if held, err := c.releaseCheckout(true, "file", "old"); err != nil || held != "new" {
-		t.Fatal("stale release not ignored:", held, err)
+		t.Fatal("held checkout not reported to a late release:", held, err)
+	} else if checkouts, err := c.checkouts(); err != nil || !reflect.DeepEqual(checkouts, expected) {
+		t.Fatalf("checkout changed by a late claim and release: %+v, %v", checkouts, err)
 	} else if _, err := c.claimCheckout(false, "file", "opposite"); !errors.Is(err, errCheckedOutOpposite) {
-		t.Fatal("checkout claimed by the opposite endpoint after a stale release:", err)
+		t.Fatal("checkout claimed by the opposite endpoint after a late claim and release:", err)
 	} else if held, err := c.releaseCheckout(true, "file", "new"); err != nil || held != "new" {
-		t.Fatal("checkout not released by its current token:", held, err)
-	} else if held, err := c.claimCheckout(false, "file", "opposite"); err != nil || held != "" {
-		t.Fatal("released checkout not claimed by the opposite endpoint:", held, err)
+		t.Fatal("checkout not released by its token:", held, err)
+	}
+
+	// A claim that arrives after the checkout was released records a checkout
+	// without a workspace, which a later claim through the same endpoint
+	// leaves as it is, until it's released by its token.
+	if held, err := c.claimCheckout(true, "file", "old"); err != nil || held != "" {
+		t.Fatal("late claim not recorded:", held, err)
+	} else if held, err := c.claimCheckout(true, "file", "next"); err != nil || held != "old" {
+		t.Fatal("abandoned checkout not reported:", held, err)
+	} else if held, err := c.releaseCheckout(true, "file", "old"); err != nil || held != "old" {
+		t.Fatal("abandoned checkout not released:", held, err)
+	} else if held, err := c.claimCheckout(true, "file", "next"); err != nil || held != "" {
+		t.Fatal("released checkout not claimed again:", held, err)
 	}
 }

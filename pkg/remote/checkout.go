@@ -20,7 +20,8 @@ type Checkout struct {
 	Path string
 	// Alpha indicates whether the conflict was checked out through alpha.
 	Alpha bool `json:",omitempty"`
-	// Token identifies the latest claim of the checkout (see ClaimCheckout).
+	// Token identifies the claim that recorded the checkout (see
+	// ClaimCheckout).
 	Token string `json:",omitempty"`
 }
 
@@ -77,16 +78,19 @@ func exchangeCheckout(ctx context.Context, connection io.ReadWriteCloser, path, 
 // ClaimCheckout records a checkout of a conflict root by the submitting
 // endpoint over a claim submission (see Dial), failing if the opposite endpoint
 // holds it or, if neither does, if the path isn't a conflict root. The claim is
-// identified by a token, which is required and replaces that of a checkout that
-// the submitting endpoint already held. It returns whether the submitting
-// endpoint already held it. It owns and closes the connection.
+// identified by a token, which is required, and it returns the token of the
+// checkout that the submitting endpoint held beforehand, if any. A checkout
+// that the submitting endpoint already holds is left as it is, so the claim is
+// only recorded if the returned token is empty or its own. It owns and closes
+// the connection.
 //
-// Each claim should use a new token, so that releases of earlier claims don't
-// remove its checkout: a release can arrive after its submitter stopped
-// waiting for it, such as on timeout, and the conflict was claimed again.
-func ClaimCheckout(ctx context.Context, connection io.ReadWriteCloser, path, token string) (bool, error) {
-	held, err := exchangeCheckout(ctx, connection, path, token)
-	return held != "", err
+// Each checkout should be claimed under a new token, so that claims and
+// releases of earlier checkouts can't take over or remove it: they can arrive
+// after their submitters stopped waiting for them, such as on timeout, and the
+// conflict was claimed again. A checkout held under another token must thus be
+// released (see ReleaseCheckout) before it's claimed again.
+func ClaimCheckout(ctx context.Context, connection io.ReadWriteCloser, path, token string) (string, error) {
+	return exchangeCheckout(ctx, connection, path, token)
 }
 
 // ReleaseCheckout removes the checkout of a conflict root held by the

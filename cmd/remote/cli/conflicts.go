@@ -492,13 +492,38 @@ func dialOpposite(ctx context.Context, directory, session string, expected *remo
 // endpoint, which alone can apply or discard its resolution, since workspaces
 // are kept on the system that checked them out, where the opposite endpoint
 // can't see them.
+//
+// Claims are only made while the local endpoint's workspace for the conflict
+// root is locked, by the checkout creating the workspace or through the
+// workspace itself, so a checkout that the endpoint holds under another token
+// has no workspace. It's abandoned, such as one left by an interrupted
+// checkout or recorded by a claim that arrived late, and claims leave it as it
+// is, so it's released by its token before claiming the checkout again, which
+// fails if the opposite endpoint claims it meanwhile.
 func claim(ctx context.Context, directory, session string, target *remote.Target, path, token string) error {
-	connection, err := dialSession(ctx, directory, session, remote.OperationClaim, target)
-	if err != nil {
+	claimOnce := func() (string, error) {
+		connection, err := dialSession(ctx, directory, session, remote.OperationClaim, target)
+		if err != nil {
+			return "", err
+		}
+		return remote.ClaimCheckout(ctx, connection, path, token)
+	}
+	held, err := claimOnce()
+	if err != nil || held == "" || held == token {
 		return err
 	}
-	_, err = remote.ClaimCheckout(ctx, connection, path, token)
-	return err
+	connection, err := dialSession(ctx, directory, session, remote.OperationRelease, target)
+	if err == nil {
+		_, err = remote.ReleaseCheckout(ctx, connection, path, held)
+	}
+	if err != nil {
+		return fmt.Errorf("unable to release an abandoned checkout: %w", err)
+	} else if held, err = claimOnce(); err != nil {
+		return err
+	} else if held != "" && held != token {
+		return errors.New("the abandoned checkout was claimed again while it was being released")
+	}
+	return nil
 }
 
 // release removes the checkout of a conflict root held by the endpoint that
@@ -522,11 +547,13 @@ func release(ctx context.Context, directory, session string, target *remote.Targ
 // remote.ReleaseCheckout), starting with the specified one, which is empty if
 // it's unknown: an operation that stops waiting for a release, such as on
 // timeout, unlocks its workspace while the release may still arrive, and the
-// token keeps it from removing the checkout of a later claim, which replaces
-// the token. A claim can arrive late as well, replacing the token of an
-// abandoned checkout, so a checkout with another token is released by that
-// token. One that arrives after the release instead leaves a checkout without
-// a workspace, which listing conflicts or discarding releases.
+// token keeps it from removing the checkout of a later claim, which has
+// another token. A claim can arrive late as well and, if the endpoint holds no
+// checkout, record one without a workspace. A checkout with another token is
+// thus abandoned too, since the local endpoint has no workspace for the
+// conflict root, so it's released by that token, and one recorded after the
+// release is released by listing conflicts, discarding, or checking the
+// conflict out again (see claim).
 func releaseOver(ctx context.Context, connection io.ReadWriteCloser, directory, session string, target *remote.Target, path, token string) (bool, error) {
 	held, err := remote.ReleaseCheckout(ctx, connection, path, token)
 	if err != nil || held == "" || held == token {
@@ -1030,9 +1057,11 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 
 	// Claim the checkout before downloading the copies, so that the opposite
 	// endpoint can't check the conflict out meanwhile, and release it if
-	// checkout fails. A checkout that the local endpoint already holds without
-	// a workspace was left by an interrupted checkout and is reused, under the
-	// workspace's token.
+	// checkout fails. The claim has a new token, which the workspace keeps, so
+	// that late claims and releases of earlier checkouts can't take over or
+	// remove its checkout. A checkout that the local endpoint already holds
+	// without a workspace, such as one left by an interrupted checkout, is
+	// released first (see claim).
 	token := rand.Text()[:8]
 	if err := claim(ctx, directory, o.session, target, path, token); err != nil {
 		return nil, err

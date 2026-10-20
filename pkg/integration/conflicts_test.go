@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/integration/protocols/netpipe"
@@ -417,31 +418,50 @@ func TestRemoteConflictCheckoutOwnership(t *testing.T) {
 	}
 }
 
-func TestRemoteConflictLateClaim(t *testing.T) {
-	// A claim can arrive after its submitter stopped waiting for it, such as on
-	// timeout, and replace the token of a checkout that a workspace holds.
-	// Discarding the workspace still releases the checkout, so that the
-	// opposite endpoint can check the conflict out.
+func TestRemoteConflictLateRequests(t *testing.T) {
+	// A claim and a release can arrive after their submitter stopped waiting
+	// for them, such as on timeout, and after the conflict was checked out
+	// again through the same endpoint. They neither take over nor remove that
+	// checkout, so the opposite endpoint can't check the conflict out.
 	alpha, beta, _ := createBothSidedConflicts(t, "file")
+	submit := func(operation remote.Operation, token string) string {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		connection, _, err := remote.Dial(ctx, alpha.directory, "", operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exchange := remote.ReleaseCheckout
+		if operation == remote.OperationClaim {
+			exchange = remote.ClaimCheckout
+		}
+		held, err := exchange(ctx, connection, "file", token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return held
+	}
 	alpha.checkout("file")
-	directory, err := filesystem.Mutagen(false, filesystem.MutagenSynchronizationCheckoutsDirectoryName)
-	if err != nil {
-		t.Fatal(err)
+	if held := submit(remote.OperationClaim, "late"); held == "" || held == "late" {
+		t.Fatalf("late claim recorded (%q)", held)
+	} else if released := submit(remote.OperationRelease, "late"); released != held {
+		t.Fatalf("late release not ignored (%q, %q)", held, released)
 	}
-	paths, err := filepath.Glob(filepath.Join(directory, "*"))
-	if err != nil || len(paths) != 1 {
-		t.Fatalf("unexpected checkouts: %v, %v", paths, err)
+	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "file")
+
+	// A claim that arrives after the checkout was released records one without
+	// a workspace, which checking the conflict out again through the same
+	// endpoint releases.
+	alpha.invoke("--conflict-discard", "file")
+	if held := submit(remote.OperationClaim, "late"); held != "" {
+		t.Fatalf("released checkout reported as held (%q)", held)
 	}
-	var checkouts []remote.Checkout
-	if err := json.Unmarshal([]byte(readFile(paths[0])), &checkouts); err != nil || len(checkouts) != 1 || checkouts[0].Token == "" {
-		t.Fatalf("unexpected checkouts: %+v, %v", checkouts, err)
+	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "file")
+	alpha.checkout("file")
+	if held := submit(remote.OperationRelease, "late"); held == "" || held == "late" {
+		t.Fatalf("abandoned checkout not replaced (%q)", held)
 	}
-	checkouts[0].Token = "late"
-	data, err := json.Marshal(checkouts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, paths[0], string(data))
 	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "file")
 	alpha.invoke("--conflict-discard", "file")
 	beta.checkout("file")
