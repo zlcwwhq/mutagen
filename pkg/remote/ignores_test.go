@@ -31,6 +31,11 @@ func TestIgnoresExcluded(t *testing.T) {
 		{docker, "data/keep/x", ""},
 		{docker, "data/other/x", "data/other"},
 		{&Ignores{Syntax: ignore.Syntax_SyntaxDocker, Patterns: []string{"build"}}, "build/x", "build"},
+		// Paths are excluded in any Unicode normalization form, and the
+		// excluded directory is reported in the form given.
+		{&Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"café"}}, "café/x", "café"},
+		{&Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"café"}}, "café", "café"},
+		{&Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"café/inner"}}, "café/inner/x", "café/inner"},
 		// Unresolved syntaxes and invalid patterns exclude nothing.
 		{&Ignores{Patterns: []string{"inner"}}, "inner", ""},
 		{&Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"inner", ""}}, "inner", ""},

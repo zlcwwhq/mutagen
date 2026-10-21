@@ -3,6 +3,8 @@ package remote
 import (
 	"strings"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 	dockerignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/docker"
 	mutagenignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/mutagen"
@@ -30,6 +32,12 @@ type Ignores struct {
 // be synchronized, and it isn't considered excluded, while content beneath it
 // that isn't unignored is excluded once nothing beneath it can be. Ignores that
 // can't be compiled exclude nothing, since sessions validate their ignores.
+//
+// The path is excluded if it's excluded in any Unicode normalization form,
+// since scans needn't see it in the form given: they recompose names on
+// filesystems that decompose them, and filesystems that look up names
+// regardless of their form let the current directory be named in a form other
+// than the stored one (as in $PWD, which os.Getwd returns).
 func (i *Ignores) excluded(path string) string {
 	if i == nil || path == "" {
 		return ""
@@ -50,23 +58,34 @@ func (i *Ignores) excluded(path string) string {
 		ignorer = ignore.IgnoreVCS(ignorer)
 	}
 	components := strings.Split(path, "/")
+	for _, form := range []string{path, norm.NFC.String(path), norm.NFD.String(path)} {
+		if depth := excludedDepth(ignorer, strings.Split(form, "/")); depth > 0 {
+			return strings.Join(components[:depth], "/")
+		}
+	}
+	return ""
+}
+
+// excludedDepth returns the number of components of the path to the directory
+// that keeps the directory with the specified path components from being
+// synchronized (see Ignores.excluded), or zero if there's none.
+func excludedDepth(ignorer ignore.Ignorer, components []string) int {
 	masked := false
 	for c := range components {
-		prefix := strings.Join(components[:c+1], "/")
-		status, traverse := ignorer.Ignore(prefix, true)
+		status, traverse := ignorer.Ignore(strings.Join(components[:c+1], "/"), true)
 		switch status {
 		case ignore.IgnoreStatusIgnored:
 			if !traverse {
-				return prefix
+				return c + 1
 			}
 			masked = true
 		case ignore.IgnoreStatusUnignored:
 			masked = false
 		default:
 			if masked && !traverse {
-				return prefix
+				return c + 1
 			}
 		}
 	}
-	return ""
+	return 0
 }
