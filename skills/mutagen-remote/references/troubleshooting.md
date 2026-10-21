@@ -19,8 +19,12 @@ what to change.
 | --- | --- | --- |
 | `no connected session with remote commands enabled contains <dir>` (255) | Outside every synced root, or the session is paused, disconnected, or doesn't execute commands on the other side (they can be enabled in one direction only) | `cd` into the synced directory; otherwise tell the user |
 | `<alpha\|beta> is not connected for remote commands` (255) | Session just started or is reconnecting | Retry after a few seconds; if it persists, tell the user |
-| `multiple sessions contain ...` / `multiple sessions match ...` (255) | The directory is synced by the sessions listed in the message | `remote -s <name-or-id> ...` or `export MUTAGEN_REMOTE_SESSION=<name>` |
+| `multiple sessions contain ...` / `multiple sessions match ...` (255) | The directory is synced by the sessions listed in the message | Add `-s <name-or-id>` to the command (`MUTAGEN_REMOTE_SESSION` also works, but only chooses among the sessions containing the directory; see "Which session and directory are used") |
+| `<dir> is synchronized by session X, not Y` (255) | `-s` selected a session whose roots don't contain the directory, which another session's root does: the command would run at the selected session's remote root, not in a corresponding directory | Drop `-s` to use the session containing the directory, or add `--cwd` to say where to run on the selected session's side |
+| `<dir> is ignored by session X` / `<dir> is inside <dir2>, which session X ignores` (255) | The session containing the directory doesn't synchronize it. Usually it's the root of a nested session that's paused or disconnected (or doesn't run commands from this side); sometimes it's a directory such as a build directory that exists separately on each side | For a nested session, tell the user that it isn't running; don't work around it with `--cwd`, which would run in the enclosing session's unsynchronized copy. Only if the directory is meant to exist separately on the other side, add `--cwd .` |
 | `both endpoints of session ... are on this system` (255) | `--session` used outside both roots of a local session | Run from inside the root you want to submit from |
+| `session ... is no longer connected for remote commands on this system` (255) | The session paused, reconnected, or was terminated after `remote` located it; `remote` doesn't switch to another session midway | Retry after a few seconds; if it persists, tell the user |
+| `the connection to the executing endpoint was lost ...` (255) | The session stopped synchronizing while the command ran (paused, reconnecting, replaced, or the daemon stopped), so the command was terminated: SIGTERM, then SIGKILL 5 seconds later | Files that it was writing may be incomplete. Once `remote --flush` succeeds, check them and rerun the command; detach long jobs. If it recurs, tell the user |
 | `registered by Mutagen X, but this is Mutagen Y` (255) | `remote` from a different Mutagen version | Use the `remote` installed with version X |
 | `warning: unable to synchronize before/after the command` | The session stopped synchronizing during a flush, or `--timeout` expired | The command still ran; retry with `remote --flush`, and tell the user if it keeps failing |
 | `synchronization stopped before the flush completed` (255 with `--flush`) | Same as above | Same as above |
@@ -28,8 +32,37 @@ what to change.
 | `remote: prologue <path> failed with exit status N` (126) | The prologue returned non-zero, had a syntax error, or exited | Inspect with `remote --no-prologue cat <path>`; repair a workspace override locally, preserving existing setup |
 | `unable to access prologue` (126) | A prologue is missing or inaccessible, or an override is a dangling link | Use `--no-prologue` to inspect the reported path; repair the workspace override, or tell the user if their configured script is unavailable |
 | `unable to access working directory` (126) | The corresponding directory doesn't exist remotely | See "Conflicts and unsynchronized content", or use `--cwd` |
+| `is checked out through the opposite endpoint` (255) | The conflict was checked out from the other side, which alone can apply or discard it | Leave it and its paths alone; if it seems abandoned, ask the user to discard it on that side (`remote --conflict-discard <path>`) |
+| `is already checked out in <dir>` (255) | The conflict has a workspace on this side, which may be another agent's or the user's resolution in progress | If you checked it out, do what the message says; otherwise leave it, or ask the user |
 
 Statuses 128+N mean that the remote command was killed by signal N.
+
+## Which session and directory are used
+
+`remote` uses the session whose root most specifically contains the current
+directory and runs commands in the corresponding remote directory, so prefer
+`cd`-ing into the synced tree. `remote pwd` shows where commands run.
+
+- `-s <name-or-id>` selects a session explicitly; prefer it for one-off
+  disambiguation. From outside the session's root, commands run at the root of
+  its opposite endpoint, or in `--cwd` (relative paths are resolved against
+  that root). From inside another session's root, `-s` naming a session whose
+  roots don't contain the directory fails unless `--cwd` is given.
+- `MUTAGEN_REMOTE_SESSION`, if exported, only chooses among the sessions whose
+  roots contain the current directory, and is ignored if none of them matches
+  it, so it never overrides the session containing the directory. Outside
+  every synced root, it selects a session as `-s` does.
+- `remote` can't find sessions that are paused, disconnected, or that don't run
+  commands submitted from this side. Inside the root of such a session nested
+  in another synced root, the enclosing session is used: if it ignores the
+  nested root, as it typically does, commands fail (see `... which session X
+  ignores` above); otherwise, they silently run in the enclosing session's copy
+  of the directory, and the flushes synchronize only the enclosing session. If
+  a nested session matters, pass `-s <nested>`, which fails instead while it's
+  unavailable, and tell the user if it isn't running.
+- `remote` locates the session once per invocation and uses it for the flushes
+  and the command, failing rather than switching sessions if it disconnects in
+  between.
 
 ## Conflicts and unsynchronized content
 
@@ -49,9 +82,12 @@ with paths relative to the current directory:
   Otherwise, copy both versions somewhere outside the synced tree first, put
   the content you want in one copy (merging both sides' changes if needed),
   delete the other copy (`rm <path>` or `remote rm <path>`), and run
-  `remote --flush`. Nothing checks that the deleted copy is unchanged, so do
-  this promptly. If it's unclear which changes to keep, show the user the diff
-  and ask.
+  `remote --flush`. In one-way-safe sessions, put the content in alpha's copy
+  and delete beta's: synchronization copies alpha's copy over a deleted beta
+  copy, but leaves beta's copy unsynchronized if alpha's is deleted, and never
+  copies beta's changes to alpha. Check the result with `remote --diff <path>`.
+  Nothing checks that the deleted copy is unchanged, so do this promptly. If
+  it's unclear which changes to keep, show the user the diff and ask.
 - `this content couldn't be synchronized`: the side in parentheses couldn't
   read or write the path, for example because of permissions. Fix it on that
   side if you can, or tell the user.
@@ -136,5 +172,6 @@ the root with `--session`. Prologues aren't supported on Windows endpoints.
   stdin when detaching (`> log 2>&1 < /dev/null &`).
 - The command is waiting for input: `remote` forwards stdin, so pass
   `< /dev/null` or use the program's non-interactive flags.
-- Use `--timeout` to bound commands that might hang; it kills the remote
-  process group and exits with 124.
+- Use `--timeout` to bound commands that might hang; it exits with 124 and
+  terminates the remote process group (SIGTERM, then SIGKILL 5 seconds later),
+  without synchronizing afterwards.

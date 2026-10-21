@@ -40,7 +40,8 @@ func TestReplacePreservesOwnership(t *testing.T) {
 	}
 	original := &Entry{Kind: EntryFile, Size: 9, Digest: fmt.Sprintf("%x", sha256.Sum256([]byte("original\n")))}
 	merged := &Entry{Kind: EntryFile, Size: 7, Digest: fmt.Sprintf("%x", sha256.Sum256([]byte("merged\n")))}
-	replacement := &Replacement{Path: "file", Expected: []*Entry{original}, Result: merged}
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	replacement := &Replacement{Path: "file", Expected: []*Entry{original}, Result: merged, Sequence: 1}
 	if err := ReplaceFile(context.Background(), directory, replacement, strings.NewReader("merged\n")); err != nil {
 		t.Fatal(err)
 	}

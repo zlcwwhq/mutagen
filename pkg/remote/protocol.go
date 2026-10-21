@@ -122,6 +122,12 @@ const (
 	// OperationConflicts requests a synchronization cycle followed by a
 	// complete listing of the session's conflicts (see ListConflicts).
 	OperationConflicts
+	// OperationClaim requests that the daemon record a checkout of a conflict
+	// by the submitting endpoint (see ClaimCheckout).
+	OperationClaim
+	// OperationRelease requests that the daemon remove a checkout held by the
+	// submitting endpoint (see ReleaseCheckout).
+	OperationRelease
 )
 
 // submission is the header of each submission, written by the submitting
@@ -161,6 +167,9 @@ type result struct {
 	// Stale indicates that a replacement failed because the entry changed
 	// since it was checked out (see ErrStale).
 	Stale bool `json:",omitempty"`
+	// Superseded indicates that a replacement failed because a replacement
+	// with a later sequence number was admitted first (see ErrSuperseded).
+	Superseded bool `json:",omitempty"`
 }
 
 // writeMessage writes bounded, length-prefixed command metadata.

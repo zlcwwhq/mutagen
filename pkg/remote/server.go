@@ -9,10 +9,28 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/multiplexing"
 )
+
+const (
+	// TerminationGracePeriod is the time that a terminated command's process
+	// group has to exit after being asked to (with SIGTERM on POSIX systems),
+	// before its remaining processes are killed (with SIGKILL). It's short so
+	// that pausing or terminating a session, which terminates its commands,
+	// doesn't take long.
+	TerminationGracePeriod = 5 * time.Second
+	// terminationPollInterval is the interval at which a terminated command's
+	// process group is checked for remaining processes once the command has
+	// exited.
+	terminationPollInterval = 10 * time.Millisecond
+)
+
+// terminationGracePeriod is the grace period used for terminated commands. It
+// is a variable so that tests can shorten it.
+var terminationGracePeriod = TerminationGracePeriod
 
 // Serve executes one command (or answers one file request) received over a
 // routed connection, resolving its working directory against the specified
@@ -93,6 +111,60 @@ func sendEntry(ctx context.Context, root, path string, output io.Writer) result 
 	return result{Entry: entry}
 }
 
+// forwardOutput copies a command's output until the command and its children
+// close it, returning the first error encountered. Once writing fails, such as
+// because the route was cancelled, the remaining output is discarded rather
+// than left unread, so that a command writing output while it terminates is
+// neither blocked nor killed by a broken pipe.
+func forwardOutput(destination io.Writer, source io.Reader) error {
+	_, err := io.Copy(destination, source)
+	if err != nil {
+		io.Copy(io.Discard, source)
+	}
+	return err
+}
+
+// terminate terminates a started command's process group, first by asking it to
+// terminate, and then, if any of its processes remain once the grace period
+// expires, by killing them. The finished channel must be closed once the
+// command has exited and its output has been closed. If the command hasn't
+// finished when the grace period expires, then abandon is called after killing
+// the process group to stop forwarding output, which a process that left the
+// group could otherwise hold open indefinitely. Where commands can't be asked
+// to terminate, they're terminated immediately, and the grace period is
+// skipped.
+func terminate(command *exec.Cmd, finished <-chan struct{}, abandon func()) {
+	interruptProcess(command)
+	period := terminationGracePeriod
+	if !gracefulTermination {
+		period = 0
+	}
+	expired := time.NewTimer(period)
+	defer expired.Stop()
+
+	// Wait for the command to finish, and then for any processes that remain
+	// in its group, such as children that closed their output, to exit.
+	select {
+	case <-finished:
+		poll := time.NewTicker(terminationPollInterval)
+		defer poll.Stop()
+		for processRemains(command) {
+			select {
+			case <-poll.C:
+			case <-expired.C:
+				killProcess(command)
+				return
+			}
+		}
+		return
+	case <-expired.C:
+	}
+
+	// Kill whatever remains of the command.
+	killProcess(command)
+	abandon()
+}
+
 // run prepares and executes a command without interpreting its arguments, or
 // performs a requested file operation.
 func run(ctx context.Context, root, prologue string, alpha bool, request *Request, stdin io.Reader, stdout, stderr io.Writer) result {
@@ -113,10 +185,17 @@ func run(ctx context.Context, root, prologue string, alpha bool, request *Reques
 		}
 		return result{Entry: entry}
 	} else if request.Replace != nil {
+		// The context is only cancelled once this executor notices that the
+		// client stopped waiting, such as on timeout, so a replacement may
+		// still write its result afterward. Replacements thus keep their
+		// entries locked until they've finished, and those of earlier applies
+		// are refused once a later apply's replacement has been admitted (see
+		// ReplaceFile).
 		if err := ReplaceFile(ctx, root, request.Replace, stdin); err != nil {
 			return result{
-				Error: fmt.Sprintf("unable to replace %s: %v", request.Replace.Path, err),
-				Stale: errors.Is(err, ErrStale),
+				Error:      fmt.Sprintf("unable to replace %s: %v", request.Replace.Path, err),
+				Stale:      errors.Is(err, ErrStale),
+				Superseded: errors.Is(err, ErrSuperseded),
 			}
 		}
 		return result{}
@@ -163,13 +242,13 @@ func run(ctx context.Context, root, prologue string, alpha bool, request *Reques
 	} else if path, err = lookPath(arguments[0], directory, append(os.Environ(), environment...)); err != nil {
 		return result{ExitCode: 127, Error: fmt.Sprintf("unable to find command: %v", err)}
 	}
-	command := exec.CommandContext(ctx, path, arguments[1:]...)
+	command := exec.Command(path, arguments[1:]...)
 	command.Args[0] = arguments[0]
 	command.Dir = directory
 	command.Env = append(command.Environ(), environment...)
 	configureProcess(command)
 
-	// Own the output pipes so that cancellation can interrupt draining even
+	// Own the output pipes so that termination can interrupt draining even
 	// after the command exits and a descendant still holds an output handle.
 	// Normal draining has no deadline, preserving output over slow links.
 	outputReader, outputWriter, err := os.Pipe()
@@ -192,32 +271,46 @@ func run(ctx context.Context, root, prologue string, alpha bool, request *Reques
 	if err != nil {
 		return result{Error: fmt.Sprintf("unable to create command input: %v", err)}
 	}
-	if err := command.Start(); err != nil {
+	if err := ctx.Err(); err != nil {
+		return result{ExitCode: 126, Error: fmt.Sprintf("unable to start command: %v", err)}
+	} else if err := command.Start(); err != nil {
 		return result{ExitCode: 126, Error: fmt.Sprintf("unable to start command: %v", err)}
 	}
 	outputWriter.Close()
 	errorWriter.Close()
-	stop := context.AfterFunc(ctx, func() {
-		command.Cancel()
-		outputReader.Close()
-		errorReader.Close()
-	})
-	defer stop()
 	outputErrors := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(stdout, outputReader)
-		outputErrors <- err
+		outputErrors <- forwardOutput(stdout, outputReader)
 	}()
 	go func() {
-		_, err := io.Copy(stderr, errorReader)
-		outputErrors <- err
+		outputErrors <- forwardOutput(stderr, errorReader)
 	}()
 	go func() {
 		io.Copy(input, stdin)
 		input.Close()
 	}()
+
+	// Terminate the command if the route is cancelled, such as because the
+	// client disconnected or the session stopped synchronizing, before the
+	// command has exited and its output has been closed. Termination then
+	// completes before returning, so that it isn't cut short when the
+	// executing process exits once its commands are done.
+	finished := make(chan struct{})
+	terminated := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(terminated)
+		terminate(command, finished, func() {
+			outputReader.Close()
+			errorReader.Close()
+		})
+	})
 	err = command.Wait()
-	if outputError := errors.Join(<-outputErrors, <-outputErrors); outputError != nil {
+	outputError := errors.Join(<-outputErrors, <-outputErrors)
+	close(finished)
+	if !stop() {
+		<-terminated
+	}
+	if outputError != nil {
 		return result{Error: fmt.Sprintf("unable to forward command output: %v", outputError)}
 	}
 	if err == nil {

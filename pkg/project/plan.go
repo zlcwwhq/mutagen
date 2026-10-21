@@ -291,7 +291,40 @@ func NewPlan(
 	}, nil
 }
 
-// Print writes a description of the plan.
+// pausedChangesOutcome describes what can happen to changes made since a
+// synchronization session was paused once a session with fresh history (i.e.
+// without an ancestor) synchronizes the same files, depending on its mode.
+const pausedChangesOutcome = "changes made since it was paused may be overwritten (two-way-resolved, " +
+	"one-way-replica) or become conflicts (two-way-safe, one-way-safe)"
+
+// notes returns notes about paused synchronization sessions that will be
+// terminated without being flushed, since flushing them would require resuming
+// them. Replacements start with fresh history, as do sessions created under
+// other names (now or later) for the same files as removed sessions.
+func (p *Plan) notes() []string {
+	var notes []string
+	for _, change := range p.synchronization {
+		if change.current == nil || !change.current.Paused {
+			continue
+		} else if change.specification != nil {
+			notes = append(notes, fmt.Sprintf(
+				"Synchronization session %q is paused and won't be flushed before it's replaced, so %s "+
+					"once the replacement is resumed. Resume it before applying to synchronize them first.",
+				change.current.Name, pausedChangesOutcome,
+			))
+		} else {
+			notes = append(notes, fmt.Sprintf(
+				"Synchronization session %q is paused and won't be flushed before it's removed, so if a new session "+
+					"synchronizes the same files, %s. Resume it before applying to synchronize them first.",
+				change.current.Name, pausedChangesOutcome,
+			))
+		}
+	}
+	return notes
+}
+
+// Print writes a description of the plan, followed by notes about paused
+// synchronization sessions that won't be flushed before being terminated.
 func (p *Plan) Print(writer io.Writer) {
 	for _, change := range p.forwarding {
 		fmt.Fprintf(writer, "%s forwarding session %q\n", change.action(), change.name())
@@ -300,6 +333,9 @@ func (p *Plan) Print(writer io.Writer) {
 		fmt.Fprintf(writer, "%s synchronization session %q\n", change.action(), change.name())
 	}
 	fmt.Fprintf(writer, "Unchanged sessions: %d\n", p.unchanged)
+	for _, note := range p.notes() {
+		fmt.Fprintln(writer, "Note:", note)
+	}
 }
 
 // SessionOperations performs the session operations required to apply a plan.
@@ -330,13 +366,48 @@ func currentIdentifiers[S projectSession, P projectSpecification](changes []*ses
 	return identifiers
 }
 
-// Apply applies the plan. Removed and replaced sessions are terminated before
-// any creation so that forwarding listeners and synchronization roots are
-// released, including when endpoints move between names. Operations are never
-// performed with an empty set of sessions, and unchanged sessions are never
-// paused, resumed, flushed, or terminated. Changes are not transactional: if
-// an operation fails, completed changes remain in place.
+// Apply applies the plan. Running synchronization sessions that will be
+// terminated are flushed first, because their replacements, as well as any
+// sessions created under other names for the same files, start with fresh
+// history and could otherwise overwrite (or turn into conflicts) the changes
+// that the terminated sessions haven't synchronized yet. If a flush fails, then
+// no session is terminated or created. Paused sessions are terminated without
+// being flushed, since that would require resuming them, which is why the plan
+// notes them. Removed and replaced sessions are then terminated before any
+// creation so that forwarding listeners and synchronization roots are released,
+// including when endpoints move between names. Operations are never performed
+// with an empty set of sessions, and unchanged sessions are never paused,
+// resumed, flushed, or terminated. Changes are not transactional: if an
+// operation fails, completed changes remain in place.
 func (p *Plan) Apply(operations SessionOperations) error {
+	// Flush running synchronization sessions that will be terminated. Once a
+	// flush completes, the endpoints agree on all content that the session can
+	// synchronize, so the lack of history in a session that takes over its
+	// files doesn't matter. Removed sessions are flushed as well, since a
+	// session created under another name (by this plan or a later one) may
+	// synchronize the same files, which can't be reliably detected by
+	// comparing endpoint URLs. Sessions are flushed individually so that a
+	// failure can identify the session.
+	for _, change := range p.synchronization {
+		if change.current == nil || change.current.Paused {
+			continue
+		}
+		if err := operations.FlushSynchronization([]string{change.current.Identifier}); err != nil {
+			action := "replacing"
+			risk := "replacing it now could overwrite its unsynchronized changes"
+			if change.specification == nil {
+				action = "removing"
+				risk = "removing it now could let a new session for the same files overwrite its unsynchronized changes"
+			}
+			return fmt.Errorf(
+				"unable to flush synchronization session %q (%s) before %s it: %w; %s, so no sessions were terminated or created: "+
+					"fix the session and apply again, or terminate it with \"mutagen sync terminate %s\" and apply again "+
+					"if its unsynchronized changes don't matter",
+				change.current.Name, change.current.Identifier, action, err, risk, change.current.Identifier,
+			)
+		}
+	}
+
 	// Terminate obsolete sessions.
 	if identifiers := currentIdentifiers(p.forwarding); len(identifiers) > 0 {
 		if err := operations.TerminateForwarding(identifiers); err != nil {

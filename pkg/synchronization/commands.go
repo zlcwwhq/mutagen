@@ -39,6 +39,10 @@ type CommandProtocolHandler interface {
 // requested by a submission completed.
 var errFlushTerminated = errors.New("synchronization stopped before the flush completed")
 
+// errResolutionUnsupported indicates that the session's synchronization mode
+// doesn't support conflict resolution.
+var errResolutionUnsupported = errors.New("conflict resolution requires the two-way-safe or one-way-safe synchronization mode")
+
 // commandRelay routes commands submitted on each endpoint's system to the
 // opposite endpoint. Routes always pass through the daemon, so neither endpoint
 // needs connectivity to the other, regardless of where the daemon runs. It also
@@ -50,9 +54,14 @@ type commandRelay struct {
 	flushRequests chan chan error
 	// report reports content that the session couldn't synchronize.
 	report func() *remote.Report
-	// conflicts lists the session's conflicts for resolution, or is nil if
-	// the session's synchronization mode doesn't support resolution.
-	conflicts func() *remote.Listing
+	// conflicts lists the session's conflicts and checkouts for resolution, or
+	// is nil if the session's synchronization mode doesn't support resolution,
+	// in which case claim and release are nil too.
+	conflicts func() (*remote.Listing, error)
+	// claim records a checkout by alpha or beta (see claimCheckout).
+	claim func(alpha bool, path, token string) (remote.CheckoutStatus, error)
+	// release removes a checkout held by alpha or beta (see releaseCheckout).
+	release func(alpha bool, path, token string) (remote.CheckoutStatus, error)
 	// channelsLock guards channels.
 	channelsLock sync.Mutex
 	// channels holds the connected alpha and beta channels (or nil).
@@ -106,9 +115,11 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 			hashingAlgorithm = c.session.Version.DefaultHashingAlgorithm()
 		}
 		algorithm, _ := hashingAlgorithm.MarshalText()
-		relay.conflicts = func() *remote.Listing {
+		relay.conflicts = func() (*remote.Listing, error) {
 			return c.remoteConflicts(string(algorithm))
 		}
+		relay.claim = c.claimCheckout
+		relay.release = c.releaseCheckout
 	}
 
 	// Each endpoint submits commands if and only if its opposite executes.
@@ -118,6 +129,12 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		c.mergedAlphaConfiguration.RemotePrologue,
 		c.mergedBetaConfiguration.RemotePrologue,
 	}
+
+	// Submissions only run commands in directories that the session
+	// synchronizes. Ignores can't be endpoint-specific, so both endpoints'
+	// merged configurations specify the same ones.
+	ignoreSyntax, ignorePatterns, ignoreVCS := effectiveIgnores(c.mergedAlphaConfiguration, c.session.Version)
+	ignores := &remote.Ignores{Syntax: ignoreSyntax, Patterns: ignorePatterns, VCS: ignoreVCS}
 	ctx, cancel := context.WithCancel(ctx)
 	var maintainers sync.WaitGroup
 	for index, url := range []*urlpkg.URL{c.session.Alpha, c.session.Beta} {
@@ -129,6 +146,7 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 			Submit:   (index == 0 && betaExecutes) || (index == 1 && alphaExecutes),
 			Execute:  (index == 0 && alphaExecutes) || (index == 1 && betaExecutes),
 			Prologue: prologues[index],
+			Ignores:  ignores,
 		}
 		maintainers.Add(1)
 		go func() {
@@ -218,12 +236,29 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		defer stop()
 		var listing *remote.Listing
 		if r.conflicts == nil {
-			err = errors.New("conflict resolution requires the two-way-safe or one-way-safe synchronization mode")
+			err = errResolutionUnsupported
 		} else if err = r.flush(ctx); err == nil {
-			listing = r.conflicts()
+			listing, err = r.conflicts()
 		}
 		if err := remote.RespondWithConflicts(submission, listing, err); err != nil {
 			r.logger.Debug("Unable to send conflicts:", err)
+		}
+		return
+	} else if operation == remote.OperationClaim || operation == remote.OperationRelease {
+		// Checkouts belong to the submitting endpoint, which is the opposite
+		// of the target.
+		alpha := target == 1
+		path, token, err := remote.ReceiveCheckout(ctx, submission)
+		var status remote.CheckoutStatus
+		if err == nil && r.claim == nil {
+			err = errResolutionUnsupported
+		} else if err == nil && operation == remote.OperationClaim {
+			status, err = r.claim(alpha, path, token)
+		} else if err == nil {
+			status, err = r.release(alpha, path, token)
+		}
+		if err := remote.RespondToCheckout(submission, status, err); err != nil {
+			r.logger.Debug("Unable to send checkout status:", err)
 		}
 		return
 	} else if operation == remote.OperationFlush {
@@ -328,10 +363,10 @@ func (c *controller) remoteReport() *remote.Report {
 
 // remoteConflicts lists all of the session's conflicts and problems as of its
 // last synchronization cycle for resolution, determining how remote can
-// resolve each conflict. The digests of conflicting files and of their common
-// ancestor are reported with the textual name of the session's hashing
-// algorithm.
-func (c *controller) remoteConflicts(algorithm string) *remote.Listing {
+// resolve each conflict, along with the session's checkouts. The digests of
+// conflicting files and of their common ancestor are reported with the textual
+// name of the session's hashing algorithm.
+func (c *controller) remoteConflicts(algorithm string) (*remote.Listing, error) {
 	// Conflicts and problems are immutable and their lists are replaced rather
 	// than modified, so the lists can be read once the lock is released.
 	c.stateLock.Lock()
@@ -356,7 +391,12 @@ func (c *controller) remoteConflicts(algorithm string) *remote.Listing {
 			listing.Problems = append(listing.Problems, remote.Problem{Alpha: list.alpha, Path: problem.Path, Error: problem.Error})
 		}
 	}
-	return listing
+	checkouts, err := c.checkouts()
+	if err != nil {
+		return nil, err
+	}
+	listing.Checkouts = checkouts
+	return listing, nil
 }
 
 // resolution determines how remote can resolve a conflict in a safe

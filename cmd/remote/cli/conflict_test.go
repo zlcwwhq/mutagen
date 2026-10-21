@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 )
 
@@ -59,10 +60,124 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 					t.Fatal("directory workspace not rejected before dialing:", err)
 				}
 			}
-			if _, err := discard(local); err != nil {
+			// Without a daemon, the workspace is set aside, but its checkout
+			// can't be released, which is reported.
+			if _, err := discard(ctx, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
+				t.Fatal("unreleased checkout not reported:", err)
+			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("directory workspace can't be discarded:", err)
 			}
 		})
+	}
+}
+
+func TestUnreadableWorkspaceDiscarded(t *testing.T) {
+	// Workspaces that can't be read, such as those whose metadata was modified
+	// or removed, can be neither checked out again nor applied, so errors point
+	// to discarding them, which sets them aside regardless. Whether anything
+	// was applied through them is unknown, so errors and discard say to check
+	// the copies against their files if anything was.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing=%t", missing), func(t *testing.T) {
+			root := t.TempDir()
+			local := filepath.Join(root, "conflict")
+			_, directory, err := workspaceDirectory(local)
+			if err != nil {
+				t.Fatal(err)
+			} else if err := os.Mkdir(directory, 0700); err != nil {
+				t.Fatal(err)
+			} else if err := os.WriteFile(filepath.Join(directory, localName), []byte("local\n"), 0600); err != nil {
+				t.Fatal(err)
+			} else if !missing {
+				if err := os.WriteFile(filepath.Join(directory, metadataName), []byte("{"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			const check = "if anything was applied through it, check the copies against its files"
+			reported := func(err error) bool {
+				return err != nil && strings.Contains(err.Error(), directory) && strings.Contains(err.Error(), "discard it") &&
+					strings.Contains(err.Error(), check)
+			}
+			target := &remote.Target{Session: "session", Root: root}
+			if _, err := checkout(ctx, root, &options{}, &remote.Listing{}, target, local); !reported(err) {
+				t.Fatal("unreadable workspace not reported by checkout:", err)
+			}
+			_, unlock, err := apply(ctx, root, &options{}, local, func() (*remote.Listing, error) {
+				t.Fatal("conflicts listed for an unreadable workspace")
+				return nil, nil
+			})
+			if unlock != nil {
+				unlock()
+			}
+			if !reported(err) {
+				t.Fatal("unreadable workspace not reported by apply:", err)
+			}
+			// Without a daemon, the workspace is set aside, but its checkout
+			// can't be released, which is reported.
+			if _, err := discard(ctx, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
+				t.Fatal("unreleased checkout not reported:", err)
+			} else if !strings.Contains(err.Error(), check) {
+				t.Fatal("copies not to be checked against the workspace:", err)
+			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("unreadable workspace not set aside:", err)
+			}
+			backups, err := filesystem.Mutagen(false, workspacesDirectoryName, backupsDirectoryName)
+			if err != nil {
+				t.Fatal(err)
+			} else if kept, _ := filepath.Glob(filepath.Join(backups, "*-"+filepath.Base(directory), localName)); len(kept) != 1 {
+				t.Fatal("unreadable workspace not kept:", kept)
+			}
+		})
+	}
+}
+
+func TestDiscardAppliedWorkspace(t *testing.T) {
+	// Discarding a workspace through which results were applied changes
+	// neither copy, but its resolution was unfinished, so a copy may still
+	// have a result, or synchronization may have copied one original copy over
+	// the other, which then exists only in the workspace. Discard says so,
+	// including when it's unable to release the checkout, since a retry finds
+	// no workspace.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	file := &remote.Entry{Kind: remote.EntryFile}
+	for _, applied := range []bool{false, true} {
+		t.Run(fmt.Sprintf("applied=%t", applied), func(t *testing.T) {
+			local := filepath.Join(t.TempDir(), "file")
+			_, directory, err := workspaceDirectory(local)
+			if err != nil {
+				t.Fatal(err)
+			} else if err := os.Mkdir(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			w := &workspace{Session: "session", Path: "file", Local: file, Remote: file, directory: directory}
+			if applied {
+				w.Applied = []*remote.Entry{{Kind: remote.EntryMissing}}
+			}
+			if err := w.save(); err != nil {
+				t.Fatal(err)
+			}
+			// Without a daemon, the workspace is set aside, but its checkout
+			// can't be released, which is reported.
+			if _, err := discard(ctx, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
+				t.Fatal("unreleased checkout not reported:", err)
+			} else if strings.Contains(err.Error(), "since results were applied through it") != applied {
+				t.Fatal("applied results misreported:", err)
+			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("workspace not set aside:", err)
+			}
+		})
+	}
+
+	// Once the checkout is released, discard locates the workspace's copies in
+	// the backup.
+	note := appliedNote("backup")
+	for _, name := range []string{localName, remoteName} {
+		if !strings.Contains(note, filepath.Join("backup", name)) {
+			t.Fatalf("%s copy not located: %s", name, note)
+		}
 	}
 }
 
@@ -170,6 +285,109 @@ func TestConflictOverlap(t *testing.T) {
 	for _, path := range []string{"sub/other", "sub/file2", "su", "other/sub/file"} {
 		if overlaps(path, "sub/file") {
 			t.Fatalf("%q overlaps", path)
+		}
+	}
+}
+
+func TestChangedSinceCheckout(t *testing.T) {
+	// Listings identify copies changed since checkout by their digests, which
+	// are listed for alpha and beta and checked out as local and remote.
+	file := &remote.Entry{Kind: remote.EntryFile}
+	listing := func(alpha, beta string) *remote.ConflictRoot {
+		return &remote.ConflictRoot{Files: true, AlphaDigest: alpha, BetaDigest: beta}
+	}
+	for _, alpha := range []bool{true, false} {
+		w := &workspace{Alpha: alpha, Local: file, Remote: file, ListedLocal: "local", ListedRemote: "remote"}
+		swap := func(local, opposite string) *remote.ConflictRoot {
+			if !alpha {
+				return listing(opposite, local)
+			}
+			return listing(local, opposite)
+		}
+		for _, test := range []struct {
+			conflict *remote.ConflictRoot
+			expected string
+		}{
+			{swap("local", "remote"), ""},
+			{swap("edited", "remote"), "local copy"},
+			{swap("local", "edited"), "remote copy"},
+			{swap("edited", "edited"), "local and remote copies"},
+			{&remote.ConflictRoot{AlphaTakable: true}, "copies"},
+		} {
+			if changed := w.changedSince(test.conflict); changed != test.expected {
+				t.Fatalf("alpha=%t: %+v: expected %q, got %q", alpha, test.conflict, test.expected, changed)
+			}
+		}
+	}
+
+	// Nothing is reported once something was applied, which changes the copies
+	// itself, or without the digests of verified copies.
+	w := &workspace{Alpha: true, Local: file, Remote: file, ListedLocal: "local", ListedRemote: "remote", Applied: []*remote.Entry{file}}
+	if changed := w.changedSince(listing("edited", "edited")); changed != "" {
+		t.Fatal("change reported after apply:", changed)
+	}
+	w = &workspace{Alpha: true, Local: file, Remote: file}
+	if changed := w.changedSince(listing("edited", "edited")); changed != "" {
+		t.Fatal("change reported without verified digests:", changed)
+	}
+}
+
+func TestCheckedOutAgain(t *testing.T) {
+	// A conflict with a workspace can't be checked out again, and the error
+	// says what to do with the workspace.
+	file := &remote.Entry{Kind: remote.EntryFile}
+	target := &remote.Target{Session: "session", Alpha: true}
+	listed := &remote.ConflictRoot{Path: "file", Files: true, AlphaDigest: "local", BetaDigest: "remote"}
+	changed := &remote.ConflictRoot{Path: "file", Files: true, AlphaDigest: "local", BetaDigest: "edited"}
+	w := func(applied bool) *workspace {
+		w := &workspace{Session: "session", Alpha: true, Path: "file", Local: file, Remote: file, ListedLocal: "local", ListedRemote: "remote", directory: "workspace"}
+		if applied {
+			w.Applied = []*remote.Entry{file}
+		}
+		return w
+	}
+	for _, test := range []struct {
+		description string
+		w           *workspace
+		conflict    *remote.ConflictRoot
+		expected    []string
+		unexpected  []string
+	}{
+		// Another agent or the user may have checked the conflict out, and a
+		// checkout after discarding their workspace would reuse its files.
+		{"checked out", w(false), listed, []string{
+			"is already checked out in workspace, possibly by another agent or the user",
+			"if you checked it out, apply it, or discard the workspace", "otherwise, leave it, or ask the user",
+		}, nil},
+		{"changed", w(false), changed, []string{"the remote copy changed since checkout: discard the workspace"}, nil},
+		// A conflict that's no longer listed may have been ended by a change
+		// after checkout, which isn't detected, rather than resolved.
+		{"ended", w(false), nil, []string{
+			"resolved some other way, or ended by a change after checkout", "one side's changes only in the workspace",
+			"compare the current file with the workspace's local and remote files before discarding it", "deleted after 7 days",
+		}, nil},
+		// Partially applied resolutions are finished by applying again, whether
+		// or not their conflicts are still listed, rather than discarded, and
+		// the copy that apply updated isn't taken for a change since checkout.
+		{"unfinished", w(true), nil, []string{"apply again to finish resolving it"}, []string{"discard"}},
+		{"partially applied", w(true), listed, []string{"a result was partially applied through it: apply again to finish resolving it"}, []string{"discard"}},
+		{"partially applied and updated", w(true), changed, []string{"apply again to finish resolving it"}, []string{"discard", "changed since"}},
+		{"unrelated", &workspace{Session: "other", Alpha: true, Path: "file", Local: file, Remote: file}, listed, []string{"an unrelated workspace exists"}, nil},
+		{"directory", &workspace{Session: "session", Alpha: true, Path: "file", Local: file, Remote: &remote.Entry{Kind: remote.EntryDirectory}}, listed, []string{"aren't supported"}, nil},
+	} {
+		err := checkedOut(test.w, test.conflict, target, "file")
+		if err == nil {
+			t.Fatalf("%s: checking out again allowed", test.description)
+		}
+		for _, expected := range test.expected {
+			if !strings.Contains(err.Error(), expected) {
+				t.Fatalf("%s: expected %q, got %v", test.description, expected, err)
+			}
+		}
+		for _, unexpected := range test.unexpected {
+			if strings.Contains(err.Error(), unexpected) {
+				t.Fatalf("%s: unexpected %q in %v", test.description, unexpected, err)
+			}
 		}
 	}
 }
@@ -297,6 +515,42 @@ func TestBinaryAndExecutableResolution(t *testing.T) {
 	}
 	if result, _, err := resolution(ctx, w, &options{conflictOptions: conflictOptions{executable: "true"}}); err != nil || !result.Executable {
 		t.Fatalf("explicit executability failed: %v", err)
+	}
+}
+
+func TestEmptyMergedResolution(t *testing.T) {
+	// A merged file that was emptied, such as by a command reading it with its
+	// output redirected to it, has no markers left, but it's refused as long as
+	// neither copy is empty, as is one created empty for binary copies.
+	ctx := context.Background()
+	empty := func(w *workspace) {
+		t.Helper()
+		if err := os.WriteFile(w.file(mergedName), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, copies := range [][2]string{{"local\n", "remote\n"}, {"same\n", "same\n"}, {"\x00local", "\x00remote"}} {
+		w := newTestWorkspace(t, copies[0], copies[1])
+		empty(w)
+		if _, _, err := resolution(ctx, w, &options{}); !errors.Is(err, errEmptyMerged) || !strings.Contains(err.Error(), "check it out again") {
+			t.Fatalf("empty merged file accepted for %q: %v", copies, err)
+		}
+	}
+
+	// Discarding isn't suggested once a result was applied, since that would
+	// leave the resolution unfinished.
+	w := newTestWorkspace(t, "local\n", "remote\n")
+	w.Applied = []*remote.Entry{w.Local}
+	empty(w)
+	if _, _, err := resolution(ctx, w, &options{}); !errors.Is(err, errEmptyMerged) || strings.Contains(err.Error(), "check it out again") {
+		t.Fatalf("empty merged file accepted or discard suggested after a result was applied: %v", err)
+	}
+
+	// If a copy is empty, an empty result is as plausible as any other.
+	w = newTestWorkspace(t, "", "remote\n")
+	empty(w)
+	if result, source, err := resolution(ctx, w, &options{}); err != nil || result.Size != 0 || source != w.file(mergedName) {
+		t.Fatalf("empty result with an empty copy refused: %v", err)
 	}
 }
 
@@ -453,7 +707,7 @@ func TestUnterminatedCopies(t *testing.T) {
 		{"local", "remote", "Neither copy ends with a newline"},
 		{"local\n", "remote\n", ""},
 	} {
-		result, err := describe(newTestWorkspace(t, test.local, test.remote), "file", false)
+		result, err := describe(newTestWorkspace(t, test.local, test.remote), "file")
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -293,8 +293,9 @@ func compareEntries(path string, local, opposite *remote.Entry) string {
 // compare prints how the remote copies of the specified path arguments (or, if
 // there are none, of the paths involved in the report's conflicts) differ from
 // the local copies, and reports whether any differ. The target and report are
-// those of a flush. Path arguments must exist on at least one endpoint.
-func compare(ctx context.Context, directory, session string, target *remote.Target, report *remote.Report, arguments []string, output, errorOutput io.Writer) (bool, error) {
+// those of a flush, and remote copies are read through the target's endpoint.
+// Path arguments must exist on at least one endpoint.
+func compare(ctx context.Context, directory string, target *remote.Target, report *remote.Report, arguments []string, output, errorOutput io.Writer) (bool, error) {
 	locator := newLocator(target)
 	var paths []string
 	if len(arguments) == 0 {
@@ -317,7 +318,7 @@ func compare(ctx context.Context, directory, session string, target *remote.Targ
 		if err != nil {
 			return differ, fmt.Errorf("unable to read %s: %w", locator.display(path), err)
 		}
-		connection, _, err := remote.Dial(ctx, directory, session, remote.OperationExecute)
+		connection, _, err := (&remote.Selection{Target: target}).Dial(ctx, directory, remote.OperationExecute)
 		if err != nil {
 			return differ, err
 		}

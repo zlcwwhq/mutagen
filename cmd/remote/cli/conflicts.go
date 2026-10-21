@@ -56,8 +56,17 @@ var errReported = errors.New("conflict operations failed")
 var errDirectoryConflict = errors.New("conflicts involving directories aren't supported; resolve this conflict manually")
 
 // errResolvedOtherwise indicates that apply refused a workspace with nothing
-// applied whose conflict is no longer listed (see workspace.applied).
-var errResolvedOtherwise = errors.New("is no longer listed as a conflict, and nothing was applied, so it was resolved some other way; apply changed neither copy: check them, then discard the workspace")
+// applied whose conflict is no longer listed (see workspace.applied). The
+// conflict may also have been ended by a change after checkout, which may have
+// left one side's changes only in the workspace.
+var errResolvedOtherwise = errors.New("is no longer listed as a conflict, and nothing was applied, so it was resolved some other way, or ended by a change after checkout, which may have left one side's changes only in the workspace; apply changed neither copy: compare the current file with the workspace's local and remote files before discarding it")
+
+// errEmptyMerged indicates that apply refused an empty merged file although
+// neither copy is empty. Such a file has no markers left to refuse, but it was
+// most likely truncated rather than resolved, such as by a command that reads
+// it and has its output redirected to it, and applying it would replace both
+// copies with nothing.
+var errEmptyMerged = errors.New("the merged file is empty, but neither copy is, so it was probably truncated, such as by redirecting a command's output to the file that it reads")
 
 // conflictOptions are the options for conflict resolution, which is separate
 // from command execution and its flush policy.
@@ -144,7 +153,8 @@ type workspace struct {
 	// Path is the slash-separated conflict root relative to the
 	// synchronization root, which is empty for the root itself.
 	Path string
-	// Token labels conflict markers in the merged file.
+	// Token identifies the workspace's claim of its checkout (see
+	// remote.ClaimCheckout) and labels conflict markers in the merged file.
 	Token string
 	// Local and Remote describe the checked-out copies (see remote.Snapshot).
 	Local, Remote *remote.Entry
@@ -154,6 +164,13 @@ type workspace struct {
 	// BaseSource describes where the copies' common ancestor in the
 	// workspace was found, if it was.
 	BaseSource string `json:",omitempty"`
+	// ListedLocal and ListedRemote are the digests of the local and remote
+	// copies of a conflict between two files, as listed when it was checked
+	// out, which checkout verified the downloaded copies to have, if it could.
+	// Listings compare them with the copies' current digests (see
+	// changedSince).
+	ListedLocal  string `json:",omitempty"`
+	ListedRemote string `json:",omitempty"`
 	// Applied describes the results (files, symbolic links, or deletions) that
 	// apply has written (or may have written) to either copy, which retries
 	// may supersede, since they're the workspace's own, even if the merged
@@ -161,6 +178,9 @@ type workspace struct {
 	Applied []*remote.Entry `json:",omitempty"`
 	// directory is the workspace directory.
 	directory string
+	// merge describes how checkout prepared the merged file, which it
+	// describes (see prepareMerged). It isn't saved.
+	merge mergeOutcome
 }
 
 // file returns the path of a file in the workspace.
@@ -192,6 +212,34 @@ func (w *workspace) hasDirectory() bool {
 // takable determines whether a copy can be taken.
 func (w *workspace) takable(side string) bool {
 	return w.files() || slices.Contains(w.Take, side)
+}
+
+// changedSince describes the copies of a checked-out conflict between two files
+// that changed since checkout, according to their digests in a later listing
+// of the conflict, or returns an empty string if neither did. Changes are only
+// detected while nothing was applied, since apply changes the copies itself,
+// and if checkout verified the digests of the copies that it downloaded.
+// Copies that are no longer both files have changed, but their listing has no
+// digests that would identify which one did.
+func (w *workspace) changedSince(conflict *remote.ConflictRoot) string {
+	if w.applied() || w.ListedLocal == "" || w.ListedRemote == "" {
+		return ""
+	} else if !conflict.Files {
+		return "copies"
+	}
+	local, opposite := conflict.AlphaDigest, conflict.BetaDigest
+	if !w.Alpha {
+		local, opposite = opposite, local
+	}
+	switch localChanged, remoteChanged := local != w.ListedLocal, opposite != w.ListedRemote; {
+	case localChanged && remoteChanged:
+		return "local and remote copies"
+	case localChanged:
+		return "local copy"
+	case remoteChanged:
+		return "remote copy"
+	}
+	return ""
 }
 
 // workspaceDirectory computes the workspaces directory and the directory of
@@ -283,14 +331,43 @@ func readWorkspace(directory string) (*workspace, error) {
 	return w, nil
 }
 
+// unreadableWorkspace indicates that the workspace for a local path exists but
+// can't be read, such as because its metadata was modified or removed. Neither
+// checkout nor apply can use it, so it can only be discarded (see discard).
+// Whether anything was applied through it is unknown, so the copies are to be
+// checked against its files if anything was.
+type unreadableWorkspace struct {
+	// directory is the workspace directory.
+	directory string
+	// err describes why it can't be read.
+	err error
+}
+
+func (e *unreadableWorkspace) Error() string {
+	return fmt.Sprintf("unable to read the workspace in %s (%v); discard it, which changes neither copy, and if anything was applied through it, check the copies against its files, which discard keeps", e.directory, e.err)
+}
+
 // loadWorkspace loads the workspace for a local path, failing with an error
-// wrapping os.ErrNotExist if there's none.
+// wrapping os.ErrNotExist if there's none, or with an unreadableWorkspace if
+// it can't be read. A workspace directory without metadata is unreadable
+// rather than missing, since checkouts create workspaces complete, and a new
+// checkout couldn't replace it.
 func loadWorkspace(local string) (*workspace, error) {
 	_, directory, err := workspaceDirectory(local)
 	if err != nil {
 		return nil, err
 	}
-	return readWorkspace(directory)
+	w, err := readWorkspace(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		if _, statErr := os.Lstat(directory); statErr != nil {
+			return nil, err
+		}
+		err = errors.New("missing metadata")
+	}
+	if err != nil {
+		return nil, &unreadableWorkspace{directory: directory, err: err}
+	}
+	return w, nil
 }
 
 // matches determines whether a workspace was checked out through a target.
@@ -403,10 +480,10 @@ func findConflict(listing *remote.Listing, path string) *remote.ConflictRoot {
 	return nil
 }
 
-// dialOpposite opens a route to the opposite endpoint, which must be the one
-// that the specified target identifies.
-func dialOpposite(ctx context.Context, directory, session string, expected *remote.Target) (io.ReadWriteCloser, error) {
-	connection, target, err := remote.Dial(ctx, directory, session, remote.OperationExecute)
+// dialSession submits an operation through the endpoint that the specified
+// target identifies, which must be the one located for the submission.
+func dialSession(ctx context.Context, directory, session string, operation remote.Operation, expected *remote.Target) (io.ReadWriteCloser, error) {
+	connection, target, err := remote.Dial(ctx, directory, session, operation)
 	if err != nil {
 		return nil, err
 	} else if target.Session != expected.Session || target.Alpha != expected.Alpha {
@@ -414,6 +491,145 @@ func dialOpposite(ctx context.Context, directory, session string, expected *remo
 		return nil, errors.New("the session was located differently while resolving the conflict")
 	}
 	return connection, nil
+}
+
+// dialOpposite opens a route to the opposite endpoint, which must be the one
+// that the specified target identifies.
+func dialOpposite(ctx context.Context, directory, session string, expected *remote.Target) (io.ReadWriteCloser, error) {
+	return dialSession(ctx, directory, session, remote.OperationExecute, expected)
+}
+
+// claim records with the daemon that a conflict root is checked out through
+// the endpoint that the specified target identifies, under a token identifying
+// the claim, failing if the opposite endpoint holds its checkout (see
+// remote.ClaimCheckout). Each conflict is checked out through a single
+// endpoint, which alone can apply or discard its resolution, since workspaces
+// are kept on the system that checked them out, where the opposite endpoint
+// can't see them.
+//
+// Claims are only made while the local endpoint's workspace for the conflict
+// root is locked, by the checkout creating the workspace or through the
+// workspace itself, so a checkout that the endpoint holds under another token
+// has no workspace. It's abandoned, such as one left by an interrupted
+// checkout or recorded by a claim that arrived late, and claims leave it as it
+// is, so it's released by its token before claiming the checkout again, which
+// fails if the opposite endpoint claims it meanwhile. A checkout recorded
+// without a token, by a build that didn't issue tokens, takes the claim's
+// token instead, since it may belong to the workspace.
+func claim(ctx context.Context, directory, session string, target *remote.Target, path, token string) error {
+	_, err := claimSequence(ctx, directory, session, target, path, token)
+	return err
+}
+
+// claimSequence claims the checkout of a conflict root (see claim) and returns
+// the claim's sequence number, which orders the replacements that an apply
+// makes after claiming its checkout (see remote.Replacement.Sequence) after
+// those of all earlier applies of the conflict, including those whose clients
+// stopped waiting for them while the replacements kept running.
+func claimSequence(ctx context.Context, directory, session string, target *remote.Target, path, token string) (uint64, error) {
+	claimOnce := func() (uint64, string, error) {
+		connection, err := dialSession(ctx, directory, session, remote.OperationClaim, target)
+		if err != nil {
+			return 0, "", err
+		}
+		return remote.ClaimCheckout(ctx, connection, path, token)
+	}
+	sequence, held, err := claimOnce()
+	if err != nil || sequence != 0 {
+		return sequence, err
+	}
+	connection, err := dialSession(ctx, directory, session, remote.OperationRelease, target)
+	if err == nil {
+		_, _, err = remote.ReleaseCheckout(ctx, connection, path, held)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("unable to release an abandoned checkout: %w", err)
+	} else if sequence, _, err = claimOnce(); err != nil {
+		return 0, err
+	} else if sequence == 0 {
+		return 0, errors.New("the abandoned checkout was claimed again while it was being released")
+	}
+	return sequence, nil
+}
+
+// release removes the checkout of a conflict root held by the endpoint that
+// the specified target identifies, if any, and returns whether it held one
+// (see releaseOver).
+func release(ctx context.Context, directory, session string, target *remote.Target, path, token string) (bool, error) {
+	connection, err := dialSession(ctx, directory, session, remote.OperationRelease, target)
+	if err != nil {
+		return false, err
+	}
+	return releaseOver(ctx, connection, directory, session, target, path, token)
+}
+
+// releaseOver removes the checkout of a conflict root held by the endpoint
+// that the specified target identifies, if any, over a release submission
+// through it, and returns whether it held one. Checkouts are only released
+// once the local endpoint has no workspace for the conflict root, which is
+// locked meanwhile, so any checkout that the endpoint holds is abandoned.
+//
+// Releases still name the token of the claim that they end (see
+// remote.ReleaseCheckout), starting with the specified one, which is empty if
+// it's unknown: an operation that stops waiting for a release, such as on
+// timeout, unlocks its workspace while the release may still arrive, and the
+// token keeps it from removing the checkout of a later claim, which has
+// another token. A claim can arrive late as well and, if the endpoint holds no
+// checkout, record one without a workspace. A checkout with another token is
+// thus abandoned too, since the local endpoint has no workspace for the
+// conflict root, so it's released by that token, and one recorded after the
+// release is released by listing conflicts, discarding, or checking the
+// conflict out again (see claim). That includes a checkout without a token,
+// recorded by a build that didn't issue tokens, which a release without one
+// removes.
+func releaseOver(ctx context.Context, connection io.ReadWriteCloser, directory, session string, target *remote.Target, path, token string) (bool, error) {
+	held, current, err := remote.ReleaseCheckout(ctx, connection, path, token)
+	if err != nil || !held || current == token {
+		return held, err
+	}
+	connection, err = dialSession(ctx, directory, session, remote.OperationRelease, target)
+	if err != nil {
+		return true, err
+	} else if stillHeld, remaining, err := remote.ReleaseCheckout(ctx, connection, path, current); err != nil {
+		return true, err
+	} else if stillHeld && remaining != current {
+		return true, errors.New("the checkout was claimed again while it was being released")
+	}
+	return true, nil
+}
+
+// releaseAbandoned releases the checkouts held by the local endpoint that have
+// no workspace, such as those left by interrupted checkouts or by releases
+// that failed, so that the opposite endpoint can check them out, and returns
+// the remaining checkouts. Checkouts of paths with an operation in progress,
+// such as a checkout that hasn't created its workspace yet, are kept, as are
+// those whose workspaces can't be read, which discarding releases, and those
+// that can't be released, since the listing is advisory.
+func releaseAbandoned(ctx context.Context, directory string, target *remote.Target, checkouts []remote.Checkout, workspaces map[string]*workspace) []remote.Checkout {
+	var remaining []remote.Checkout
+	for _, checkout := range checkouts {
+		if checkout.Alpha != target.Alpha || workspaces[checkout.Path] != nil || !releaseIfAbandoned(ctx, directory, target, checkout) {
+			remaining = append(remaining, checkout)
+		}
+	}
+	return remaining
+}
+
+// releaseIfAbandoned releases a listed checkout held by the local endpoint if
+// it has no workspace and no operation on its path is in progress, and returns
+// whether the local endpoint no longer holds it.
+func releaseIfAbandoned(ctx context.Context, directory string, target *remote.Target, checkout remote.Checkout) bool {
+	local := filepath.Join(target.Root, filepath.FromSlash(checkout.Path))
+	unlock, err := lockWorkspace(local)
+	if err != nil {
+		return false
+	}
+	defer unlock()
+	if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	_, err = release(ctx, directory, target.Session, target, checkout.Path, checkout.Token)
+	return err == nil
 }
 
 // outside verifies that a directory isn't inside a synchronization root, where
@@ -546,17 +762,14 @@ type outcome struct {
 	Regions int `json:",omitempty"`
 	// Take lists the copies that apply can take.
 	Take []string `json:",omitempty"`
-	// Pending indicates that a workspace's conflict is no longer listed.
-	Pending bool `json:",omitempty"`
-	// Applied indicates that apply has changed (or may have changed) either
-	// copy through the workspace, so that its resolution is unfinished until
-	// verified. A pending workspace with nothing applied was resolved some
-	// other way, and apply refuses it.
-	Applied bool `json:",omitempty"`
 	// Resolved indicates that apply resolved the conflict.
 	Resolved bool `json:",omitempty"`
 	// Discarded indicates that discard set the workspace aside.
 	Discarded bool `json:",omitempty"`
+	// Applied indicates that results were applied through a discarded
+	// workspace, so that a copy may have one, or one original copy may exist
+	// only in the workspace (see appliedNote).
+	Applied bool `json:",omitempty"`
 	// Backup is the location where a resolved or discarded workspace is kept.
 	Backup string `json:",omitempty"`
 	// lines are the lines printed as text.
@@ -608,6 +821,17 @@ func retentionNote(backup string) string {
 	return fmt.Sprintf("The workspace, with the original copies, is kept in %s for %d days.", backup, int(backupRetention.Hours()/24))
 }
 
+// appliedNote warns that a workspace through which results were applied, which
+// discard set aside in a backup, belonged to an unfinished resolution: a copy
+// may still have a result, or synchronization may have copied one original
+// copy over a partially applied result (a deletion, or a result matching the
+// copies' common ancestor), so that the other original copy exists only in the
+// backup.
+func appliedNote(backup string) string {
+	return fmt.Sprintf("Results were applied through it, so a copy may still have one, or synchronization may have copied one original copy over the other, which then exists only in the workspace's local or remote file: compare the current file with %s and %s.",
+		filepath.Join(backup, localName), filepath.Join(backup, remoteName))
+}
+
 // runConflicts performs a conflict operation. Failures for individual paths
 // are printed as they occur and reported with errReported, while other errors
 // are returned.
@@ -624,7 +848,7 @@ func runConflicts(ctx context.Context, directory string, o *options, output, err
 		err = applyAll(ctx, directory, o, p)
 	} else {
 		for _, argument := range o.arguments {
-			result, err := discard(argument)
+			result, err := discard(ctx, o, argument)
 			p.print(argument, result, err)
 		}
 	}
@@ -647,21 +871,41 @@ type listedConflict struct {
 	Files bool `json:",omitempty"`
 	// Take lists the copies that can be taken.
 	Take []string `json:",omitempty"`
-	// CheckedOut indicates whether a workspace exists for the conflict.
-	CheckedOut bool `json:",omitempty"`
+	// CheckedOut identifies the endpoint through which the conflict is checked
+	// out, if it is: local, or remote for the opposite endpoint, which alone
+	// can apply or discard it.
+	CheckedOut string `json:",omitempty"`
+	// Changed indicates that a copy of a conflict checked out locally changed
+	// since checkout, so that its workspace must be discarded and checked out
+	// again.
+	Changed bool `json:",omitempty"`
+	// Applied indicates that apply has changed (or may have changed) either
+	// copy through the local workspace of a conflict checked out locally (see
+	// workspace.applied), so that its resolution is unfinished and is finished
+	// by applying again, since a copy may already have the result.
+	Applied bool `json:",omitempty"`
+	// changed describes the copies that changed (see workspace.changedSince).
+	changed string
 }
 
 // pendingResolution is a workspace as listed by --conflicts --json whose
-// conflict is no longer listed. If something was applied, its resolution is
-// unfinished, and it's finished by applying again or set aside by discarding
-// it. Otherwise, the conflict was resolved some other way, apply refuses it,
-// and it's set aside by discarding it.
+// conflict is no longer listed, along with its location. If something was
+// applied, its resolution is unfinished, and it's finished by applying again.
+// Otherwise, the conflict was resolved some other way, or ended by a change
+// after checkout, such as one copy reverted or deleted, so that
+// synchronization copied the other copy over it, which can't be told apart.
+// Apply refuses it, and it's set aside by discarding it, but it may hold the
+// only copy of one side's changes, so its copies are compared with the current
+// file first.
 type pendingResolution struct {
 	// Path is the local path of the conflict root.
 	Path string
 	// Applied indicates whether apply has changed (or may have changed) either
 	// copy through the workspace (see workspace.applied).
 	Applied bool `json:",omitempty"`
+	// Workspace is the workspace directory, which contains the checked-out
+	// copies (see localName and remoteName).
+	Workspace string
 }
 
 // localSides converts which endpoints' copies of a conflict can be taken to
@@ -681,12 +925,22 @@ func localSides(conflict *remote.ConflictRoot, target *remote.Target) []string {
 	return sides
 }
 
-// printConflicts lists conflicts and the workspaces whose conflicts are no
-// longer listed: unfinished resolutions, whose conflicts may no longer be
-// listed if synchronization propagated one copy over a partially applied
-// resolution, and workspaces with nothing applied, whose conflicts were
-// resolved some other way. Paths are local paths, which are relative to the
-// working directory if it's inside the root, as other operations expect.
+// printConflicts lists conflicts, the endpoint through which each one is
+// checked out, if any, whether a local checkout's copies changed since checkout
+// or results were applied through its workspace, and the workspaces whose
+// conflicts are no longer listed, with their locations: unfinished
+// resolutions, whose conflicts may no longer be listed if synchronization
+// propagated one copy over a partially applied resolution, and workspaces with
+// nothing applied, whose conflicts were resolved some other way or ended by a
+// change after checkout, which may have left one side's changes only in the
+// workspace. Changes since checkout can't be identified once a conflict is no
+// longer listed, so the listing says to compare the current file with the
+// workspace's copies before discarding it. It also lists the paths whose
+// conflicts are no longer listed but which the opposite endpoint has checked
+// out, possibly for unfinished resolutions, and releases abandoned local
+// checkouts (see releaseAbandoned). Paths are local paths, which are relative
+// to the working directory if it's inside the root, as other operations
+// expect.
 func printConflicts(ctx context.Context, directory string, o *options, output io.Writer) error {
 	listing, target, err := listConflicts(ctx, directory, o.session)
 	if err != nil {
@@ -694,37 +948,67 @@ func printConflicts(ctx context.Context, directory string, o *options, output io
 	}
 	l := newLocator(target)
 	workspaces := sessionWorkspaces(target)
+	holders := make(map[string]bool)
+	for _, checkout := range releaseAbandoned(ctx, directory, target, listing.Checkouts, workspaces) {
+		holders[checkout.Path] = checkout.Alpha
+	}
+	// A checkout held by the opposite endpoint prevails over a local workspace,
+	// which apply then refuses.
+	checkedOut := func(path string) string {
+		if alpha, held := holders[path]; held && alpha != target.Alpha {
+			return sideRemote
+		} else if held || workspaces[path] != nil {
+			return sideLocal
+		}
+		return ""
+	}
 	conflicts := make([]listedConflict, len(listing.Conflicts))
 	for c := range listing.Conflicts {
 		conflict := &listing.Conflicts[c]
-		conflicts[c] = listedConflict{
+		listed := listedConflict{
 			Path: l.local(conflict.Path), Resolvable: conflict.Resolvable(), Files: conflict.Files,
-			Take: localSides(conflict, target), CheckedOut: workspaces[conflict.Path] != nil,
+			Take: localSides(conflict, target), CheckedOut: checkedOut(conflict.Path),
 		}
+		// Copies changed since checkout are only identified while nothing was
+		// applied (see workspace.changedSince), so a workspace through which
+		// results were applied is marked as such instead, since its resolution
+		// is unfinished. Neither is marked for a conflict that the opposite
+		// endpoint has checked out, whose workspace apply refuses.
+		if w := workspaces[conflict.Path]; w != nil && listed.CheckedOut == sideLocal {
+			listed.changed = w.changedSince(conflict)
+			listed.Changed = listed.changed != ""
+			listed.Applied = w.applied()
+		}
+		conflicts[c] = listed
 		delete(workspaces, conflict.Path)
+		delete(holders, conflict.Path)
 	}
-	var pending, unfinished, unapplied []string
+	var pending, elsewhere []string
 	for path := range workspaces {
 		pending = append(pending, path)
 	}
 	slices.Sort(pending)
-	for _, path := range pending {
-		if workspaces[path].applied() {
-			unfinished = append(unfinished, path)
-		} else {
-			unapplied = append(unapplied, path)
+	for path, alpha := range holders {
+		if alpha != target.Alpha {
+			elsewhere = append(elsewhere, path)
 		}
 	}
+	slices.Sort(elsewhere)
 	if o.json {
 		listed := struct {
-			Conflicts []listedConflict
-			Pending   []pendingResolution
-		}{Conflicts: conflicts, Pending: make([]pendingResolution, len(pending))}
+			Conflicts     []listedConflict
+			Pending       []pendingResolution
+			RemotePending []string
+		}{Conflicts: conflicts, Pending: make([]pendingResolution, len(pending)), RemotePending: make([]string, len(elsewhere))}
 		for p, path := range pending {
-			listed.Pending[p] = pendingResolution{Path: l.local(path), Applied: workspaces[path].applied()}
+			w := workspaces[path]
+			listed.Pending[p] = pendingResolution{Path: l.local(path), Applied: w.applied(), Workspace: w.directory}
+		}
+		for p, path := range elsewhere {
+			listed.RemotePending[p] = l.local(path)
 		}
 		return json.NewEncoder(output).Encode(&listed)
-	} else if len(conflicts) == 0 && len(pending) == 0 {
+	} else if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 {
 		_, err := fmt.Fprintln(output, "No conflicts.")
 		return err
 	}
@@ -735,26 +1019,50 @@ func printConflicts(ctx context.Context, directory string, o *options, output io
 		} else if !conflict.Files {
 			line += fmt.Sprintf(" (not two files, so it can only be resolved with --take %s)", strings.Join(conflict.Take, " or --take "))
 		}
-		if conflict.CheckedOut {
+		switch {
+		case conflict.Changed:
+			line += fmt.Sprintf(" (checked out, but the %s changed since: discard and check out again)", conflict.changed)
+		case conflict.Applied:
+			line += " (checked out and partially applied: apply again to finish)"
+		case conflict.CheckedOut == sideLocal:
 			line += " (checked out)"
+		case conflict.CheckedOut == sideRemote:
+			line += " (checked out through the opposite endpoint, which alone can apply or discard it)"
 		}
 		if _, err := fmt.Fprintln(output, line); err != nil {
 			return err
 		}
 	}
+	// Workspaces whose conflicts are no longer listed are listed with their
+	// locations, since they may hold the only copy of one side's changes.
+	var unfinished, unapplied, remotely []string
+	for _, path := range pending {
+		w := workspaces[path]
+		line := fmt.Sprintf("%s (workspace: %s)", l.display(path), w.directory)
+		if w.applied() {
+			unfinished = append(unfinished, line)
+		} else {
+			unapplied = append(unapplied, line)
+		}
+	}
+	for _, path := range elsewhere {
+		remotely = append(remotely, l.display(path))
+	}
 	for _, section := range []struct {
 		heading string
-		paths   []string
+		lines   []string
 	}{
-		{"Applied, but no longer listed as conflicts (apply again to finish resolving, or discard):", unfinished},
-		{"Checked out, but no longer listed as conflicts, with nothing applied (resolved some other way; discard, which changes neither copy):", unapplied},
+		{"Partially applied, but no longer listed as conflicts (synchronization may have copied an original copy over a partial result; apply again to finish resolving):", unfinished},
+		{fmt.Sprintf("Checked out, but no longer listed as conflicts, with nothing applied (resolved some other way, or ended by a change after checkout, which may have left one side's changes only in the workspace; compare the current file with the workspace's local and remote files before discarding, since discarded workspaces are deleted after %d days):",
+			int(backupRetention.Hours()/24)), unapplied},
+		{"Checked out through the opposite endpoint, but no longer listed as conflicts (possibly unfinished; leave them unchanged until applied or discarded there):", remotely},
 	} {
-		if len(section.paths) == 0 {
+		if len(section.lines) == 0 {
 			continue
 		}
 		fmt.Fprintln(output, section.heading)
-		for _, path := range section.paths {
-			if _, err := fmt.Fprintln(output, "  "+l.display(path)); err != nil {
+		for _, line := range section.lines {
+			if _, err := fmt.Fprintln(output, "  "+line); err != nil {
 				return err
 			}
 		}
@@ -775,10 +1083,45 @@ func checkoutAll(ctx context.Context, directory string, o *options, p *printer) 
 	return nil
 }
 
-// checkout downloads both copies of a conflict into its workspace. An existing
-// workspace is reused, preserving edits to its merged file, even if its
-// conflict is no longer listed, but not with a specified common ancestor,
-// which only a new workspace's merged file can be based on.
+// checkedOut explains why a conflict with a workspace can't be checked out
+// again: each conflict has a single workspace, on either endpoint, until it's
+// applied or discarded, so that the merged file's edits are never replaced and
+// resolutions never race.
+//
+// A workspace through which results were applied is finished by applying
+// again, whether or not its conflict is still listed, rather than discarded,
+// since a copy may already have a result, or synchronization may have copied
+// one original copy over a partially applied result. A workspace with nothing
+// applied whose conflict is no longer listed may hold the only copy of one
+// side's changes, if a change ended the conflict, so the current file is
+// compared with its copies before discarding it. Otherwise, the workspace may
+// be another agent's or the user's resolution in progress, since checkouts
+// aren't tied to whoever made them, and a checkout after discarding it would
+// reuse its files, so it's only applied or discarded by whoever checked it
+// out.
+func checkedOut(w *workspace, conflict *remote.ConflictRoot, target *remote.Target, path string) error {
+	if !w.matches(target, path) {
+		return errors.New("an unrelated workspace exists for this path; discard it first")
+	}
+	message := "is already checked out in " + w.directory
+	if w.hasDirectory() {
+		return fmt.Errorf("%s, but %w (discard the workspace, which changes neither copy)", message, errDirectoryConflict)
+	} else if conflict == nil && w.applied() {
+		return fmt.Errorf("%s, and results were applied through it, but the conflict is no longer listed, since synchronization may have copied an original copy over a partial result: apply again to finish resolving it", message)
+	} else if conflict == nil {
+		return fmt.Errorf("%s, but the conflict is no longer listed, and nothing was applied, so it was resolved some other way, or ended by a change after checkout, which may have left one side's changes only in the workspace: compare the current file with the workspace's local and remote files before discarding it (which changes neither copy, and discarded workspaces are deleted after %d days)",
+			message, int(backupRetention.Hours()/24))
+	} else if w.applied() {
+		return fmt.Errorf("%s, and a result was partially applied through it: apply again to finish resolving it", message)
+	} else if changed := w.changedSince(conflict); changed != "" {
+		return fmt.Errorf("%s, but the %s changed since checkout: discard the workspace (which changes neither copy) and check out again", message, changed)
+	}
+	return fmt.Errorf("%s, possibly by another agent or the user, whose resolution may be in progress: if you checked it out, apply it, or discard the workspace (which changes neither copy) to check out again; otherwise, leave it, or ask the user", message)
+}
+
+// checkout downloads both copies of a conflict into a new workspace. A
+// conflict that's already checked out, through either endpoint, can't be
+// checked out again until its workspace is applied or discarded.
 func checkout(ctx context.Context, directory string, o *options, listing *remote.Listing, target *remote.Target, argument string) (*outcome, error) {
 	local, err := filepath.Abs(argument)
 	if err != nil {
@@ -795,16 +1138,7 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 	}
 	conflict := findConflict(listing, path)
 	if w, err := loadWorkspace(local); err == nil {
-		if !w.matches(target, path) {
-			return nil, errors.New("an unrelated workspace exists for this path; discard it first")
-		} else if w.hasDirectory() {
-			return nil, errDirectoryConflict
-		} else if o.base != "" {
-			// The merged file may have been edited, and merging with another
-			// ancestor would replace it.
-			return nil, errors.New("is already checked out, so --base can't be used; discard the workspace first (which changes neither copy), then check out again with --base")
-		}
-		return describe(w, argument, conflict == nil)
+		return nil, checkedOut(w, conflict, target, path)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	} else if conflict == nil {
@@ -814,6 +1148,24 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 	} else if o.base != "" && !conflict.Files {
 		return nil, errors.New("--base requires a conflict between two files")
 	}
+
+	// Claim the checkout before downloading the copies, so that the opposite
+	// endpoint can't check the conflict out meanwhile, and release it if
+	// checkout fails. The claim has a new token, which the workspace keeps, so
+	// that late claims and releases of earlier checkouts can't take over or
+	// remove its checkout. A checkout that the local endpoint already holds
+	// without a workspace, such as one left by an interrupted checkout, is
+	// released first (see claim).
+	token := rand.Text()[:8]
+	if err := claim(ctx, directory, o.session, target, path, token); err != nil {
+		return nil, err
+	}
+	created := false
+	defer func() {
+		if !created {
+			release(ctx, directory, o.session, target, path, token)
+		}
+	}()
 	base, final, err := workspaceDirectory(local)
 	if err != nil {
 		return nil, err
@@ -828,7 +1180,7 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 		return nil, fmt.Errorf("unable to create workspace: %w", err)
 	}
 	defer os.RemoveAll(staging)
-	w := &workspace{Session: target.Session, Alpha: target.Alpha, Path: path, Token: rand.Text()[:8], directory: staging}
+	w := &workspace{Session: target.Session, Alpha: target.Alpha, Path: path, Token: token, directory: staging}
 	if conflict.Files {
 		err = checkoutFiles(ctx, conflict, local, o.base, w, func(output io.Writer) (*remote.Entry, error) {
 			return remote.CopyFile(ctx, target.Root, path, output)
@@ -850,6 +1202,7 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 	} else if err := os.Rename(staging, final); err != nil {
 		return nil, fmt.Errorf("unable to save workspace: %w", err)
 	}
+	created = true
 	// The workspace's files and directory were flushed (see workspace.save),
 	// so flush the workspaces directory that it was moved into, and that
 	// directory's parent, in case the workspaces directory was just created,
@@ -859,7 +1212,7 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 		return nil, fmt.Errorf("unable to save workspace: %w", err)
 	}
 	w.directory = final
-	return describe(w, argument, false)
+	return describe(w, argument)
 }
 
 // errCopiesChanged indicates that the copies downloaded for a checkout aren't
@@ -916,6 +1269,9 @@ func checkoutFiles(ctx context.Context, conflict *remote.ConflictRoot, local, ex
 	} else if err := prepareMerged(w); err != nil {
 		return fmt.Errorf("unable to create merged file: %w", err)
 	}
+	if unverifiable == nil {
+		w.ListedLocal, w.ListedRemote = listed[0], listed[1]
+	}
 	return nil
 }
 
@@ -954,27 +1310,15 @@ func describeKind(entry *remote.Entry) string {
 	return entry.Kind
 }
 
-// pendingNote describes what remains to do for a workspace whose conflict is
-// no longer listed.
-func pendingNote(w *workspace) string {
-	if w.applied() {
-		return "The conflict is no longer listed: apply again to finish resolving it, or discard the workspace."
-	}
-	return "The conflict is no longer listed, and nothing was applied, so it was resolved some other way: discard the workspace, which changes neither copy (apply refuses it)."
-}
-
 // describe describes a workspace for its checkout.
-func describe(w *workspace, argument string, pending bool) (*outcome, error) {
-	result := &outcome{Path: argument, Local: w.file(localName), Remote: w.file(remoteName), Files: w.files(), Take: w.Take, Pending: pending, Applied: w.applied()}
+func describe(w *workspace, argument string) (*outcome, error) {
+	result := &outcome{Path: argument, Local: w.file(localName), Remote: w.file(remoteName), Files: w.files(), Take: w.Take}
 	note := func(format string, arguments ...any) {
 		result.lines = append(result.lines, fmt.Sprintf(format, arguments...))
 	}
 	if !w.files() {
 		note("Local:  %s (%s)", result.Local, describeKind(w.Local))
 		note("Remote: %s (%s)", result.Remote, describeKind(w.Remote))
-		if pending {
-			note("%s", pendingNote(w))
-		}
 		var options []string
 		for _, side := range w.Take {
 			options = append(options, "--take "+side)
@@ -992,9 +1336,6 @@ func describe(w *workspace, argument string, pending bool) (*outcome, error) {
 		note("Base:   %s (%s)", result.Base, w.BaseSource)
 	}
 	note("Merged: %s", result.Merged)
-	if pending {
-		note("%s", pendingNote(w))
-	}
 	if _, err := os.Lstat(result.Merged); errors.Is(err, os.ErrNotExist) {
 		result.Binary = true
 		note("The copies are binary, so no merged file was created: create it, or use --take.")
@@ -1004,13 +1345,7 @@ func describe(w *workspace, argument string, pending bool) (*outcome, error) {
 			return nil, err
 		}
 		result.Regions = regions
-		if result.Base == "" {
-			note("No common ancestor was found, so every region where the copies differ is marked (%d), and neither side's additions or deletions are known to be newer.", regions)
-		} else if regions == 0 {
-			note("Both copies' changes since their common ancestor were merged without overlapping: review the merged file, then apply it.")
-		} else {
-			note("%d regions changed differently on each side since their common ancestor are marked with the local, base, and remote versions.", regions)
-		}
+		note("%s", mergeNote(w, regions))
 		if unterminated := unterminatedNote(w); unterminated != "" {
 			note("%s", unterminated)
 		}
@@ -1023,7 +1358,9 @@ func describe(w *workspace, argument string, pending bool) (*outcome, error) {
 
 // resolution determines the result entry of a resolution and the workspace
 // file providing its contents (for a file result). Copies that aren't both
-// files can only be resolved by taking one of them as checked out.
+// files can only be resolved by taking one of them as checked out. A merged
+// file is refused if it still contains conflict markers, or if it's empty
+// while neither copy is (see errEmptyMerged).
 func resolution(ctx context.Context, w *workspace, o *options) (*remote.Entry, string, error) {
 	if !w.files() && (o.take == "" || o.executable != "") {
 		return nil, "", errors.New("the copies aren't both files, so they can only be resolved with --take local or --take remote")
@@ -1063,6 +1400,15 @@ func resolution(ctx context.Context, w *workspace, o *options) (*remote.Entry, s
 			return nil, "", err
 		} else if found {
 			return nil, "", errors.New("the merged file still contains conflict markers")
+		} else if result.Size == 0 && w.Local.Size != 0 && w.Remote.Size != 0 {
+			// Checking out again recreates the merged file, but discarding a
+			// workspace through which a result was applied would leave that
+			// resolution unfinished (see workspace.applied).
+			recreate := "recreate it from the workspace's other files"
+			if !w.applied() {
+				recreate += " (or discard the workspace and check it out again, which recreates it)"
+			}
+			return nil, "", fmt.Errorf("%w; apply changed neither copy: %s, or, if the result should be empty, discard the workspace and empty both copies", errEmptyMerged, recreate)
 		}
 	}
 	result.Data = nil
@@ -1217,12 +1563,41 @@ func apply(ctx context.Context, directory string, o *options, argument string, l
 			return nil, unlock, errResolvedOtherwise
 		}
 	}
-	return a, unlock, a.write(ctx, connection, source)
+	// Only the endpoint holding a conflict's checkout can resolve it. A
+	// workspace whose checkout is missing claims it again, if the conflict is
+	// still listed and the opposite endpoint hasn't checked it out. Each apply
+	// claims the checkout again, since the claim's sequence number orders its
+	// replacements after those of earlier applies (see write).
+	sequence, err := claimSequence(ctx, directory, o.session, target, w.Path, w.Token)
+	if err != nil {
+		connection.Close()
+		return nil, unlock, err
+	}
+	return a, unlock, a.write(ctx, connection, source, sequence)
+}
+
+// supersededHint adds advice to an error caused by a later apply of the
+// conflict, which replaced a copy (or tried to) first.
+func supersededHint(err error) error {
+	if errors.Is(err, remote.ErrSuperseded) {
+		return fmt.Errorf("%w; list conflicts (remote --conflicts) to see whether it resolved the conflict", err)
+	}
+	return staleHint(err)
 }
 
 // write writes the result to both copies using a connection to the opposite
-// endpoint, reading a file result's contents from a workspace file.
-func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, source string) error {
+// endpoint, reading a file result's contents from a workspace file, with the
+// sequence number of the apply's claim of the checkout.
+//
+// An apply whose client stops waiting, such as on timeout, may leave its
+// replacement of the remote copy running, and a retry, or another resolution
+// of the conflict, may then replace the copy first. The replacements of each
+// copy are thus serialized and ordered by the sequence numbers of their
+// applies' claims, on the remote copy's system and on this one, which applies
+// through either endpoint share, and a replacement whose sequence number is
+// earlier than that of one admitted before fails with remote.ErrSuperseded,
+// without changing the copy (see remote.ReplaceFile).
+func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, source string, sequence uint64) error {
 	w := a.w
 	open := func() (io.ReadCloser, error) {
 		if source == "" {
@@ -1231,7 +1606,7 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 		return os.Open(source)
 	}
 	expected := append([]*remote.Entry{w.Local, w.Remote}, w.Applied...)
-	replacement := &remote.Replacement{Path: w.Path, Expected: expected, Result: a.result}
+	replacement := &remote.Replacement{Path: w.Path, Expected: expected, Result: a.result, Sequence: sequence}
 	// Check the local copy first, so that one changed since checkout doesn't
 	// leave only the remote copy updated.
 	if err := remote.CheckFile(ctx, a.target.Root, replacement); err != nil {
@@ -1239,7 +1614,12 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 		return fmt.Errorf("unable to update the local copy: %w", staleHint(err))
 	}
 	// Record the result before writing it, since either write may succeed even
-	// if apply fails, so that retries recognize it.
+	// if apply fails, so that retries recognize it. A result recorded for this
+	// attempt is forgotten if neither copy was written, such as when the remote
+	// copy changed since checkout or a later apply reached it first, so that
+	// the workspace isn't taken for an unfinished resolution. Failing to forget
+	// it is merely conservative.
+	recorded := false
 	if !slices.ContainsFunc(w.Applied, func(applied *remote.Entry) bool {
 		return remote.SameContents(applied, a.result)
 	}) {
@@ -1248,16 +1628,29 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 			connection.Close()
 			return fmt.Errorf("unable to save workspace: %w", err)
 		}
+		recorded = true
+	}
+	forget := func() {
+		if recorded {
+			w.Applied = w.Applied[:len(w.Applied)-1]
+			w.save()
+		}
 	}
 	input, err := open()
 	if err != nil {
 		connection.Close()
+		forget()
 		return err
 	}
 	err = remote.Replace(ctx, connection, replacement, input)
 	input.Close()
 	if err != nil {
-		return fmt.Errorf("unable to update the remote copy: %w", staleHint(err))
+		// Stale and superseded replacements fail before writing (see
+		// remote.ReplaceFile).
+		if errors.Is(err, remote.ErrStale) || errors.Is(err, remote.ErrSuperseded) {
+			forget()
+		}
+		return fmt.Errorf("unable to update the remote copy: %w", supersededHint(err))
 	}
 	if input, err = open(); err != nil {
 		return err
@@ -1265,7 +1658,7 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 	err = remote.ReplaceFile(ctx, a.target.Root, replacement, input)
 	input.Close()
 	if err != nil {
-		return fmt.Errorf("updated the remote copy, but unable to update the local copy: %w", staleHint(err))
+		return fmt.Errorf("updated the remote copy, but unable to update the local copy: %w", supersededHint(err))
 	}
 	return nil
 }
@@ -1332,11 +1725,60 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 	if err != nil {
 		return nil, fmt.Errorf("resolved, but unable to set the workspace aside: %w", err)
 	}
-	return &outcome{Path: a.argument, Resolved: true, Backup: backup, lines: []string{resolved, retentionNote(backup)}}, nil
+	lines := []string{resolved, retentionNote(backup)}
+	// The checkout is released once the workspace is set aside. One left
+	// behind is released by the next listing (see releaseAbandoned).
+	if _, err := release(ctx, directory, o.session, a.target, w.Path, w.Token); err != nil {
+		lines = append(lines, fmt.Sprintf("Unable to release the checkout (%v); remote --conflicts releases it.", err))
+	}
+	return &outcome{Path: a.argument, Resolved: true, Backup: backup, lines: lines}, nil
 }
 
-// discard sets a workspace aside without changing either copy.
-func discard(argument string) (*outcome, error) {
+// releaseAt releases the checkout of the conflict root at a local path, held
+// by the endpoint whose root contains it, and returns whether that endpoint
+// held one (see remote.ReleaseCheckout). The endpoint is located by the
+// conflict root's parent rather than the working directory, so that it's found
+// from outside the root, or from inside the opposite root, even if both
+// endpoints are on this system. The parent is used since the conflict root may
+// be a symbolic link, which would be resolved, or missing; a conflict at the
+// root of a single-file session is outside its parent, so it's located by the
+// session alone. If a workspace is specified, which must have been set aside,
+// the checkout must be the one that it was checked out through, and it's
+// released starting with the workspace's token. Otherwise, the token is
+// unknown (see releaseOver).
+func releaseAt(ctx context.Context, local, session string, w *workspace) (bool, error) {
+	connection, target, err := remote.Dial(ctx, filepath.Dir(local), session, remote.OperationRelease)
+	if err != nil {
+		return false, err
+	}
+	path, err := newLocator(target).resolve(local)
+	if err == nil && w != nil && !w.matches(target, path) {
+		err = errors.New("the workspace was checked out through a different session or endpoint")
+	}
+	if err != nil {
+		connection.Close()
+		return false, err
+	}
+	var token string
+	if w != nil {
+		token = w.Token
+	}
+	return releaseOver(ctx, connection, filepath.Dir(local), session, target, path, token)
+}
+
+// discard sets a workspace aside without changing either copy and releases its
+// checkout, so that the conflict can be checked out again, through either
+// endpoint. A checkout without a workspace, such as one left by an interrupted
+// checkout or by a discard whose release failed, is released as well, as is
+// one whose workspace can't be read, which is set aside regardless.
+//
+// Leaving the copies unchanged doesn't make discarding a workspace through
+// which results were applied inconsequential, since its resolution was
+// unfinished (see appliedNote), so discard says so, and where the workspace's
+// copies are kept. Whether anything was applied through an unreadable
+// workspace is unknown, so the copies are to be checked against its files if
+// anything was.
+func discard(ctx context.Context, o *options, argument string) (*outcome, error) {
 	local, err := filepath.Abs(argument)
 	if err != nil {
 		return nil, fmt.Errorf("unable to locate it: %w", err)
@@ -1347,8 +1789,31 @@ func discard(argument string) (*outcome, error) {
 	}
 	defer unlock()
 	w, err := loadWorkspace(local)
+	var unreadable *unreadableWorkspace
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, errors.New("isn't checked out")
+		if held, err := releaseAt(ctx, local, o.session, nil); err != nil {
+			return nil, err
+		} else if !held {
+			return nil, errors.New("isn't checked out")
+		}
+		return &outcome{Path: argument, Discarded: true, lines: []string{
+			"Released the checkout, which had no workspace, without changing either copy.",
+		}}, nil
+	} else if errors.As(err, &unreadable) {
+		// An unreadable workspace would otherwise keep its conflict checked out
+		// indefinitely. Its session and endpoint are unknown, so its checkout
+		// is released like one without a workspace, as a retry would release
+		// it once the workspace is set aside.
+		backup, err := (&workspace{directory: unreadable.directory}).retire()
+		if err != nil {
+			return nil, fmt.Errorf("unable to set the workspace aside: %w", err)
+		} else if _, err := releaseAt(ctx, local, o.session, nil); err != nil {
+			return nil, fmt.Errorf("set the unreadable workspace aside without changing either copy (it's kept in %s; if anything was applied through it, check the copies against its files), but unable to release its checkout, so the opposite endpoint can't check the conflict out yet: %w; discard again to release it", backup, err)
+		}
+		return &outcome{Path: argument, Discarded: true, Backup: backup, lines: []string{
+			"Set aside the workspace, which couldn't be read, without changing either copy.", retentionNote(backup),
+			"If anything was applied through it, check the copies against its files.",
+		}}, nil
 	} else if err != nil {
 		return nil, err
 	}
@@ -1356,7 +1821,20 @@ func discard(argument string) (*outcome, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to set the workspace aside: %w", err)
 	}
-	return &outcome{Path: argument, Discarded: true, Backup: backup, lines: []string{
-		"Discarded the workspace without changing either copy.", retentionNote(backup),
-	}}, nil
+	// The workspace's session is selected by its identifier, so that it's
+	// found even if --session wasn't specified for a single-file session. A
+	// retry would find no workspace, so a failure to release the checkout
+	// mentions anything applied through it as well.
+	if _, err := releaseAt(ctx, local, w.Session, w); err != nil {
+		kept := "it's kept in " + backup
+		if w.applied() {
+			kept += ", and since results were applied through it, a copy may still have one, or one original copy may exist only in its local or remote file"
+		}
+		return nil, fmt.Errorf("discarded the workspace without changing either copy (%s), but unable to release its checkout, so the opposite endpoint can't check the conflict out yet: %w; discard again to release it", kept, err)
+	}
+	lines := []string{"Discarded the workspace without changing either copy.", retentionNote(backup)}
+	if w.applied() {
+		lines = append(lines, appliedNote(backup))
+	}
+	return &outcome{Path: argument, Discarded: true, Applied: w.applied(), Backup: backup, lines: lines}, nil
 }

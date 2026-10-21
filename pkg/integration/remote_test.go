@@ -261,16 +261,36 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 // can also be selected from outside the roots when synchronizing single files.
 func createRemoteDiffSession(t *testing.T, alphaRoot, betaRoot string) string {
 	t.Helper()
+	return createRemoteSession(t, "remoteDiff", alphaRoot, betaRoot, false)
+}
+
+// createRemoteSession creates a session with the specified name from a local
+// alpha to an in-memory beta, with watching disabled, so that only flushes
+// synchronize. Only one endpoint submits commands, so that the session can
+// also be selected from outside the roots: alpha, for beta's agent-style
+// executor, unless alphaExecutes is true, in which case beta submits commands
+// that alpha executes in the daemon process. It performs the initial
+// synchronization through the session itself, from the submitting endpoint,
+// even if another session's root contains its root, and waits until the
+// session can execute commands. The session ignores the specified patterns, if
+// any.
+func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaExecutes bool, ignores ...string) string {
+	t.Helper()
+	mode, submitting := synchronization.RemoteCommandMode_RemoteCommandModeBeta, alphaRoot
+	if alphaExecutes {
+		mode, submitting = synchronization.RemoteCommandMode_RemoteCommandModeAlpha, betaRoot
+	}
 	ctx := context.Background()
 	sessionID, err := synchronizationManager.Create(ctx,
 		&url.URL{Path: alphaRoot},
 		&url.URL{Protocol: netpipe.Protocol_Netpipe, Path: betaRoot},
 		&synchronization.Configuration{
 			WatchMode:         synchronization.WatchMode_WatchModeNoWatch,
-			RemoteCommandMode: synchronization.RemoteCommandMode_RemoteCommandModeBeta,
+			RemoteCommandMode: mode,
+			Ignores:           ignores,
 		},
 		&synchronization.Configuration{}, &synchronization.Configuration{},
-		"remoteDiff", nil, false, "",
+		name, nil, false, "",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -280,16 +300,25 @@ func createRemoteDiffSession(t *testing.T, alphaRoot, betaRoot string) string {
 			t.Error("unable to terminate session:", err)
 		}
 	})
-	if _, err := flushRemote(alphaRoot); err != nil {
-		t.Fatal("unable to synchronize:", err)
+	readyContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for {
+		connection, _, err := remote.Dial(readyContext, submitting, sessionID, remote.OperationFlush)
+		if err == nil {
+			_, err = remote.Flush(readyContext, connection)
+		}
+		if err == nil {
+			break
+		} else if readyContext.Err() != nil {
+			t.Fatal("unable to synchronize:", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// The executor channel connects independently of synchronization. Wait
 	// until it can serve entries before exercising the command line.
-	readyContext, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
 	for {
-		connection, _, err := remote.Dial(readyContext, alphaRoot, sessionID, remote.OperationExecute)
+		connection, _, err := remote.Dial(readyContext, submitting, sessionID, remote.OperationExecute)
 		if err == nil {
 			_, err = remote.Fetch(readyContext, connection, "")
 		}
@@ -328,6 +357,226 @@ func TestRemoteWorkspacePrologueOutsideRoot(t *testing.T) {
 	}
 	if code, _, errorOutput := runRemote(t, alphaRoot, "true"); code != 126 {
 		t.Fatalf("inside submission didn't source override: %d, %q", code, errorOutput)
+	}
+}
+
+func TestRemoteSessionSelection(t *testing.T) {
+	// Commands rely on a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+
+	// Create two sessions synchronizing distinct roots, each with output that
+	// commands submitted for the other session must not delete.
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstAlpha, firstBeta := filepath.Join(directory, "first-alpha"), filepath.Join(directory, "first-beta")
+	secondAlpha, secondBeta := filepath.Join(directory, "second-alpha"), filepath.Join(directory, "second-beta")
+	for _, root := range []string{firstAlpha, secondAlpha} {
+		if err := os.MkdirAll(filepath.Join(root, "sub", "build"), 0700); err != nil {
+			t.Fatal(err)
+		} else if err := os.WriteFile(filepath.Join(root, "sub", "build", "output"), []byte("output"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	createRemoteSession(t, "first", firstAlpha, firstBeta, false)
+	createRemoteSession(t, "second", secondAlpha, secondBeta, false)
+	submission := filepath.Join(secondAlpha, "sub")
+	pwd := []string{"sh", "-c", "pwd -P"}
+
+	// MUTAGEN_REMOTE_SESSION doesn't redirect commands submitted from inside
+	// another session's root, but it selects a session outside every root,
+	// where commands run at the root of the session's opposite endpoint.
+	t.Setenv("MUTAGEN_REMOTE_SESSION", "first")
+	for _, test := range []struct{ from, expected string }{
+		{submission, filepath.Join(secondBeta, "sub")},
+		{directory, firstBeta},
+	} {
+		if code, output, errorOutput := runRemote(t, test.from, pwd...); code != 0 || output != test.expected+"\n" {
+			t.Fatalf("incorrect directory for submission from %s: %d, %q, %q", test.from, code, output, errorOutput)
+		}
+	}
+
+	// Explicitly selecting a session whose roots don't contain the directory
+	// fails while another session's root does, without running the command or
+	// synchronizing, unless the directory is specified explicitly.
+	if code, _, errorOutput := runRemote(t, submission, "-s", "first", "rm", "-rf", "sub/build"); code != 255 ||
+		!strings.Contains(errorOutput, "is synchronized by session second") {
+		t.Fatalf("explicit session redirected a command: %d, %q", code, errorOutput)
+	}
+	for _, root := range []string{firstAlpha, firstBeta} {
+		if _, err := os.Stat(filepath.Join(root, "sub", "build", "output")); err != nil {
+			t.Fatal("redirected command ran:", err)
+		}
+	}
+	explicit := append([]string{"-s", "first", "--cwd", "sub"}, pwd...)
+	if code, output, errorOutput := runRemote(t, submission, explicit...); code != 0 || output != filepath.Join(firstBeta, "sub")+"\n" {
+		t.Fatalf("explicit directory not used: %d, %q, %q", code, output, errorOutput)
+	}
+
+	// Explicit selections still apply to operations that don't run in a
+	// corresponding directory, and to commands outside every root.
+	if code, _, errorOutput := runRemote(t, submission, "-s", "first", "--flush"); code != 0 {
+		t.Fatalf("explicitly selected session not synchronized: %d, %q", code, errorOutput)
+	}
+	t.Setenv("MUTAGEN_REMOTE_SESSION", "")
+	if code, output, errorOutput := runRemote(t, directory, append([]string{"-s", "second"}, pwd...)...); code != 0 || output != secondBeta+"\n" {
+		t.Fatalf("explicit session not used outside every root: %d, %q, %q", code, output, errorOutput)
+	}
+}
+
+func TestRemoteNestedSessionSelection(t *testing.T) {
+	// Commands rely on a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer, inner := filepath.Join(directory, "outer"), filepath.Join(directory, "outer", "inner")
+	if err := os.MkdirAll(filepath.Join(inner, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	outerBeta, innerBeta := filepath.Join(directory, "outer-beta"), filepath.Join(directory, "inner-beta")
+	createRemoteSession(t, "outer", outer, outerBeta, false)
+	innerID := createRemoteSession(t, "inner", inner, innerBeta, false)
+
+	// Commands submitted inside the nested session's root run through it.
+	submission := filepath.Join(inner, "sub")
+	if code, output, errorOutput := runRemote(t, submission, "sh", "-c", "pwd -P"); code != 0 || output != filepath.Join(innerBeta, "sub")+"\n" {
+		t.Fatalf("nested session not used: %d, %q, %q", code, output, errorOutput)
+	}
+
+	// While the nested session is paused, selecting it explicitly fails,
+	// rather than running the command through the enclosing session.
+	if err := synchronizationManager.Pause(context.Background(), &selection.Selection{Specifications: []string{innerID}}, ""); err != nil {
+		t.Fatal("unable to pause session:", err)
+	} else if code, output, errorOutput := runRemote(t, submission, "-s", "inner", "sh", "-c", "pwd -P"); code != 255 || output != "" ||
+		!strings.Contains(errorOutput, `no connected session matching "inner"`) {
+		t.Fatalf("paused session not reported: %d, %q, %q", code, output, errorOutput)
+	}
+}
+
+func TestRemoteNestedSessionExcluded(t *testing.T) {
+	// Commands rely on a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer, inner := filepath.Join(directory, "outer"), filepath.Join(directory, "outer", "inner")
+	if err := os.MkdirAll(filepath.Join(inner, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	outerBeta, innerBeta := filepath.Join(directory, "outer-beta"), filepath.Join(directory, "inner-beta")
+	createRemoteSession(t, "outer", outer, outerBeta, false, "inner")
+	innerID := createRemoteSession(t, "inner", inner, innerBeta, false)
+	submission := filepath.Join(inner, "sub")
+	pwd := []string{"sh", "-c", "pwd -P"}
+	if code, output, errorOutput := runRemote(t, submission, pwd...); code != 0 || output != filepath.Join(innerBeta, "sub")+"\n" {
+		t.Fatalf("nested session not used: %d, %q, %q", code, output, errorOutput)
+	}
+
+	// While the nested session is paused, commands submitted inside its root
+	// aren't run through the enclosing session, which ignores it, unless the
+	// directory is specified explicitly.
+	if err := synchronizationManager.Pause(context.Background(), &selection.Selection{Specifications: []string{innerID}}, ""); err != nil {
+		t.Fatal("unable to pause session:", err)
+	} else if code, output, errorOutput := runRemote(t, submission, pwd...); code != 255 || output != "" ||
+		!strings.Contains(errorOutput, "is inside "+inner+", which session outer") || !strings.Contains(errorOutput, "--cwd .") {
+		t.Fatalf("command in an excluded directory not refused: %d, %q, %q", code, output, errorOutput)
+	}
+	if err := os.MkdirAll(filepath.Join(outerBeta, "inner", "sub"), 0700); err != nil {
+		t.Fatal(err)
+	} else if code, output, errorOutput := runRemote(t, submission, append([]string{"--cwd", "."}, pwd...)...); code != 0 ||
+		output != filepath.Join(outerBeta, "inner", "sub")+"\n" {
+		t.Fatalf("explicit directory not used: %d, %q, %q", code, output, errorOutput)
+	}
+}
+
+func TestRemoteCommandTerminatedByPause(t *testing.T) {
+	// Commands rely on a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+
+	// Commands are executed by an agent-style executor on beta, and by the
+	// daemon itself on alpha.
+	for _, alphaExecutes := range []bool{false, true} {
+		name := "agent executor"
+		if alphaExecutes {
+			name = "daemon executor"
+		}
+		t.Run(name, func(t *testing.T) {
+			directory, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			alphaRoot, betaRoot := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta")
+			if err := os.Mkdir(alphaRoot, 0700); err != nil {
+				t.Fatal(err)
+			}
+			sessionID := createRemoteSession(t, "paused", alphaRoot, betaRoot, alphaExecutes)
+			submitting := alphaRoot
+			if alphaExecutes {
+				submitting = betaRoot
+			}
+
+			// Run a command that cleans up when asked to terminate, keeping
+			// its markers outside the roots, and pause the session once it's
+			// running.
+			started, terminated := filepath.Join(directory, "started"), filepath.Join(directory, "terminated")
+			script := `trap 'echo terminated > "$2"; exit 1' TERM; touch "$1"; while :; do sleep 1; done`
+			t.Chdir(submitting)
+			type outcome struct {
+				code        int
+				errorOutput string
+			}
+			outcomes := make(chan outcome, 1)
+			go func() {
+				var output, errorOutput strings.Builder
+				code := cli.Run([]string{"sh", "-c", script, "sh", started, terminated}, strings.NewReader(""), &output, &errorOutput)
+				outcomes <- outcome{code, errorOutput.String()}
+			}()
+			for deadline := time.Now().Add(30 * time.Second); ; {
+				if _, err := os.Stat(started); err == nil {
+					break
+				} else if time.Now().After(deadline) {
+					t.Fatal("command didn't start")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			pausing := time.Now()
+			if err := synchronizationManager.Pause(context.Background(), &selection.Selection{Specifications: []string{sessionID}}, ""); err != nil {
+				t.Fatal("unable to pause session:", err)
+			}
+			paused := time.Since(pausing)
+
+			// The command is asked to terminate, which doesn't delay pausing
+			// beyond the time that the command takes to exit, and remote
+			// reports that it was terminated and that the session wasn't
+			// synchronized afterwards.
+			select {
+			case result := <-outcomes:
+				expected := "remote: the connection to the executing endpoint was lost (the session may have stopped synchronizing), " +
+					"so the command was terminated and the session wasn't synchronized afterwards\n"
+				if result.code != 255 || result.errorOutput != expected {
+					t.Fatalf("termination reported incorrectly: %d, %q", result.code, result.errorOutput)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("remote didn't exit")
+			}
+			if data, err := os.ReadFile(terminated); err != nil || string(data) != "terminated\n" {
+				t.Fatalf("command wasn't asked to terminate: %q, %v", data, err)
+			} else if paused >= remote.TerminationGracePeriod {
+				t.Fatalf("pausing waited for the grace period: %v", paused)
+			}
+		})
 	}
 }
 

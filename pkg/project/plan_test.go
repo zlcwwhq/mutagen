@@ -94,6 +94,8 @@ Create synchronization session "add"
 Remove synchronization session "remove"
 Replace synchronization session "replace"
 Unchanged sessions: 2
+Note: Synchronization session "remove" is paused and won't be flushed before it's removed, so if a new session synchronizes the same files, changes made since it was paused may be overwritten (two-way-resolved, one-way-replica) or become conflicts (two-way-safe, one-way-safe). Resume it before applying to synchronize them first.
+Note: Synchronization session "replace" is paused and won't be flushed before it's replaced, so changes made since it was paused may be overwritten (two-way-resolved, one-way-replica) or become conflicts (two-way-safe, one-way-safe) once the replacement is resumed. Resume it before applying to synchronize them first.
 `
 	if output := testPlanOutput(plan); output != expected {
 		t.Fatalf("unexpected plan:\n%s", output)
@@ -117,6 +119,59 @@ Unchanged sessions: 2
 		if s.Paused {
 			t.Error("planning modified desired synchronization specification:", s.Name)
 		}
+	}
+}
+
+// TestPlanNotes verifies that paused synchronization sessions that will be
+// replaced or removed are noted, even if the plan doesn't create sessions, and
+// that running, unchanged, and forwarding sessions are not.
+func TestPlanNotes(t *testing.T) {
+	current := testSpecifications(t, `
+forward:
+  defaults: {source: "tcp:127.0.0.1:8000", destination: "tcp:127.0.0.1:8001"}
+  remove: {}
+  replace: {}
+sync:
+  defaults: {alpha: ./alpha, beta: ./beta}
+  keep: {}
+  remove: {}
+  replace: {}
+`)
+	desired := testSpecifications(t, `
+forward:
+  defaults: {source: "tcp:127.0.0.1:8000", destination: "tcp:127.0.0.1:8001"}
+  replace: {destination: "tcp:127.0.0.1:8002"}
+sync:
+  defaults: {alpha: ./alpha, beta: ./beta}
+  keep: {}
+  replace: {beta: ./other}
+`)
+	forwardingStates, synchronizationStates := testSessionStates(current)
+	for _, state := range forwardingStates {
+		state.Session.Paused = true
+	}
+
+	// Running synchronization sessions and paused forwarding sessions are not
+	// noted.
+	plan, err := NewPlan(desired, forwardingStates, synchronizationStates)
+	if err != nil {
+		t.Fatal(err)
+	} else if notes := plan.notes(); len(notes) > 0 {
+		t.Error("running or forwarding sessions were noted:", notes)
+	}
+
+	// Paused synchronization sessions are noted when replaced or removed, but
+	// not when unchanged.
+	for _, state := range synchronizationStates {
+		state.Session.Paused = true
+	}
+	plan, err = NewPlan(desired, forwardingStates, synchronizationStates)
+	if err != nil {
+		t.Fatal(err)
+	} else if notes := plan.notes(); len(notes) != 2 ||
+		!strings.HasPrefix(notes[0], `Synchronization session "remove" is paused and won't be flushed before it's removed,`) ||
+		!strings.HasPrefix(notes[1], `Synchronization session "replace" is paused and won't be flushed before it's replaced,`) {
+		t.Error("unexpected notes for paused sessions:", notes)
 	}
 }
 
@@ -269,14 +324,19 @@ forward:
 	}
 }
 
+// errTestFlush is the error returned by testSessionOperations when a simulated
+// flush fails.
+var errTestFlush = errors.New("flush failed")
+
 // testSessionOperations records session operations and simulates failures.
 type testSessionOperations struct {
 	// operations records the operations performed.
 	operations []string
 	// failCreation specifies synchronization sessions whose creation fails.
 	failCreation map[string]bool
-	// failFlush indicates that flushing fails.
-	failFlush bool
+	// failFlush specifies synchronization sessions, by identifier, whose flush
+	// fails.
+	failFlush map[string]bool
 }
 
 func (o *testSessionOperations) TerminateForwarding(identifiers []string) error {
@@ -304,15 +364,19 @@ func (o *testSessionOperations) CreateSynchronization(specification *synchroniza
 
 func (o *testSessionOperations) FlushSynchronization(identifiers []string) error {
 	o.operations = append(o.operations, "flush synchronization "+strings.Join(identifiers, ","))
-	if o.failFlush {
-		return errors.New("flush failed")
+	for _, identifier := range identifiers {
+		if o.failFlush[identifier] {
+			return errTestFlush
+		}
 	}
 	return nil
 }
 
-// TestPlanApply verifies that obsolete sessions are terminated before creation,
-// that replacements retain paused state, and that only running sessions
-// created by the plan are flushed.
+// TestPlanApply verifies that running synchronization sessions that will be
+// terminated are flushed individually before any session is terminated, that
+// paused and unchanged sessions are never flushed, that obsolete sessions are
+// terminated before creation, that replacements retain paused state, and that
+// running sessions created by the plan are flushed after creation.
 func TestPlanApply(t *testing.T) {
 	current := testSpecifications(t, `
 forward:
@@ -324,7 +388,9 @@ sync:
   defaults: {alpha: ./alpha, beta: ./beta}
   keep: {}
   replace: {}
+  replace-paused: {}
   remove: {}
+  remove-paused: {}
 `)
 	desired := testSpecifications(t, `
 forward:
@@ -336,11 +402,12 @@ sync:
   defaults: {alpha: ./alpha, beta: ./beta, flushOnCreate: true}
   keep: {}
   replace: {beta: ./other}
+  replace-paused: {beta: ./other}
   add: {}
 `)
 	forwardingStates, synchronizationStates := testSessionStates(current)
 	for _, state := range synchronizationStates {
-		state.Session.Paused = state.Session.Name == "replace"
+		state.Session.Paused = strings.HasSuffix(state.Session.Name, "-paused")
 	}
 	plan, err := NewPlan(desired, forwardingStates, synchronizationStates)
 	if err != nil {
@@ -351,13 +418,16 @@ sync:
 		t.Fatal(err)
 	}
 	expected := []string{
+		"flush synchronization sync-remove",
+		"flush synchronization sync-replace",
 		"terminate forwarding forward-remove,forward-replace",
-		"terminate synchronization sync-remove,sync-replace",
+		"terminate synchronization sync-remove,sync-remove-paused,sync-replace,sync-replace-paused",
 		"create forwarding add paused=false",
 		"create forwarding replace paused=false",
 		"create synchronization add paused=false",
-		"create synchronization replace paused=true",
-		"flush synchronization new-add",
+		"create synchronization replace paused=false",
+		"create synchronization replace-paused paused=true",
+		"flush synchronization new-add,new-replace",
 	}
 	if strings.Join(operations.operations, "\n") != strings.Join(expected, "\n") {
 		t.Fatalf("unexpected operations:\n%s", strings.Join(operations.operations, "\n"))
@@ -371,6 +441,70 @@ sync:
 	operations = &testSessionOperations{}
 	if err := plan.Apply(operations); err != nil || len(operations.operations) > 0 {
 		t.Fatal("plan without changes performed operations:", operations.operations)
+	}
+}
+
+// TestPlanApplyFlushFailure verifies that if a running synchronization session
+// can't be flushed before it's terminated, then no session is terminated or
+// created, and that the error identifies the session, wraps the cause, and
+// explains how to proceed.
+func TestPlanApplyFlushFailure(t *testing.T) {
+	current := testSpecifications(t, `
+forward:
+  remove: {source: "tcp:127.0.0.1:8000", destination: "tcp:127.0.0.1:8001"}
+sync:
+  defaults: {alpha: ./alpha, beta: ./beta}
+  remove: {}
+  replace: {}
+`)
+	desired := testSpecifications(t, `
+sync:
+  defaults: {alpha: ./alpha, beta: ./beta, flushOnCreate: true}
+  add: {}
+  replace: {beta: ./other}
+`)
+	forwardingStates, synchronizationStates := testSessionStates(current)
+	for _, test := range []struct {
+		// failing is the identifier of the session whose flush fails.
+		failing string
+		// operations are the expected operations.
+		operations []string
+		// message is the expected error message.
+		message string
+	}{
+		{
+			"sync-remove",
+			[]string{"flush synchronization sync-remove"},
+			`unable to flush synchronization session "remove" (sync-remove) before removing it: flush failed; ` +
+				`removing it now could let a new session for the same files overwrite its unsynchronized changes, ` +
+				`so no sessions were terminated or created: fix the session and apply again, or terminate it with ` +
+				`"mutagen sync terminate sync-remove" and apply again if its unsynchronized changes don't matter`,
+		},
+		{
+			"sync-replace",
+			[]string{"flush synchronization sync-remove", "flush synchronization sync-replace"},
+			`unable to flush synchronization session "replace" (sync-replace) before replacing it: flush failed; ` +
+				`replacing it now could overwrite its unsynchronized changes, so no sessions were terminated or ` +
+				`created: fix the session and apply again, or terminate it with "mutagen sync terminate sync-replace" ` +
+				`and apply again if its unsynchronized changes don't matter`,
+		},
+	} {
+		plan, err := NewPlan(desired, forwardingStates, synchronizationStates)
+		if err != nil {
+			t.Fatal(err)
+		}
+		operations := &testSessionOperations{failFlush: map[string]bool{test.failing: true}}
+		err = plan.Apply(operations)
+		if err == nil {
+			t.Fatal("flush failure was not reported")
+		} else if err.Error() != test.message {
+			t.Error("unexpected flush failure message:", err)
+		} else if !errors.Is(err, errTestFlush) {
+			t.Error("flush failure does not wrap its cause")
+		}
+		if strings.Join(operations.operations, "\n") != strings.Join(test.operations, "\n") {
+			t.Errorf("unexpected operations:\n%s", strings.Join(operations.operations, "\n"))
+		}
 	}
 }
 
@@ -390,7 +524,10 @@ sync:
 		if err != nil {
 			t.Fatal(err)
 		}
-		operations := &testSessionOperations{failCreation: map[string]bool{"second": true}, failFlush: failFlush}
+		operations := &testSessionOperations{
+			failCreation: map[string]bool{"second": true},
+			failFlush:    map[string]bool{"new-first": failFlush},
+		}
 		err = plan.Apply(operations)
 		if err == nil || !strings.Contains(err.Error(), "unable to create synchronization session (second)") {
 			t.Fatal("creation failure was not reported:", err)

@@ -86,7 +86,8 @@ func TestSymbolicLinkTargetsSlashSeparated(t *testing.T) {
 	} else if entry, err := Snapshot(ctx, root, "link"); err != nil || entry.Kind != EntrySymbolicLink || entry.Target != "dir/target" {
 		t.Fatalf("link snapshotted as %+v: %v", entry, err)
 	}
-	replacement := &Replacement{Path: "replaced", Expected: []*Entry{{Kind: EntryMissing}}, Result: &Entry{Kind: EntrySymbolicLink, Target: "dir/target"}}
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	replacement := &Replacement{Path: "replaced", Expected: []*Entry{{Kind: EntryMissing}}, Result: &Entry{Kind: EntrySymbolicLink, Target: "dir/target"}, Sequence: 1}
 	if err := ReplaceFile(ctx, root, replacement, strings.NewReader("")); err != nil {
 		t.Fatal(err)
 	} else if entry, err := Snapshot(ctx, root, "replaced"); err != nil || !SameContents(entry, replacement.Result) {
