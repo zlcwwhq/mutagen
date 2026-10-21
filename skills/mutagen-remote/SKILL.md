@@ -21,6 +21,17 @@ wrong:
   a flush failed). Files that a detached job writes later arrive through normal
   synchronization; run `remote --flush` before reading them. `--no-flush` skips
   both flushes for commands that don't touch synced files, such as `nvidia-smi`.
+- **The current directory picks the session.** Commands run in the remote
+  directory corresponding to the current one, through the session whose root
+  contains it, so `cd` into the synced tree instead of selecting sessions. From
+  outside every synced root, `-s <name-or-id>` runs at that session's remote
+  root (or in `--cwd`); `-s` naming a session whose root doesn't contain the
+  current directory requires `--cwd` if another session's root does.
+  `MUTAGEN_REMOTE_SESSION` never overrides the session containing the current
+  directory. Inside a session nested in another synced root, commands run
+  through the enclosing session while the nested one is paused or
+  disconnected; `-s <nested>` fails instead, and `remote pwd` shows where
+  commands run.
 - **Your shell runs first.** Variables, globs, `~`, pipes, and `&&` are
   processed locally, and nothing is reinterpreted remotely: `remote echo $HOME`
   prints the local home, while `remote sh -c 'echo $HOME'` prints the remote
@@ -43,6 +54,12 @@ wrong:
   `remote` waits for them):
   `remote sh -c 'nohup python train.py > train.log 2>&1 < /dev/null &'`, then
   `remote tail -n 40 train.log`.
+- **Commands stop when synchronization stops.** If the session is paused or
+  reconnects while a command runs, the command is terminated (SIGTERM, then
+  SIGKILL 5 seconds later, as for `--timeout`), and `remote` exits with 255,
+  saying that the connection was lost, without synchronizing afterwards. Files
+  that it was writing may be incomplete; rerun it once `remote --flush`
+  succeeds. Detached jobs keep running.
 
 If `remote` exits with 255, 126, or 127, prints a `remote:` error or warning, a
 command sees outdated files, or a command is missing from the remote

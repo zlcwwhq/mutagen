@@ -204,6 +204,29 @@ func TestExecuteCancellation(t *testing.T) {
 	}
 }
 
+func TestExecuteConnectionLoss(t *testing.T) {
+	// The executor's context is cancelled when its channel closes, such as
+	// when the session stops synchronizing, which closes the connection while
+	// the command runs and terminates the command. The client distinguishes
+	// this from other failures.
+	client, server := net.Pipe()
+	executorCtx, closeExecutor := context.WithCancel(context.Background())
+	defer closeExecutor()
+	served := make(chan error, 1)
+	go func() { served <- Serve(executorCtx, server, "", "", false) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := Execute(ctx, client, helperRequest(t, "wait"), strings.NewReader(""), &readyWriter{ready: closeExecutor}, io.Discard)
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatal("connection loss not reported:", err)
+	}
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not terminate")
+	}
+}
+
 func TestExecuteStartupFailures(t *testing.T) {
 	// Failures are reported with conventional exit codes and identify their
 	// cause, rather than (for example) reporting a missing working directory
@@ -601,6 +624,8 @@ func TestStandardStreamFailures(t *testing.T) {
 		cancel()
 		if err == nil {
 			t.Fatal("standard stream failure was not reported")
+		} else if errors.Is(err, ErrConnectionLost) {
+			t.Fatal("standard stream failure reported as connection loss:", err)
 		}
 	}
 }

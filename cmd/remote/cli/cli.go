@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -63,6 +64,21 @@ Notes:
     variables, globs, and ~ before remote sees them. Use sh -c '...' for
     anything that should be expanded remotely.
   - Options must precede the command.
+  - The session used is the one whose root most specifically contains the
+    current directory. --session selects one by name or identifier instead,
+    even if its roots don't contain the current directory: commands then run
+    at the root of its opposite endpoint, or in --cwd (relative to that
+    root), and require --cwd if another session's root contains the
+    directory. An exported MUTAGEN_REMOTE_SESSION only selects among the
+    sessions containing the current directory, and is ignored if none of
+    them matches it; outside every root, it selects a session as --session
+    does.
+  - Sessions that are paused, disconnected, or don't run commands submitted
+    from this side can't be found, so inside the root of such a session that
+    is nested in another session's root, commands run through the enclosing
+    session (in its copy of the directory), unless --session selects the
+    nested session, which makes them fail instead. Once remote has located
+    the session, it doesn't switch to another, even if that one disconnects.
   - The session is synchronized before the command, so that it sees local
     changes, and after it, so that its changes are present locally when remote
     exits. Failure to synchronize only produces a warning, as do conflicts
@@ -138,6 +154,13 @@ Notes:
     writing the remote copy, and apply fails without changing a copy that a
     later apply (through either endpoint) reached first; run --conflicts.
   - No terminal is allocated, so interactive programs don't work.
+  - Commands are terminated when --timeout expires, when remote is
+    interrupted, and when the session stops synchronizing (such as when it's
+    paused or reconnects, or the daemon stops): their process group receives
+    SIGTERM, then SIGKILL 5 seconds later if any of it remains (on Windows,
+    the command is killed at once). If the session stops synchronizing,
+    remote reports that the connection to the executing endpoint was lost
+    and exits with status 255, without synchronizing afterwards.
   - /bin/sh sources .remote-prologue.sh in the executing endpoint's sync root
     if it exists, otherwise that endpoint's configured remotePrologue, before
     commands submitted from inside the root (even with --cwd). --no-prologue
@@ -155,7 +178,8 @@ Notes:
 
 Exit status is the command's own, or:
   255  not routed (no connected session with remote commands, or ambiguous),
-       or remote --flush or a conflict operation failed
+       the connection was lost while the command ran, or remote --flush or a
+       conflict operation failed
   127  command not found
   126  command couldn't be started, or the prologue failed
   124  --timeout expired before the command finished
@@ -169,6 +193,10 @@ type options struct {
 	conflictOptions
 	// session selects a session by identifier or name.
 	session string
+	// defaultSession is the value of remote.SessionVariable if session wasn't
+	// specified, which only selects among the sessions whose roots contain the
+	// working directory, unless none does (see remote.Selection).
+	defaultSession string
 	// directory overrides the working directory.
 	directory string
 	// environment contains NAME=VALUE entries or names to forward.
@@ -208,11 +236,11 @@ func parse(arguments []string) (*options, error) {
 	flags.SetInterspersed(false)
 	flags.SortFlags = false
 	// Names in backquotes are used as value placeholders in usage information.
-	flags.StringVarP(&result.session, "session", "s", "", "Use the session with this `NAME` or identifier, which also allows running outside its root (default $MUTAGEN_REMOTE_SESSION)")
+	flags.StringVarP(&result.session, "session", "s", "", "Use the session with this `NAME` or identifier, which also allows running outside its root (see Notes for $MUTAGEN_REMOTE_SESSION)")
 	flags.StringVarP(&result.directory, "cwd", "C", "", "Run in `DIR`: absolute and ~ paths are on the opposite endpoint, others are relative to the corresponding directory")
 	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set `NAME[=VALUE]`, where a bare NAME forwards the local value (repeatable)")
 	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read literal NAME=VALUE lines from `FILE` (repeatable)")
-	flags.DurationVar(&result.timeout, "timeout", 0, "Exit after `DURATION`, such as 30s or 10m, killing the command if it's running")
+	flags.DurationVar(&result.timeout, "timeout", 0, "Exit after `DURATION`, such as 30s or 10m, terminating the command if it's running")
 	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the workspace or configured remote prologue")
 	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize the session before and after the command")
 	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
@@ -230,7 +258,7 @@ func parse(arguments []string) (*options, error) {
 	result.arguments = flags.Args()
 	result.flags = flags
 	if !flags.Changed("session") {
-		result.session = os.Getenv("MUTAGEN_REMOTE_SESSION")
+		result.defaultSession = os.Getenv(remote.SessionVariable)
 	}
 	if result.timeout < 0 {
 		return nil, errors.New("timeout must not be negative")
@@ -346,13 +374,34 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	// dial submits an operation through the session's endpoint. The first
+	// submission locates the session, and later ones are pinned to the session
+	// and endpoint that it located, failing rather than reaching a different
+	// session if sessions connect or disconnect in between, such as a nested
+	// session reconnecting after the enclosing session was synchronized.
+	// Commands run in the directory corresponding to the working directory
+	// unless --cwd is specified, so an explicitly selected session can't run
+	// them at its root while another session synchronizes the directory.
+	selection := &remote.Selection{
+		Session:       options.session,
+		Default:       options.defaultSession,
+		Corresponding: request != nil && options.directory == "",
+	}
+	dial := func(operation remote.Operation) (net.Conn, *remote.Target, error) {
+		connection, target, err := selection.Dial(ctx, directory, operation)
+		if err == nil && selection.Target == nil {
+			selection = &remote.Selection{Target: target}
+		}
+		return connection, target, err
+	}
+
 	// synchronize forces a synchronization cycle for the session and warns
 	// about content that couldn't be synchronized, omitting warnings issued by
 	// previous cycles. It returns the target if the session was located, along
 	// with the report.
 	var reports *reporter
 	synchronize := func() (*remote.Target, *remote.Report, error) {
-		connection, target, err := remote.Dial(ctx, directory, options.session, remote.OperationFlush)
+		connection, target, err := dial(remote.OperationFlush)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -384,7 +433,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	// Compare copies if requested.
 	if options.diff {
-		differ, err := compare(ctx, directory, options.session, target, report, options.arguments, stdout, stderr)
+		differ, err := compare(ctx, directory, target, report, options.arguments, stdout, stderr)
 		if interruptedCode, ok := interrupted("comparing"); ok {
 			return interruptedCode
 		} else if err != nil {
@@ -398,7 +447,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	// Locate the route and run the command.
-	connection, target, err := remote.Dial(ctx, directory, options.session, remote.OperationExecute)
+	connection, target, err := dial(remote.OperationExecute)
 	if interruptedCode, ok := interrupted("running the command"); ok {
 		return interruptedCode
 	} else if err != nil {
@@ -409,6 +458,14 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	code, err := remote.Execute(ctx, connection, request, stdin, stdout, stderr)
 	if interruptedCode, ok := interrupted("running the command"); ok {
 		return interruptedCode
+	} else if errors.Is(err, remote.ErrConnectionLost) {
+		// The executing endpoint terminates the command when the connection is
+		// lost, which happens whenever the session stops synchronizing, so
+		// synchronizing afterwards isn't attempted.
+		if options.noFlush {
+			return fail(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated"))
+		}
+		return fail(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated and the session wasn't synchronized afterwards"))
 	} else if err != nil {
 		// Startup failures such as missing commands report conventional exit
 		// codes (126 or 127) alongside the error.

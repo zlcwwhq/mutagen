@@ -11,6 +11,11 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/multiplexing"
 )
 
+// ErrConnectionLost indicates that the connection to the executing endpoint was
+// lost before a command's result was received, such as because the session
+// stopped synchronizing, which terminates the command.
+var ErrConnectionLost = errors.New("the connection to the executing endpoint was lost")
+
 // commandMultiplexerConfiguration returns the configuration for multiplexing a
 // single command's streams. Heartbeats are disabled because each hop of the
 // route already fails when its underlying connection or process terminates, and
@@ -25,8 +30,9 @@ func commandMultiplexerConfiguration() *multiplexing.Configuration {
 
 // Execute runs one command over an established route (see Dial). It owns and
 // closes the connection. Cancellation closes the connection, terminating the
-// remote command. The caller must unblock a blocking stdin reader after return
-// if it needs to reclaim the input forwarding goroutine.
+// remote command, as does losing the connection, which is reported with an
+// error wrapping ErrConnectionLost. The caller must unblock a blocking stdin
+// reader after return if it needs to reclaim the input forwarding goroutine.
 func Execute(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	response, err := execute(ctx, connection, request, stdin, stdout, stderr)
 	if err != nil {
@@ -118,8 +124,13 @@ func execute(ctx context.Context, connection io.ReadWriteCloser, request *Reques
 		return nil, fmt.Errorf("unable to read command input: %w", err)
 	default:
 	}
+	// The multiplexer only fails internally, rather than being closed here,
+	// when the connection fails. Before the result arrives, that terminates
+	// the command (see Serve).
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	} else if internalError := mux.InternalError(); responseErr != nil && internalError != nil {
+		return nil, fmt.Errorf("%w (%v)", ErrConnectionLost, internalError)
 	} else if forwardingError := errors.Join(forwardingErrors[:]...); forwardingError != nil {
 		return nil, fmt.Errorf("unable to forward command output: %w", forwardingError)
 	} else if responseErr != nil {

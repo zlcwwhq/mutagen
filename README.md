@@ -126,12 +126,32 @@ symbolic link, or a hard link on Windows), normally at
 that path, or put that directory on `PATH`; links to it must also be named
 `remote`.
 
-Use `--session` (or `MUTAGEN_REMOTE_SESSION`) to select a session by name or
-identifier, which also allows invocation outside its root. `--cwd` overrides the
-working directory (relative values are resolved against the corresponding
-directory). `-e NAME=VALUE` sets a variable, `-e NAME` forwards a local one, and
-`--env-file` loads literal `NAME=VALUE` lines. Otherwise, commands inherit the
-environment of the agent (or, on the daemon's system, of the daemon).
+`remote` uses the session whose root most specifically contains the current
+directory. Use `--session` (`-s`) to select a session by name or identifier
+instead, which also allows invocation outside its roots: commands submitted from
+outside the selected session's roots run at the root of its opposite endpoint,
+or in the directory specified by `--cwd`. If another session's root contains the
+current directory, such commands require `--cwd`, since they would otherwise run
+at the selected session's root rather than in a directory corresponding to the
+current one. An exported `MUTAGEN_REMOTE_SESSION` only selects among the
+sessions whose roots contain the current directory, such as to resolve ambiguity
+between them, and is ignored if none of them matches it; outside every session's
+root, it selects a session as `--session` does. Once `remote` has located the
+session, it uses that session for the rest of the invocation, rather than
+switching to another session if it disconnects in the meantime.
+
+`remote` can't find sessions that are paused, disconnected, or that don't run
+commands submitted from the current endpoint. Inside the root of such a session
+that's nested in another session's root, commands therefore run through the
+enclosing session, in its copy of the directory, unless `--session` selects the
+nested session, which makes them fail instead.
+
+`--cwd` overrides the working directory (relative values are resolved against
+the corresponding directory, or against the opposite endpoint's root when
+submitting from outside the session's root). `-e NAME=VALUE` sets a variable,
+`-e NAME` forwards a local one, and `--env-file` loads literal `NAME=VALUE`
+lines. Otherwise, commands inherit the environment of the agent (or, on the
+daemon's system, of the daemon).
 
 Every command receives `MUTAGEN_REMOTE_ENDPOINT=alpha` or `beta`, identifying
 the endpoint where it executes. This value overrides inherited values and
@@ -209,9 +229,10 @@ Prologues aren't supported on Windows endpoints.
 Options must precede the command, and arguments are passed without shell
 interpretation, so shell syntax requires an explicit shell. Standard streams and
 the exit status are preserved (255 indicates that the command couldn't be
-routed), but no pseudo-terminal is allocated. Commands can only be routed while the
-session is connected, and the daemon connects command channels in the
-background, so SSH authentication must work non-interactively.
+routed, or that the connection was lost while it ran), but no pseudo-terminal is
+allocated. Commands can only be routed while the session is connected, and the
+daemon connects command channels in the background, so SSH authentication must
+work non-interactively.
 
 `remote` flushes the session (as `mutagen sync flush` does) before the command,
 so that it sees local changes, and after it, so that its changes are present
@@ -219,6 +240,18 @@ locally when `remote` exits. This works from either endpoint, since the daemon
 performs the flush. If flushing fails, then `remote` prints a warning and
 continues with the command's exit status; `--no-flush` skips both flushes, and
 `remote --flush` only flushes. `--timeout` includes the time spent flushing.
+
+Commands are terminated when `--timeout` expires, when `remote` is interrupted,
+and when the session stops synchronizing, such as when it's paused, reconnects
+after an error, or is replaced by `mutagen project apply`, or when the daemon
+stops. The executing endpoint sends SIGTERM to the command's process group, so
+that processes can exit cleanly, and SIGKILL 5 seconds later to any that remain.
+(On Windows endpoints, the command is killed immediately, without its child
+processes.) When the session stops synchronizing, `remote` reports that the
+connection to the executing endpoint was lost and exits with status 255 without
+synchronizing afterwards; files that the command was writing may be left
+incomplete, and are synchronized as such once synchronization resumes. Detach
+jobs that must outlive these events, with their output redirected.
 
 After each flush, `remote` also warns about content that the session couldn't
 synchronize: conflicts (paths modified on both endpoints, which aren't

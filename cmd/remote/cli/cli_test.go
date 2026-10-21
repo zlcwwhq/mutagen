@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mutagen-io/mutagen/pkg/remote"
 )
 
 func TestParseArgumentBoundary(t *testing.T) {
@@ -73,7 +76,8 @@ func TestHelp(t *testing.T) {
 		t.Fatal("help failed:", code)
 	}
 	help := output.String()
-	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--diff"} {
+	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--diff",
+		"MUTAGEN_REMOTE_SESSION", fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second)} {
 		if !strings.Contains(help, expected) {
 			t.Errorf("help is missing %q", expected)
 		}
@@ -86,11 +90,14 @@ func TestHelp(t *testing.T) {
 }
 
 func TestSessionEnvironmentDefault(t *testing.T) {
+	// The environment variable is only a default, which can't redirect
+	// submissions from inside another session's root, so it's kept separate
+	// from an explicit selection, which takes precedence.
 	t.Setenv("MUTAGEN_REMOTE_SESSION", "from-environment")
-	if options, err := parse([]string{"true"}); err != nil || options.session != "from-environment" {
-		t.Fatal("session environment variable ignored:", err)
-	} else if options, err := parse([]string{"-s", "explicit", "true"}); err != nil || options.session != "explicit" {
-		t.Fatal("explicit session did not take precedence:", err)
+	if options, err := parse([]string{"true"}); err != nil || options.session != "" || options.defaultSession != "from-environment" {
+		t.Fatalf("session environment variable parsed incorrectly: %+v, %v", options, err)
+	} else if options, err := parse([]string{"-s", "explicit", "true"}); err != nil || options.session != "explicit" || options.defaultSession != "" {
+		t.Fatalf("explicit session did not take precedence: %+v, %v", options, err)
 	}
 }
 
