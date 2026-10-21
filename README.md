@@ -33,12 +33,38 @@ mutagen project apply
 The command starts the project if needed and matches existing sessions by type
 and name within that project. It creates new sessions, terminates removed
 sessions, and recreates sessions whose endpoints or merged configurations have
-changed. Unchanged sessions retain their identifiers, synchronization history,
-scan caches, and paused state. Renaming a session removes the old session and
-creates a new one; replaced synchronization sessions start with fresh history
-and scan caches. Docker environment variables such as `DOCKER_HOST` are not
+changed, including the `remote` and `remotePrologue` settings of
+synchronization sessions, even though these only affect remote commands.
+Unchanged sessions retain their identifiers, synchronization history, scan
+caches, and paused state. Renaming a session removes the old session and
+creates a new one. Docker environment variables such as `DOCKER_HOST` are not
 compared: retained sessions keep the environment they were created with, while
 new and replaced sessions use the current environment.
+
+Replaced synchronization sessions, like sessions created under a new name,
+start with fresh history and scan caches. Without a record of the last
+synchronized state, they can't tell which endpoint changed a file:
+
+- Files that differ between the endpoints become conflicts in `two-way-safe`
+  (the default) and `one-way-safe` modes, and are overwritten with alpha's
+  version in `two-way-resolved` and `one-way-replica` modes.
+- Files that exist on only one endpoint are copied to the other, which undoes
+  deletions that weren't synchronized, except that `one-way-safe` leaves files
+  that exist only on beta in place and `one-way-replica` deletes them.
+
+To protect changes that haven't been synchronized, `apply` flushes the running
+synchronization sessions that it replaces or removes before terminating any
+session. If a flush fails, nothing is terminated or created: fix the session and
+apply again, or, if its unsynchronized changes don't matter, terminate it with
+`mutagen sync terminate` and apply again. Changes that a flush leaves
+unsynchronized, such as those blocked by problems, aren't protected, and neither
+are changes made while `apply` runs, so stop processes that modify synchronized
+files before replacing or renaming their sessions. Paused sessions are neither
+flushed nor resumed, so changes made since a session was paused may be
+overwritten (`two-way-resolved`, `one-way-replica`) or become conflicts
+(`two-way-safe`, `one-way-safe`) once its replacement is resumed or a session
+created under a new name synchronizes them. The plan notes such sessions; resume
+them before applying to synchronize their changes first.
 
 Use `-f path/to/project.yml` for another project file. Relative endpoint paths
 are resolved against its directory. Global configuration is included unless
