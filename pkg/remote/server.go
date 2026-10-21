@@ -113,10 +113,17 @@ func run(ctx context.Context, root, prologue string, alpha bool, request *Reques
 		}
 		return result{Entry: entry}
 	} else if request.Replace != nil {
+		// The context is only cancelled once this executor notices that the
+		// client stopped waiting, such as on timeout, so a replacement may
+		// still write its result afterward. Replacements thus keep their
+		// entries locked until they've finished, and those of earlier applies
+		// are refused once a later apply's replacement has been admitted (see
+		// ReplaceFile).
 		if err := ReplaceFile(ctx, root, request.Replace, stdin); err != nil {
 			return result{
-				Error: fmt.Sprintf("unable to replace %s: %v", request.Replace.Path, err),
-				Stale: errors.Is(err, ErrStale),
+				Error:      fmt.Sprintf("unable to replace %s: %v", request.Replace.Path, err),
+				Stale:      errors.Is(err, ErrStale),
+				Superseded: errors.Is(err, ErrSuperseded),
 			}
 		}
 		return result{}

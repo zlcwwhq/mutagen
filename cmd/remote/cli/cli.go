@@ -133,7 +133,10 @@ Notes:
     some other way or ended by a change; compare the current file with the
     workspace's copies before discarding it. Copies differing in
     executability need --executable or --take. A conflict operation fails
-    while another one on the same path is running on the same system.
+    while another one on the same path is running on the same system. Writes
+    of a copy wait for each other, since an apply that timed out may still be
+    writing the remote copy, and apply fails without changing a copy that a
+    later apply (through either endpoint) reached first; run --conflicts.
   - No terminal is allocated, so interactive programs don't work.
   - /bin/sh sources .remote-prologue.sh in the executing endpoint's sync root
     if it exists, otherwise that endpoint's configured remotePrologue, before

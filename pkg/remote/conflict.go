@@ -163,6 +163,15 @@ type Replacement struct {
 	// Result is the replacement regular file or symbolic link, or a missing
 	// entry to delete the entry. Its data, if any, is ignored.
 	Result *Entry
+	// Sequence orders the replacement among the entry's replacements, which
+	// are refused once a replacement with a later sequence number has been
+	// admitted for the entry (see ReplaceFile). It's required. Resolutions use
+	// the sequence number that the daemon issued to the claim that their apply
+	// made of the conflict's checkout (see ClaimCheckout), which is later than
+	// those of all earlier applies of the conflict, whether through the same
+	// workspace, through one that replaced it, or through the opposite
+	// endpoint.
+	Sequence uint64 `json:",omitempty"`
 }
 
 // ErrStale indicates that a replacement would overwrite unseen changes.
@@ -185,7 +194,7 @@ func (e *staleError) Is(target error) bool {
 // ensureValid checks that a replacement is well-formed.
 func (r *Replacement) ensureValid() error {
 	result := r.Result
-	if len(r.Expected) == 0 || result == nil || result.Size < 0 ||
+	if len(r.Expected) == 0 || r.Sequence == 0 || result == nil || result.Size < 0 ||
 		(result.Kind != EntryFile && result.Kind != EntrySymbolicLink && result.Kind != EntryMissing) ||
 		(result.Kind == EntrySymbolicLink && result.Target == "") {
 		return errors.New("invalid replacement")
@@ -463,6 +472,15 @@ func stageFile(ctx context.Context, root *os.Root, path, name string, result *En
 	return errors.Join(err, file.Close())
 }
 
+// ReplaceHook, if non-nil, is called by each replacement (see ReplaceFile)
+// with the stage that it has reached, its root, and its path: "locking"
+// immediately before it locks the entry, once it has staged its result, if
+// needed, and "writing" once it has checked the entry for the last time,
+// immediately before it replaces or deletes the entry. It exists so that tests
+// can pause replacements to schedule them deterministically, and must be nil
+// otherwise.
+var ReplaceHook func(stage, directory, path string)
+
 // ReplaceFile replaces the entry described by a replacement with its result,
 // read from input for a file, or deletes it, if the entry is one of the
 // replacement's expected entries, failing with ErrStale otherwise. An entry
@@ -476,10 +494,24 @@ func stageFile(ctx context.Context, root *os.Root, path, name string, result *En
 // flushed (see SyncDirectory), so that a replacement that succeeds survives a
 // power loss or an operating system crash where directories can be flushed.
 //
-// The entry is checked again immediately before it's replaced, but an entry
-// changed after that check is replaced regardless: resolutions require that
-// conflicting paths aren't changed while they're resolved, and only detect
-// changes made before they apply a result.
+// Replacements of an entry are serialized and ordered by their sequence
+// numbers, since a resolution's replacement may still be running after its
+// client stopped waiting for it, such as on timeout, until the endpoint
+// notices, while a retry or another resolution of the conflict replaces the
+// entry. Checking the entry can't tell the earlier replacement apart from the
+// later one, since replacements accept both checked-out copies, which the
+// later one may have written. Once its result is staged, a replacement thus
+// locks the entry (see lockReplacement), which excludes the entry's other
+// replacements on this system, and fails with ErrSuperseded, without changing
+// the entry, if a replacement with a later sequence number was admitted for
+// it before. Otherwise, it's admitted: it records its sequence number (see
+// replacementLock.admit), whatever its outcome, then checks the entry again,
+// since it may have changed meanwhile, and replaces it and flushes the result
+// before unlocking it, even if its context is cancelled meanwhile.
+//
+// Changes made by other means after that last check are replaced regardless:
+// resolutions require that conflicting paths aren't changed while they're
+// resolved, and only detect changes made before they apply a result.
 func ReplaceFile(ctx context.Context, directory string, replacement *Replacement, input io.Reader) error {
 	if err := replacement.ensureValid(); err != nil {
 		return err
@@ -492,35 +524,71 @@ func ReplaceFile(ctx context.Context, directory string, replacement *Replacement
 	result := replacement.Result
 	if isRoot && result.Kind != EntryFile {
 		return errors.New("the synchronization root can only be replaced with a file")
-	} else if done, err := replacement.check(ctx, root, path); err != nil {
-		return err
-	} else if done {
-		return syncExisting(root, path, result)
-	} else if result.Kind == EntryMissing {
-		if err := root.Remove(path); err != nil {
-			return err
-		}
-		return syncParent(root, path)
 	}
 
-	// Stage the result, then check the entry again, since staging may take a
-	// while.
-	staged := filepath.Join(filepath.Dir(path), filesystem.TemporaryNamePrefix+"conflict-"+rand.Text())
-	defer root.Remove(staged)
-	if result.Kind == EntrySymbolicLink {
-		// Targets are slash-separated (see normalizeTarget), and Go converts
-		// them to backslashes when creating links on Windows.
-		err = root.Symlink(result.Target, staged)
-	} else {
-		err = stageFile(ctx, root, path, staged, result, input)
+	// Stage a file or symbolic link result next to the entry before locking
+	// it, since staging may take a while, unless the entry is stale or already
+	// has the result. Stale replacements thus fail without reading their
+	// input, but they're still admitted first, like those that find the result
+	// present, so that no earlier replacement is admitted after them.
+	var staged string
+	defer func() {
+		if staged != "" {
+			root.Remove(staged)
+		}
+	}()
+	stage := func() error {
+		staged = filepath.Join(filepath.Dir(path), filesystem.TemporaryNamePrefix+"conflict-"+rand.Text())
+		if result.Kind == EntrySymbolicLink {
+			// Targets are slash-separated (see normalizeTarget), and Go
+			// converts them to backslashes when creating links on Windows.
+			return root.Symlink(result.Target, staged)
+		}
+		return stageFile(ctx, root, path, staged, result, input)
+	}
+	if done, err := replacement.check(ctx, root, path); err != nil && !errors.Is(err, ErrStale) {
+		return err
+	} else if err == nil && !done && result.Kind != EntryMissing {
+		if err := stage(); err != nil {
+			return err
+		}
+	}
+
+	// Lock the entry and admit the replacement before checking the entry
+	// again. An entry that was stale or had the result when it was first
+	// checked, but is now one of the expected entries, gets its result staged
+	// now and is checked once more.
+	if ReplaceHook != nil {
+		ReplaceHook("locking", directory, replacement.Path)
+	}
+	lock, err := lockReplacement(ctx, directory, requestPath(replacement.Path))
+	if err != nil {
+		return err
+	}
+	defer lock.unlock()
+	if err := lock.admit(directory, requestPath(replacement.Path), replacement.Sequence); err != nil {
+		return err
+	}
+	done, err := replacement.check(ctx, root, path)
+	if err == nil && !done && result.Kind != EntryMissing && staged == "" {
+		if err = stage(); err == nil {
+			done, err = replacement.check(ctx, root, path)
+		}
 	}
 	if err != nil {
 		return err
-	} else if done, err := replacement.check(ctx, root, path); err != nil {
-		return err
 	} else if done {
 		return syncExisting(root, path, result)
-	} else if err := root.Rename(staged, path); err != nil {
+	}
+	if ReplaceHook != nil {
+		ReplaceHook("writing", directory, replacement.Path)
+	}
+	if result.Kind == EntryMissing {
+		err = root.Remove(path)
+	} else if err = root.Rename(staged, path); err == nil {
+		staged = ""
+	}
+	if err != nil {
 		return err
 	}
 	return syncParent(root, path)
@@ -536,10 +604,12 @@ func requestPath(path string) string {
 }
 
 // responseError converts an error reported by the executor, preserving whether
-// a replacement was stale.
+// a replacement was stale or superseded.
 func responseError(response *result) error {
 	if response.Stale {
 		return &staleError{response.Error}
+	} else if response.Superseded {
+		return &supersededError{response.Error}
 	}
 	return errors.New(response.Error)
 }
@@ -579,10 +649,14 @@ func Archive(ctx context.Context, connection io.ReadWriteCloser, path string, ou
 
 // Replace performs a replacement (see ReplaceFile) on the opposite endpoint
 // over an established route (see Dial), sending input as the new contents. It
-// owns and closes the connection. Stale replacements fail with an error
-// matching ErrStale.
+// owns and closes the connection. Stale and superseded replacements, which
+// don't change the entry, fail with errors matching ErrStale and ErrSuperseded.
+// A replacement whose wait is cancelled may still change the entry.
 func Replace(ctx context.Context, connection io.ReadWriteCloser, replacement *Replacement, input io.Reader) error {
-	replacement = &Replacement{Path: requestPath(replacement.Path), Expected: replacement.Expected, Result: replacement.Result}
+	replacement = &Replacement{
+		Path: requestPath(replacement.Path), Expected: replacement.Expected,
+		Result: replacement.Result, Sequence: replacement.Sequence,
+	}
 	response, err := execute(ctx, connection, &Request{Replace: replacement}, input, io.Discard, io.Discard)
 	if err != nil {
 		return err

@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -430,7 +432,7 @@ func TestRemoteConflictLateRequests(t *testing.T) {
 	// again through the same endpoint. They neither take over nor remove that
 	// checkout, so the opposite endpoint can't check the conflict out.
 	alpha, beta, _ := createBothSidedConflicts(t, "file")
-	submit := func(operation remote.Operation, token string) string {
+	submit := func(operation remote.Operation, token string) (uint64, string) {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -438,20 +440,23 @@ func TestRemoteConflictLateRequests(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		exchange := remote.ReleaseCheckout
 		if operation == remote.OperationClaim {
-			exchange = remote.ClaimCheckout
+			sequence, held, err := remote.ClaimCheckout(ctx, connection, "file", token)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return sequence, held
 		}
-		held, err := exchange(ctx, connection, "file", token)
+		_, held, err := remote.ReleaseCheckout(ctx, connection, "file", token)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return held
+		return 0, held
 	}
 	alpha.checkout("file")
-	if held := submit(remote.OperationClaim, "late"); held == "" || held == "late" {
-		t.Fatalf("late claim recorded (%q)", held)
-	} else if released := submit(remote.OperationRelease, "late"); released != held {
+	if sequence, held := submit(remote.OperationClaim, "late"); sequence != 0 || held == "" || held == "late" {
+		t.Fatalf("late claim recorded (%d, %q)", sequence, held)
+	} else if _, released := submit(remote.OperationRelease, "late"); released != held {
 		t.Fatalf("late release not ignored (%q, %q)", held, released)
 	}
 	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "file")
@@ -460,17 +465,88 @@ func TestRemoteConflictLateRequests(t *testing.T) {
 	// a workspace, which checking the conflict out again through the same
 	// endpoint releases.
 	alpha.invoke("--conflict-discard", "file")
-	if held := submit(remote.OperationClaim, "late"); held != "" {
-		t.Fatalf("released checkout reported as held (%q)", held)
+	if sequence, _ := submit(remote.OperationClaim, "late"); sequence == 0 {
+		t.Fatal("late claim of a released checkout not recorded")
 	}
 	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "file")
 	alpha.checkout("file")
-	if held := submit(remote.OperationRelease, "late"); held == "" || held == "late" {
+	if _, held := submit(remote.OperationRelease, "late"); held == "" || held == "late" {
 		t.Fatalf("abandoned checkout not replaced (%q)", held)
 	}
 	beta.fail("checked out through the opposite endpoint", "--conflict-checkout", "file")
 	alpha.invoke("--conflict-discard", "file")
 	beta.checkout("file")
+}
+
+func TestRemoteConflictLegacyCheckouts(t *testing.T) {
+	// Builds that didn't issue tokens recorded checkouts without them. Applying
+	// a workspace that such a build checked out claims its checkout, which
+	// records the workspace's token, so that resolving the conflict releases
+	// the checkout. Discarding releases such a checkout too, with or without a
+	// workspace, and reports it. The opposite endpoint can then check the
+	// conflicts out.
+	alpha, beta, _ := createBothSidedConflicts(t, "applied", "discarded", "abandoned")
+	for _, path := range []string{"applied", "discarded", "abandoned"} {
+		w := alpha.checkout(path)
+		if path == "abandoned" {
+			if err := os.RemoveAll(filepath.Dir(w.Local)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	directory, err := filesystem.Mutagen(false, filesystem.MutagenSynchronizationCheckoutsDirectoryName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkouts, err := filepath.Glob(filepath.Join(directory, "*"))
+	if err != nil || len(checkouts) != 1 {
+		t.Fatalf("unexpected checkouts: %v, %v", checkouts, err)
+	}
+	writeFile(t, checkouts[0], `[{"Path":"abandoned","Alpha":true},{"Path":"applied","Alpha":true},{"Path":"discarded","Alpha":true}]`)
+	if applied := alpha.outcomes("--conflict-apply", "--take", "local", "applied")[0]; !applied.Resolved {
+		t.Fatalf("conflict not resolved: %+v", applied)
+	} else if listing := beta.list(); len(listing.RemotePending) != 0 {
+		t.Fatalf("checkout of a resolved conflict not released: %+v", listing)
+	}
+	if discarded := alpha.outcomes("--conflict-discard", "discarded")[0]; !discarded.Discarded || discarded.Backup == "" {
+		t.Fatalf("workspace not discarded: %+v", discarded)
+	} else if discarded := alpha.outcomes("--conflict-discard", "abandoned")[0]; !discarded.Discarded || discarded.Backup != "" {
+		t.Fatalf("checkout without a workspace not released: %+v", discarded)
+	}
+	alpha.fail("isn't checked out", "--conflict-discard", "abandoned")
+	beta.checkout("discarded")
+	beta.checkout("abandoned")
+}
+
+func TestRemoteConflictCorruptCheckouts(t *testing.T) {
+	// Checkouts that can't be read, such as an empty file left by an operating
+	// system crash, aren't taken for no checkouts, which would let both
+	// endpoints check out the same conflict. Conflict operations report the
+	// file, which can be removed to resolve conflicts again, and a workspace
+	// whose conflict is still listed then claims its checkout again.
+	alpha, _, roots := createBothSidedConflicts(t, "file")
+	alpha.checkout("file")
+	directory, err := filesystem.Mutagen(false, filesystem.MutagenSynchronizationCheckoutsDirectoryName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkouts, err := filepath.Glob(filepath.Join(directory, "*"))
+	if err != nil || len(checkouts) != 1 {
+		t.Fatalf("unexpected checkouts: %v, %v", checkouts, err)
+	}
+	writeFile(t, checkouts[0], "")
+	alpha.fail(checkouts[0], "--conflicts")
+	alpha.fail("remove that file", "--conflict-apply", "--take", "local", "file")
+	if err := os.Remove(checkouts[0]); err != nil {
+		t.Fatal(err)
+	} else if applied := alpha.outcomes("--conflict-apply", "--take", "local", "file")[0]; !applied.Resolved {
+		t.Fatalf("conflict not resolved: %+v", applied)
+	}
+	for _, root := range roots {
+		if data := readFile(filepath.Join(root, "file")); data != "alpha\n" {
+			t.Fatalf("resolution not applied: %q", data)
+		}
+	}
 }
 
 func TestRemoteConflictAbandonedCheckout(t *testing.T) {
@@ -585,6 +661,65 @@ func TestRemoteConflictStaleApplyForgotten(t *testing.T) {
 		t.Fatal("resolution replaced")
 	}
 	c.invoke("--conflict-discard", "file")
+}
+
+func TestRemoteConflictTimedOutApply(t *testing.T) {
+	// An apply that times out while the opposite endpoint replaces the remote
+	// copy may leave that replacement running, since the endpoint only notices
+	// later, even once it has checked the copy for the last time. Replacements
+	// of a path are serialized, so a retry that takes the local copy, which
+	// that replacement accepts as a checked-out copy, waits for it rather than
+	// have its result overwritten by it, and supersedes it once it finishes.
+	roots := createConflictSession(t, true, core.SynchronizationMode_SynchronizationModeTwoWaySafe)
+	local, opposite := filepath.Join(roots[0], "file"), filepath.Join(roots[1], "file")
+	writeFile(t, local, "base\n")
+	if _, err := flushRemote(roots[0]); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, local, "local\n")
+	writeFile(t, opposite, "remote\n")
+	c := &conflictCommands{t: t, directory: roots[0]}
+	writeFile(t, c.checkout("file").Merged, "merged\n")
+
+	// Pause the first replacement of the remote copy immediately before it
+	// writes the merged file.
+	var first atomic.Bool
+	paused, resumed := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	resume := func() { once.Do(func() { close(resumed) }) }
+	remote.ReplaceHook = func(stage, directory, _ string) {
+		if stage == "writing" && directory == roots[1] && first.CompareAndSwap(false, true) {
+			close(paused)
+			<-resumed
+		}
+	}
+	t.Cleanup(func() {
+		resume()
+		remote.ReplaceHook = nil
+	})
+	if code, _, errors := runRemote(t, roots[0], "--timeout", "2s", "--conflict-apply", "file"); code != 124 {
+		t.Fatalf("apply didn't time out: %d: %s", code, errors)
+	}
+	select {
+	case <-paused:
+	default:
+		t.Fatal("replacement of the remote copy not pending")
+	}
+
+	// A retry waits for the pending replacement, here until it times out too,
+	// and once that replacement finishes, a retry supersedes it.
+	if code, _, errors := runRemote(t, roots[0], "--timeout", "2s", "--conflict-apply", "--take", "local", "file"); code != 124 {
+		t.Fatalf("retry not serialized with the pending replacement: %d: %s", code, errors)
+	} else if data := readFile(opposite); data != "remote\n" {
+		t.Fatalf("remote copy replaced while a replacement was pending: %q", data)
+	}
+	resume()
+	c.invoke("--conflict-apply", "--take", "local", "file")
+	for _, root := range roots {
+		if data := readFile(filepath.Join(root, "file")); data != "local\n" {
+			t.Fatalf("retry's result not kept: %q", data)
+		}
+	}
 }
 
 func TestRemoteConflictRetryWithChangedResult(t *testing.T) {

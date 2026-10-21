@@ -1,14 +1,15 @@
 package synchronization
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"slices"
 	"strings"
+	"time"
 
-	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 )
@@ -29,45 +30,76 @@ func compareCheckout(checkout remote.Checkout, path string) int {
 	return strings.Compare(checkout.Path, path)
 }
 
-// loadCheckouts loads the session's checkouts (see remote.Checkout), sorted by
-// path. It must be called with checkoutsLock held.
-func (c *controller) loadCheckouts() ([]remote.Checkout, error) {
+// checkoutsRecord is the serialized form of a session's checkouts (see
+// remote.Checkout). Builds that didn't number claims serialized the checkouts
+// alone, as an array, which loadCheckouts still reads.
+type checkoutsRecord struct {
+	// Sequence is the sequence number of the session's latest successful claim
+	// (see claimCheckout). It's kept once the session's checkouts are released,
+	// so that later claims are numbered after it.
+	Sequence uint64 `json:",omitempty"`
+	// Checkouts are the session's checkouts, sorted by path.
+	Checkouts []remote.Checkout
+}
+
+// number issues the sequence number of a successful claim, which is later than
+// that of the session's previous one. Sequence numbers are also no earlier
+// than the time at which they're issued, in nanoseconds since the epoch, so
+// that they remain ordered after earlier ones if the record of those is lost,
+// such as when the session is recreated or its checkouts file is removed, and
+// are ordered with those that the daemon issued for other sessions, since
+// replacements compare sequence numbers by root and path (see
+// remote.Replacement.Sequence).
+func (r *checkoutsRecord) number() uint64 {
+	r.Sequence = max(r.Sequence+1, uint64(time.Now().UnixNano()))
+	return r.Sequence
+}
+
+// loadCheckouts loads the session's checkouts, sorted by path, along with the
+// sequence number of its latest successful claim. A file that can't be decoded
+// is reported, rather than taken for one without checkouts, which would let
+// both endpoints check out the same conflict. It must be called with
+// checkoutsLock held.
+func (c *controller) loadCheckouts() (*checkoutsRecord, error) {
 	path, err := pathForCheckouts(c.session.Identifier)
 	if err != nil {
 		return nil, err
 	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return &checkoutsRecord{}, nil
 	} else if err != nil {
 		return nil, fmt.Errorf("unable to read conflict checkouts: %w", err)
 	}
-	var checkouts []remote.Checkout
-	if err := json.Unmarshal(data, &checkouts); err != nil {
-		return nil, fmt.Errorf("invalid conflict checkouts: %w", err)
+	record := &checkoutsRecord{}
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && trimmed[0] == '[' {
+		err = json.Unmarshal(data, &record.Checkouts)
+	} else {
+		err = json.Unmarshal(data, record)
 	}
-	slices.SortFunc(checkouts, func(a, b remote.Checkout) int {
+	if err != nil {
+		return nil, fmt.Errorf("the session's conflict checkouts in %s, on the Mutagen daemon's system, are corrupt (%v); remove that file to resolve conflicts again, after which workspaces can only be applied if their conflicts are still listed, and must otherwise be discarded", path, err)
+	}
+	slices.SortFunc(record.Checkouts, func(a, b remote.Checkout) int {
 		return compareCheckout(a, b.Path)
 	})
-	return checkouts, nil
+	return record, nil
 }
 
-// saveCheckouts saves the session's checkouts, removing them from disk if there
-// are none. It must be called with checkoutsLock held.
-func (c *controller) saveCheckouts(checkouts []remote.Checkout) error {
+// saveCheckouts saves the session's checkouts durably (see
+// remote.WriteFileDurably), since an operating system crash could otherwise
+// leave the file empty, which loadCheckouts would then refuse. The file is kept
+// once the session's checkouts are released, since it records the sequence
+// number of its latest claim. It must be called with checkoutsLock held.
+func (c *controller) saveCheckouts(record *checkoutsRecord) error {
 	path, err := pathForCheckouts(c.session.Identifier)
 	if err != nil {
 		return err
-	} else if len(checkouts) == 0 {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("unable to remove conflict checkouts: %w", err)
-		}
-		return nil
 	}
-	data, err := json.Marshal(checkouts)
+	data, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("unable to encode conflict checkouts: %w", err)
-	} else if err := filesystem.WriteFileAtomic(path, data, 0600); err != nil {
+	} else if err := remote.WriteFileDurably(path, data); err != nil {
 		return fmt.Errorf("unable to save conflict checkouts: %w", err)
 	}
 	return nil
@@ -77,78 +109,107 @@ func (c *controller) saveCheckouts(checkouts []remote.Checkout) error {
 func (c *controller) checkouts() ([]remote.Checkout, error) {
 	c.checkoutsLock.Lock()
 	defer c.checkoutsLock.Unlock()
-	return c.loadCheckouts()
+	record, err := c.loadCheckouts()
+	if err != nil {
+		return nil, err
+	}
+	return record.Checkouts, nil
 }
 
 // claimCheckout records a checkout of a conflict root through an endpoint,
-// identified by the claim's token, and returns the token of the checkout that
-// the endpoint held beforehand, if any. Each conflict is checked out through a
-// single endpoint at a time, which alone can apply or discard its resolution,
-// so the claim fails if the opposite endpoint holds the checkout. New
-// checkouts are only recorded for conflict roots of the last synchronization
-// cycle, while existing ones may outlive their conflicts, such as for
-// unfinished resolutions. Checkouts are kept until released, including across
-// daemon restarts, since workspaces outlive both.
+// identified by the claim's token, and reports whether the endpoint held a
+// checkout of the conflict root beforehand, along with its token. Each
+// conflict is checked out through a single endpoint at a time, which alone can
+// apply or discard its resolution, so the claim fails if the opposite endpoint
+// holds the checkout. New checkouts are only recorded for conflict roots of
+// the last synchronization cycle, while existing ones may outlive their
+// conflicts, such as for unfinished resolutions. Checkouts are kept until
+// released, including across daemon restarts, since workspaces outlive both.
 //
-// A claim leaves a checkout that the endpoint already holds as it is, so it's
-// only recorded if the returned token is empty or its own. Claims and releases
-// may arrive after their submitters stopped waiting for them, such as on
-// timeout, and each submission is handled separately, so a checkout keeps the
-// token of the claim that recorded it until it's released by that token (see
-// releaseCheckout): neither a late claim nor a late release can take over or
-// remove the checkout of a later claim. A checkout held under another token
-// must be released first, once its endpoint knows that it's abandoned.
-func (c *controller) claimCheckout(alpha bool, path, token string) (string, error) {
+// A claim leaves a checkout that the endpoint already holds as it is, so it
+// only succeeds if the endpoint holds none or holds one with its token.
+// Claims and releases may arrive after their submitters stopped waiting for
+// them, such as on timeout, and each submission is handled separately, so a
+// checkout keeps the token of the claim that recorded it until it's released
+// by that token (see releaseCheckout): neither a late claim nor a late release
+// can take over or remove the checkout of a later claim. A checkout held under
+// another token must be released first, once its endpoint knows that it's
+// abandoned. Checkouts recorded by builds that didn't issue tokens are the
+// exception: they take the token of the first claim through their endpoint, so
+// that workspaces checked out by those builds keep their checkouts, even if
+// their conflicts are no longer listed, and late requests can't take them over
+// or remove them afterward.
+//
+// A claim that succeeds is numbered with a sequence number, which orders the
+// replacements that resolutions make after claiming their checkouts (see
+// remote.Replacement.Sequence), since resolutions claim their checkouts again
+// before applying their results.
+func (c *controller) claimCheckout(alpha bool, path, token string) (remote.CheckoutStatus, error) {
 	if token == "" {
-		return "", errMissingToken
+		return remote.CheckoutStatus{}, errMissingToken
 	}
 	c.checkoutsLock.Lock()
 	defer c.checkoutsLock.Unlock()
-	checkouts, err := c.loadCheckouts()
+	record, err := c.loadCheckouts()
 	if err != nil {
-		return "", err
+		return remote.CheckoutStatus{}, err
 	}
-	index, found := slices.BinarySearchFunc(checkouts, path, compareCheckout)
-	if found && checkouts[index].Alpha == alpha {
-		return checkouts[index].Token, nil
+	var status remote.CheckoutStatus
+	index, found := slices.BinarySearchFunc(record.Checkouts, path, compareCheckout)
+	if found && record.Checkouts[index].Alpha == alpha {
+		status = remote.CheckoutStatus{Held: true, Token: record.Checkouts[index].Token}
+		if status.Token != "" && status.Token != token {
+			return status, nil
+		}
+		record.Checkouts[index].Token = token
 	} else if found {
-		return "", errCheckedOutOpposite
+		return remote.CheckoutStatus{}, errCheckedOutOpposite
+	} else {
+		c.stateLock.Lock()
+		listed := slices.ContainsFunc(c.state.Conflicts, func(conflict *core.Conflict) bool {
+			return conflict.Root == path
+		})
+		c.stateLock.UnlockWithoutNotify()
+		if !listed {
+			return remote.CheckoutStatus{}, errNotConflictRoot
+		}
+		record.Checkouts = slices.Insert(record.Checkouts, index, remote.Checkout{Path: path, Alpha: alpha, Token: token})
 	}
-	c.stateLock.Lock()
-	listed := slices.ContainsFunc(c.state.Conflicts, func(conflict *core.Conflict) bool {
-		return conflict.Root == path
-	})
-	c.stateLock.UnlockWithoutNotify()
-	if !listed {
-		return "", errNotConflictRoot
+	status.Sequence = record.number()
+	if err := c.saveCheckouts(record); err != nil {
+		return remote.CheckoutStatus{}, err
 	}
-	checkouts = slices.Insert(checkouts, index, remote.Checkout{Path: path, Alpha: alpha, Token: token})
-	return "", c.saveCheckouts(checkouts)
+	return status, nil
 }
 
 // releaseCheckout removes the checkout of a conflict root held by an endpoint
-// if it has the specified token, and returns the token of the checkout that
-// the endpoint held, if any. A checkout held by the opposite endpoint is left
-// as it is, as is one recorded by another claim, so that a release that
-// arrives after its submitter stopped waiting for it doesn't remove the
-// checkout of a later claim. Claims require a token, so a release without one
-// only reports the token.
-func (c *controller) releaseCheckout(alpha bool, path, token string) (string, error) {
+// if it has the specified token, and reports whether the endpoint held one,
+// along with its token. A checkout held by the opposite endpoint is left as it
+// is, as is one recorded by another claim, so that a release that arrives
+// after its submitter stopped waiting for it doesn't remove the checkout of a
+// later claim. Claims require a token, so a release without one only reports
+// the token, unless a build that didn't issue tokens recorded the checkout,
+// which the release then removes.
+func (c *controller) releaseCheckout(alpha bool, path, token string) (remote.CheckoutStatus, error) {
 	c.checkoutsLock.Lock()
 	defer c.checkoutsLock.Unlock()
-	checkouts, err := c.loadCheckouts()
+	record, err := c.loadCheckouts()
 	if err != nil {
-		return "", err
+		return remote.CheckoutStatus{}, err
 	}
-	index, found := slices.BinarySearchFunc(checkouts, path, compareCheckout)
-	if !found || checkouts[index].Alpha != alpha {
-		return "", nil
+	index, found := slices.BinarySearchFunc(record.Checkouts, path, compareCheckout)
+	if !found || record.Checkouts[index].Alpha != alpha {
+		return remote.CheckoutStatus{}, nil
 	}
-	held := checkouts[index].Token
-	if held != token {
-		return held, nil
+	status := remote.CheckoutStatus{Held: true, Token: record.Checkouts[index].Token}
+	if status.Token != token {
+		return status, nil
 	}
-	return held, c.saveCheckouts(slices.Delete(checkouts, index, index+1))
+	record.Checkouts = slices.Delete(record.Checkouts, index, index+1)
+	if err := c.saveCheckouts(record); err != nil {
+		return remote.CheckoutStatus{}, err
+	}
+	return status, nil
 }
 
 // removeCheckouts removes the session's checkouts from disk when the session
@@ -156,5 +217,11 @@ func (c *controller) releaseCheckout(alpha bool, path, token string) (string, er
 func (c *controller) removeCheckouts() error {
 	c.checkoutsLock.Lock()
 	defer c.checkoutsLock.Unlock()
-	return c.saveCheckouts(nil)
+	path, err := pathForCheckouts(c.session.Identifier)
+	if err != nil {
+		return err
+	} else if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("unable to remove conflict checkouts: %w", err)
+	}
+	return nil
 }

@@ -104,17 +104,21 @@ without applying your result. A copy that already has the result is left
 alone, a copy with a result applied before is replaced, and the workspace
 remains until both copies match. Don't discard a partially applied resolution
 instead: a copy may keep the result, or one side's original may then exist
-only in the workspace, as discard warns. If apply reports a problem that
-synchronization has with the path (such as a permission error), it updated the
-copies but couldn't verify the resolution: fix the problem if you can (or
-report it to the user), then retry. If nothing was applied and the conflict is
-no longer listed, apply refuses without changing either copy, since the
-conflict was resolved some other way or ended by a change: follow the recovery
-steps below before discarding the workspace. If apply says that the conflict
-is checked out through the other side, that side resolves it: discard this
-workspace. Existing workspaces involving directories can only be discarded, not
-applied. A conflict operation on a path fails while another one on it is in
-progress on the same side, without changing anything.
+only in the workspace, as discard warns. An apply that timed out may still be
+writing the remote copy, and a retry waits for that write to finish. If apply
+reports that a later apply of the conflict reached a copy first, it didn't
+change that copy: another apply (such as one through the other side) got there
+first, so run `remote --conflicts` to see what's left. If apply reports a
+problem that synchronization has with the path (such as a permission error),
+it updated the copies but couldn't verify the resolution: fix the problem if
+you can (or report it to the user), then retry. If nothing was applied and the
+conflict is no longer listed, apply refuses without changing either copy, since
+the conflict was resolved some other way or ended by a change: follow the
+recovery steps below before discarding the workspace. If apply says that the
+conflict is checked out through the other side, that side resolves it: discard
+this workspace. Existing workspaces involving directories can only be
+discarded, not applied. A conflict operation on a path fails while another one
+on it is in progress on the same side, without changing anything.
 
 If a conflicting path changed after checkout anyway (by you, the user, or a
 tool on either side), first find and stop whatever changed it, such as an

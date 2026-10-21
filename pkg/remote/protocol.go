@@ -167,6 +167,9 @@ type result struct {
 	// Stale indicates that a replacement failed because the entry changed
 	// since it was checked out (see ErrStale).
 	Stale bool `json:",omitempty"`
+	// Superseded indicates that a replacement failed because a replacement
+	// with a later sequence number was admitted first (see ErrSuperseded).
+	Superseded bool `json:",omitempty"`
 }
 
 // writeMessage writes bounded, length-prefixed command metadata.

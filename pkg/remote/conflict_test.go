@@ -17,6 +17,7 @@ import (
 )
 
 func TestCopyAndReplace(t *testing.T) {
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	root := t.TempDir()
 	path := filepath.Join(root, "file")
 	original := bytes.Repeat([]byte("large file\n"), 200000)
@@ -50,8 +51,11 @@ func TestCopyAndReplace(t *testing.T) {
 		t.Fatal(err)
 	}
 	result.Executable = true
+	var sequence uint64
 	replace := func(expected []*Entry, result *Entry, input string) error {
-		return Replace(ctx, route(), &Replacement{Path: "file", Expected: expected, Result: result}, strings.NewReader(input))
+		sequence++
+		replacement := &Replacement{Path: "file", Expected: expected, Result: result, Sequence: sequence}
+		return Replace(ctx, route(), replacement, strings.NewReader(input))
 	}
 	// other stands in for the opposite endpoint's checked-out copy, which may
 	// be listed as expected in either order.
@@ -99,11 +103,12 @@ func TestReplaceIgnoresUnpreservedExecutability(t *testing.T) {
 	// Filesystems that don't preserve executability, such as those on Windows,
 	// report files as not executable (or as executable) regardless of how they
 	// were written or synchronized, which must not make retries fail as stale.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	ctx := context.Background()
 	root := t.TempDir()
 	path := filepath.Join(root, "file")
 	unrelated := &Entry{Kind: EntryFile, Size: 1, Digest: strings.Repeat("0", 64)}
-	for _, test := range []struct {
+	for s, test := range []struct {
 		description, contents string
 		expected              func(*Entry) *Entry
 		executable            bool
@@ -121,7 +126,7 @@ func TestReplaceIgnoresUnpreservedExecutability(t *testing.T) {
 			t.Fatal(err)
 		}
 		result := &Entry{Kind: EntryFile, Size: 7, Digest: fmt.Sprintf("%x", sha256.Sum256([]byte("merged\n"))), Executable: test.executable}
-		replacement := &Replacement{Path: "file", Expected: []*Entry{unrelated, test.expected(current)}, Result: result}
+		replacement := &Replacement{Path: "file", Expected: []*Entry{unrelated, test.expected(current)}, Result: result, Sequence: uint64(s + 1)}
 		if err := ReplaceFile(ctx, root, replacement, strings.NewReader("merged\n")); err != nil {
 			t.Fatalf("%s: %v", test.description, err)
 		} else if data, _ := os.ReadFile(path); string(data) != "merged\n" {
@@ -141,6 +146,7 @@ func TestReplaceKinds(t *testing.T) {
 	// Expected entries of any kind other than directories can be replaced with
 	// a file or a symbolic link, or deleted, without leaving temporary files.
 	// Directories are never expected, so they're stale, like unexpected files.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	ctx := context.Background()
 	kinds := []struct {
 		kind  string
@@ -167,7 +173,7 @@ func TestReplaceKinds(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				replacement := &Replacement{Path: "entry", Expected: []*Entry{current.entry}, Result: result}
+				replacement := &Replacement{Path: "entry", Expected: []*Entry{current.entry}, Result: result, Sequence: 1}
 				err = ReplaceFile(ctx, directory, replacement, strings.NewReader("result\n"))
 				after, readErr := ReadEntry(ctx, path)
 				if readErr != nil {
@@ -190,14 +196,15 @@ func TestReplaceKinds(t *testing.T) {
 		}
 	}
 
-	// Directories can be neither expected nor results, and symbolic links
-	// need targets.
+	// Directories can be neither expected nor results, symbolic links need
+	// targets, and replacements need sequence numbers.
 	file := contentsEntry("file\n")
 	for _, replacement := range []*Replacement{
-		{Path: "entry", Expected: []*Entry{{Kind: EntryDirectory, Digest: "digest"}}, Result: &Entry{Kind: EntryMissing}},
-		{Path: "entry", Expected: []*Entry{file}, Result: &Entry{Kind: EntryDirectory, Digest: "digest"}},
-		{Path: "entry", Expected: []*Entry{file}, Result: &Entry{Kind: EntrySymbolicLink}},
-		{Path: "entry", Expected: []*Entry{nil}, Result: file},
+		{Path: "entry", Expected: []*Entry{{Kind: EntryDirectory, Digest: "digest"}}, Result: &Entry{Kind: EntryMissing}, Sequence: 1},
+		{Path: "entry", Expected: []*Entry{file}, Result: &Entry{Kind: EntryDirectory, Digest: "digest"}, Sequence: 1},
+		{Path: "entry", Expected: []*Entry{file}, Result: &Entry{Kind: EntrySymbolicLink}, Sequence: 1},
+		{Path: "entry", Expected: []*Entry{nil}, Result: file, Sequence: 1},
+		{Path: "entry", Expected: []*Entry{file}, Result: &Entry{Kind: EntryMissing}},
 	} {
 		if err := ReplaceFile(ctx, t.TempDir(), replacement, nil); err == nil || !strings.Contains(err.Error(), "invalid") {
 			t.Fatalf("invalid replacement accepted: %v", err)
@@ -209,6 +216,7 @@ func TestReplaceRoot(t *testing.T) {
 	// A single-file session's root is replaced in its parent directory, but it
 	// can't be deleted or replaced with a symbolic link, which synchronization
 	// would refuse.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	ctx := context.Background()
 	root := filepath.Join(t.TempDir(), "root")
 	if err := os.WriteFile(root, []byte("original\n"), 0600); err != nil {
@@ -216,12 +224,12 @@ func TestReplaceRoot(t *testing.T) {
 	}
 	original := contentsEntry("original\n")
 	for _, result := range []*Entry{{Kind: EntryMissing}, {Kind: EntrySymbolicLink, Target: "target"}} {
-		replacement := &Replacement{Path: ".", Expected: []*Entry{original}, Result: result}
+		replacement := &Replacement{Path: ".", Expected: []*Entry{original}, Result: result, Sequence: 1}
 		if err := ReplaceFile(ctx, root, replacement, strings.NewReader("")); err == nil || !strings.Contains(err.Error(), "only be replaced with a file") {
 			t.Fatalf("root replaced with %s: %v", result.Kind, err)
 		}
 	}
-	replacement := &Replacement{Path: ".", Expected: []*Entry{original}, Result: contentsEntry("merged\n")}
+	replacement := &Replacement{Path: ".", Expected: []*Entry{original}, Result: contentsEntry("merged\n"), Sequence: 1}
 	if err := ReplaceFile(ctx, root, replacement, strings.NewReader("merged\n")); err != nil {
 		t.Fatal(err)
 	} else if data, _ := os.ReadFile(root); string(data) != "merged\n" {

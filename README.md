@@ -350,6 +350,11 @@ recovered. The retention follows the system clock: backups are named by the
 time they were set aside and deleted by it, so a clock jump can delete them
 early.
 
+Writes of a copy wait for each other, since an apply that timed out may still
+be writing the remote copy, and apply fails without changing a copy that a
+later apply, through either endpoint, reached first, in which case
+`remote --conflicts` shows what that apply left.
+
 Conflict operations accept several paths, after their options, and `--json`
 prints machine-readable results, one line per path. A conflict operation fails
 while another one on the same path is running on the same system.

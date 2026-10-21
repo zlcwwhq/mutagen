@@ -503,31 +503,43 @@ func dialOpposite(ctx context.Context, directory, session string, expected *remo
 // has no workspace. It's abandoned, such as one left by an interrupted
 // checkout or recorded by a claim that arrived late, and claims leave it as it
 // is, so it's released by its token before claiming the checkout again, which
-// fails if the opposite endpoint claims it meanwhile.
+// fails if the opposite endpoint claims it meanwhile. A checkout recorded
+// without a token, by a build that didn't issue tokens, takes the claim's
+// token instead, since it may belong to the workspace.
 func claim(ctx context.Context, directory, session string, target *remote.Target, path, token string) error {
-	claimOnce := func() (string, error) {
+	_, err := claimSequence(ctx, directory, session, target, path, token)
+	return err
+}
+
+// claimSequence claims the checkout of a conflict root (see claim) and returns
+// the claim's sequence number, which orders the replacements that an apply
+// makes after claiming its checkout (see remote.Replacement.Sequence) after
+// those of all earlier applies of the conflict, including those whose clients
+// stopped waiting for them while the replacements kept running.
+func claimSequence(ctx context.Context, directory, session string, target *remote.Target, path, token string) (uint64, error) {
+	claimOnce := func() (uint64, string, error) {
 		connection, err := dialSession(ctx, directory, session, remote.OperationClaim, target)
 		if err != nil {
-			return "", err
+			return 0, "", err
 		}
 		return remote.ClaimCheckout(ctx, connection, path, token)
 	}
-	held, err := claimOnce()
-	if err != nil || held == "" || held == token {
-		return err
+	sequence, held, err := claimOnce()
+	if err != nil || sequence != 0 {
+		return sequence, err
 	}
 	connection, err := dialSession(ctx, directory, session, remote.OperationRelease, target)
 	if err == nil {
-		_, err = remote.ReleaseCheckout(ctx, connection, path, held)
+		_, _, err = remote.ReleaseCheckout(ctx, connection, path, held)
 	}
 	if err != nil {
-		return fmt.Errorf("unable to release an abandoned checkout: %w", err)
-	} else if held, err = claimOnce(); err != nil {
-		return err
-	} else if held != "" && held != token {
-		return errors.New("the abandoned checkout was claimed again while it was being released")
+		return 0, fmt.Errorf("unable to release an abandoned checkout: %w", err)
+	} else if sequence, _, err = claimOnce(); err != nil {
+		return 0, err
+	} else if sequence == 0 {
+		return 0, errors.New("the abandoned checkout was claimed again while it was being released")
 	}
-	return nil
+	return sequence, nil
 }
 
 // release removes the checkout of a conflict root held by the endpoint that
@@ -557,18 +569,20 @@ func release(ctx context.Context, directory, session string, target *remote.Targ
 // thus abandoned too, since the local endpoint has no workspace for the
 // conflict root, so it's released by that token, and one recorded after the
 // release is released by listing conflicts, discarding, or checking the
-// conflict out again (see claim).
+// conflict out again (see claim). That includes a checkout without a token,
+// recorded by a build that didn't issue tokens, which a release without one
+// removes.
 func releaseOver(ctx context.Context, connection io.ReadWriteCloser, directory, session string, target *remote.Target, path, token string) (bool, error) {
-	held, err := remote.ReleaseCheckout(ctx, connection, path, token)
-	if err != nil || held == "" || held == token {
-		return held != "", err
+	held, current, err := remote.ReleaseCheckout(ctx, connection, path, token)
+	if err != nil || !held || current == token {
+		return held, err
 	}
 	connection, err = dialSession(ctx, directory, session, remote.OperationRelease, target)
 	if err != nil {
 		return true, err
-	} else if current, err := remote.ReleaseCheckout(ctx, connection, path, held); err != nil {
+	} else if stillHeld, remaining, err := remote.ReleaseCheckout(ctx, connection, path, current); err != nil {
 		return true, err
-	} else if current != "" && current != held {
+	} else if stillHeld && remaining != current {
 		return true, errors.New("the checkout was claimed again while it was being released")
 	}
 	return true, nil
@@ -1536,17 +1550,39 @@ func apply(ctx context.Context, directory string, o *options, argument string, l
 	}
 	// Only the endpoint holding a conflict's checkout can resolve it. A
 	// workspace whose checkout is missing claims it again, if the conflict is
-	// still listed and the opposite endpoint hasn't checked it out.
-	if err := claim(ctx, directory, o.session, target, w.Path, w.Token); err != nil {
+	// still listed and the opposite endpoint hasn't checked it out. Each apply
+	// claims the checkout again, since the claim's sequence number orders its
+	// replacements after those of earlier applies (see write).
+	sequence, err := claimSequence(ctx, directory, o.session, target, w.Path, w.Token)
+	if err != nil {
 		connection.Close()
 		return nil, unlock, err
 	}
-	return a, unlock, a.write(ctx, connection, source)
+	return a, unlock, a.write(ctx, connection, source, sequence)
+}
+
+// supersededHint adds advice to an error caused by a later apply of the
+// conflict, which replaced a copy (or tried to) first.
+func supersededHint(err error) error {
+	if errors.Is(err, remote.ErrSuperseded) {
+		return fmt.Errorf("%w; list conflicts (remote --conflicts) to see whether it resolved the conflict", err)
+	}
+	return staleHint(err)
 }
 
 // write writes the result to both copies using a connection to the opposite
-// endpoint, reading a file result's contents from a workspace file.
-func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, source string) error {
+// endpoint, reading a file result's contents from a workspace file, with the
+// sequence number of the apply's claim of the checkout.
+//
+// An apply whose client stops waiting, such as on timeout, may leave its
+// replacement of the remote copy running, and a retry, or another resolution
+// of the conflict, may then replace the copy first. The replacements of each
+// copy are thus serialized and ordered by the sequence numbers of their
+// applies' claims, on the remote copy's system and on this one, which applies
+// through either endpoint share, and a replacement whose sequence number is
+// earlier than that of one admitted before fails with remote.ErrSuperseded,
+// without changing the copy (see remote.ReplaceFile).
+func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, source string, sequence uint64) error {
 	w := a.w
 	open := func() (io.ReadCloser, error) {
 		if source == "" {
@@ -1555,7 +1591,7 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 		return os.Open(source)
 	}
 	expected := append([]*remote.Entry{w.Local, w.Remote}, w.Applied...)
-	replacement := &remote.Replacement{Path: w.Path, Expected: expected, Result: a.result}
+	replacement := &remote.Replacement{Path: w.Path, Expected: expected, Result: a.result, Sequence: sequence}
 	// Check the local copy first, so that one changed since checkout doesn't
 	// leave only the remote copy updated.
 	if err := remote.CheckFile(ctx, a.target.Root, replacement); err != nil {
@@ -1565,8 +1601,9 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 	// Record the result before writing it, since either write may succeed even
 	// if apply fails, so that retries recognize it. A result recorded for this
 	// attempt is forgotten if neither copy was written, such as when the remote
-	// copy changed since checkout, so that the workspace isn't taken for an
-	// unfinished resolution. Failing to forget it is merely conservative.
+	// copy changed since checkout or a later apply reached it first, so that
+	// the workspace isn't taken for an unfinished resolution. Failing to forget
+	// it is merely conservative.
 	recorded := false
 	if !slices.ContainsFunc(w.Applied, func(applied *remote.Entry) bool {
 		return remote.SameContents(applied, a.result)
@@ -1593,11 +1630,12 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 	err = remote.Replace(ctx, connection, replacement, input)
 	input.Close()
 	if err != nil {
-		// Stale replacements fail before writing (see remote.ReplaceFile).
-		if errors.Is(err, remote.ErrStale) {
+		// Stale and superseded replacements fail before writing (see
+		// remote.ReplaceFile).
+		if errors.Is(err, remote.ErrStale) || errors.Is(err, remote.ErrSuperseded) {
 			forget()
 		}
-		return fmt.Errorf("unable to update the remote copy: %w", staleHint(err))
+		return fmt.Errorf("unable to update the remote copy: %w", supersededHint(err))
 	}
 	if input, err = open(); err != nil {
 		return err
@@ -1605,7 +1643,7 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 	err = remote.ReplaceFile(ctx, a.target.Root, replacement, input)
 	input.Close()
 	if err != nil {
-		return fmt.Errorf("updated the remote copy, but unable to update the local copy: %w", staleHint(err))
+		return fmt.Errorf("updated the remote copy, but unable to update the local copy: %w", supersededHint(err))
 	}
 	return nil
 }
