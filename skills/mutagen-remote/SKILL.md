@@ -84,7 +84,13 @@ apply or discard it: leave conflicts checked out through the other side to it,
 and don't edit their paths. A conflict checked out on your side may be another
 agent's or the user's resolution in progress: apply or discard only conflicts
 that you checked out, and ask the user about others.
-Preserve both sides' intent when it is clear, and ask the user when it's
-ambiguous, especially without a common ancestor.
+With a common ancestor, merging uses a text-based three-way model similar to
+Git's, with additional conservative checks. Even without conflict markers, it
+can take lines that were removed and then restored for unchanged, keep twice a
+change that both sides made in different places, or misread moves, especially
+of repeated lines such as blank lines or closing braces: review the whole
+merged file against both copies and the ancestor, when available, before
+applying it. Preserve both sides' intent when it is clear, and ask the user
+when it's ambiguous, especially without a common ancestor.
 Conflicts involving directories require manual resolution; checkout and apply
 reject them, including existing workspaces. Report these to the user.

@@ -288,31 +288,50 @@ and prints their paths. For two files, it also looks for their common ancestor,
 the file that both endpoints had when they last agreed: Mutagen records only
 its digest, so checkout verifies candidates against it, trying the versions in
 Git's `HEAD` commit and index (read with `git cat-file`), or a file given with
-`--base`. With the ancestor, the `merged` file contains both sides' changes and
-marks only regions changed differently on each side, showing the local, base,
-and remote versions in Git's `diff3` style; without it, every region where the
-copies differ is marked. Changes among repeated lines (such as closing braces)
-can be aligned with the ancestor in several ways, which can drop or duplicate
-them, so checkout merges both sides' changes separately only where a line that
-occurs once in each version separates them, and otherwise marks them together,
-with all three versions. Lines that one side moved are marked too, from one
-end of the move to the other, if the other side made only one end's change,
-such as adding the same lines where they went (it may have copied them) or
-deleting them where they were (it may have deleted them). If the result would
-still contain a line more or less often than applying each side's changes once
-allows (such as a line that each side moved elsewhere), checkout marks every
-region where the copies differ instead, without the base version. Merging line
-by line can still misplace changes (such as moves of lines that repeat), so
-review the merged file against both copies and the ancestor before applying
-it, even if nothing is marked. Copies too large to
-compare line by line (or with too many lines) and copies that aren't valid
-UTF-8 are enclosed whole in a single region, with the ancestor, and binary
-copies get no merged file; checkout says which applies. Since synchronization
-continues meanwhile, checkout verifies that it downloaded the copies that it
-listed, whose ancestor it knows, and otherwise fails; check out again. A
-conflict can't be checked out again while its workspace exists, so checking out
-with `--base` after checking out without it requires discarding the workspace
-first (which changes neither copy).
+`--base`.
+
+With the ancestor, checkout uses a text-based three-way merge model similar to
+Git's: it compares the ancestor with both current copies, merges regions changed
+on only one side or changed identically on both, and marks regions changed
+differently on both sides with the local, base, and remote versions in Git's
+`diff3` style. The implementation includes additional conservative checks and
+may mark more conflicts than Git; its results and conflict boundaries aren't
+guaranteed to match Git's. Without the ancestor, every region where the copies
+differ is marked.
+
+Like Git's three-way merge, this compares file snapshots and doesn't track
+editing operations or the identity of moved lines, so a merge with no conflict
+markers can still misrepresent intended changes. Lines removed and then
+restored in place look unchanged: if both sides deleted a function and one side
+then restored it, the merge deletes it. A change that both sides made in the
+same place is kept once, even if each side meant to add its own copy, and one
+that they made in different places (such as the same import added at different
+lines) can be kept twice. Moved lines, especially lines that repeat (such as
+blank lines or closing braces), can be misplaced, or kept too often or too
+rarely. Review the complete `merged` file against both copies and the ancestor
+before applying it, even if nothing is marked, checking these cases in
+particular, and resolve ambiguous intent manually.
+
+Changes among repeated lines can be aligned with the ancestor in several ways,
+which can drop or duplicate them, so checkout merges both sides' changes
+separately only where a line that occurs once in each version separates them,
+and otherwise marks them together, with all three versions, even if they look
+independent. For example, if each side modified a different copy of a repeated
+block, both sides may instead have deleted a copy and then each added a
+modified one, and merging the changes separately would drop a whole copy. Both
+ends of a detected move may be marked together too. If its line-count checks
+find an inconsistent result, it marks every region where the copies differ
+instead, without the base version. These checks don't establish that the result
+preserves the intended changes.
+
+Copies too large to compare line by line (or with too many lines) and copies
+that aren't valid UTF-8 are enclosed whole in a single region, with the
+ancestor, and binary copies get no merged file; checkout says which applies.
+Since synchronization continues meanwhile, checkout verifies that it downloaded
+the copies that it listed, whose ancestor it knows, and otherwise fails; check
+out again. A conflict can't be checked out again while its workspace exists,
+so checking out with `--base` after checking out without it requires discarding
+the workspace first (which changes neither copy).
 
 Resolution assumes that the conflicting paths don't change from checkout until
 apply finishes, so before checking out, stop editors, builds, and anything else

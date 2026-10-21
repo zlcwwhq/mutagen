@@ -58,14 +58,25 @@ that you checked out, and ask the user about others.
    ```
 
    - **With `Base`** (the file that both sides last agreed on, verified by its
-     digest), changes made on only one side are already merged, and only
-     regions changed differently on both sides are marked; checkout says how
-     many. Compare each side with the base to see what each changed, combine
-     both changes, and remove the markers. Merging line by line can misplace
-     changes, so compare the whole merged file with `Local`, `Remote`, and
-     `Base` before applying it, even if nothing is marked. If checkout says
-     that the changes couldn't be merged reliably (such as a line that each
-     side moved elsewhere), every region where the copies differ is marked
+     digest), checkout uses a text-based three-way merge model similar to
+     Git's. It merges regions changed on one side or identically on both and
+     marks regions changed differently on both sides; checkout says how many.
+     Changes separated only by repeated lines (such as closing braces) are
+     marked together, even if they look independent, since they can be
+     aligned in several ways. Additional conservative checks may mark more
+     conflicts than Git, and results aren't guaranteed to match Git's. This
+     model compares snapshots without tracking editing operations, so even a
+     merge with no markers can misrepresent changes. Check especially lines
+     that were removed and then restored, which look unchanged (if both sides
+     deleted a function and one side restored it, the merge deletes it);
+     changes that both sides made in different places, which can be kept
+     twice; and moved lines, especially repeated ones such as blank lines or
+     closing braces, which can be misplaced or kept too often or too rarely.
+     Compare the whole merged file with `Local`, `Remote`, and `Base` before
+     applying it, combine the intended changes, and remove the markers. Ask
+     the user when intent is unclear. If checkout says that
+     the changes couldn't be merged reliably (such as a line that each side
+     moved elsewhere), every region where the copies differ is marked
      instead, without the base's lines.
    - **Without `Base`**, every region where the copies differ is marked, and
      neither side's additions or deletions are known to be newer. Checkout

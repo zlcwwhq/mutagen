@@ -122,17 +122,26 @@ Notes:
     the Mutagen data directory) and prints their paths. For two files, it also
     looks for their common ancestor (the file that both endpoints last agreed
     on) in Git's HEAD commit and index, or in the file given with --base,
-    verified by its digest. With it, the merged file contains both sides'
-    changes, and marks only regions changed differently on each side, showing
-    the local, base, and remote versions; without it, every region where the
-    copies differ is marked. If changes can't be merged reliably (such as a
-    line that each side moved elsewhere), every difference is marked, without
-    the base version. Review the merged file against the copies and the
-    ancestor even if nothing is marked. Files too large to compare line by
-    line or not valid UTF-8 are enclosed whole in one region, and binary
-    copies get no merged file; checkout says which applies. Checkout fails
-    if the copies changed since they were listed (the ancestor might not be
-    theirs); check out again. To check out with --base after checking out
+    verified by its digest. With it, checkout uses a text-based three-way merge
+    model similar to Git's, comparing the ancestor and both current copies.
+    Regions changed on one side or identically on both are merged; regions
+    changed differently are marked with the local, base, and remote versions.
+    Changes separated only by repeated lines (such as closing braces) are
+    marked together, even if they look independent, since they can be aligned
+    in several ways. Additional conservative checks may mark more conflicts
+    than Git, and the results needn't match Git's. Without the ancestor, every
+    region where the copies differ is marked. If consistency checks fail, every
+    difference is marked, without the base version. Like Git, this model
+    doesn't track editing operations, so even a merge without markers can
+    misrepresent changes: lines removed and then restored look unchanged, a
+    change made on both sides in different places can be kept twice, and moved
+    lines, especially repeated ones, can be misplaced or kept too often or too
+    rarely. Review the whole merged file against the copies and the ancestor
+    before applying it, even if nothing is marked. Files too large to compare
+    line by line or not valid UTF-8 are enclosed whole in one region, and
+    binary copies get no merged file; checkout says which applies. Checkout
+    fails if the copies changed since they were listed (the ancestor might not
+    be theirs); check out again. To check out with --base after checking out
     without it, discard the workspace first. Conflicts involving directories
     require manual resolution; checkout and apply reject them.
   - For two files, --conflict-apply writes the merged file (or the copy chosen

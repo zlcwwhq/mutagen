@@ -142,6 +142,19 @@ func TestMergeMisalignedChanges(t *testing.T) {
 		// it twice (git marks it).
 		{"line moved differently by each side", "import \"a\"\nimport \"b\"\nimport \"c\"\n", "import \"a\"\nimport \"c\"\nimport \"b\"\n", "import \"c\"\nimport \"a\"\nimport \"b\"\n",
 			region("import \"a\"\nimport \"c\"\nimport \"b\"\n", "import \"a\"\nimport \"b\"\nimport \"c\"\n", "import \"c\"\nimport \"a\"\nimport \"b\"\n")},
+		// Local modified the first of five equal lines, and remote the last,
+		// which look like independent replacements, but both sides may have
+		// deleted one of the lines and then each added a line, which merging
+		// them separately would drop (git merges them into "  - 5", three
+		// "  - 0", and "  - 7").
+		{"modifications at opposite ends of a run", "values:\n  - 0\n  - 0\n  - 0\n  - 0\n  - 0\nend\n", "values:\n  - 5\n  - 0\n  - 0\n  - 0\n  - 0\nend\n", "values:\n  - 0\n  - 0\n  - 0\n  - 0\n  - 7\nend\n",
+			"values:\n" + region("  - 5\n  - 0\n  - 0\n  - 0\n  - 0\n", "  - 0\n  - 0\n  - 0\n  - 0\n  - 0\n", "  - 0\n  - 0\n  - 0\n  - 0\n  - 7\n") + "end\n"},
+		// Likewise, each side modified a line in a different copy of a block,
+		// but both sides may have deleted a copy and then each added a modified
+		// one, so that merging them separately would drop a whole copy, however
+		// large (git merges them, keeping two copies).
+		{"modifications of different copies of a block", "steps:\n  - run: make\n    env: dev\n  - run: make\n    env: dev\n  - run: make\n    env: dev\nend\n", "steps:\n  - run: make\n    env: prod\n  - run: make\n    env: dev\n  - run: make\n    env: dev\nend\n", "steps:\n  - run: make\n    env: dev\n  - run: make\n    env: dev\n  - run: make test\n    env: dev\nend\n",
+			"steps:\n" + region("  - run: make\n    env: prod\n  - run: make\n    env: dev\n  - run: make\n    env: dev\n", "  - run: make\n    env: dev\n  - run: make\n    env: dev\n  - run: make\n    env: dev\n", "  - run: make\n    env: dev\n  - run: make\n    env: dev\n  - run: make test\n    env: dev\n") + "end\n"},
 		// A region marked elsewhere doesn't excuse a lossy merge of the rest,
 		// which an agent resolving the marked region wouldn't review.
 		{"modification next to a deletion, and a conflict", "values:\n  - 0\n  - 0\n  - 0\nend\nX\n", "values:\n  - 5\n  - 0\n  - 0\nend\nL\n", "values:\n  - 0\n  - 0\nend\nR\n",
@@ -366,7 +379,7 @@ func TestMergedFileNotes(t *testing.T) {
 		whole, withBase bool
 	}{
 		{"clean merge", "1\nlocal\n3\n4\n", "1\n2\n3\nremote\n", "1\n2\n3\n4\n",
-			"merged without conflicts, but merging line by line can misplace changes: compare the merged file with Local, Remote, and Base before applying it", 0, false, false},
+			"merged without conflicts, but merging line by line can misplace changes, especially repeated lines (such as blank lines or closing braces), moved lines, and changes made on both sides: compare the merged file with Local, Remote, and Base before applying it", 0, false, false},
 		{"conflicting region", "local\n", "remote\n", "base\n",
 			"1 region changed differently on each side since their common ancestor is marked with the local, base, and remote versions", 1, false, true},
 		{"inconsistent merge", "y\nx\n}\n", "y\n}\nx\n", "}\nx\n}\ny\nx\n",

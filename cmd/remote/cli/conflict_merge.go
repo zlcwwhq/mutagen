@@ -250,7 +250,7 @@ func mergeNote(w *workspace, regions int) string {
 	case method == mergeInconsistent:
 		return fmt.Sprintf("Both sides' changes since their common ancestor couldn't be merged reliably (such as a line that each side moved elsewhere), so every region where the copies differ is marked (%d), without the base version: compare each side with Base to see what each changed, and combine both sides' changes.", regions)
 	case method == mergeAncestor && regions == 0:
-		return "Both copies' changes since their common ancestor were merged without conflicts, but merging line by line can misplace changes: compare the merged file with Local, Remote, and Base before applying it."
+		return "Both copies' changes since their common ancestor were merged without conflicts, but merging line by line can misplace changes, especially repeated lines (such as blank lines or closing braces), moved lines, and changes made on both sides: compare the merged file with Local, Remote, and Base before applying it."
 	case method == mergeAncestor:
 		subject := fmt.Sprintf("%d regions changed differently on each side since their common ancestor are", regions)
 		if regions == 1 {
