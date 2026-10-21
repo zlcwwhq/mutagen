@@ -204,7 +204,9 @@ func dialTest(selection *Selection, directory string) (*Target, error) {
 }
 
 // registerIncompatible registers a live endpoint as another version of Mutagen
-// would.
+// would. Its connections are accepted and closed, as its version handshake
+// would fail: on Windows, clients can't connect to a named pipe until its
+// server accepts, so liveness probes would otherwise wait for their deadline.
 func registerIncompatible(t *testing.T, registry, session, root string) {
 	t.Helper()
 	base := filepath.Join(registry, session)
@@ -212,7 +214,21 @@ func registerIncompatible(t *testing.T, registry, session, root string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { listener.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connection.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		listener.Close()
+		<-done
+	})
 	data, err := json.Marshal(&record{Version: "0.0.1", Session: session, Root: root})
 	if err != nil {
 		t.Fatal(err)
