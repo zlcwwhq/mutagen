@@ -518,6 +518,42 @@ func TestBinaryAndExecutableResolution(t *testing.T) {
 	}
 }
 
+func TestEmptyMergedResolution(t *testing.T) {
+	// A merged file that was emptied, such as by a command reading it with its
+	// output redirected to it, has no markers left, but it's refused as long as
+	// neither copy is empty, as is one created empty for binary copies.
+	ctx := context.Background()
+	empty := func(w *workspace) {
+		t.Helper()
+		if err := os.WriteFile(w.file(mergedName), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, copies := range [][2]string{{"local\n", "remote\n"}, {"same\n", "same\n"}, {"\x00local", "\x00remote"}} {
+		w := newTestWorkspace(t, copies[0], copies[1])
+		empty(w)
+		if _, _, err := resolution(ctx, w, &options{}); !errors.Is(err, errEmptyMerged) || !strings.Contains(err.Error(), "check it out again") {
+			t.Fatalf("empty merged file accepted for %q: %v", copies, err)
+		}
+	}
+
+	// Discarding isn't suggested once a result was applied, since that would
+	// leave the resolution unfinished.
+	w := newTestWorkspace(t, "local\n", "remote\n")
+	w.Applied = []*remote.Entry{w.Local}
+	empty(w)
+	if _, _, err := resolution(ctx, w, &options{}); !errors.Is(err, errEmptyMerged) || strings.Contains(err.Error(), "check it out again") {
+		t.Fatalf("empty merged file accepted or discard suggested after a result was applied: %v", err)
+	}
+
+	// If a copy is empty, an empty result is as plausible as any other.
+	w = newTestWorkspace(t, "", "remote\n")
+	empty(w)
+	if result, source, err := resolution(ctx, w, &options{}); err != nil || result.Size != 0 || source != w.file(mergedName) {
+		t.Fatalf("empty result with an empty copy refused: %v", err)
+	}
+}
+
 func TestWorkspaceMetadata(t *testing.T) {
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	local := filepath.Join(t.TempDir(), "file")

@@ -61,6 +61,13 @@ var errDirectoryConflict = errors.New("conflicts involving directories aren't su
 // left one side's changes only in the workspace.
 var errResolvedOtherwise = errors.New("is no longer listed as a conflict, and nothing was applied, so it was resolved some other way, or ended by a change after checkout, which may have left one side's changes only in the workspace; apply changed neither copy: compare the current file with the workspace's local and remote files before discarding it")
 
+// errEmptyMerged indicates that apply refused an empty merged file although
+// neither copy is empty. Such a file has no markers left to refuse, but it was
+// most likely truncated rather than resolved, such as by a command that reads
+// it and has its output redirected to it, and applying it would replace both
+// copies with nothing.
+var errEmptyMerged = errors.New("the merged file is empty, but neither copy is, so it was probably truncated, such as by redirecting a command's output to the file that it reads")
+
 // conflictOptions are the options for conflict resolution, which is separate
 // from command execution and its flush policy.
 type conflictOptions struct {
@@ -1351,7 +1358,9 @@ func describe(w *workspace, argument string) (*outcome, error) {
 
 // resolution determines the result entry of a resolution and the workspace
 // file providing its contents (for a file result). Copies that aren't both
-// files can only be resolved by taking one of them as checked out.
+// files can only be resolved by taking one of them as checked out. A merged
+// file is refused if it still contains conflict markers, or if it's empty
+// while neither copy is (see errEmptyMerged).
 func resolution(ctx context.Context, w *workspace, o *options) (*remote.Entry, string, error) {
 	if !w.files() && (o.take == "" || o.executable != "") {
 		return nil, "", errors.New("the copies aren't both files, so they can only be resolved with --take local or --take remote")
@@ -1391,6 +1400,15 @@ func resolution(ctx context.Context, w *workspace, o *options) (*remote.Entry, s
 			return nil, "", err
 		} else if found {
 			return nil, "", errors.New("the merged file still contains conflict markers")
+		} else if result.Size == 0 && w.Local.Size != 0 && w.Remote.Size != 0 {
+			// Checking out again recreates the merged file, but discarding a
+			// workspace through which a result was applied would leave that
+			// resolution unfinished (see workspace.applied).
+			recreate := "recreate it from the workspace's other files"
+			if !w.applied() {
+				recreate += " (or discard the workspace and check it out again, which recreates it)"
+			}
+			return nil, "", fmt.Errorf("%w; apply changed neither copy: %s, or, if the result should be empty, discard the workspace and empty both copies", errEmptyMerged, recreate)
 		}
 	}
 	result.Data = nil

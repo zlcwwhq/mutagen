@@ -131,7 +131,10 @@ Notes:
     without it, discard the workspace first. Conflicts involving directories
     require manual resolution; checkout and apply reject them.
   - For two files, --conflict-apply writes the merged file (or the copy chosen
-    by --take, or deletion with --delete) to both copies. For other conflicts
+    by --take, or deletion with --delete) to both copies, but refuses a merged
+    file that still contains conflict markers, or one that's empty while
+    neither copy is, which was probably truncated (such as by a command whose
+    output was redirected to the file that it reads). For other conflicts
     (such as a symbolic link and a file), only --take is possible: it writes
     the copy taken, as checked out, to the other endpoint. Apply then
     synchronizes and checks that both copies match and no conflict or problem

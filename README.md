@@ -355,7 +355,12 @@ as those of interrupted checkouts, as does discarding them.
 
 For two files, apply writes the merged file to both copies, or an original copy
 (`--take local` or `--take remote`), or deletes both copies (`--delete`);
-copies that differ in executability require `--executable` or `--take`.
+copies that differ in executability require `--executable` or `--take`. It
+refuses a merged file that still contains conflict markers, or one that's empty
+while neither copy is: such a file was probably truncated, such as by a command
+that reads it with its output redirected to it (`sed ... merged > merged`), and
+would replace both copies with nothing. If the result should be empty, discard
+the workspace and empty both copies, which then agree.
 Conflicts involving directories require manual resolution: checkout and apply
 reject them, including apply through an existing workspace. Other conflicts,
 such as a symbolic link on one endpoint and a file on the other, can only be

@@ -84,6 +84,12 @@ that you checked out, and ask the user about others.
    doesn't end with a newline, the markers may have added one at the end of
    `Merged`; remove it unless the result should end with one.
 
+   Don't redirect a command's output to `Merged` while the command reads it
+   (as in `sed ... Merged > Merged` or `grep -v ... Merged > Merged`): the
+   shell empties `Merged` before the command runs. Write the output to another
+   file, check it, and then move it over `Merged`, or edit `Merged` directly.
+   Apply refuses an empty `Merged` unless a copy is empty.
+
    For other supported conflicts (such as a symbolic link on one side and a
    file on the other), there's nothing to merge: decide which copy to keep.
    To keep content from both, take one copy, then edit it once apply has
@@ -100,6 +106,12 @@ that you checked out, and ask the user about others.
    follow the system clock: backups are named by the time they were set aside
    and deleted by it, so a clock jump can delete them early.
 5. Run the project's relevant checks.
+
+If apply says that the merged file is empty, it changed neither copy: rebuild
+`Merged` from `Local`, `Remote`, and `Base`, or, if the message suggests it
+(nothing was applied yet), discard the workspace and check out again, which
+recreates it. If the result really should be empty, discard the workspace and
+empty both copies, which then agree.
 
 If apply reports that a copy changed since checkout, it didn't change that copy
 (if it also says that it updated the remote copy, that copy already has your
