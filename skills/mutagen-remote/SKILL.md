@@ -28,10 +28,11 @@ wrong:
   root (or in `--cwd`); `-s` naming a session whose root doesn't contain the
   current directory requires `--cwd` if another session's root does.
   `MUTAGEN_REMOTE_SESSION` never overrides the session containing the current
-  directory. Inside a session nested in another synced root, commands run
-  through the enclosing session while the nested one is paused or
-  disconnected; `-s <nested>` fails instead, and `remote pwd` shows where
-  commands run.
+  directory. Commands refuse to run in a directory that the session ignores.
+  Inside a session nested in another synced root, the enclosing session is
+  used while the nested one is paused or disconnected: commands are refused if
+  it ignores the nested root, and otherwise run in its copy; `-s <nested>`
+  fails instead, and `remote pwd` shows where commands run.
 - **Your shell runs first.** Variables, globs, `~`, pipes, and `&&` are
   processed locally, and nothing is reinterpreted remotely: `remote echo $HOME`
   prints the local home, while `remote sh -c 'echo $HOME'` prints the remote

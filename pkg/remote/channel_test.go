@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/ipc"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 )
 
 // useTestRegistry isolates the command registry in a temporary data directory.
@@ -391,6 +392,54 @@ func TestDialPinned(t *testing.T) {
 	}
 }
 
+func TestDialExcluded(t *testing.T) {
+	useTestRegistry(t)
+	base := resolveSymbolicLinks(t.TempDir())
+	outer := filepath.Join(base, "outer")
+	inner := filepath.Join(outer, "inner")
+	mkdirs(t, filepath.Join(inner, "x"), filepath.Join(outer, "y"))
+	var lock sync.Mutex
+	var accepted []string
+	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"inner"}}
+	registerTest(t, &Endpoint{Session: "sync_outer", Name: "outer", Root: outer, Alpha: true, Ignores: ignores}, "outer", &accepted, &lock)
+	registration := registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "inner", &accepted, &lock)
+	directory := filepath.Join(inner, "x")
+	if target, err := dialTest(&Selection{Corresponding: true}, directory); err != nil || target.Session != "sync_inner" {
+		t.Fatalf("incorrect nested selection: %+v, %v", target, err)
+	}
+
+	// Once the nested session disconnects, operations corresponding to the
+	// directory aren't submitted through the enclosing session, which ignores
+	// it, however that session is selected.
+	registration.listener.Close()
+	<-registration.done
+	for _, selection := range []*Selection{
+		{Corresponding: true},
+		{Session: "outer", Corresponding: true},
+		{Default: "inner", Corresponding: true},
+	} {
+		if _, err := dialTest(selection, directory); err == nil ||
+			!strings.Contains(err.Error(), directory+" is inside "+inner+", which session outer (sync_outer) ignores") ||
+			!strings.Contains(err.Error(), "use --cwd .") {
+			t.Errorf("excluded directory not refused (%+v): %v", selection, err)
+		}
+	}
+	if _, err := dialTest(&Selection{Corresponding: true}, inner); err == nil ||
+		!strings.Contains(err.Error(), inner+" is ignored by session outer (sync_outer)") {
+		t.Error("excluded root of the nested session not refused:", err)
+	}
+
+	// Other operations, synchronized directories, and pinned selections are
+	// unaffected.
+	if target, err := dialTest(&Selection{}, directory); err != nil || target.Session != "sync_outer" || target.Path != "inner/x" {
+		t.Errorf("non-corresponding operation refused: %+v, %v", target, err)
+	} else if target, err := dialTest(&Selection{Corresponding: true}, filepath.Join(outer, "y")); err != nil || target.Path != "y" {
+		t.Errorf("synchronized directory refused: %+v, %v", target, err)
+	} else if pinned, err := dialTest(&Selection{Target: target, Corresponding: true}, directory); err != nil || pinned.Path != "inner/x" {
+		t.Errorf("pinned selection refused: %+v, %v", pinned, err)
+	}
+}
+
 // testChannel connects an agent-style channel to an in-memory executor.
 func testChannel(t *testing.T, endpoint *Endpoint, install ExecutableInstaller) Channel {
 	t.Helper()
@@ -444,7 +493,7 @@ func TestAgentChannel(t *testing.T) {
 	useTestRegistry(t)
 	base := resolveSymbolicLinks(t.TempDir())
 	root, opposite := filepath.Join(base, "root"), filepath.Join(base, "opposite")
-	mkdirs(t, filepath.Join(root, "sub"), filepath.Join(opposite, "sub"))
+	mkdirs(t, filepath.Join(root, "sub"), filepath.Join(root, "ignored"), filepath.Join(opposite, "sub"))
 
 	// The remote executable is installed on initialization.
 	var installed bool
@@ -452,7 +501,8 @@ func TestAgentChannel(t *testing.T) {
 		installed = true
 		return filepath.Join(base, "agents", "remote"), nil
 	}
-	channel := testChannel(t, &Endpoint{Session: "sync_test", Root: root, Submit: true, Execute: true}, install)
+	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"ignored"}}
+	channel := testChannel(t, &Endpoint{Session: "sync_test", Root: root, Submit: true, Execute: true, Ignores: ignores}, install)
 	if !installed {
 		t.Fatal("remote executable not installed")
 	}
@@ -487,6 +537,13 @@ func TestAgentChannel(t *testing.T) {
 		t.Fatal(err)
 	} else if directory := inspectDirectory(t, connection, target.Path); directory != filepath.Join(opposite, "sub") {
 		t.Fatal("incorrect submission directory:", directory)
+	}
+
+	// The registration records the session's ignores, so commands aren't
+	// submitted from directories that the session doesn't synchronize.
+	if _, _, err := (&Selection{Corresponding: true}).Dial(ctx, filepath.Join(root, "ignored"), OperationExecute); err == nil ||
+		!strings.Contains(err.Error(), "is ignored by session sync_test") {
+		t.Fatal("ignores not registered:", err)
 	}
 }
 

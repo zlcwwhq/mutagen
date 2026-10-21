@@ -21,6 +21,7 @@ what to change.
 | `<alpha\|beta> is not connected for remote commands` (255) | Session just started or is reconnecting | Retry after a few seconds; if it persists, tell the user |
 | `multiple sessions contain ...` / `multiple sessions match ...` (255) | The directory is synced by the sessions listed in the message | Add `-s <name-or-id>` to the command (`MUTAGEN_REMOTE_SESSION` also works, but only chooses among the sessions containing the directory; see "Which session and directory are used") |
 | `<dir> is synchronized by session X, not Y` (255) | `-s` selected a session whose roots don't contain the directory, which another session's root does: the command would run at the selected session's remote root, not in a corresponding directory | Drop `-s` to use the session containing the directory, or add `--cwd` to say where to run on the selected session's side |
+| `<dir> is ignored by session X` / `<dir> is inside <dir2>, which session X ignores` (255) | The session containing the directory doesn't synchronize it. Usually it's the root of a nested session that's paused or disconnected (or doesn't run commands from this side); sometimes it's a directory such as a build directory that exists separately on each side | For a nested session, tell the user that it isn't running; don't work around it with `--cwd`, which would run in the enclosing session's unsynchronized copy. Only if the directory is meant to exist separately on the other side, add `--cwd .` |
 | `both endpoints of session ... are on this system` (255) | `--session` used outside both roots of a local session | Run from inside the root you want to submit from |
 | `session ... is no longer connected for remote commands on this system` (255) | The session paused, reconnected, or was terminated after `remote` located it; `remote` doesn't switch to another session midway | Retry after a few seconds; if it persists, tell the user |
 | `the connection to the executing endpoint was lost ...` (255) | The session stopped synchronizing while the command ran (paused, reconnecting, replaced, or the daemon stopped), so the command was terminated: SIGTERM, then SIGKILL 5 seconds later | Files that it was writing may be incomplete. Once `remote --flush` succeeds, check them and rerun the command; detach long jobs. If it recurs, tell the user |
@@ -53,10 +54,12 @@ directory and runs commands in the corresponding remote directory, so prefer
   every synced root, it selects a session as `-s` does.
 - `remote` can't find sessions that are paused, disconnected, or that don't run
   commands submitted from this side. Inside the root of such a session nested
-  in another synced root, commands silently run through the enclosing session,
-  in its copy of the directory, and the flushes synchronize only the enclosing
-  session. If a nested session matters, pass `-s <nested>`, which fails instead
-  while it's unavailable, and tell the user if it isn't running.
+  in another synced root, the enclosing session is used: if it ignores the
+  nested root, as it typically does, commands fail (see `... which session X
+  ignores` above); otherwise, they silently run in the enclosing session's copy
+  of the directory, and the flushes synchronize only the enclosing session. If
+  a nested session matters, pass `-s <nested>`, which fails instead while it's
+  unavailable, and tell the user if it isn't running.
 - `remote` locates the session once per invocation and uses it for the flushes
   and the command, failing rather than switching sessions if it disconnects in
   between.

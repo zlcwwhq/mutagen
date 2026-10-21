@@ -73,12 +73,17 @@ Notes:
     sessions containing the current directory, and is ignored if none of
     them matches it; outside every root, it selects a session as --session
     does.
+  - Commands don't run in a directory that the session ignores (or inside
+    one), since the session doesn't synchronize it, unless --cwd is given:
+    --cwd . runs them in the corresponding directory anyway, such as in an
+    ignored build directory that exists on both endpoints.
   - Sessions that are paused, disconnected, or don't run commands submitted
     from this side can't be found, so inside the root of such a session that
-    is nested in another session's root, commands run through the enclosing
-    session (in its copy of the directory), unless --session selects the
-    nested session, which makes them fail instead. Once remote has located
-    the session, it doesn't switch to another, even if that one disconnects.
+    is nested in another session's root, the enclosing session is used: if
+    it ignores the nested root, as it typically does, commands are refused,
+    and otherwise they run in its copy of the directory. --session selecting
+    the nested session makes them fail instead. Once remote has located the
+    session, it doesn't switch to another, even if that one disconnects.
   - The session is synchronized before the command, so that it sees local
     changes, and after it, so that its changes are present locally when remote
     exits. Failure to synchronize only produces a warning, as do conflicts

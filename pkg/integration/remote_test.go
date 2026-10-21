@@ -272,8 +272,9 @@ func createRemoteDiffSession(t *testing.T, alphaRoot, betaRoot string) string {
 // that alpha executes in the daemon process. It performs the initial
 // synchronization through the session itself, from the submitting endpoint,
 // even if another session's root contains its root, and waits until the
-// session can execute commands.
-func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaExecutes bool) string {
+// session can execute commands. The session ignores the specified patterns, if
+// any.
+func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaExecutes bool, ignores ...string) string {
 	t.Helper()
 	mode, submitting := synchronization.RemoteCommandMode_RemoteCommandModeBeta, alphaRoot
 	if alphaExecutes {
@@ -286,6 +287,7 @@ func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaEx
 		&synchronization.Configuration{
 			WatchMode:         synchronization.WatchMode_WatchModeNoWatch,
 			RemoteCommandMode: mode,
+			Ignores:           ignores,
 		},
 		&synchronization.Configuration{}, &synchronization.Configuration{},
 		name, nil, false, "",
@@ -455,6 +457,45 @@ func TestRemoteNestedSessionSelection(t *testing.T) {
 	} else if code, output, errorOutput := runRemote(t, submission, "-s", "inner", "sh", "-c", "pwd -P"); code != 255 || output != "" ||
 		!strings.Contains(errorOutput, `no connected session matching "inner"`) {
 		t.Fatalf("paused session not reported: %d, %q, %q", code, output, errorOutput)
+	}
+}
+
+func TestRemoteNestedSessionExcluded(t *testing.T) {
+	// Commands rely on a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer, inner := filepath.Join(directory, "outer"), filepath.Join(directory, "outer", "inner")
+	if err := os.MkdirAll(filepath.Join(inner, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	outerBeta, innerBeta := filepath.Join(directory, "outer-beta"), filepath.Join(directory, "inner-beta")
+	createRemoteSession(t, "outer", outer, outerBeta, false, "inner")
+	innerID := createRemoteSession(t, "inner", inner, innerBeta, false)
+	submission := filepath.Join(inner, "sub")
+	pwd := []string{"sh", "-c", "pwd -P"}
+	if code, output, errorOutput := runRemote(t, submission, pwd...); code != 0 || output != filepath.Join(innerBeta, "sub")+"\n" {
+		t.Fatalf("nested session not used: %d, %q, %q", code, output, errorOutput)
+	}
+
+	// While the nested session is paused, commands submitted inside its root
+	// aren't run through the enclosing session, which ignores it, unless the
+	// directory is specified explicitly.
+	if err := synchronizationManager.Pause(context.Background(), &selection.Selection{Specifications: []string{innerID}}, ""); err != nil {
+		t.Fatal("unable to pause session:", err)
+	} else if code, output, errorOutput := runRemote(t, submission, pwd...); code != 255 || output != "" ||
+		!strings.Contains(errorOutput, "is inside "+inner+", which session outer") || !strings.Contains(errorOutput, "--cwd .") {
+		t.Fatalf("command in an excluded directory not refused: %d, %q, %q", code, output, errorOutput)
+	}
+	if err := os.MkdirAll(filepath.Join(outerBeta, "inner", "sub"), 0700); err != nil {
+		t.Fatal(err)
+	} else if code, output, errorOutput := runRemote(t, submission, append([]string{"--cwd", "."}, pwd...)...); code != 0 ||
+		output != filepath.Join(outerBeta, "inner", "sub")+"\n" {
+		t.Fatalf("explicit directory not used: %d, %q, %q", code, output, errorOutput)
 	}
 }
 

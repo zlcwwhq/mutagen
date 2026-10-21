@@ -140,11 +140,18 @@ root, it selects a session as `--session` does. Once `remote` has located the
 session, it uses that session for the rest of the invocation, rather than
 switching to another session if it disconnects in the meantime.
 
+Commands don't run in a directory that the session ignores, or inside one, since
+the session doesn't synchronize it, unless `--cwd` is given: `--cwd .` runs them
+in the corresponding directory anyway, such as in an ignored build directory
+that exists on both endpoints.
+
 `remote` can't find sessions that are paused, disconnected, or that don't run
 commands submitted from the current endpoint. Inside the root of such a session
-that's nested in another session's root, commands therefore run through the
-enclosing session, in its copy of the directory, unless `--session` selects the
-nested session, which makes them fail instead.
+that's nested in another session's root, the enclosing session is used instead:
+if it ignores the nested root, as it typically does, commands are refused, and
+otherwise they run in its copy of the directory. `--session` selecting the
+nested session makes them fail instead. `--flush` and `--diff` still use the
+enclosing session.
 
 `--cwd` overrides the working directory (relative values are resolved against
 the corresponding directory, or against the opposite endpoint's root when

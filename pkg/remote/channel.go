@@ -50,6 +50,11 @@ type Endpoint struct {
 	// are interpreted on the endpoint's system, while other paths are resolved
 	// against Root.
 	Prologue string
+	// Ignores are the session's ignores, which submissions from the endpoint's
+	// system use to determine whether the session synchronizes the directory
+	// corresponding to theirs (see Selection.Corresponding). If nil, then no
+	// directory is considered excluded.
+	Ignores *Ignores `json:",omitempty"`
 }
 
 // Channel connects the daemon to one endpoint's command facilities. Routes

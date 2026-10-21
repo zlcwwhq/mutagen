@@ -50,6 +50,8 @@ type record struct {
 	// Created is the registration time, used to prefer the newest registration
 	// when an endpoint's previous executor has not yet noticed disconnection.
 	Created time.Time
+	// Ignores are the session's ignores, if known (see Endpoint.Ignores).
+	Ignores *Ignores `json:",omitempty"`
 }
 
 // registration is a record loaded from the registry.
@@ -157,6 +159,7 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 		Root:    root,
 		Alpha:   endpoint.Alpha,
 		Created: time.Now(),
+		Ignores: endpoint.Ignores,
 	})
 	if err != nil {
 		listener.Close()
@@ -231,7 +234,12 @@ type Selection struct {
 	// it through a session selected by Session whose roots don't contain the
 	// directory if another session's root does, since it would apply to the
 	// root of the selected session, rather than to anything corresponding to
-	// the directory.
+	// the directory. Dial also refuses to submit it through a session whose
+	// ignores exclude the directory or a parent of it inside the root (see
+	// Ignores), since the session doesn't synchronize the corresponding
+	// directory. Such a directory is typically the root of a nested session
+	// that isn't connected for remote commands on this system, and through
+	// which the submission would otherwise have been made.
 	Corresponding bool
 	// Target, if non-nil, restricts the selection to the session and endpoint
 	// that it identifies, which were typically located by a previous
@@ -448,6 +456,21 @@ func describe(session, name string) string {
 	return session
 }
 
+// excludedError reports that an operation corresponding to a directory can't
+// be submitted through the session of a candidate whose ignores exclude it,
+// given the excluded slash-separated path relative to the session's root (see
+// Ignores.excluded).
+func excludedError(directory string, c *candidate, excluded string) error {
+	session := describe(c.Session, c.Name)
+	excludedDirectory := filepath.Join(resolveSymbolicLinks(c.Root), filepath.FromSlash(excluded))
+	location := fmt.Sprintf("%s is ignored by session %s", directory, session)
+	if excluded != c.path {
+		location = fmt.Sprintf("%s is inside %s, which session %s ignores", directory, excludedDirectory, session)
+	}
+	return fmt.Errorf("%s, so that session doesn't synchronize the corresponding directory on its opposite endpoint; if %s is the root of another session, then that session is paused, disconnected, or doesn't run commands submitted from this side, so commands can't run through it until it does; otherwise, to run the command in the corresponding directory anyway, use --cwd .",
+		location, excludedDirectory)
+}
+
 // Dial submits the specified operation through the endpoint that a selection of
 // the specified session, if non-empty, locates for the specified directory,
 // with the session named by SessionVariable, if set, as the selection's
@@ -497,9 +520,18 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 	if err != nil {
 		return nil, nil, err
 	}
+	connection, c := endpoint.connection, endpoint.candidate
+
+	// Refuse operations corresponding to a directory that the session doesn't
+	// synchronize (see Selection.Corresponding).
+	if s.Target == nil && s.Corresponding && c.contained {
+		if excluded := c.Ignores.excluded(c.path); excluded != "" {
+			connection.Close()
+			return nil, nil, excludedError(directory, c, excluded)
+		}
+	}
 
 	// Perform the version handshake and submit the operation.
-	connection, c := endpoint.connection, endpoint.candidate
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
 	err = mutagen.ClientVersionHandshake(connection)
 	if err == nil {
