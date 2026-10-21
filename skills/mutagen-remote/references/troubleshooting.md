@@ -29,6 +29,7 @@ what to change.
 | `unable to access prologue` (126) | A prologue is missing or inaccessible, or an override is a dangling link | Use `--no-prologue` to inspect the reported path; repair the workspace override, or tell the user if their configured script is unavailable |
 | `unable to access working directory` (126) | The corresponding directory doesn't exist remotely | See "Conflicts and unsynchronized content", or use `--cwd` |
 | `is checked out through the opposite endpoint` (255) | The conflict was checked out from the other side, which alone can apply or discard it | Leave it and its paths alone; if it seems abandoned, ask the user to discard it on that side (`remote --conflict-discard <path>`) |
+| `is already checked out in <dir>` (255) | The conflict has a workspace on this side, which may be another agent's or the user's resolution in progress | If you checked it out, do what the message says; otherwise leave it, or ask the user |
 
 Statuses 128+N mean that the remote command was killed by signal N.
 
@@ -50,9 +51,12 @@ with paths relative to the current directory:
   Otherwise, copy both versions somewhere outside the synced tree first, put
   the content you want in one copy (merging both sides' changes if needed),
   delete the other copy (`rm <path>` or `remote rm <path>`), and run
-  `remote --flush`. Nothing checks that the deleted copy is unchanged, so do
-  this promptly. If it's unclear which changes to keep, show the user the diff
-  and ask.
+  `remote --flush`. In one-way-safe sessions, put the content in alpha's copy
+  and delete beta's: synchronization copies alpha's copy over a deleted beta
+  copy, but leaves beta's copy unsynchronized if alpha's is deleted, and never
+  copies beta's changes to alpha. Check the result with `remote --diff <path>`.
+  Nothing checks that the deleted copy is unchanged, so do this promptly. If
+  it's unclear which changes to keep, show the user the diff and ask.
 - `this content couldn't be synchronized`: the side in parentheses couldn't
   read or write the path, for example because of permissions. Fix it on that
   side if you can, or tell the user.

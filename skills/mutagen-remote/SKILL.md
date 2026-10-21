@@ -55,13 +55,17 @@ In two-way-safe (the default) and one-way-safe sessions, use the
 [conflict workflow](references/conflicts.md) to download both copies of a
 conflict, merge them locally, and apply the result to both sides. Use
 `remote --conflicts` rather than flush warnings as the complete list, including
-resolutions left unfinished and workspaces to discard. From checkout until
-apply finishes, leave the conflicting paths unchanged on both sides and edit
-only the workspace; if they changed anyway, follow the workflow's recovery
-steps, since one side's changes may then exist only in the workspace. A
-conflict is checked out once, through one side, which alone can apply or
-discard it: leave conflicts checked out through the other side to it, and
-don't edit their paths.
+partially applied resolutions, which you finish by applying again, and
+workspaces whose conflicts are no longer listed. From checkout until apply
+finishes, leave the conflicting paths unchanged on both sides and edit only the
+workspace; if they changed anyway, follow the workflow's recovery steps, since
+one side's changes may then exist only in the workspace, which you must compare
+with the current file before discarding it: discarded workspaces are deleted
+after 7 days. A conflict is checked out once, through one side, which alone can
+apply or discard it: leave conflicts checked out through the other side to it,
+and don't edit their paths. A conflict checked out on your side may be another
+agent's or the user's resolution in progress: apply or discard only conflicts
+that you checked out, and ask the user about others.
 Preserve both sides' intent when it is clear, and ask the user when it's
 ambiguous, especially without a common ancestor.
 Conflicts involving directories require manual resolution; checkout and apply

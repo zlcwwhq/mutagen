@@ -74,7 +74,9 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 	// Workspaces that can't be read, such as those whose metadata was modified
 	// or removed, can be neither checked out again nor applied, so errors point
-	// to discarding them, which sets them aside regardless.
+	// to discarding them, which sets them aside regardless. Whether anything
+	// was applied through them is unknown, so errors and discard say to check
+	// the copies against their files if anything was.
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	ctx := context.Background()
 	for _, missing := range []bool{false, true} {
@@ -93,8 +95,10 @@ func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			const check = "if anything was applied through it, check the copies against its files"
 			reported := func(err error) bool {
-				return err != nil && strings.Contains(err.Error(), directory) && strings.Contains(err.Error(), "discard it")
+				return err != nil && strings.Contains(err.Error(), directory) && strings.Contains(err.Error(), "discard it") &&
+					strings.Contains(err.Error(), check)
 			}
 			target := &remote.Target{Session: "session", Root: root}
 			if _, err := checkout(ctx, root, &options{}, &remote.Listing{}, target, local); !reported(err) {
@@ -114,6 +118,8 @@ func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 			// can't be released, which is reported.
 			if _, err := discard(ctx, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
 				t.Fatal("unreleased checkout not reported:", err)
+			} else if !strings.Contains(err.Error(), check) {
+				t.Fatal("copies not to be checked against the workspace:", err)
 			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("unreadable workspace not set aside:", err)
 			}
@@ -124,6 +130,54 @@ func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 				t.Fatal("unreadable workspace not kept:", kept)
 			}
 		})
+	}
+}
+
+func TestDiscardAppliedWorkspace(t *testing.T) {
+	// Discarding a workspace through which results were applied changes
+	// neither copy, but its resolution was unfinished, so a copy may still
+	// have a result, or synchronization may have copied one original copy over
+	// the other, which then exists only in the workspace. Discard says so,
+	// including when it's unable to release the checkout, since a retry finds
+	// no workspace.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	file := &remote.Entry{Kind: remote.EntryFile}
+	for _, applied := range []bool{false, true} {
+		t.Run(fmt.Sprintf("applied=%t", applied), func(t *testing.T) {
+			local := filepath.Join(t.TempDir(), "file")
+			_, directory, err := workspaceDirectory(local)
+			if err != nil {
+				t.Fatal(err)
+			} else if err := os.Mkdir(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			w := &workspace{Session: "session", Path: "file", Local: file, Remote: file, directory: directory}
+			if applied {
+				w.Applied = []*remote.Entry{{Kind: remote.EntryMissing}}
+			}
+			if err := w.save(); err != nil {
+				t.Fatal(err)
+			}
+			// Without a daemon, the workspace is set aside, but its checkout
+			// can't be released, which is reported.
+			if _, err := discard(ctx, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
+				t.Fatal("unreleased checkout not reported:", err)
+			} else if strings.Contains(err.Error(), "since results were applied through it") != applied {
+				t.Fatal("applied results misreported:", err)
+			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("workspace not set aside:", err)
+			}
+		})
+	}
+
+	// Once the checkout is released, discard locates the workspace's copies in
+	// the backup.
+	note := appliedNote("backup")
+	for _, name := range []string{localName, remoteName} {
+		if !strings.Contains(note, filepath.Join("backup", name)) {
+			t.Fatalf("%s copy not located: %s", name, note)
+		}
 	}
 }
 
@@ -293,19 +347,47 @@ func TestCheckedOutAgain(t *testing.T) {
 		return w
 	}
 	for _, test := range []struct {
-		w        *workspace
-		conflict *remote.ConflictRoot
-		expected string
+		description string
+		w           *workspace
+		conflict    *remote.ConflictRoot
+		expected    []string
+		unexpected  []string
 	}{
-		{w(false), listed, "is already checked out in workspace: apply it"},
-		{w(false), changed, "the remote copy changed since checkout: discard the workspace"},
-		{w(false), nil, "resolved some other way"},
-		{w(true), nil, "apply again to finish resolving it"},
-		{&workspace{Session: "other", Alpha: true, Path: "file", Local: file, Remote: file}, listed, "an unrelated workspace exists"},
-		{&workspace{Session: "session", Alpha: true, Path: "file", Local: file, Remote: &remote.Entry{Kind: remote.EntryDirectory}}, listed, "aren't supported"},
+		// Another agent or the user may have checked the conflict out, and a
+		// checkout after discarding their workspace would reuse its files.
+		{"checked out", w(false), listed, []string{
+			"is already checked out in workspace, possibly by another agent or the user",
+			"if you checked it out, apply it, or discard the workspace", "otherwise, leave it, or ask the user",
+		}, nil},
+		{"changed", w(false), changed, []string{"the remote copy changed since checkout: discard the workspace"}, nil},
+		// A conflict that's no longer listed may have been ended by a change
+		// after checkout, which isn't detected, rather than resolved.
+		{"ended", w(false), nil, []string{
+			"resolved some other way, or ended by a change after checkout", "one side's changes only in the workspace",
+			"compare the current file with the workspace's local and remote files before discarding it", "deleted after 7 days",
+		}, nil},
+		// Partially applied resolutions are finished by applying again, whether
+		// or not their conflicts are still listed, rather than discarded, and
+		// the copy that apply updated isn't taken for a change since checkout.
+		{"unfinished", w(true), nil, []string{"apply again to finish resolving it"}, []string{"discard"}},
+		{"partially applied", w(true), listed, []string{"a result was partially applied through it: apply again to finish resolving it"}, []string{"discard"}},
+		{"partially applied and updated", w(true), changed, []string{"apply again to finish resolving it"}, []string{"discard", "changed since"}},
+		{"unrelated", &workspace{Session: "other", Alpha: true, Path: "file", Local: file, Remote: file}, listed, []string{"an unrelated workspace exists"}, nil},
+		{"directory", &workspace{Session: "session", Alpha: true, Path: "file", Local: file, Remote: &remote.Entry{Kind: remote.EntryDirectory}}, listed, []string{"aren't supported"}, nil},
 	} {
-		if err := checkedOut(test.w, test.conflict, target, "file"); err == nil || !strings.Contains(err.Error(), test.expected) {
-			t.Fatalf("expected %q, got %v", test.expected, err)
+		err := checkedOut(test.w, test.conflict, target, "file")
+		if err == nil {
+			t.Fatalf("%s: checking out again allowed", test.description)
+		}
+		for _, expected := range test.expected {
+			if !strings.Contains(err.Error(), expected) {
+				t.Fatalf("%s: expected %q, got %v", test.description, expected, err)
+			}
+		}
+		for _, unexpected := range test.unexpected {
+			if strings.Contains(err.Error(), unexpected) {
+				t.Fatalf("%s: unexpected %q in %v", test.description, unexpected, err)
+			}
 		}
 	}
 }

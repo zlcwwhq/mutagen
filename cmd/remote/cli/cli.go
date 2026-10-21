@@ -76,10 +76,12 @@ Notes:
   - Conflicts can be resolved in two-way-safe and one-way-safe sessions.
     remote --conflicts synchronizes, lists every conflict, how it can be
     resolved, and through which endpoint it's checked out, flags checked-out
-    copies that changed since checkout, and lists workspaces whose conflicts
-    are no longer listed: unfinished resolutions, and workspaces with nothing
-    applied, whose conflicts were resolved some other way. Conflict operations
-    accept several paths, with options before them.
+    copies that changed since checkout and partially applied resolutions, and
+    lists workspaces whose conflicts are no longer listed, with their
+    locations: unfinished resolutions, and workspaces with nothing applied,
+    whose conflicts were resolved some other way or ended by a change after
+    checkout. Conflict operations accept several paths, with options before
+    them.
   - Before checking out, stop anything that writes the conflicting paths on
     either endpoint, and leave them unchanged until apply finishes; changing
     them meanwhile isn't supported. Apply fails without writing a copy that
@@ -87,10 +89,14 @@ Notes:
     they change anyway, stop whatever changed them, then discard the
     workspace and check out again. A change that ends the conflict (such as
     reverting or deleting one copy, so that synchronization copies the other
-    over it) may leave one side's changes only in the workspace, which
-    discard keeps. Each conflict is checked out once, through one endpoint,
-    which alone can apply or discard it: checking it out again, through
-    either endpoint, fails until then.
+    over it) may leave one side's changes only in the workspace: compare the
+    current file with its local and remote files before discarding it, and
+    restore what's needed (on alpha in one-way-safe sessions, which never
+    copy beta's changes to alpha). Each conflict is checked out once, through
+    one endpoint, which alone can apply or discard it: checking it out again,
+    through either endpoint, fails until then. A local checkout may be
+    another agent's or the user's resolution in progress, so apply or discard
+    only checkouts that you made.
   - --conflict-checkout downloads both complete copies into a workspace (in
     the Mutagen data directory) and prints their paths. For two files, it also
     looks for their common ancestor (the file that both endpoints last agreed
@@ -109,20 +115,23 @@ Notes:
     the copy taken, as checked out, to the other endpoint. Apply then
     synchronizes and checks that both copies match and no conflict or problem
     involves the path. The workspace, with the original copies, is then kept
-    for 7 days in case the resolution was wrong, as is one that
-    --conflict-discard sets aside without changing either copy. Both release
-    the checkout, so the conflict can be checked out again; --conflicts also
-    releases checkouts whose workspaces are missing, such as after an
-    interrupted checkout. Discard also sets aside a workspace that can't be
-    read, which checkout and apply report.
+    for 7 days (by the system clock, so a clock jump can delete it early) in
+    case the resolution was wrong, as is one that --conflict-discard sets
+    aside without changing either copy. Both release the checkout, so the
+    conflict can be checked out again; --conflicts also releases checkouts
+    whose workspaces are missing, such as after an interrupted checkout.
+    Discard also sets aside a workspace that can't be read, which checkout
+    and apply report.
   - Apply only replaces or deletes a copy that matches a checked-out copy
     (synchronization may copy one over the other), which the workspace keeps,
     or a result that it applied before, so it fails if either copy changed
-    since checkout; then discard the workspace and check out again. Other
-    failures can be retried, even if the conflict is no longer listed or the
-    merged file was edited since. If nothing was applied and the conflict is
-    no longer listed, apply refuses without changing either copy, since it
-    was resolved some other way; discard the workspace. Copies differing in
+    since checkout; then discard the workspace and check out again. Retry
+    other failures rather than discarding, since a copy may already have the
+    result, even if the conflict is no longer listed or the merged file was
+    edited since. If nothing was applied and the conflict is no longer
+    listed, apply refuses without changing either copy, since it was resolved
+    some other way or ended by a change; compare the current file with the
+    workspace's copies before discarding it. Copies differing in
     executability need --executable or --take. A conflict operation fails
     while another one on the same path is running on the same system.
   - No terminal is allocated, so interactive programs don't work.

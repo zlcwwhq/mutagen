@@ -264,26 +264,35 @@ that might write them on either endpoint. Changing a checked-out path isn't
 supported: apply refuses copies that changed before it runs, without writing
 them, but it doesn't lock them, so changes made while it runs can be
 overwritten. `remote --conflicts` flags checked-out copies that changed since
-checkout, so that their workspaces can be discarded before any merge work.
+checkout, so that their workspaces can be discarded before any merge work, as
+long as their conflicts are still listed: a change can also end a conflict.
 
 If a checked-out path changes anyway, first stop whatever changed it, so that
-it doesn't change again. The synchronized copies remain authoritative, and
-discarding the workspace is always safe, since it changes neither copy and
-keeps the workspace. A conflict that's still listed, such as one flagged as
-changed, or one that apply reports as changed or conflicting again, is
-resolved by discarding its workspace and checking it out again; if
-apply already updated the remote copy, the new conflict is between that result
-and the changed local copy, and the discarded workspace's merged file still
-has the earlier merge. A change can also end the conflict by itself, such as by
-making the copies identical, or by reverting or deleting one copy so that
-synchronization copies the other over it, including after part of a
-resolution was applied, which applying again then reports as a changed copy.
-The overwritten side's changes then remain only in the workspace, and checking
-out again fails: after discarding it, compare its `local`, `remote`, and
-`merged` files with the current file, and restore what's needed by editing the
-file, which is no longer a conflict. Changes made while apply writes a copy
-can't be recovered. A workspace that can't be read, such as one whose metadata
-was modified, can only be discarded, which sets it aside as well.
+it doesn't change again. The synchronized copies remain authoritative.
+Discarding the workspace changes neither copy and keeps the workspace, but the
+workspace may hold the only copy of one side's changes, and it's deleted after
+7 days. A conflict that's still listed, such as one flagged as changed, or one
+that apply reports as changed or conflicting again, is resolved by discarding
+its workspace and checking it out again; if apply already updated the remote
+copy, the new conflict is between that result and the changed local copy, and
+the discarded workspace's merged file still has the earlier merge. A change can
+also end the conflict by itself, such as by making the copies identical, or by
+reverting or deleting one copy so that synchronization copies the other over
+it, including after part of a resolution was applied, which applying again then
+reports as a changed copy. The overwritten side's changes then remain only in
+the workspace, and checking out again fails. `remote --conflicts` can't tell
+such a change from a deliberate resolution, so it lists the workspace, with its
+location, as one whose conflict was resolved some other way or ended by a
+change: before discarding it, compare its `local`, `remote`, and `merged` files
+with the current file, restore what's needed by editing the file, which is no
+longer a conflict, and check the copies with `remote --diff <path>`. In
+one-way-safe sessions, synchronization copies alpha's copy over a reverted or
+deleted beta copy, but leaves beta's copy unsynchronized if alpha's was
+deleted, and never copies beta's changes to alpha, so content is restored on
+alpha. Changes made while apply writes a copy can't be recovered. A workspace
+that can't be read, such as one whose metadata was modified, can only be
+discarded, which sets it aside as well; if anything was applied through it,
+check the copies against its files.
 
 Each conflict is checked out once, through one endpoint. Workspaces are kept on
 the system that checked them out, so the daemon records which endpoint checked
@@ -291,6 +300,10 @@ out each conflict, in its data directory, until the session is terminated.
 Checking a conflict out again, through either endpoint, fails until that
 endpoint applies or discards it, which releases the checkout, and
 `remote --conflicts` says through which endpoint each conflict is checked out.
+Checkouts aren't tied to whoever made them, so a conflict checked out on a
+system may be another agent's or person's resolution in progress there, and
+discarding its workspace would let a new checkout reuse its files: only
+whoever checked a conflict out should apply or discard it.
 Apply confirms the checkout before writing either copy, so a workspace whose
 conflict the opposite endpoint has checked out can only be discarded.
 `remote --conflicts` also releases checkouts whose workspaces are missing, such
@@ -321,14 +334,21 @@ partially applied result (a deletion, or a result matching what both copies
 last agreed on), which also removes the conflict. If either copy changed since
 checkout, apply fails without changing it; discard the workspace and check out
 again. Any other failed apply can be retried, even if the conflict is no longer
-listed (`remote --conflicts` lists such unfinished resolutions) or the merged
-file was edited since, and copies that already have the result are left as they
-are. A workspace through which nothing was applied, however, belongs to a
-conflict that was resolved some other way once it's no longer listed (such as
-by editing a copy): `remote --conflicts` lists it separately, and apply refuses
-it without changing either copy, rather than replace that resolution, so
-discard it. Workspaces of resolved and discarded conflicts are kept for 7 days,
-so that the original copies can be recovered.
+listed or the merged file was edited since, and copies that already have the
+result are left as they are. `remote --conflicts` marks such partially applied
+resolutions, whether or not their conflicts are still listed, to be applied
+again rather than discarded: discarding may leave a copy with the result, or
+one side's original only in the workspace if synchronization copied the other
+over it, as discard then points out. A workspace through which nothing was
+applied, however, belongs to a conflict that was resolved some other way (such
+as by editing a copy), or ended by a change after checkout, once it's no longer
+listed: `remote --conflicts` lists it separately, and apply refuses it without
+changing either copy, rather than replace that resolution, so compare it with
+the current file, as above, before discarding it. Workspaces of resolved and
+discarded conflicts are kept for 7 days, so that the original copies can be
+recovered. The retention follows the system clock: backups are named by the
+time they were set aside and deleted by it, so a clock jump can delete them
+early.
 
 Conflict operations accept several paths, after their options, and `--json`
 prints machine-readable results, one line per path. A conflict operation fails
