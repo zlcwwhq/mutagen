@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -247,7 +248,7 @@ func mergeNote(w *workspace, regions int) string {
 	case method == mergeWhole:
 		return fmt.Sprintf("No common ancestor was found, and the copies couldn't be compared line by line, since %s, so the merged file is a single region with both complete copies: compare them; neither side's additions or deletions are known to be newer.", w.merge.reason)
 	case method == mergeInconsistent:
-		return fmt.Sprintf("Both sides' changes since their common ancestor couldn't be merged reliably (such as a line that each side moved elsewhere, or changes among repeated lines), so every region where the copies differ is marked (%d), without the base version: compare each side with Base to see what each changed, and combine both sides' changes.", regions)
+		return fmt.Sprintf("Both sides' changes since their common ancestor couldn't be merged reliably (such as a line that each side moved elsewhere), so every region where the copies differ is marked (%d), without the base version: compare each side with Base to see what each changed, and combine both sides' changes.", regions)
 	case method == mergeAncestor && regions == 0:
 		return "Both copies' changes since their common ancestor were merged without conflicts, but merging line by line can misplace changes: compare the merged file with Local, Remote, and Base before applying it."
 	case method == mergeAncestor:
@@ -308,8 +309,8 @@ func markedMerge(a, b []byte, markers conflictMarkers) string {
 	return merged
 }
 
-// maximumAnchoringDepth bounds the recursion of anchoredEdits, which bounds its
-// cost for inputs whose lines only become unique in ever smaller ranges.
+// maximumAnchoringDepth bounds the recursion of mergeSegments, which bounds
+// its cost for inputs whose lines only become unique in ever smaller ranges.
 const maximumAnchoringDepth = 16
 
 // longestIncreasing returns the indices of a longest strictly increasing
@@ -342,32 +343,11 @@ func longestIncreasing(values []int) []int {
 	return result
 }
 
-// anchoredEdits computes edit scripts transforming base into local and into
-// remote for a three-way merge. Both leave the lines that occur exactly once in
-// each of the three versions unchanged, as long as they appear in the same
-// order in all of them (keeping a longest such sequence), as patience diff
-// does for two versions, and recurse into the lines between them, where other
-// lines may occur once. Where there are no such lines, they're minimal (see
-// diffLines). They aren't necessarily minimal overall, which merges don't
-// require, since they compare the regions between unchanged lines by their
-// contents.
-//
-// Minimal scripts are often ambiguous: one may keep a line unchanged by
-// matching it with an equal line across a unique one, such as a delimiter,
-// deleting and inserting that one instead, as if the line had moved, while
-// another, equally short, keeps the delimiter. Scripts computed separately for
-// each side may resolve such ambiguities differently, depending on the changes
-// elsewhere, and a merge would then see a change made identically on both
-// sides as different changes, and apply it twice, or apply a deletion to a
-// line that one side inserted. Lines that are unique in all three versions are
-// matched the same way in both scripts, regardless of the changes around them,
-// and they divide the versions into the same ranges for both sides. (Lines
-// unique in base and in one side only, such as a line that the other side
-// duplicated, would be matched differently in the other side's script.)
-func anchoredEdits(base, local, remote []string, depth int) ([]edit, []edit) {
-	if depth >= maximumAnchoringDepth {
-		return diffLines(base, local), diffLines(base, remote)
-	}
+// uniqueAnchors returns the positions in base, local, and remote of lines that
+// occur exactly once in each of the three versions, as long as they appear in
+// the same order in all of them, keeping a longest such sequence, as patience
+// diff does for two versions. Such lines correspond unambiguously.
+func uniqueAnchors(base, local, remote []string) [][3]int {
 	type occurrences struct {
 		base, local, remote int
 		// at holds the positions in local and remote.
@@ -394,12 +374,12 @@ func anchoredEdits(base, local, remote []string, depth int) ([]edit, []edit) {
 		}
 	}
 
-	// Find unique lines in the same order in all three versions. A longest
-	// such sequence is approximated by a longest sequence in the same order in
-	// base and one side, and of those, a longest sequence in the same order in
-	// the other side too, starting with whichever side yields more. (Lines
-	// that moved differently on each side may otherwise displace others, which
-	// are then ordered differently in the other side.)
+	// A longest sequence in the same order in all three versions is
+	// approximated by a longest sequence in the same order in base and one
+	// side, and of those, a longest sequence in the same order in the other
+	// side too, starting with whichever side yields more. (Lines that moved
+	// differently on each side may otherwise displace others, which are then
+	// ordered differently in the other side.)
 	var candidates [][3]int
 	for i, line := range base {
 		if c := counts[line]; c.base == 1 && c.local == 1 && c.remote == 1 {
@@ -421,104 +401,7 @@ func anchoredEdits(base, local, remote []string, depth int) ([]edit, []edit) {
 	if alternative := ordered(ordered(candidates, 2), 1); len(alternative) > len(anchors) {
 		anchors = alternative
 	}
-	if len(anchors) == 0 {
-		return diffLines(base, local), diffLines(base, remote)
-	}
-
-	// Compute the scripts between the anchors.
-	var localScript, remoteScript []edit
-	i, j, k := 0, 0, 0
-	for _, anchor := range append(anchors, [3]int{len(base), len(local), len(remote)}) {
-		localGap, remoteGap := anchoredEdits(base[i:anchor[0]], local[j:anchor[1]], remote[k:anchor[2]], depth+1)
-		localScript, remoteScript = append(localScript, localGap...), append(remoteScript, remoteGap...)
-		if anchor[0] < len(base) {
-			localScript = append(localScript, edit{' ', base[anchor[0]]})
-			remoteScript = append(remoteScript, edit{' ', base[anchor[0]]})
-		}
-		i, j, k = anchor[0]+1, anchor[1]+1, anchor[2]+1
-	}
-	return localScript, remoteScript
-}
-
-// embedLeftmost determines which lines of a sequence are changed if a
-// subsequence of it, its unchanged lines, is matched as early as possible.
-func embedLeftmost(lines, unchanged []string) []bool {
-	changed := make([]bool, len(lines))
-	k := 0
-	for i, line := range lines {
-		if k < len(unchanged) && line == unchanged[k] {
-			k++
-		} else {
-			changed[i] = true
-		}
-	}
-	return changed
-}
-
-// canonicalEdits returns an edit script transforming base into other that
-// leaves lines with the same contents unchanged as a script does, but
-// positions every changed line canonically. A change adjacent to equal lines,
-// such as a line inserted next to an equal line, has several equivalent
-// positions, and scripts computed for different versions may choose different
-// ones, depending on the changes elsewhere (diffLines, for example, keeps
-// unchanged leading and trailing lines first). A three-way merge compares two
-// scripts' positions, so it would see an identical change made on both sides
-// at different positions as two changes, and apply it twice, without marking a
-// conflict. The unchanged lines are thus matched as early as possible in both
-// base and other, which moves each changed line as late as possible and
-// depends only on the lines around it, while leaving the unchanged lines'
-// contents, and thus their correspondence, as they were. (Git moves runs of
-// changes as late as possible too, but additionally prefers positions where
-// deletions and insertions are adjacent, which depends on the other changes in
-// the script, and thus differs between the sides.) Deletions and insertions
-// thus move separately, which can separate a replacement next to equal lines
-// into an insertion and the deletion of another line, misrepresenting it
-// (see unambiguousSegments).
-func canonicalEdits(base, other []string, script []edit) []edit {
-	var unchanged []string
-	for _, e := range script {
-		if e.operation == ' ' {
-			unchanged = append(unchanged, e.line)
-		}
-	}
-	baseChanged, otherChanged := embedLeftmost(base, unchanged), embedLeftmost(other, unchanged)
-
-	// Rebuild the script, pairing the unchanged lines in order.
-	script = make([]edit, 0, len(script))
-	for i, j := 0, 0; i < len(base) || j < len(other); {
-		if i < len(base) && baseChanged[i] {
-			script = append(script, edit{'-', base[i]})
-			i++
-		} else if j < len(other) && otherChanged[j] {
-			script = append(script, edit{'+', other[j]})
-			j++
-		} else {
-			script = append(script, edit{' ', base[i]})
-			i, j = i+1, j+1
-		}
-	}
-	return script
-}
-
-// matchLines maps each line of base to the line of the other version that an
-// edit script transforming base into it leaves the line unchanged as, or to -1
-// if it's changed. Matches increase monotonically.
-func matchLines(base []string, script []edit) []int {
-	matches := make([]int, len(base))
-	i, j := 0, 0
-	for _, edit := range script {
-		switch edit.operation {
-		case ' ':
-			matches[i] = j
-			i, j = i+1, j+1
-		case '-':
-			matches[i] = -1
-			i++
-		case '+':
-			j++
-		}
-	}
-	return matches
+	return anchors
 }
 
 // mergeSegment is a part of a merge, which consists of consecutive lines of
@@ -549,180 +432,214 @@ func (s *mergeSegment) resolve() {
 }
 
 // mergeSegments merges the local and remote versions of text with their
-// common ancestor line by line, as diff3 does: lines unchanged on both sides
-// delimit regions, which are resolved separately (see mergeSegment.resolve).
+// common ancestor line by line. Lines that occur once in each version, in the
+// same order in all of them (see uniqueAnchors), are unchanged on both sides,
+// and divide the versions into regions, which are merged the same way, since
+// other lines may occur once in them. A region without such lines is merged as
+// a whole, as diff3 merges a region (see mergeSegment.resolve), so that both
+// sides' changes in it are marked together unless only one side changed it, or
+// both changed it identically.
 //
-// A merge is only as good as each side's alignment with the ancestor: a change
-// that both sides made identically must be aligned identically, since it would
-// otherwise be seen as two changes and applied twice (or, for a deletion,
-// delete more than either side did) without marking a conflict. The edit
-// scripts are thus anchored at the same lines (see anchoredEdits), and their
-// changes are positioned canonically (see canonicalEdits). Alignments can
-// still misrepresent changes where lines repeat, however, which
-// unambiguousSegments detects.
-func mergeSegments(b, l, r []string) []mergeSegment {
-	localScript, remoteScript := anchoredEdits(b, l, r, 0)
-	localMatches := matchLines(b, canonicalEdits(b, l, localScript))
-	remoteMatches := matchLines(b, canonicalEdits(b, r, remoteScript))
+// Lines in such a region repeat (or are missing from some version), so each
+// side's changes there can be aligned with the ancestor in several ways, and
+// alignments computed separately for each side can misrepresent changes in
+// ways that merging them line by line wouldn't reveal: a change made
+// identically on both sides can be aligned differently on each, and applied
+// twice, or a replacement can be aligned as the insertion of a line and the
+// deletion of another, equal one, which coincides with a deletion on the other
+// side, so that the merge drops it. Lines that occur once in each version
+// divide the versions into the same regions for both sides, and merging each
+// region as a whole loses nothing: a marked region contains everything that
+// each version has there. Both sides' changes separated only by repeated lines
+// are thus marked together, as are both sides' changes in ranges that recursion
+// doesn't reach (see maximumAnchoringDepth).
+func mergeSegments(base, local, remote []string, depth int) []mergeSegment {
+	var anchors [][3]int
+	if depth < maximumAnchoringDepth {
+		anchors = uniqueAnchors(base, local, remote)
+	}
+	if len(anchors) == 0 {
+		if len(base) == 0 && len(local) == 0 && len(remote) == 0 {
+			return nil
+		}
+		region := mergeSegment{base: base, local: local, remote: remote}
+		region.resolve()
+		return []mergeSegment{region}
+	}
 	var segments []mergeSegment
 	i, j, k := 0, 0, 0
-	for i < len(b) || j < len(l) || k < len(r) {
-		if i < len(b) && localMatches[i] == j && remoteMatches[i] == k {
-			line := b[i : i+1]
+	for _, anchor := range append(anchors, [3]int{len(base), len(local), len(remote)}) {
+		segments = append(segments, mergeSegments(base[i:anchor[0]], local[j:anchor[1]], remote[k:anchor[2]], depth+1)...)
+		if anchor[0] < len(base) {
+			line := base[anchor[0] : anchor[0]+1]
 			segments = append(segments, mergeSegment{base: line, local: line, remote: line, merged: line})
-			i, j, k = i+1, j+1, k+1
-			continue
 		}
-
-		// The region ends at the next base line that's unchanged on both sides,
-		// or at the end of every version.
-		end := i
-		for end < len(b) && (localMatches[end] < 0 || remoteMatches[end] < 0) {
-			end++
-		}
-		localEnd, remoteEnd := len(l), len(r)
-		if end < len(b) {
-			localEnd, remoteEnd = localMatches[end], remoteMatches[end]
-		}
-		segment := mergeSegment{base: b[i:end], local: l[j:localEnd], remote: r[k:remoteEnd]}
-		segment.resolve()
-		segments = append(segments, segment)
-		i, j, k = end, localEnd, remoteEnd
+		i, j, k = anchor[0]+1, anchor[1]+1, anchor[2]+1
 	}
 	return segments
 }
 
-// reversedLines returns a copy of lines in reverse order.
-func reversedLines(lines []string) []string {
-	result := make([]string, len(lines))
-	for i, line := range lines {
-		result[len(lines)-1-i] = line
+// moveKeys returns keys identifying the lines that a version of a segment
+// removes from its base version and the lines that it adds, which the segments
+// at either end of a move share (see markAmbiguousMoves): one for all of them,
+// regardless of their order, which is equal for versions that remove (or add)
+// the same lines as many times, and one for each of them that occurs once in
+// the whole base version.
+func moveKeys(base, version []string, unique map[string]bool) (removed, added []string) {
+	if slices.Equal(base, version) {
+		return nil, nil
 	}
-	return result
+	counts := make(map[string]int)
+	for _, line := range base {
+		counts[line]++
+	}
+	for _, line := range version {
+		counts[line]--
+	}
+	var removals, additions strings.Builder
+	for _, line := range slices.Sorted(maps.Keys(counts)) {
+		lines, keys, count := &removals, &removed, counts[line]
+		if count < 0 {
+			lines, keys, count = &additions, &added, -count
+		}
+		if count > 0 && unique[line] {
+			*keys = append(*keys, "line "+line)
+		}
+		for ; count > 0; count-- {
+			fmt.Fprintf(lines, "%d:%s", len(line), line)
+		}
+	}
+	if removals.Len() > 0 {
+		removed = append(removed, "lines "+removals.String())
+	}
+	if additions.Len() > 0 {
+		added = append(added, "lines "+additions.String())
+	}
+	return removed, added
 }
 
-// mirroredSegments merges the versions with their lines in reverse order (see
-// mergeSegments) and returns the segments in the original order, with their
-// lines in the original order. Changes are thus positioned canonically in the
-// opposite direction, as early as possible rather than as late as possible
-// (see canonicalEdits), and where several sequences of unique lines could
-// anchor the edit scripts, another may be chosen (see anchoredEdits).
-func mirroredSegments(b, l, r []string) []mergeSegment {
-	segments := mergeSegments(reversedLines(b), reversedLines(l), reversedLines(r))
-	slices.Reverse(segments)
+// markAmbiguousMoves marks the parts of a merge of text with its common
+// ancestor, base, where lines that one side moved coincide with an identical
+// change on the other side at only one end of the move, from one end to the
+// other, as a whole, with all three versions (see mergeSegment.resolve).
+//
+// Regions are merged separately, so lines that one side moved, which one
+// region loses and another gains, are merged as separate changes. If the other
+// side made only one of them, such as adding the same lines where the first
+// side moved them, or deleting them where they were, then that change is
+// merged as one made identically on both sides, which conceals the other
+// side's intent: it may have copied the lines, or moved them too and added
+// others where they were, and it may have deleted the lines, or moved them
+// elsewhere. The merge would keep the lines once, dropping the other side's
+// addition, or keep the lines that it deleted, even if the other end of the
+// move is in a marked region, which needn't reveal the move. Lines that one
+// side moved while the other side left both ends unchanged, or made the same
+// move, are merged as usual. Moves are recognized by regions removing and
+// adding the same lines, or a line that occurs once in the base version.
+// (Lines that repeat, such as closing braces or empty lines, are removed and
+// added separately too often to recognize moves of them individually, so the
+// merge can still misrepresent those.)
+func markAmbiguousMoves(base []string, segments []mergeSegment) []mergeSegment {
+	occurrences := make(map[string]int, len(base))
+	for _, line := range base {
+		occurrences[line]++
+	}
+	unique := make(map[string]bool, len(occurrences))
+	for line, count := range occurrences {
+		unique[line] = count == 1
+	}
+
+	// Find the extent of the regions that remove and that add the lines that
+	// each key identifies, with separate extents for changes that one side
+	// made ([0]) and that both sides made ([1]).
+	type extent struct {
+		first, last int
+		found       bool
+	}
+	removing, adding := make(map[string]*[2]extent), make(map[string]*[2]extent)
+	include := func(extents map[string]*[2]extent, local, remote []string, s int) {
+		sides := make(map[string]int, len(local)+len(remote))
+		for _, key := range local {
+			sides[key]++
+		}
+		for _, key := range remote {
+			sides[key]++
+		}
+		for key, count := range sides {
+			if extents[key] == nil {
+				extents[key] = new([2]extent)
+			}
+			if e := &extents[key][count-1]; e.found {
+				e.last = s
+			} else {
+				*e = extent{s, s, true}
+			}
+		}
+	}
 	for s := range segments {
 		segment := &segments[s]
-		segment.base, segment.local = reversedLines(segment.base), reversedLines(segment.local)
-		segment.remote, segment.merged = reversedLines(segment.remote), reversedLines(segment.merged)
-	}
-	return segments
-}
-
-// sameMerge determines whether two sequences of merge segments have the same
-// result: the same merged lines, and the same conflicting regions in the same
-// places.
-func sameMerge(a, b []mergeSegment) bool {
-	var aLines, bLines []string
-	for i, j := 0, 0; ; i, j = i+1, j+1 {
-		aLines, bLines = aLines[:0], bLines[:0]
-		for ; i < len(a) && !a[i].conflict; i++ {
-			aLines = append(aLines, a[i].merged...)
-		}
-		for ; j < len(b) && !b[j].conflict; j++ {
-			bLines = append(bLines, b[j].merged...)
-		}
-		if !slices.Equal(aLines, bLines) {
-			return false
-		} else if i == len(a) || j == len(b) {
-			return i == len(a) && j == len(b)
-		} else if !slices.Equal(a[i].local, b[j].local) || !slices.Equal(a[i].base, b[j].base) ||
-			!slices.Equal(a[i].remote, b[j].remote) {
-			return false
-		}
-	}
-}
-
-// mergePosition is a position in each version of a three-way merge.
-type mergePosition struct {
-	base, local, remote int
-}
-
-// after returns the position following a segment that starts at a position.
-func (p mergePosition) after(segment mergeSegment) mergePosition {
-	return mergePosition{p.base + len(segment.base), p.local + len(segment.local), p.remote + len(segment.remote)}
-}
-
-// unambiguousSegments merges the local and remote versions of text with their
-// common ancestor line by line, as mergeSegments does, except where the result
-// depends on how the changes are aligned with the ancestor, which it marks.
-//
-// Where lines repeat, changes have several equivalent positions, and the
-// positions that mergeSegments chooses for each side can misrepresent a change
-// as another, such as a replacement as an insertion and the deletion of an
-// equal line elsewhere, which coincides with a deletion on the other side, so
-// that the merge drops the other side's deletion. The versions are thus also
-// merged in the opposite direction (see mirroredSegments), which positions
-// changes differently wherever their positions are ambiguous. Positions where
-// both merges have segment boundaries, which both merges align the same way,
-// divide the versions into parts. Each part takes the forward merge's segments
-// if both merges agree on its result, and is otherwise merged as a whole, as
-// diff3 merges a region (see mergeSegment.resolve), which usually marks it,
-// with all three versions, so that no change is lost.
-func unambiguousSegments(b, l, r []string) []mergeSegment {
-	// Index the positions of the forward merge's segment boundaries.
-	forward, mirrored := mergeSegments(b, l, r), mirroredSegments(b, l, r)
-	boundaries := make(map[mergePosition]int, len(forward)+1)
-	var position mergePosition
-	boundaries[position] = 0
-	for s, segment := range forward {
-		position = position.after(segment)
-		boundaries[position] = s + 1
+		localRemoved, localAdded := moveKeys(segment.base, segment.local, unique)
+		remoteRemoved, remoteAdded := moveKeys(segment.base, segment.remote, unique)
+		include(removing, localRemoved, remoteRemoved, s)
+		include(adding, localAdded, remoteAdded, s)
 	}
 
-	// Compare the merges' results between the boundaries that they share,
-	// which occur in the same order in both, including the end of every
-	// version.
-	var segments []mergeSegment
-	var start, end mergePosition
-	f, m := 0, 0
-	for s, segment := range mirrored {
-		end = end.after(segment)
-		next, shared := boundaries[end]
-		if !shared {
-			continue
-		} else if sameMerge(forward[f:next], mirrored[m:s+1]) {
-			segments = append(segments, forward[f:next]...)
-		} else {
-			part := mergeSegment{
-				base:   b[start.base:end.base],
-				local:  l[start.local:end.local],
-				remote: r[start.remote:end.remote],
+	// Mark the parts from each end of such moves to the other. A part spans
+	// every region that removes the lines that a key identifies and every
+	// region that adds them, since each pair of them may be the ends of a move.
+	var marked []extent
+	for key, removals := range removing {
+		if additions := adding[key]; additions != nil {
+			for both := range 2 {
+				if removal, addition := removals[both], additions[1-both]; removal.found && addition.found {
+					marked = append(marked, extent{min(removal.first, addition.first), max(removal.last, addition.last), true})
+				}
 			}
-			part.resolve()
-			segments = append(segments, part)
 		}
-		start, f, m = end, next, s+1
 	}
-	return segments
+	if len(marked) == 0 {
+		return segments
+	}
+	slices.SortFunc(marked, func(a, b extent) int { return a.first - b.first })
+	var result []mergeSegment
+	next := 0
+	for m := 0; m < len(marked); {
+		first, last := marked[m].first, marked[m].last
+		for m++; m < len(marked) && marked[m].first <= last; m++ {
+			last = max(last, marked[m].last)
+		}
+		var part mergeSegment
+		for _, segment := range segments[first : last+1] {
+			part.base = append(part.base, segment.base...)
+			part.local = append(part.local, segment.local...)
+			part.remote = append(part.remote, segment.remote...)
+		}
+		part.resolve()
+		result = append(append(result, segments[next:first]...), part)
+		next = last + 1
+	}
+	return append(result, segments[next:]...)
 }
 
 // consistentRange computes the range of the occurrences of a line in a merge
 // that applies each side's changes once, given its occurrences in the base,
 // local, and remote versions: between as many as each side has, and as many
 // as applying both sides' changes separately yields (as many as both sides
-// have, minus the base's), which changes made identically on both sides
-// reduce.
+// have, minus the base's, but never fewer than none), which changes made
+// identically on both sides reduce. (A conflicting region whose sides both
+// delete a line that occurs elsewhere in the merge thus can't excuse those
+// occurrences.)
 func consistentRange(occurrences [3]int) (int, int) {
-	separate := occurrences[1] + occurrences[2] - occurrences[0]
+	separate := max(0, occurrences[1]+occurrences[2]-occurrences[0])
 	return min(occurrences[1], occurrences[2], separate), max(occurrences[1], occurrences[2], separate)
 }
 
 // consistentCounts determines whether the number of occurrences of each line
 // in a three-way merge is consistent with applying each side's changes once
 // (see consistentRange). Merges that keep a line twice because each side moved
-// it somewhere else violate it, as do some misaligned changes that merging in
-// both directions agrees on, but changes dropped or applied twice within the
-// range aren't detected, which unambiguousSegments must do. Conflicting
+// it somewhere else violate it, but changes dropped or applied twice within
+// the range aren't detected, which mergeSegments and markAmbiguousMoves must
+// avoid. Conflicting
 // regions have yet to be resolved, so each can add as many occurrences as
 // resolving it by applying both sides' changes in it once does, and the total
 // only needs to be consistent for some such resolution.
@@ -827,15 +744,16 @@ func renderMerge(segments []mergeSegment, markers conflictMarkers, withBase bool
 }
 
 // mergeWithBase merges the local and remote versions of text with their
-// common ancestor line by line (see unambiguousSegments), returning the merged
-// text, the number of marked regions, and whether the merge is three-way. A
+// common ancestor line by line (see mergeSegments and markAmbiguousMoves),
+// returning the merged text, the number of marked regions, and whether the
+// merge is three-way. A
 // merge whose line counts are inconsistent (see consistentCounts) misrepresents
 // some change, which may be anywhere, so every region where the local and
 // remote versions differ is marked instead, without the base version, as
 // markedMerge does.
 func mergeWithBase(base, local, remote []byte, markers conflictMarkers) (string, int, bool) {
 	b, l, r := splitLines(base), splitLines(local), splitLines(remote)
-	if segments := unambiguousSegments(b, l, r); consistentCounts(b, l, r, segments) {
+	if segments := markAmbiguousMoves(b, mergeSegments(b, l, r, 0)); consistentCounts(b, l, r, segments) {
 		merged, regions := renderMerge(segments, markers, true)
 		return merged, regions, true
 	}

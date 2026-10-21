@@ -13,10 +13,11 @@ func TestMergeThreeWayAmbiguousAlignment(t *testing.T) {
 	// Changes made identically on both sides must be applied once, even where
 	// edit scripts could align them in several ways, such as next to equal
 	// lines, or by matching a line across a delimiter, as if it had moved.
-	// Where the result depends on the alignment, which merging in both
-	// directions reveals (see unambiguousSegments), the part of the versions
-	// involved is marked instead, with all three versions, which loses
-	// nothing: each region contains everything that each version has there.
+	// Changes are thus only merged separately where a line that occurs once in
+	// each version separates them (see mergeSegments), and a region between
+	// such lines that both sides changed differently is marked, with all three
+	// versions, which loses nothing: each region contains everything that each
+	// version has there.
 	markers := markersFor("test")
 	region := func(local, base, remote string) string {
 		return markers.local + "\n" + local + markers.base + "\n" + base + markers.separator + "\n" + remote + markers.remote + "\n"
@@ -27,23 +28,34 @@ func TestMergeThreeWayAmbiguousAlignment(t *testing.T) {
 	}{
 		{"insertion after a repeated line", "a\nb\n", "x\na\nb\nb\n", "a\nb\nb\n", "x\na\nb\nb\n"},
 		{"insertion before a repeated line", "a\nb\n", "a\na\nb\nx\n", "a\na\nb\n", "a\na\nb\nx\n"},
-		// Positioned as early as possible, the a that both sides inserted is
-		// next to x, and the sides' insertions differ there, so the run is
-		// marked.
+		// Both sides inserted an a into the run, which local also preceded
+		// with x, so the run is marked.
 		{"insertion into a run", "a\na\na\nb\n", "x\na\na\na\na\nb\n", "a\na\na\na\nb\n",
 			region("x\na\na\na\na\n", "a\na\na\n", "a\na\na\na\n") + "b\n"},
-		// Likewise, the a that both sides deleted is next to x.
+		// Likewise for an a that both sides deleted.
 		{"deletion from a run", "a\na\na\nb\n", "x\na\na\nb\n", "a\na\nb\n",
 			region("x\na\na\n", "a\na\na\n", "a\na\n") + "b\n"},
-		// Likewise, the repeated block, which both sides inserted, is next to x
-		// if positioned before the original.
+		// Likewise for a repeated block that both sides inserted.
 		{"repeated block", "a\nb\n", "x\na\nb\na\nb\n", "a\nb\na\nb\n",
 			region("x\na\nb\na\nb\n", "a\nb\n", "a\nb\na\nb\n")},
 		{"removal of a repeated block", "a\nb\na\nb\nc\n", "a\nb\nc\ny\n", "a\nb\nc\n", "a\nb\nc\ny\n"},
 		{"insertion without a final newline", "a\nb", "x\na\nb\nb", "a\nb\nb", "x\na\nb\nb"},
 		{"deletion matched across a delimiter", "S1\nb\nb\nb\nS2\nb\n", "a\na\na\nb\nS1\nb\nb\nS2\nb\n", "S1\nb\nb\nS2\nb\n", "a\na\na\nb\nS1\nb\nb\nS2\nb\n"},
-		{"insertion of lines that a separate change removes", "a\na\nb\nc\nS1\na\n", "a\na\na\nS1\na\nb\na\nc\na\n", "a\na\nb\nc\nS1\na\nb\na\nc\na\n", "a\na\na\nS1\na\nb\na\nc\na\n"},
-		{"deletion of a line that a separate change inserts", "S1\nb\na\nb\n", "b\na\nb\nb\nS1\nb\nb\n", "S1\nb\nb\n", "b\na\nb\nb\nS1\nb\nb\n"},
+		// Local removed b and c, which both sides inserted after S1, while
+		// remote kept them: local may have moved them, and remote copied them,
+		// so both ends are marked (see markAmbiguousMoves).
+		{"insertion of lines that a separate change removes", "a\na\nb\nc\nS1\na\n", "a\na\na\nS1\na\nb\na\nc\na\n", "a\na\nb\nc\nS1\na\nb\na\nc\na\n",
+			region("a\na\na\nS1\na\nb\na\nc\na\n", "a\na\nb\nc\nS1\na\n", "a\na\nb\nc\nS1\na\nb\na\nc\na\n")},
+		// Likewise, both sides deleted a, which local inserted before S1: local
+		// may have moved it, and remote deleted it.
+		{"deletion of a line that a separate change inserts", "S1\nb\na\nb\n", "b\na\nb\nb\nS1\nb\nb\n", "S1\nb\nb\n",
+			region("b\na\nb\nb\nS1\nb\nb\n", "S1\nb\na\nb\n", "S1\nb\nb\n")},
+		// Each side moved a (with other lines) to a different segment, and
+		// merging would keep it twice, which no version has. Both sides
+		// removed a where it was, and only one added it in each place, so both
+		// ends of each move are marked.
+		{"line moved differently by each side", "b\nc\nc\nb\nS1\nc\nS2\nb\na\nc\n", "b\nc\nc\nb\nS1\nc\nc\na\nc\nS2\n", "c\nb\nc\nc\na\nS1\nc\nS2\n",
+			region("b\nc\nc\nb\nS1\nc\nc\na\nc\nS2\n", "b\nc\nc\nb\nS1\nc\nS2\nb\na\nc\n", "c\nb\nc\nc\na\nS1\nc\nS2\n")},
 	} {
 		for _, swap := range []bool{false, true} {
 			local, remote, expected := test.local, test.remote, test.merged
@@ -56,16 +68,16 @@ func TestMergeThreeWayAmbiguousAlignment(t *testing.T) {
 		}
 	}
 
-	// Each side moved a (with other lines) to a different segment, and merging
-	// would keep it twice, which no version has, so the merge's line counts
-	// are inconsistent (see consistentCounts), and every region where the
-	// sides differ is marked instead, without the base version, which the
-	// base still has.
-	base, local, remote := "b\nc\nc\nb\nS1\nc\nS2\nb\na\nc\n", "b\nc\nc\nb\nS1\nc\nc\na\nc\nS2\n", "c\nb\nc\nc\na\nS1\nc\nS2\n"
+	// Each side moved lines that repeat differently, which marking moves
+	// doesn't recognize, and merging would keep x twice, which no version has,
+	// so the merge's line counts are inconsistent (see consistentCounts), and
+	// every region where the sides differ is marked instead, without the base
+	// version, which the base still has.
+	base, local, remote := "}\nx\n}\ny\nx\n", "y\nx\n}\n", "y\n}\nx\n"
 	for _, sides := range [][2]string{{local, remote}, {remote, local}} {
 		if merged, _, threeWay := mergeWithBase([]byte(base), []byte(sides[0]), []byte(sides[1]), markers); threeWay ||
 			merged != markedMerge([]byte(sides[0]), []byte(sides[1]), markers) {
-			t.Errorf("line moved differently by each side: %q and %q merged into %q (three-way: %t)", sides[0], sides[1], merged, threeWay)
+			t.Errorf("repeated lines moved differently by each side: %q and %q merged into %q (three-way: %t)", sides[0], sides[1], merged, threeWay)
 		}
 	}
 }
@@ -104,12 +116,32 @@ func TestMergeMisalignedChanges(t *testing.T) {
 		// and remote also added e after the first b. The merge applied the
 		// identical changes twice (git merges them into remote's version).
 		{"identical changes next to an insertion", "a\nb\nc\nd\nb\ne\n", "d\na\nb\nc\na\ne\n", "d\na\nb\ne\nc\na\ne\n",
-			region("d\na\nb\nc\na\ne\n", "a\nb\nc\nd\nb\ne\n", "d\na\nb\ne\nc\na\ne\n")},
+			"d\na\nb\n" + region("c\na\ne\n", "e\n", "e\nc\na\ne\n")},
 		// Both sides added an empty line before the last brace, and local also
 		// added two lines at the start. The merge added the empty line twice
 		// (git merges them into local's version).
 		{"identical insertion among equal lines", "}\n}\n}\nu3\nu4\nu5\nu6\na\n", "a\n}\n}\n}\n\n}\nu3\nu4\nu5\nu6\na\n", "}\n}\n\n}\nu3\nu4\nu5\nu6\na\n",
 			region("a\n}\n}\n}\n\n}\n", "}\n}\n}\n", "}\n}\n\n}\n") + "u3\nu4\nu5\nu6\na\n"},
+		// Each side replaced a different line, and both deleted one of the
+		// braces between them, which the merge aligned with a different brace
+		// on each side, deleting two.
+		{"replacements among repeated lines", "}\nx\n}\n}\n}\ny\n}\n", "}\n}\nX\n}\n}\ny\n}\n}\n", "}\n}\nx\n}\n}\nY\n}\n}\n",
+			region("}\n}\nX\n}\n}\ny\n}\n}\n", "}\nx\n}\n}\n}\ny\n}\n", "}\n}\nx\n}\n}\nY\n}\n}\n")},
+		// Both sides moved two braces after "five", and remote also added two
+		// braces where they were. The merge took the braces that remote kept
+		// for unchanged and deleted them, as local did (git's histogram
+		// algorithm merges them into local's version): remote may have copied
+		// the braces, or moved them and then added two more.
+		{"block moved on both sides and added again on one", "one\ntwo\nthree\n}\n}\nfive\nsix\n", "one\ntwo\nthree\nfive\n}\n}\nsix\n", "one\ntwo\nthree\n}\n}\nfive\n}\n}\nsix\n",
+			"one\ntwo\nthree\n" + region("five\n}\n}\n", "}\n}\nfive\n", "}\n}\nfive\n}\n}\n") + "six\n"},
+		// Local moved b before a, and remote deleted b. The merge kept b, as
+		// moved, since both sides deleted it where it was.
+		{"function moved on one side and deleted on the other", "package p\n\nfunc a() {\n\ta()\n}\n\nfunc b() {\n\tb()\n}\n", "package p\n\nfunc b() {\n\tb()\n}\n\nfunc a() {\n\ta()\n}\n", "package p\n\nfunc a() {\n\ta()\n}\n",
+			"package p\n" + region("\nfunc b() {\n\tb()\n}\n\nfunc a() {\n\ta()\n}\n", "\nfunc a() {\n\ta()\n}\n\nfunc b() {\n\tb()\n}\n", "\nfunc a() {\n\ta()\n}\n")},
+		// Each side moved the same line to a different place, and merging kept
+		// it twice (git marks it).
+		{"line moved differently by each side", "import \"a\"\nimport \"b\"\nimport \"c\"\n", "import \"a\"\nimport \"c\"\nimport \"b\"\n", "import \"c\"\nimport \"a\"\nimport \"b\"\n",
+			region("import \"a\"\nimport \"c\"\nimport \"b\"\n", "import \"a\"\nimport \"b\"\nimport \"c\"\n", "import \"c\"\nimport \"a\"\nimport \"b\"\n")},
 		// A region marked elsewhere doesn't excuse a lossy merge of the rest,
 		// which an agent resolving the marked region wouldn't review.
 		{"modification next to a deletion, and a conflict", "values:\n  - 0\n  - 0\n  - 0\nend\nX\n", "values:\n  - 5\n  - 0\n  - 0\nend\nL\n", "values:\n  - 0\n  - 0\nend\nR\n",
@@ -125,15 +157,35 @@ func TestMergeMisalignedChanges(t *testing.T) {
 			}
 		}
 	}
+}
 
-	// Each side moved the same line to a different place, and merging kept it
-	// twice (git marks it), so every region where the copies differ is marked
-	// instead, without the base version.
-	base, local, remote := "import \"a\"\nimport \"b\"\nimport \"c\"\n", "import \"a\"\nimport \"c\"\nimport \"b\"\n", "import \"c\"\nimport \"a\"\nimport \"b\"\n"
-	for _, sides := range [][2]string{{local, remote}, {remote, local}} {
-		if merged, regions, threeWay := mergeWithBase([]byte(base), []byte(sides[0]), []byte(sides[1]), markers); threeWay ||
-			regions != 2 || merged != markedMerge([]byte(sides[0]), []byte(sides[1]), markers) {
-			t.Errorf("line moved differently by each side: %q and %q merged into %q (three-way: %t)", sides[0], sides[1], merged, threeWay)
+func TestMergeMovedCode(t *testing.T) {
+	// Both sides moved a function, and one side then inserted closing braces
+	// or an empty line anywhere, or deleted some lines, which may have added
+	// lines where the function was, or deleted it where it went. The result
+	// is that side, so a merge must be resolvable into it, which the clean
+	// parts of a merge that kept the lines that one side moved where the other
+	// side added them, or the lines that the other side deleted, aren't.
+	markers := markersFor("test")
+	base := splitLines([]byte("package p\n\nfunc a() {\n\tif x {\n\t\tx()\n\t}\n}\n\nfunc b() {\n\tif y {\n\t\ty()\n\t}\n}\n\nfunc c() {\n\tz()\n}\n"))
+	moved := slices.Concat(base[:2], base[8:14], base[2:8], base[14:])
+	var changed [][]string
+	for _, inserted := range [][]string{{"}\n", "}\n"}, {"\t}\n", "}\n"}, {"}\n"}, {"\n"}} {
+		for at := 0; at <= len(moved); at++ {
+			changed = append(changed, slices.Concat(moved[:at], inserted, moved[at:]))
+		}
+	}
+	for start := 0; start < len(moved); start++ {
+		for end := start + 1; end <= min(start+6, len(moved)); end++ {
+			changed = append(changed, slices.Concat(moved[:start], moved[end:]))
+		}
+	}
+	for _, further := range changed {
+		for _, sides := range [][2][]string{{moved, further}, {further, moved}} {
+			merged, _, threeWay := mergeWithBase([]byte(strings.Join(base, "")), []byte(strings.Join(sides[0], "")), []byte(strings.Join(sides[1], "")), markers)
+			if threeWay && !resolvable(cleanParts(merged, markers), further) {
+				t.Errorf("%q and %q merged into %q, which doesn't resolve into the latter", strings.Join(sides[0], ""), strings.Join(sides[1], ""), merged)
+			}
 		}
 	}
 }
@@ -263,7 +315,7 @@ func TestConsistentCounts(t *testing.T) {
 	// A merge that keeps a moved line twice has inconsistent line counts, even
 	// with a conflicting region elsewhere, unless resolving the region could
 	// make them consistent. Some misaligned changes leave the counts
-	// consistent, however, which merging in both directions detects instead.
+	// consistent, however, which merging by region avoids instead.
 	clean := func(merged string) []mergeSegment {
 		return []mergeSegment{{merged: splitLines([]byte(merged))}}
 	}
@@ -281,6 +333,10 @@ func TestConsistentCounts(t *testing.T) {
 			append(clean("b\na\nc\na\n"), conflict), false},
 		{"conflict resolvable into consistent counts", "a\nb\nX\n", "b\na\nL\n", "b\na\nR\n",
 			append(clean("b\na\n"), conflict), true},
+		// A region whose sides both lack a line can't remove its occurrences
+		// elsewhere.
+		{"line moved differently by each side, and a conflict deleting it", "m\na\nb\n", "a\nm\nb\n", "n\na\nb\nm\n",
+			append([]mergeSegment{{base: []string{"m\n"}, remote: []string{"n\n"}, conflict: true}}, clean("a\nm\nb\nm\n")...), false},
 		// These merges are wrong, but their counts are consistent.
 		{"identical insertions applied twice", "a\n", "a\nx\n", "a\nx\n", clean("a\nx\nx\n"), true},
 		{"dropped deletion", "0\n0\n0\n", "5\n0\n0\n", "0\n0\n", clean("5\n0\n0\n"), true},
@@ -313,8 +369,8 @@ func TestMergedFileNotes(t *testing.T) {
 			"merged without conflicts, but merging line by line can misplace changes: compare the merged file with Local, Remote, and Base before applying it", 0, false, false},
 		{"conflicting region", "local\n", "remote\n", "base\n",
 			"1 region changed differently on each side since their common ancestor is marked with the local, base, and remote versions", 1, false, true},
-		{"inconsistent merge", "import \"a\"\nimport \"c\"\nimport \"b\"\n", "import \"c\"\nimport \"a\"\nimport \"b\"\n", "import \"a\"\nimport \"b\"\nimport \"c\"\n",
-			"couldn't be merged reliably (such as a line that each side moved elsewhere, or changes among repeated lines), so every region where the copies differ is marked (2), without the base version: compare each side with Base", 2, false, false},
+		{"inconsistent merge", "y\nx\n}\n", "y\n}\nx\n", "}\nx\n}\ny\nx\n",
+			"couldn't be merged reliably (such as a line that each side moved elsewhere), so every region where the copies differ is marked (2), without the base version: compare each side with Base", 2, false, false},
 		{"invalid UTF-8", "caf\xe9\nlocal\n", "caf\xe9\nremote\n", "caf\xe9\n",
 			"The copies couldn't be merged line by line, since the local copy isn't valid UTF-8 text, so the merged file is a single region with the complete local, base, and remote versions: compare each side with Base", 1, true, true},
 		{"large copy", "remote\n", large, "base\n",

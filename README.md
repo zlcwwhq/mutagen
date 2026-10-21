@@ -291,15 +291,20 @@ Git's `HEAD` commit and index (read with `git cat-file`), or a file given with
 `--base`. With the ancestor, the `merged` file contains both sides' changes and
 marks only regions changed differently on each side, showing the local, base,
 and remote versions in Git's `diff3` style; without it, every region where the
-copies differ is marked. Changes among repeated lines can be aligned with the
-ancestor in several ways, which can drop or duplicate them, so checkout also
-merges in the opposite direction and marks whatever the two merges disagree
-on, with all three versions. If the result would still contain a line more or
-less often than applying each side's changes once allows (such as a line that
-each side moved elsewhere), checkout marks every region where the copies
-differ instead, without the base version. Merging line by line can still
-misplace changes, so review the merged file against both copies and the
-ancestor before applying it, even if nothing is marked. Copies too large to
+copies differ is marked. Changes among repeated lines (such as closing braces)
+can be aligned with the ancestor in several ways, which can drop or duplicate
+them, so checkout merges both sides' changes separately only where a line that
+occurs once in each version separates them, and otherwise marks them together,
+with all three versions. Lines that one side moved are marked too, from one
+end of the move to the other, if the other side made only one end's change,
+such as adding the same lines where they went (it may have copied them) or
+deleting them where they were (it may have deleted them). If the result would
+still contain a line more or less often than applying each side's changes once
+allows (such as a line that each side moved elsewhere), checkout marks every
+region where the copies differ instead, without the base version. Merging line
+by line can still misplace changes (such as moves of lines that repeat), so
+review the merged file against both copies and the ancestor before applying
+it, even if nothing is marked. Copies too large to
 compare line by line (or with too many lines) and copies that aren't valid
 UTF-8 are enclosed whole in a single region, with the ancestor, and binary
 copies get no merged file; checkout says which applies. Since synchronization
