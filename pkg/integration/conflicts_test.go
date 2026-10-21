@@ -404,7 +404,7 @@ func TestRemoteConflictCheckoutOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkouts, err := filepath.Glob(filepath.Join(directory, "*"))
+	checkouts, err := filepath.Glob(filepath.Join(directory, "sync_*"))
 	if err != nil || len(checkouts) != 1 {
 		t.Fatalf("unexpected checkouts: %v, %v", checkouts, err)
 	} else if err := os.Remove(checkouts[0]); err != nil {
@@ -498,7 +498,7 @@ func TestRemoteConflictLegacyCheckouts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkouts, err := filepath.Glob(filepath.Join(directory, "*"))
+	checkouts, err := filepath.Glob(filepath.Join(directory, "sync_*"))
 	if err != nil || len(checkouts) != 1 {
 		t.Fatalf("unexpected checkouts: %v, %v", checkouts, err)
 	}
@@ -530,7 +530,7 @@ func TestRemoteConflictCorruptCheckouts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkouts, err := filepath.Glob(filepath.Join(directory, "*"))
+	checkouts, err := filepath.Glob(filepath.Join(directory, "sync_*"))
 	if err != nil || len(checkouts) != 1 {
 		t.Fatalf("unexpected checkouts: %v, %v", checkouts, err)
 	}

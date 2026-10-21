@@ -213,15 +213,40 @@ func TestCheckoutSequences(t *testing.T) {
 		t.Fatal("claim not numbered after those of released checkouts:", status, err)
 	}
 
-	// Sequence numbers are no earlier than the time at which they're issued,
-	// so that they remain ordered after earlier ones if those aren't recorded
-	// anymore, such as when the session is recreated.
+	// The daemon records the latest sequence number that it issued, so claims
+	// remain numbered after earlier ones if the session's record of those is
+	// lost, such as when the session is recreated, even though the system
+	// clock is behind them (as if it had been turned back since), and claims
+	// of other sessions are numbered after them too.
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
+	} else if status, err := c.claimCheckout(true, "file", "e"); err != nil || status.Sequence != recorded+3 {
+		t.Fatal("claim not numbered after those of a lost record:", status, err)
 	}
+	other := newCheckoutController("file")
+	other.session.Identifier = "sync_other"
+	if status, err := other.claimCheckout(false, "file", "f"); err != nil || status.Sequence != recorded+4 {
+		t.Fatal("claim not numbered after those of another session:", status, err)
+	}
+
+	// Sequence numbers are no earlier than the time at which they're issued,
+	// so that they likely remain ordered after earlier ones if the daemon's
+	// record of those is lost too.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	before := uint64(time.Now().UnixNano())
-	if status, err := c.claimCheckout(true, "file", "e"); err != nil || status.Sequence < before {
+	if status, err := c.claimCheckout(true, "file", "g"); err != nil || status.Sequence < before {
 		t.Fatal("claim numbered before the time at which it was made:", status, err)
+	}
+
+	// A corrupt record of the latest sequence number is reported, rather than
+	// taken for none, which could number claims before earlier ones.
+	sequencePath, err := pathForCheckouts(sequenceName)
+	if err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(sequencePath, []byte("corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	} else if _, err := c.claimCheckout(true, "file", "g"); err == nil || !strings.Contains(err.Error(), "is corrupt") {
+		t.Fatal("corrupt record of the latest sequence number not reported:", err)
 	}
 }
 
@@ -297,12 +322,14 @@ func TestCorruptCheckouts(t *testing.T) {
 	}
 
 	// Once the file is removed, conflicts can be checked out again. Checkouts
-	// are saved durably, without leaving temporary files behind.
+	// and the latest sequence number are saved durably, without leaving
+	// temporary files behind.
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	} else if status, err := c.claimCheckout(true, "file", "token"); err != nil || status.Sequence == 0 {
 		t.Fatal("checkout not claimed once corrupt checkouts were removed:", status, err)
-	} else if entries, err := os.ReadDir(filepath.Dir(path)); err != nil || len(entries) != 1 {
+	} else if entries, err := os.ReadDir(filepath.Dir(path)); err != nil || len(entries) != 2 ||
+		entries[0].Name() != sequenceName || entries[1].Name() != c.session.Identifier {
 		t.Fatal("checkouts not saved or temporary files left behind:", entries, err)
 	}
 }

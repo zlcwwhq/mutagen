@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/remote"
@@ -42,17 +44,58 @@ type checkoutsRecord struct {
 	Checkouts []remote.Checkout
 }
 
+// sequenceName is the name of the file in the checkouts directory that records
+// the latest sequence number that the daemon issued to any session's claim
+// (see issueSequence), which no session identifier matches.
+const sequenceName = "sequence"
+
+// sequenceLock serializes the issue of sequence numbers to the claims of the
+// daemon's sessions (see issueSequence).
+var sequenceLock sync.Mutex
+
+// issueSequence issues a sequence number that's later than a session's
+// previous one and than any that the daemon issued before, the latest of which
+// it records durably in its data directory.
+func issueSequence(previous uint64) (uint64, error) {
+	sequenceLock.Lock()
+	defer sequenceLock.Unlock()
+	path, err := pathForCheckouts(sequenceName)
+	if err != nil {
+		return 0, err
+	}
+	var latest uint64
+	if data, err := os.ReadFile(path); err == nil {
+		if latest, err = strconv.ParseUint(string(data), 10, 64); err != nil {
+			return 0, fmt.Errorf("the latest sequence number of conflict checkouts in %s, on the Mutagen daemon's system, is corrupt (%v); remove that file to resolve conflicts again", path, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return 0, fmt.Errorf("unable to read the latest sequence number of conflict checkouts: %w", err)
+	}
+	sequence := max(latest+1, previous+1, uint64(time.Now().UnixNano()))
+	if err := remote.WriteFileDurably(path, []byte(strconv.FormatUint(sequence, 10))); err != nil {
+		return 0, fmt.Errorf("unable to save the latest sequence number of conflict checkouts: %w", err)
+	}
+	return sequence, nil
+}
+
 // number issues the sequence number of a successful claim, which is later than
-// that of the session's previous one. Sequence numbers are also no earlier
+// that of the session's previous one, and than those that the daemon issued to
+// other sessions' claims, since replacements compare sequence numbers by root
+// and path (see remote.Replacement.Sequence). The daemon records the latest one
+// that it issued (see issueSequence), so that sequence numbers remain ordered
+// after earlier ones when the session's record of those is lost, such as when
+// the session is recreated or its checkouts file is removed, even if the
+// system clock was turned back meanwhile. Sequence numbers are also no earlier
 // than the time at which they're issued, in nanoseconds since the epoch, so
-// that they remain ordered after earlier ones if the record of those is lost,
-// such as when the session is recreated or its checkouts file is removed, and
-// are ordered with those that the daemon issued for other sessions, since
-// replacements compare sequence numbers by root and path (see
-// remote.Replacement.Sequence).
-func (r *checkoutsRecord) number() uint64 {
-	r.Sequence = max(r.Sequence+1, uint64(time.Now().UnixNano()))
-	return r.Sequence
+// that they likely remain ordered after earlier ones if the daemon's record is
+// lost too, or if another daemon issued them.
+func (r *checkoutsRecord) number() (uint64, error) {
+	sequence, err := issueSequence(r.Sequence)
+	if err != nil {
+		return 0, err
+	}
+	r.Sequence = sequence
+	return sequence, nil
 }
 
 // loadCheckouts loads the session's checkouts, sorted by path, along with the
@@ -175,8 +218,9 @@ func (c *controller) claimCheckout(alpha bool, path, token string) (remote.Check
 		}
 		record.Checkouts = slices.Insert(record.Checkouts, index, remote.Checkout{Path: path, Alpha: alpha, Token: token})
 	}
-	status.Sequence = record.number()
-	if err := c.saveCheckouts(record); err != nil {
+	if status.Sequence, err = record.number(); err != nil {
+		return remote.CheckoutStatus{}, err
+	} else if err := c.saveCheckouts(record); err != nil {
 		return remote.CheckoutStatus{}, err
 	}
 	return status, nil
