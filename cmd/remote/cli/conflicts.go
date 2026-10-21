@@ -171,6 +171,9 @@ type workspace struct {
 	Applied []*remote.Entry `json:",omitempty"`
 	// directory is the workspace directory.
 	directory string
+	// merge describes how checkout prepared the merged file, which it
+	// describes (see prepareMerged). It isn't saved.
+	merge mergeOutcome
 }
 
 // file returns the path of a file in the workspace.
@@ -1335,13 +1338,7 @@ func describe(w *workspace, argument string) (*outcome, error) {
 			return nil, err
 		}
 		result.Regions = regions
-		if result.Base == "" {
-			note("No common ancestor was found, so every region where the copies differ is marked (%d), and neither side's additions or deletions are known to be newer.", regions)
-		} else if regions == 0 {
-			note("Both copies' changes since their common ancestor were merged without overlapping: review the merged file, then apply it.")
-		} else {
-			note("%d regions changed differently on each side since their common ancestor are marked with the local, base, and remote versions.", regions)
-		}
+		note("%s", mergeNote(w, regions))
 		if unterminated := unterminatedNote(w); unterminated != "" {
 			note("%s", unterminated)
 		}

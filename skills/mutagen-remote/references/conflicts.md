@@ -51,7 +51,7 @@ that you checked out, and ask the user about others.
    <<<<<<< local <token>
    (local lines)
    ||||||| base <token>
-   (common ancestor's lines, only if Base was found)
+   (common ancestor's lines, if merged with Base)
    ======= <token>
    (remote lines)
    >>>>>>> remote <token>
@@ -61,8 +61,12 @@ that you checked out, and ask the user about others.
      digest), changes made on only one side are already merged, and only
      regions changed differently on both sides are marked; checkout says how
      many. Compare each side with the base to see what each changed, combine
-     both changes, and remove the markers. Review a clean merge before
-     applying it.
+     both changes, and remove the markers. Merging line by line can misplace
+     changes, so compare the whole merged file with `Local`, `Remote`, and
+     `Base` before applying it, even if nothing is marked. If checkout says
+     that the changes couldn't be merged reliably (such as a line that each
+     side moved elsewhere), every region where the copies differ is marked
+     instead, without the base's lines.
    - **Without `Base`**, every region where the copies differ is marked, and
      neither side's additions or deletions are known to be newer. Checkout
      tries Git's `HEAD` commit and index; if the ancestor is elsewhere (another
@@ -70,11 +74,15 @@ that you checked out, and ask the user about others.
      `--base <file>` (after `--conflict-discard`, if already checked out).
      Otherwise, infer intent from context, and ask the user when unsure.
 
-   Very large files are enclosed in a single region; use ordinary file tools
-   to inspect manageable ranges. Binary copies get no merged file: create it,
-   or choose a copy with `--take`. If checkout says that a copy doesn't end
-   with a newline, the markers may have added one at the end of `Merged`;
-   remove it unless the result should end with one.
+   Files that are very large, have too many lines, or aren't valid UTF-8
+   can't be merged line by line, so the merged file is a single region with
+   each complete copy (and `Base`), and checkout says why: compare each side
+   with `Base` (or, without it, the copies with each other) and combine both
+   sides' changes rather than keep either copy whole, using ordinary file
+   tools to inspect manageable ranges. Binary copies get no merged file:
+   create it, or choose a copy with `--take`. If checkout says that a copy
+   doesn't end with a newline, the markers may have added one at the end of
+   `Merged`; remove it unless the result should end with one.
 
    For other supported conflicts (such as a symbolic link on one side and a
    file on the other), there's nothing to merge: decide which copy to keep.

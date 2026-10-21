@@ -120,7 +120,12 @@ Notes:
     verified by its digest. With it, the merged file contains both sides'
     changes, and marks only regions changed differently on each side, showing
     the local, base, and remote versions; without it, every region where the
-    copies differ is marked. Binary copies get no merged file. Checkout fails
+    copies differ is marked. If changes can't be merged reliably (such as a
+    line that each side moved elsewhere), every difference is marked, without
+    the base version. Review the merged file against the copies and the
+    ancestor even if nothing is marked. Files too large to compare line by
+    line or not valid UTF-8 are enclosed whole in one region, and binary
+    copies get no merged file; checkout says which applies. Checkout fails
     if the copies changed since they were listed (the ancestor might not be
     theirs); check out again. To check out with --base after checking out
     without it, discard the workspace first. Conflicts involving directories
