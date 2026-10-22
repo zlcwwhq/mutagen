@@ -457,11 +457,21 @@ Any process running as your user on a submitting endpoint's system can run
 commands on the executing endpoint, so only enable remote commands toward
 endpoints whose systems you trust as much as the executing endpoint itself.
 
-The [`skills/mutagen-remote`](skills/mutagen-remote/SKILL.md) agent skill
-teaches coding agents to use `remote`, covering synchronization, quoting,
-prologues, exit statuses, and long-running jobs. For Claude
-Code, copy or link that directory into `~/.claude/skills/` on each system where
-agents submit commands.
+The [mutagen-remote](https://github.com/zlcwwhq/mutagen-remote-skill) agent
+skill teaches coding agents to use `remote`, covering synchronization, quoting,
+prologues, exit statuses, long-running jobs, and conflicts. Its repository is
+also a Claude Code plugin marketplace. On each system where agents submit
+commands, install it in Claude Code with:
+
+```
+/plugin marketplace add zlcwwhq/mutagen-remote-skill
+/plugin install mutagen-remote@mutagen-remote-skill
+```
+
+To keep it updated, enable auto-update for the marketplace in `/plugin`. The
+skill's README describes the alternatives and how its versions relate to
+`remote`. This repository references the matching version of the skill as the
+`skills/mutagen-remote` Git submodule.
 
 
 ## Community

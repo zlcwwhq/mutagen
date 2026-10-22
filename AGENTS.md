@@ -78,8 +78,11 @@ follow the code and update this file.
 - `images/sidecar/linux` contains the sidecar image build.
 - `tools/` contains standalone developer utilities such as
   `scan_bench` and `watch_demo`.
-- `skills/` contains agent skills shipped with the project, such as
-  `skills/mutagen-remote`, which teaches agents to use `remote`.
+- `skills/mutagen-remote` is a Git submodule of
+  `zlcwwhq/mutagen-remote-skill`, the agent skill that teaches agents
+  to use `remote` and the Claude Code plugin marketplace that
+  distributes it. It pins the skill version matching this code; run
+  `git submodule update --init` to check it out.
 - `sspl/` contains optional SSPL-licensed code paths.
 
 ## Build And Test
@@ -157,12 +160,14 @@ compliance before committing:
 - Fanotify support is Linux-only, SSPL-only, and currently
   sidecar-specific.
 - When changing `remote` behavior (options, exit statuses, working
-  directory mapping, synchronization, or prologues), update its help
-  text in `cmd/remote/cli/cli.go`, `README.md`, and
-  `skills/mutagen-remote` together.
-- `skills/mutagen-remote` must only direct agents to use `remote`
-  itself, since agents may run on endpoints without the `mutagen` CLI.
-  Anything that requires `mutagen` belongs with the user.
+  directory mapping, synchronization, prologues, or conflicts), update
+  its help text in `cmd/remote/cli/cli.go` and
+  `cmd/remote/cli/help.go`, `README.md`, and the skill together.
+  Commit skill changes in the skill repository, following its
+  `CLAUDE.md`, and point the `skills/mutagen-remote` submodule at
+  them. Installations update from the skill's `main` branch, so
+  changes for unreleased behavior go on another branch until the fork
+  release that supports them is published.
 - External pull requests are not accepted for code under `sspl/`.
 - Public docs in this repository should not describe local scratch
   files, untracked helper scripts, or internal-only workflow

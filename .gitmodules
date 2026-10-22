@@ -1,0 +1,3 @@
+[submodule "skills/mutagen-remote"]
+	path = skills/mutagen-remote
+	url = https://github.com/zlcwwhq/mutagen-remote-skill.git
