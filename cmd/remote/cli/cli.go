@@ -14,6 +14,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -32,183 +34,6 @@ const (
 	// which matches the convention used by timeout.
 	timeoutExitCode = 124
 )
-
-// usage is the usage summary printed before the option list. It's written to
-// be sufficient on its own for people and agents unfamiliar with remote.
-const usage = `Usage: remote [options] <command> [<args>...]
-       remote --flush [options]
-       remote --diff [options] [<path>...]
-       remote --conflicts [--json]
-       remote --conflict-checkout [--base <file>] [--json] <path>...
-       remote --conflict-apply [--take local|remote | --delete]
-              [--executable true|false] [--json] <path>...
-       remote --conflict-discard [--json] <path>...
-
-Run a command on the opposite endpoint of the Mutagen synchronization session
-whose root contains the current directory, in the corresponding directory
-there. Standard input, output, error, and the exit status are forwarded.
-
-Examples:
-  remote pytest -x tests/
-  remote sh -c 'make && ./bin/app'      (shell syntax needs an explicit shell)
-  remote -e CONDA_ENV=torch python train.py
-  remote --timeout 10m make bench
-  remote --flush                        (only synchronize)
-  remote --diff                         (show how conflicting files differ)
-  remote --conflicts                    (list all conflicts)
-  remote --conflict-checkout app.go     (download both copies for merging)
-  remote --conflict-apply app.go        (write the merged file to both copies)
-
-Notes:
-  - No remote shell interprets the arguments, and your local shell expands
-    variables, globs, and ~ before remote sees them. Use sh -c '...' for
-    anything that should be expanded remotely.
-  - Options must precede the command.
-  - The session used is the one whose root most specifically contains the
-    current directory. --session selects one by name or identifier instead,
-    even if its roots don't contain the current directory: commands then run
-    at the root of its opposite endpoint, or in --cwd (relative to that
-    root), and require --cwd if another session's root contains the
-    directory. An exported MUTAGEN_REMOTE_SESSION only selects among the
-    sessions containing the current directory, and is ignored if none of
-    them matches it; outside every root, it selects a session as --session
-    does.
-  - Commands don't run in a directory that the session ignores (or inside
-    one), since the session doesn't synchronize it, unless --cwd is given:
-    --cwd . runs them in the corresponding directory anyway, such as in an
-    ignored build directory that exists on both endpoints.
-  - Sessions that are paused, disconnected, or don't run commands submitted
-    from this side can't be found, so inside the root of such a session that
-    is nested in another session's root, the enclosing session is used: if
-    it ignores the nested root, as it typically does, commands are refused,
-    and otherwise they run in its copy of the directory. --session selecting
-    the nested session makes them fail instead. Once remote has located the
-    session, it doesn't switch to another, even if that one disconnects.
-  - The session is synchronized before the command, so that it sees local
-    changes, and after it, so that its changes are present locally when remote
-    exits. Failure to synchronize only produces a warning, as do conflicts
-    (files modified on both endpoints, which stay unsynchronized until
-    resolved) and other content that couldn't be synchronized.
-  - remote --diff shows how the remote copies of the given paths, or of the
-    conflicting files, differ from the local copies, as a unified diff
-    (- local, + remote). For a single-file session, use --session from outside
-    its root. Large conflict reports may omit changes and say how many;
-    specify paths to compare omitted files. --timeout also covers file reads.
-  - Conflicts can be resolved in two-way-safe and one-way-safe sessions.
-    remote --conflicts synchronizes, lists every conflict, how it can be
-    resolved, and through which endpoint it's checked out, flags checked-out
-    copies that changed since checkout and partially applied resolutions, and
-    lists workspaces whose conflicts are no longer listed, with their
-    locations: unfinished resolutions, and workspaces with nothing applied,
-    whose conflicts were resolved some other way or ended by a change after
-    checkout. Conflict operations accept several paths, with options before
-    them.
-  - Before checking out, stop anything that writes the conflicting paths on
-    either endpoint, and leave them unchanged until apply finishes; changing
-    them meanwhile isn't supported. Apply fails without writing a copy that
-    changed before it ran, but can overwrite changes made while it runs. If
-    they change anyway, stop whatever changed them, then discard the
-    workspace and check out again. A change that ends the conflict (such as
-    reverting or deleting one copy, so that synchronization copies the other
-    over it) may leave one side's changes only in the workspace: compare the
-    current file with its local and remote files before discarding it, and
-    restore what's needed (on alpha in one-way-safe sessions, which never
-    copy beta's changes to alpha). Each conflict is checked out once, through
-    one endpoint, which alone can apply or discard it: checking it out again,
-    through either endpoint, fails until then. A local checkout may be
-    another agent's or the user's resolution in progress, so apply or discard
-    only checkouts that you made.
-  - --conflict-checkout downloads both complete copies into a workspace (in
-    the Mutagen data directory) and prints their paths. For two files, it also
-    looks for their common ancestor (the file that both endpoints last agreed
-    on) in Git's HEAD commit and index, or in the file given with --base,
-    verified by its digest. With it, checkout uses a text-based three-way merge
-    model similar to Git's, comparing the ancestor and both current copies.
-    Regions changed on one side or identically on both are merged; regions
-    changed differently are marked with the local, base, and remote versions.
-    Changes separated only by repeated lines (such as closing braces) are
-    marked together, even if they look independent, since they can be aligned
-    in several ways. Additional conservative checks may mark more conflicts
-    than Git, and the results needn't match Git's. Without the ancestor, every
-    region where the copies differ is marked. If consistency checks fail, every
-    difference is marked, without the base version. Like Git, this model
-    doesn't track editing operations, so even a merge without markers can
-    misrepresent changes: lines removed and then restored look unchanged, a
-    change made on both sides in different places can be kept twice, and moved
-    lines, especially repeated ones, can be misplaced or kept too often or too
-    rarely. Review the whole merged file against the copies and the ancestor
-    before applying it, even if nothing is marked. Files too large to compare
-    line by line or not valid UTF-8 are enclosed whole in one region, and
-    binary copies get no merged file; checkout says which applies. Checkout
-    fails if the copies changed since they were listed (the ancestor might not
-    be theirs); check out again. To check out with --base after checking out
-    without it, discard the workspace first. Conflicts involving directories
-    require manual resolution; checkout and apply reject them.
-  - For two files, --conflict-apply writes the merged file (or the copy chosen
-    by --take, or deletion with --delete) to both copies, but refuses a merged
-    file that still contains conflict markers, or one that's empty while
-    neither copy is, which was probably truncated (such as by a command whose
-    output was redirected to the file that it reads). For other conflicts
-    (such as a symbolic link and a file), only --take is possible: it writes
-    the copy taken, as checked out, to the other endpoint. Apply then
-    synchronizes and checks that both copies match and no conflict or problem
-    involves the path. The workspace, with the original copies, is then kept
-    for 7 days (by the system clock, so a clock jump can delete it early) in
-    case the resolution was wrong, as is one that --conflict-discard sets
-    aside without changing either copy. Both release the checkout, so the
-    conflict can be checked out again; --conflicts also releases checkouts
-    whose workspaces are missing, such as after an interrupted checkout.
-    Discard also sets aside a workspace that can't be read, which checkout
-    and apply report.
-  - Apply only replaces or deletes a copy that matches a checked-out copy
-    (synchronization may copy one over the other), which the workspace keeps,
-    or a result that it applied before, so it fails if either copy changed
-    since checkout; then discard the workspace and check out again. Retry
-    other failures rather than discarding, since a copy may already have the
-    result, even if the conflict is no longer listed or the merged file was
-    edited since. If nothing was applied and the conflict is no longer
-    listed, apply refuses without changing either copy, since it was resolved
-    some other way or ended by a change; compare the current file with the
-    workspace's copies before discarding it. Copies differing in
-    executability need --executable or --take. A conflict operation fails
-    while another one on the same path is running on the same system. Writes
-    of a copy wait for each other, since an apply that timed out may still be
-    writing the remote copy, and apply fails without changing a copy that a
-    later apply (through either endpoint) reached first; run --conflicts.
-  - No terminal is allocated, so interactive programs don't work.
-  - Commands are terminated when --timeout expires, when remote is
-    interrupted, and when the session stops synchronizing (such as when it's
-    paused or reconnects, or the daemon stops): their process group receives
-    SIGTERM, then SIGKILL 5 seconds later if any of it remains (on Windows,
-    the command is killed at once). If the session stops synchronizing,
-    remote reports that the connection to the executing endpoint was lost
-    and exits with status 255, without synchronizing afterwards.
-  - /bin/sh sources .remote-prologue.sh in the executing endpoint's sync root
-    if it exists, otherwise that endpoint's configured remotePrologue, before
-    commands submitted from inside the root (even with --cwd). --no-prologue
-    skips both. The workspace script replaces the configured script; an empty
-    file does nothing, and deleting it restores the configured default. Edits
-    take effect on the next command that sees them, without a session restart.
-    The file follows normal sync rules; ignored files, failed flushes, and
-    --no-flush can leave the executing copy outdated. Scripts must use POSIX
-    shell syntax and need no executable permission. Failure prevents execution
-    (status 126); prologues aren't supported on Windows.
-  - Commands and prologues receive MUTAGEN_REMOTE_ENDPOINT=alpha or beta,
-    identifying the executing endpoint. Use it to branch in a shared script.
-    This overrides inherited values and those passed with -e or --env-file,
-    even with --no-prologue or when submitting from outside the root.
-
-Exit status is the command's own, or:
-  255  not routed (no connected session with remote commands, or ambiguous),
-       the connection was lost while the command ran, or remote --flush or a
-       conflict operation failed
-  127  command not found
-  126  command couldn't be started, or the prologue failed
-  124  --timeout expired before the command finished
-With --diff, it's 0 if the copies are identical and 1 if they differ.
-
-Options:
-`
 
 // options are the parsed command line options.
 type options struct {
@@ -239,14 +64,51 @@ type options struct {
 	// diff indicates that local and remote copies of the paths specified by
 	// arguments (or of conflicting files) should be compared.
 	diff bool
-	// help indicates that usage information was requested.
+	// sessions indicates that the sessions through which operations can be
+	// submitted should be listed.
+	sessions bool
+	// help indicates that usage information was requested, for the topic
+	// specified as an argument, if any.
 	help bool
 	// version indicates that version information was requested.
 	version bool
-	// arguments are the command and its arguments, or the paths to compare.
+	// arguments are the command and its arguments, the paths to compare, or
+	// the help topic.
 	arguments []string
 	// flags is the parsed flag set, used to print usage information.
 	flags *pflag.FlagSet
+	// conflictFlags is the subset of flags containing the conflict options,
+	// whose usage is only printed with the conflicts help topic.
+	conflictFlags *pflag.FlagSet
+}
+
+// timeoutValue is the value of --timeout, which, like the argument of timeout,
+// is a number of seconds unless it specifies a unit, such as 10m or 1h30m.
+type timeoutValue time.Duration
+
+// Set implements pflag.Value.Set.
+func (t *timeoutValue) Set(value string) error {
+	duration := value
+	if number := strings.TrimPrefix(value, "-"); number != "" && strings.Trim(number, "0123456789.") == "" {
+		duration += "s"
+	}
+	parsed, err := time.ParseDuration(duration)
+	if err != nil {
+		return errors.New("expected seconds or a duration with a unit, such as 10m")
+	}
+	*t = timeoutValue(parsed)
+	return nil
+}
+
+// String implements pflag.Value.String. It formats the value as seconds, which
+// also keeps the zero default out of usage information.
+func (t *timeoutValue) String() string {
+	return strconv.FormatFloat(time.Duration(*t).Seconds(), 'f', -1, 64)
+}
+
+// Type implements pflag.Value.Type.
+func (t *timeoutValue) Type() string {
+	return "duration"
 }
 
 // parse parses command line arguments, stopping at the first non-option
@@ -258,17 +120,21 @@ func parse(arguments []string) (*options, error) {
 	flags.SetInterspersed(false)
 	flags.SortFlags = false
 	// Names in backquotes are used as value placeholders in usage information.
-	flags.StringVarP(&result.session, "session", "s", "", "Use the session with this `NAME` or identifier, which also allows running outside its root (see Notes for $MUTAGEN_REMOTE_SESSION)")
+	flags.StringVarP(&result.session, "session", "s", "", "Use the session with this `NAME` or identifier, even from outside its root")
 	flags.StringVarP(&result.directory, "cwd", "C", "", "Run in `DIR`: absolute and ~ paths are on the opposite endpoint, others are relative to the corresponding directory")
 	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set `NAME[=VALUE]`, where a bare NAME forwards the local value (repeatable)")
 	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read literal NAME=VALUE lines from `FILE` (repeatable)")
-	flags.DurationVar(&result.timeout, "timeout", 0, "Exit after `DURATION`, such as 30s or 10m, terminating the command if it's running")
+	flags.Var((*timeoutValue)(&result.timeout), "timeout", "Exit after `DURATION` (seconds, or with a unit such as 10m), terminating the command")
 	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the workspace or configured remote prologue")
 	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize the session before and after the command")
 	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
 	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
-	result.conflictOptions.register(flags)
-	flags.BoolVarP(&result.help, "help", "h", false, "Show this help")
+	flags.BoolVar(&result.sessions, "sessions", false, "List the connected sessions, showing which ones contain the current directory and which one is used")
+	result.conflictFlags = pflag.NewFlagSet("conflicts", pflag.ContinueOnError)
+	result.conflictFlags.SortFlags = false
+	result.conflictOptions.register(result.conflictFlags)
+	flags.AddFlagSet(result.conflictFlags)
+	flags.BoolVarP(&result.help, "help", "h", false, "Show this help, or the help topic given as an argument")
 	flags.BoolVar(&result.version, "version", false, "Show version information")
 	if err := flags.Parse(arguments); err != nil {
 		if err == pflag.ErrHelp {
@@ -282,13 +148,17 @@ func parse(arguments []string) (*options, error) {
 	if !flags.Changed("session") {
 		result.defaultSession = os.Getenv(remote.SessionVariable)
 	}
-	if result.timeout < 0 {
+	if result.help || result.version {
+		return result, nil
+	} else if result.timeout < 0 {
 		return nil, errors.New("timeout must not be negative")
 	} else if result.flush && result.noFlush {
 		return nil, errors.New("--flush and --no-flush are mutually exclusive")
 	} else if result.diff && (result.flush || result.noFlush) {
 		return nil, errors.New("--diff can't be combined with --flush or --no-flush")
-	} else if !result.help && !result.version && !result.flush && !result.diff && !result.active() && len(result.arguments) == 0 {
+	} else if result.sessions && (flags.NFlag() > 1 || len(result.arguments) > 0) {
+		return nil, errors.New("--sessions doesn't accept other options or arguments")
+	} else if !result.flush && !result.diff && !result.sessions && !result.active() && len(result.arguments) == 0 {
 		return nil, errors.New("no command specified")
 	}
 	if err := result.validateConflicts(); err != nil {
@@ -310,7 +180,9 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(fmt.Errorf("%w (see remote --help)", err))
 	} else if options.help {
-		fmt.Fprint(stdout, usage, options.flags.FlagUsagesWrapped(80))
+		if err := printHelp(options, stdout); err != nil {
+			return fail(err)
+		}
 		return 0
 	} else if options.version {
 		fmt.Fprintln(stdout, mutagen.Version)
@@ -384,7 +256,15 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return fail(fmt.Errorf("unable to determine working directory: %w", err))
 	}
 
-	if options.active() {
+	if options.sessions {
+		err := printSessions(ctx, directory, options.defaultSession, stdout)
+		if code, ok := interrupted("listing sessions"); ok {
+			return code
+		} else if err != nil {
+			return fail(err)
+		}
+		return 0
+	} else if options.active() {
 		err := runConflicts(ctx, directory, options, stdout, stderr)
 		if code, ok := interrupted("resolving conflicts"); ok {
 			return code
@@ -412,6 +292,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	dial := func(operation remote.Operation) (net.Conn, *remote.Target, error) {
 		connection, target, err := selection.Dial(ctx, directory, operation)
 		if err == nil && selection.Target == nil {
+			warnOverlapping(stderr, target)
 			selection = &remote.Selection{Target: target}
 		}
 		return connection, target, err

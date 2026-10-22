@@ -134,11 +134,22 @@ or in the directory specified by `--cwd`. If another session's root contains the
 current directory, such commands require `--cwd`, since they would otherwise run
 at the selected session's root rather than in a directory corresponding to the
 current one. An exported `MUTAGEN_REMOTE_SESSION` only selects among the
-sessions whose roots contain the current directory, such as to resolve ambiguity
-between them, and is ignored if none of them matches it; outside every session's
+sessions whose roots contain the current directory, such as to choose between
+them, and is ignored if none of them matches it; outside every session's
 root, it selects a session as `--session` does. Once `remote` has located the
 session, it uses that session for the rest of the invocation, rather than
 switching to another session if it disconnects in the meantime.
+
+If several sessions' roots contain the current directory equally
+specifically, such as when one directory is synchronized to several machines,
+the session created first is used. `remote --sessions` lists the sessions
+connected for remote commands on the current system, separating those whose
+roots contain the current directory and marking the one used by default. When
+several sessions synchronize the current directory (their roots contain it,
+and they don't ignore it), `remote` names them in a warning, unless the session
+was selected with `--session` or a matching `MUTAGEN_REMOTE_SESSION`. Sessions
+are named by their names, or by their identifiers if they're unnamed or share
+their names, as `--session` accepts them.
 
 Commands don't run in a directory that the session ignores, or inside one, since
 the session doesn't synchronize it, unless `--cwd` is given: `--cwd .` runs them
@@ -239,14 +250,17 @@ the exit status are preserved (255 indicates that the command couldn't be
 routed, or that the connection was lost while it ran), but no pseudo-terminal is
 allocated. Commands can only be routed while the session is connected, and the
 daemon connects command channels in the background, so SSH authentication must
-work non-interactively.
+work non-interactively. `remote --help` summarizes usage, and
+`remote --help <topic>` covers sessions, synchronization, environment setup,
+termination, and conflicts in detail.
 
 `remote` flushes the session (as `mutagen sync flush` does) before the command,
 so that it sees local changes, and after it, so that its changes are present
 locally when `remote` exits. This works from either endpoint, since the daemon
 performs the flush. If flushing fails, then `remote` prints a warning and
 continues with the command's exit status; `--no-flush` skips both flushes, and
-`remote --flush` only flushes. `--timeout` includes the time spent flushing.
+`remote --flush` only flushes. `--timeout` takes seconds, or a duration with a
+unit such as `10m`, and includes the time spent flushing.
 
 Commands are terminated when `--timeout` expires, when `remote` is interrupted,
 and when the session stops synchronizing, such as when it's paused, reconnects

@@ -72,7 +72,7 @@ func TestReporter(t *testing.T) {
 		Resolution: true,
 	}
 	reports.print(report)
-	expected := "remote: warning: these conflicts aren't synchronized until resolved (see remote --diff and remote --conflicts):\n" +
+	expected := "remote: warning: these conflicts aren't synchronized until resolved (see remote --diff and remote --help conflicts):\n" +
 		"remote:   out: deleted directory locally, modified file " + filepath.Join("out", "log") + " remotely, " +
 		"created symbolic link " + filepath.Join("out", "new") + " remotely, changed file to executable file " + filepath.Join("out", "run") + " remotely\n" +
 		"remote: warning: this content couldn't be synchronized:\n" +
@@ -95,7 +95,7 @@ func TestReporter(t *testing.T) {
 	})
 	report.ExcludedConflicts = 3
 	reports.print(report)
-	expected = "remote: warning: these conflicts aren't synchronized until resolved (see remote --diff and remote --conflicts):\n" +
+	expected = "remote: warning: these conflicts aren't synchronized until resolved (see remote --diff and remote --help conflicts):\n" +
 		"remote:   a: created file locally, created file remotely\n" +
 		"remote:   ...and 3 more conflicts\n"
 	if output.String() != expected {

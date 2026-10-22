@@ -32,6 +32,61 @@ func TestParseArgumentBoundary(t *testing.T) {
 	}
 }
 
+func TestParseTimeout(t *testing.T) {
+	// Numbers without a unit are seconds, as with timeout.
+	for value, expected := range map[string]time.Duration{
+		"600":   10 * time.Minute,
+		"1.5":   1500 * time.Millisecond,
+		"0":     0,
+		"10m":   10 * time.Minute,
+		"1h30m": 90 * time.Minute,
+		"250ms": 250 * time.Millisecond,
+	} {
+		if options, err := parse([]string{"--timeout", value, "true"}); err != nil {
+			t.Errorf("--timeout %s rejected: %v", value, err)
+		} else if options.timeout != expected {
+			t.Errorf("--timeout %s parsed as %v instead of %v", value, options.timeout, expected)
+		}
+	}
+	for _, value := range []string{"", "-1", "-1s", "1.2.3", ".", "10x", "1e3", "inf", "s"} {
+		if _, err := parse([]string{"--timeout", value, "true"}); err == nil {
+			t.Errorf("invalid --timeout %q accepted", value)
+		}
+	}
+}
+
+func TestParseSessions(t *testing.T) {
+	if options, err := parse([]string{"--sessions"}); err != nil || !options.sessions {
+		t.Fatal("--sessions rejected:", err)
+	}
+	for _, arguments := range [][]string{{"--sessions", "true"}, {"--sessions", "-s", "name"}, {"--sessions", "--flush"}, {"--sessions", "--conflicts"}} {
+		if _, err := parse(arguments); err == nil {
+			t.Errorf("invalid arguments accepted: %v", arguments)
+		}
+	}
+}
+
+func TestWarnOverlapping(t *testing.T) {
+	var output strings.Builder
+	warnOverlapping(&output, &remote.Target{Session: "sync_inner", Name: "inner"})
+	if output.Len() != 0 {
+		t.Fatal("warned without overlapping sessions:", output.String())
+	}
+	for _, test := range []struct {
+		overlapping []string
+		expected    string
+	}{
+		{[]string{"gpu1", "gpu2"}, "remote: warning: sessions gpu1 and gpu2 both synchronize the current directory; using gpu1 (select one with -s)\n"},
+		{[]string{"gpu1", "sync_x", "gpu3"}, "remote: warning: sessions gpu1, sync_x, and gpu3 all synchronize the current directory; using gpu1 (select one with -s)\n"},
+	} {
+		output.Reset()
+		warnOverlapping(&output, &remote.Target{Overlapping: test.overlapping})
+		if output.String() != test.expected {
+			t.Errorf("incorrect warning: %q", output.String())
+		}
+	}
+}
+
 func TestParseNoPrologue(t *testing.T) {
 	if options, err := parse([]string{"true"}); err != nil || options.noPrologue {
 		t.Fatal("prologue disabled by default:", err)
@@ -76,16 +131,41 @@ func TestHelp(t *testing.T) {
 		t.Fatal("help failed:", code)
 	}
 	help := output.String()
-	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--diff",
-		"MUTAGEN_REMOTE_SESSION", fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second)} {
+	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--diff"} {
 		if !strings.Contains(help, expected) {
 			t.Errorf("help is missing %q", expected)
 		}
 	}
-	for _, unexpected := range []string{"stringArray", "duration "} {
+	// Conflict options are only described by their help topic, and the zero
+	// timeout isn't shown as a default.
+	for _, unexpected := range []string{"stringArray", "duration ", "--take", "default"} {
 		if strings.Contains(help, unexpected) {
-			t.Errorf("help contains flag type %q instead of a placeholder", unexpected)
+			t.Errorf("help contains %q", unexpected)
 		}
+	}
+
+	// Every listed topic has its own help.
+	expectations := map[string][]string{
+		"sessions":    {"MUTAGEN_REMOTE_SESSION"},
+		"termination": {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second)},
+		"conflicts":   {"--conflict-checkout", "--take SIDE", "--base FILE", "--json"},
+	}
+	for _, topic := range helpTopics {
+		if !strings.Contains(help, "\n  "+topic.name+" ") {
+			t.Errorf("help doesn't list topic %q", topic.name)
+		}
+		output.Reset()
+		if code := Run([]string{"--help", topic.name}, strings.NewReader(""), &output, io.Discard); code != 0 {
+			t.Errorf("help for topic %q failed: %d", topic.name, code)
+		}
+		for _, expected := range expectations[topic.name] {
+			if !strings.Contains(output.String(), expected) {
+				t.Errorf("help for topic %q is missing %q", topic.name, expected)
+			}
+		}
+	}
+	if code := Run([]string{"--help", "unknown"}, strings.NewReader(""), io.Discard, io.Discard); code != failureExitCode {
+		t.Error("unknown help topic accepted:", code)
 	}
 }
 

@@ -116,7 +116,7 @@ func (r *reporter) print(report *remote.Report) {
 	// Only sessions that support resolution refer to it.
 	heading := "these conflicts aren't synchronized until one side's copy is deleted (see remote --diff):"
 	if report.Resolution {
-		heading = "these conflicts aren't synchronized until resolved (see remote --diff and remote --conflicts):"
+		heading = "these conflicts aren't synchronized until resolved (see remote --diff and remote --help conflicts):"
 	}
 	r.section(heading, conflicts)
 	var problems []string

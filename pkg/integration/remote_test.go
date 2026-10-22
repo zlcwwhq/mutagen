@@ -446,10 +446,21 @@ func TestRemoteNestedSessionSelection(t *testing.T) {
 	createRemoteSession(t, "outer", outer, outerBeta, false)
 	innerID := createRemoteSession(t, "inner", inner, innerBeta, false)
 
-	// Commands submitted inside the nested session's root run through it.
+	// Commands submitted inside the nested session's root run through it, with
+	// a warning, since the enclosing session also synchronizes the directory,
+	// unless the session is selected explicitly.
 	submission := filepath.Join(inner, "sub")
-	if code, output, errorOutput := runRemote(t, submission, "sh", "-c", "pwd -P"); code != 0 || output != filepath.Join(innerBeta, "sub")+"\n" {
-		t.Fatalf("nested session not used: %d, %q, %q", code, output, errorOutput)
+	if code, output, errorOutput := runRemote(t, submission, "sh", "-c", "pwd -P"); code != 0 || output != filepath.Join(innerBeta, "sub")+"\n" ||
+		errorOutput != "remote: warning: sessions inner and outer both synchronize the current directory; using inner (select one with -s)\n" {
+		t.Fatalf("nested session not used with a warning: %d, %q, %q", code, output, errorOutput)
+	} else if code, _, errorOutput := runRemote(t, submission, "-s", "inner", "true"); code != 0 || errorOutput != "" {
+		t.Fatalf("explicitly selected session warned: %d, %q", code, errorOutput)
+	}
+
+	// Both sessions are listed, with the one that's used marked.
+	if code, output, errorOutput := runRemote(t, submission, "--sessions"); code != 0 ||
+		output != "Sessions whose roots contain the current directory:\n  inner: alpha root "+inner+" (used by default)\n  outer: alpha root "+outer+"\n" {
+		t.Fatalf("incorrect session listing: %d, %q, %q", code, output, errorOutput)
 	}
 
 	// While the nested session is paused, selecting it explicitly fails,
@@ -459,6 +470,43 @@ func TestRemoteNestedSessionSelection(t *testing.T) {
 	} else if code, output, errorOutput := runRemote(t, submission, "-s", "inner", "sh", "-c", "pwd -P"); code != 255 || output != "" ||
 		!strings.Contains(errorOutput, `no connected session matching "inner"`) {
 		t.Fatalf("paused session not reported: %d, %q, %q", code, output, errorOutput)
+	}
+}
+
+func TestRemoteSharedRootSelection(t *testing.T) {
+	// Commands rely on a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(directory, "project")
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	firstBeta, secondBeta := filepath.Join(directory, "gpu1"), filepath.Join(directory, "gpu2")
+	createRemoteSession(t, "gpu1", root, firstBeta, false)
+	createRemoteSession(t, "gpu2", root, secondBeta, false)
+	submission := filepath.Join(root, "sub")
+	pwd := []string{"sh", "-c", "pwd -P"}
+
+	// The session created first is used, with a warning, unless a session is
+	// selected.
+	if code, output, errorOutput := runRemote(t, submission, pwd...); code != 0 || output != filepath.Join(firstBeta, "sub")+"\n" ||
+		errorOutput != "remote: warning: sessions gpu1 and gpu2 both synchronize the current directory; using gpu1 (select one with -s)\n" {
+		t.Fatalf("first session not used with a warning: %d, %q, %q", code, output, errorOutput)
+	} else if code, output, errorOutput := runRemote(t, submission, append([]string{"-s", "gpu2"}, pwd...)...); code != 0 ||
+		output != filepath.Join(secondBeta, "sub")+"\n" || errorOutput != "" {
+		t.Fatalf("selected session not used: %d, %q, %q", code, output, errorOutput)
+	}
+	t.Setenv("MUTAGEN_REMOTE_SESSION", "gpu2")
+	if code, output, errorOutput := runRemote(t, submission, pwd...); code != 0 || output != filepath.Join(secondBeta, "sub")+"\n" || errorOutput != "" {
+		t.Fatalf("default session not used: %d, %q, %q", code, output, errorOutput)
+	} else if code, output, errorOutput := runRemote(t, submission, "--sessions"); code != 0 ||
+		output != "Sessions whose roots contain the current directory:\n  gpu1: alpha root "+root+"\n  gpu2: alpha root "+root+" (used by default)\n" {
+		t.Fatalf("incorrect session listing: %d, %q, %q", code, output, errorOutput)
 	}
 }
 
@@ -480,8 +528,8 @@ func TestRemoteNestedSessionExcluded(t *testing.T) {
 	innerID := createRemoteSession(t, "inner", inner, innerBeta, false)
 	submission := filepath.Join(inner, "sub")
 	pwd := []string{"sh", "-c", "pwd -P"}
-	if code, output, errorOutput := runRemote(t, submission, pwd...); code != 0 || output != filepath.Join(innerBeta, "sub")+"\n" {
-		t.Fatalf("nested session not used: %d, %q, %q", code, output, errorOutput)
+	if code, output, errorOutput := runRemote(t, submission, pwd...); code != 0 || output != filepath.Join(innerBeta, "sub")+"\n" || errorOutput != "" {
+		t.Fatalf("nested session not used without warnings: %d, %q, %q", code, output, errorOutput)
 	}
 
 	// While the nested session is paused, commands submitted inside its root

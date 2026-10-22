@@ -39,6 +39,10 @@ type Endpoint struct {
 	Root string
 	// Alpha indicates whether the endpoint is alpha.
 	Alpha bool
+	// SessionCreated is the session's creation time, which determines the
+	// preferred session among those whose roots contain a submission directory
+	// equally specifically.
+	SessionCreated time.Time
 	// Submit indicates whether invocations on the endpoint's system may submit
 	// commands to the opposite endpoint.
 	Submit bool

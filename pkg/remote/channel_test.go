@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/ipc"
+	"github.com/mutagen-io/mutagen/pkg/mutagen"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 )
 
@@ -137,12 +138,20 @@ func TestDialSelection(t *testing.T) {
 		t.Fatal("older registration selected:", last)
 	}
 
-	// Distinct sessions with the same root are ambiguous.
-	registerTest(t, &Endpoint{Session: "sync_other", Root: outer}, "other", &accepted, &lock)
-	if _, err := dial(filepath.Join(outer, "y"), ""); err == nil || !strings.Contains(err.Error(), "multiple sessions") {
-		t.Fatal("ambiguous sessions accepted:", err)
-	} else if target, err := dial(filepath.Join(outer, "y"), "sync_other"); err != nil || target.Session != "sync_other" {
-		t.Fatalf("explicit selection did not resolve ambiguity: %+v, %v", target, err)
+	// Among distinct sessions with the same root, the session created first is
+	// used, with ties broken by identifier, and the sessions are labeled for a
+	// warning, unless one is selected explicitly.
+	registerTest(t, &Endpoint{Session: "sync_other", Root: outer, SessionCreated: time.Now()}, "other", &accepted, &lock)
+	if target, err := dial(filepath.Join(outer, "y"), ""); err != nil || target.Session != "sync_outer" ||
+		!reflect.DeepEqual(target.Overlapping, []string{"outer-name", "sync_other"}) {
+		t.Fatalf("incorrect selection among equally specific roots: %+v, %v", target, err)
+	} else if target, err := dial(filepath.Join(outer, "y"), "sync_other"); err != nil || target.Session != "sync_other" || target.Overlapping != nil {
+		t.Fatalf("explicit selection not used: %+v, %v", target, err)
+	}
+	registerTest(t, &Endpoint{Session: "sync_another", Root: outer}, "another", &accepted, &lock)
+	if target, err := dial(filepath.Join(outer, "y"), ""); err != nil || target.Session != "sync_another" ||
+		!reflect.DeepEqual(target.Overlapping, []string{"sync_another", "outer-name", "sync_other"}) {
+		t.Fatalf("tie not broken by identifier: %+v, %v", target, err)
 	}
 
 	// If both endpoints of a session are on this system, then selecting the
@@ -338,14 +347,16 @@ func TestDialSessionDefault(t *testing.T) {
 		}
 	}
 
-	// Ambiguity among containing sessions is resolved by a matching default,
-	// but not by one matching neither of them.
-	registerTest(t, &Endpoint{Session: "sync_other", Name: "other", Root: outer}, "other", &accepted, &lock)
-	if _, err := dialTest(&Selection{Default: "first"}, filepath.Join(outer, "y")); err == nil ||
-		!strings.Contains(err.Error(), "multiple sessions contain") {
-		t.Error("ambiguity resolved by an unrelated default:", err)
-	} else if target, err := dialTest(&Selection{Default: "other"}, filepath.Join(outer, "y")); err != nil || target.Session != "sync_other" {
-		t.Errorf("ambiguity not resolved by the default: %+v, %v", target, err)
+	// A default matching one of several equally specific containing sessions
+	// selects it, while an unrelated default leaves the session created first
+	// in use, with a warning.
+	registerTest(t, &Endpoint{Session: "sync_other", Name: "other", Root: outer, SessionCreated: time.Now()}, "other", &accepted, &lock)
+	if target, err := dialTest(&Selection{Default: "first"}, filepath.Join(outer, "y")); err != nil || target.Session != "sync_outer" ||
+		!reflect.DeepEqual(target.Overlapping, []string{"outer", "other"}) {
+		t.Errorf("incorrect selection with an unrelated default: %+v, %v", target, err)
+	} else if target, err := dialTest(&Selection{Default: "other"}, filepath.Join(outer, "y")); err != nil || target.Session != "sync_other" ||
+		target.Overlapping != nil {
+		t.Errorf("default not used: %+v, %v", target, err)
 	}
 
 	// A root synchronized by another version of Mutagen isn't treated as being
@@ -504,6 +515,125 @@ func TestDialExcluded(t *testing.T) {
 		t.Errorf("synchronized directory refused: %+v, %v", target, err)
 	} else if pinned, err := dialTest(&Selection{Target: target, Corresponding: true}, directory); err != nil || pinned.Path != "inner/x" {
 		t.Errorf("pinned selection refused: %+v, %v", pinned, err)
+	}
+}
+
+func TestDialOverlapping(t *testing.T) {
+	registry := useTestRegistry(t)
+	base := resolveSymbolicLinks(t.TempDir())
+	outer, first := filepath.Join(base, "outer"), filepath.Join(base, "first")
+	inner := filepath.Join(outer, "inner")
+	directory := filepath.Join(inner, "x")
+	mkdirs(t, directory, filepath.Join(outer, "y"), first)
+	var lock sync.Mutex
+	var accepted []string
+	registerTest(t, &Endpoint{Session: "sync_outer", Name: "outer", Root: outer, Alpha: true}, "outer", &accepted, &lock)
+	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "inner", &accepted, &lock)
+	registerTest(t, &Endpoint{Session: "sync_first", Name: "first", Root: first}, "first", &accepted, &lock)
+
+	// Sessions that also synchronize the directory are described unless the
+	// session was selected, explicitly or by a matching default.
+	for _, test := range []struct {
+		selection   *Selection
+		directory   string
+		overlapping []string
+	}{
+		{&Selection{}, directory, []string{"inner", "outer"}},
+		{&Selection{Default: "first"}, directory, []string{"inner", "outer"}},
+		{&Selection{Default: "inner"}, directory, nil},
+		{&Selection{Session: "inner"}, directory, nil},
+		{&Selection{Session: "outer"}, directory, nil},
+		{&Selection{}, filepath.Join(outer, "y"), nil},
+		{&Selection{Default: "first"}, base, nil},
+		{&Selection{Target: &Target{Session: "sync_inner"}}, directory, nil},
+	} {
+		if target, err := dialTest(test.selection, test.directory); err != nil {
+			t.Errorf("selection failed (%+v from %s): %v", test.selection, test.directory, err)
+		} else if !reflect.DeepEqual(target.Overlapping, test.overlapping) {
+			t.Errorf("incorrect overlapping sessions (%+v from %s): %#v", test.selection, test.directory, target.Overlapping)
+		}
+	}
+
+	// Sessions whose ignores exclude the directory don't synchronize it, while
+	// sessions registered by other versions of Mutagen do. Equally specific
+	// sessions follow the order of preference.
+	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"inner"}}
+	registerTest(t, &Endpoint{Session: "sync_ignoring", Root: outer, Ignores: ignores}, "ignoring", &accepted, &lock)
+	registerIncompatible(t, registry, "sync_legacy", outer)
+	if target, err := dialTest(&Selection{}, directory); err != nil || !reflect.DeepEqual(target.Overlapping, []string{"inner", "sync_legacy", "outer"}) {
+		t.Errorf("incorrect overlapping sessions: %+v, %v", target, err)
+	}
+
+	// Sessions sharing a name are labeled by identifier.
+	registerTest(t, &Endpoint{Session: "sync_twin", Name: "outer", Root: first}, "twin", &accepted, &lock)
+	if target, err := dialTest(&Selection{}, directory); err != nil || !reflect.DeepEqual(target.Overlapping, []string{"inner", "sync_legacy", "sync_outer"}) {
+		t.Errorf("shared name not replaced by identifier: %+v, %v", target, err)
+	}
+}
+
+func TestSessions(t *testing.T) {
+	registry := useTestRegistry(t)
+	base := resolveSymbolicLinks(t.TempDir())
+	outer, first := filepath.Join(base, "outer"), filepath.Join(base, "first")
+	inner := filepath.Join(outer, "inner")
+	directory := filepath.Join(inner, "x")
+	mkdirs(t, directory, first)
+	var lock sync.Mutex
+	var accepted []string
+	sessions := func(selection *Selection, directory string) []Session {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		result, err := selection.Sessions(ctx, directory)
+		if err != nil {
+			t.Fatal("unable to list sessions:", err)
+		}
+		return result
+	}
+	if listed := sessions(&Selection{}, directory); len(listed) != 0 {
+		t.Fatalf("sessions listed without registrations: %+v", listed)
+	}
+
+	// Containing sessions come first, most specific first and then in the order
+	// of preference, and the session that's used is marked. Replaced and dead
+	// registrations aren't listed.
+	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"inner"}}
+	registerTest(t, &Endpoint{Session: "sync_outer", Name: "outer", Root: outer, Alpha: true, Ignores: ignores}, "outer", &accepted, &lock)
+	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "inner", &accepted, &lock)
+	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "replacement", &accepted, &lock)
+	registerTest(t, &Endpoint{Session: "sync_late", Name: "late", Root: inner, SessionCreated: time.Now()}, "late", &accepted, &lock)
+	registerTest(t, &Endpoint{Session: "sync_first", Name: "first", Root: first}, "first", &accepted, &lock)
+	stale := registerTest(t, &Endpoint{Session: "sync_stale", Root: base}, "stale", &accepted, &lock)
+	stale.listener.(*registeredListener).Listener.Close()
+	registerIncompatible(t, registry, "sync_legacy", filepath.Join(base, "legacy"))
+	expected := []Session{
+		{Session: "sync_inner", Name: "inner", Label: "inner", Root: inner, Version: mutagen.Version, Contained: true, Selected: true},
+		{Session: "sync_late", Name: "late", Label: "late", Root: inner, Version: mutagen.Version, Contained: true},
+		{Session: "sync_outer", Name: "outer", Label: "outer", Alpha: true, Root: outer, Version: mutagen.Version, Contained: true, Excluded: true},
+		{Session: "sync_first", Name: "first", Label: "first", Root: first, Version: mutagen.Version},
+		{Session: "sync_legacy", Label: "sync_legacy", Root: filepath.Join(base, "legacy"), Version: "0.0.1"},
+	}
+	if listed := sessions(&Selection{}, directory); !reflect.DeepEqual(listed, expected) {
+		t.Errorf("incorrect sessions:\n%+v\nexpected:\n%+v", listed, expected)
+	}
+
+	// The selection determines the session that's marked, and none is marked
+	// if it doesn't locate one.
+	selected := func(listed []Session) []string {
+		var result []string
+		for _, session := range listed {
+			if session.Selected {
+				result = append(result, session.Session)
+			}
+		}
+		return result
+	}
+	if marked := selected(sessions(&Selection{Default: "first"}, base)); !reflect.DeepEqual(marked, []string{"sync_first"}) {
+		t.Errorf("default selection not marked: %v", marked)
+	} else if marked := selected(sessions(&Selection{Default: "outer"}, directory)); !reflect.DeepEqual(marked, []string{"sync_outer"}) {
+		t.Errorf("default selection among containing sessions not marked: %v", marked)
+	} else if marked := selected(sessions(&Selection{}, base)); marked != nil {
+		t.Errorf("session marked outside every root: %v", marked)
 	}
 }
 

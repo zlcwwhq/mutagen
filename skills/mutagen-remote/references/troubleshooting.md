@@ -12,20 +12,23 @@ what to change.
   isn't on `PATH`.
 - `remote --flush` checks routing and synchronization without running a
   command.
+- `remote --help <topic>` documents sessions, synchronization, environment
+  setup, termination, and conflicts in detail.
 
 ## Error messages
 
 | Message | Cause | Fix |
 | --- | --- | --- |
-| `no connected session with remote commands enabled contains <dir>` (255) | Outside every synced root, or the session is paused, disconnected, or doesn't execute commands on the other side (they can be enabled in one direction only) | `cd` into the synced directory; otherwise tell the user |
+| `no connected session with remote commands enabled contains <dir>` (255) | Outside every synced root, or the session is paused, disconnected, or doesn't execute commands on the other side (they can be enabled in one direction only) | `cd` into the synced directory (`remote --sessions` lists the connected sessions' roots); otherwise tell the user |
 | `<alpha\|beta> is not connected for remote commands` (255) | Session just started or is reconnecting | Retry after a few seconds; if it persists, tell the user |
-| `multiple sessions contain ...` / `multiple sessions match ...` (255) | The directory is synced by the sessions listed in the message | Add `-s <name-or-id>` to the command (`MUTAGEN_REMOTE_SESSION` also works, but only chooses among the sessions containing the directory; see "Which session and directory are used") |
+| `multiple sessions match ...` (255) | The name given with `-s` or `MUTAGEN_REMOTE_SESSION` is shared by the sessions listed in the message | Use a session identifier from the message |
 | `<dir> is synchronized by session X, not Y` (255) | `-s` selected a session whose roots don't contain the directory, which another session's root does: the command would run at the selected session's remote root, not in a corresponding directory | Drop `-s` to use the session containing the directory, or add `--cwd` to say where to run on the selected session's side |
 | `<dir> is ignored by session X` / `<dir> is inside <dir2>, which session X ignores` (255) | The session containing the directory doesn't synchronize it. Usually it's the root of a nested session that's paused or disconnected (or doesn't run commands from this side); sometimes it's a directory such as a build directory that exists separately on each side | For a nested session, tell the user that it isn't running; don't work around it with `--cwd`, which would run in the enclosing session's unsynchronized copy. Only if the directory is meant to exist separately on the other side, add `--cwd .` |
 | `both endpoints of session ... are on this system` (255) | `--session` used outside both roots of a local session | Run from inside the root you want to submit from |
 | `session ... is no longer connected for remote commands on this system` (255) | The session paused, reconnected, or was terminated after `remote` located it; `remote` doesn't switch to another session midway | Retry after a few seconds; if it persists, tell the user |
 | `the connection to the executing endpoint was lost ...` (255) | The session stopped synchronizing while the command ran (paused, reconnecting, replaced, or the daemon stopped), so the command was terminated: SIGTERM, then SIGKILL 5 seconds later | Files that it was writing may be incomplete. Once `remote --flush` succeeds, check them and rerun the command; detach long jobs. If it recurs, tell the user |
 | `registered by Mutagen X, but this is Mutagen Y` (255) | `remote` from a different Mutagen version | Use the `remote` installed with version X |
+| `warning: sessions X and Y both synchronize the current directory; using X` | Several sessions synchronize the directory, such as one directory synced to several machines, or nested roots; `remote` used the most specific root, then the session created first | Nothing, if X is the intended session (ask the user if unsure); otherwise add `-s <session>` with a session from the warning. `remote --sessions` shows their roots |
 | `warning: unable to synchronize before/after the command` | The session stopped synchronizing during a flush, or `--timeout` expired | The command still ran; retry with `remote --flush`, and tell the user if it keeps failing |
 | `synchronization stopped before the flush completed` (255 with `--flush`) | Same as above | Same as above |
 | `unable to find command` (127) | Not on the remote `PATH` | See "Commands missing from the remote environment" |
@@ -41,7 +44,12 @@ Statuses 128+N mean that the remote command was killed by signal N.
 
 `remote` uses the session whose root most specifically contains the current
 directory and runs commands in the corresponding remote directory, so prefer
-`cd`-ing into the synced tree. `remote pwd` shows where commands run.
+`cd`-ing into the synced tree. Among equally specific roots, such as one
+directory synced to several machines, it uses the session created first, and
+it warns whenever several sessions synchronize the directory. `remote pwd`
+shows where commands run, and `remote --sessions` lists the connected
+sessions, marking the one used by default and those whose roots contain the
+current directory.
 
 - `-s <name-or-id>` selects a session explicitly; prefer it for one-off
   disambiguation. From outside the session's root, commands run at the root of
@@ -166,12 +174,17 @@ paths inside the script use the command's working directory. `--no-prologue`
 skips both workspace and configured scripts, as does submission from outside
 the root with `--session`. Prologues aren't supported on Windows endpoints.
 
-## Commands that don't return
+## Long-running commands and commands that don't return
 
 - A background process still holds stdout or stderr: redirect all output and
   stdin when detaching (`> log 2>&1 < /dev/null &`).
 - The command is waiting for input: `remote` forwards stdin, so pass
   `< /dev/null` or use the program's non-interactive flags.
-- Use `--timeout` to bound commands that might hang; it exits with 124 and
-  terminates the remote process group (SIGTERM, then SIGKILL 5 seconds later),
-  without synchronizing afterwards.
+- Use `--timeout` to bound commands that might hang (in seconds, or with a
+  unit such as `10m`); it exits with 124 and terminates the remote process
+  group (SIGTERM, then SIGKILL 5 seconds later), without synchronizing
+  afterwards.
+- Commands are also terminated when the session stops synchronizing (see the
+  lost connection above), but detached jobs keep running. Files that they
+  write arrive through normal synchronization; run `remote --flush` before
+  reading them locally.

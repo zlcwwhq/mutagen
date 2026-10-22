@@ -64,6 +64,9 @@ type record struct {
 	// Created is the registration time, used to prefer the newest registration
 	// when an endpoint's previous executor has not yet noticed disconnection.
 	Created time.Time
+	// SessionCreated is the session's creation time (see
+	// Endpoint.SessionCreated).
+	SessionCreated time.Time
 	// Ignores are the session's ignores, if known (see Endpoint.Ignores).
 	Ignores *Ignores `json:",omitempty"`
 }
@@ -189,13 +192,14 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 	// refuses connections is known to be stale. Rename it into place so that
 	// readers never observe a partial record.
 	data, err := json.Marshal(&record{
-		Version: mutagen.Version,
-		Session: endpoint.Session,
-		Name:    endpoint.Name,
-		Root:    root,
-		Alpha:   endpoint.Alpha,
-		Created: time.Now(),
-		Ignores: endpoint.Ignores,
+		Version:        mutagen.Version,
+		Session:        endpoint.Session,
+		Name:           endpoint.Name,
+		Root:           root,
+		Alpha:          endpoint.Alpha,
+		Created:        time.Now(),
+		SessionCreated: endpoint.SessionCreated,
+		Ignores:        endpoint.Ignores,
 	})
 	if err != nil {
 		listener.Close()
@@ -239,6 +243,43 @@ type Target struct {
 	// in which case Path identifies the corresponding directory on the
 	// opposite endpoint.
 	Contained bool
+	// Overlapping labels the sessions whose roots contain the submission
+	// directory and that synchronize it (see Session.Label), starting with the
+	// located session and continuing in the order of preference, if there are
+	// several and the session was located without being selected (by
+	// Selection.Session or a matching Selection.Default), since the submission
+	// may then have been meant for another one. It's empty otherwise, and for
+	// pinned selections.
+	Overlapping []string
+}
+
+// Session describes a session endpoint on this system through which
+// operations can be submitted, as listed by Selection.Sessions.
+type Session struct {
+	// Session is the session identifier.
+	Session string
+	// Name is the session name, if any.
+	Name string
+	// Label is the session name, or the identifier if the session is unnamed
+	// or another registered session shares its name, so that it selects the
+	// session unambiguously.
+	Label string
+	// Alpha indicates whether the endpoint is alpha.
+	Alpha bool
+	// Root is the endpoint's synchronization root.
+	Root string
+	// Version is the Mutagen version that registered the endpoint, which must
+	// match this version for submissions through it.
+	Version string
+	// Contained indicates whether Root contains the directory.
+	Contained bool
+	// Excluded indicates whether the session's ignores exclude the directory,
+	// or a parent of it inside Root, so that the session doesn't synchronize
+	// it (see Selection.Corresponding).
+	Excluded bool
+	// Selected indicates whether the selection locates the endpoint for the
+	// directory.
+	Selected bool
 }
 
 // SessionVariable is the environment variable that selects a session, by
@@ -405,8 +446,8 @@ func probeTier(ctx context.Context, tier []*candidate) ([]liveEndpoint, error) {
 // locate ranks candidates and connects to the live endpoints in the first tier
 // of equally ranked candidates that has any, returning none if no candidate is
 // live. Containing roots rank first, then more specific containing roots, and
-// registrations of the same endpoint are ranked by age (see probeTier). More
-// than one live endpoint indicates ambiguity, which the caller reports.
+// registrations of the same endpoint are ranked by age (see probeTier). The
+// caller resolves or reports ambiguity among several live endpoints.
 func locate(ctx context.Context, candidates []*candidate) ([]liveEndpoint, error) {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if candidates[i].contained != candidates[j].contained {
@@ -430,21 +471,36 @@ func locate(ctx context.Context, candidates []*candidate) ([]liveEndpoint, error
 	return nil, nil
 }
 
-// synchronizing describes the sessions with live registrations among
+// precedes orders candidates whose roots contain the submission directory
+// equally specifically: the session created first is preferred, with ties
+// broken by identifier, so that the preference doesn't change as sessions
+// reconnect or more sessions are created.
+func precedes(a, b *candidate) bool {
+	if !a.SessionCreated.Equal(b.SessionCreated) {
+		return a.SessionCreated.Before(b.SessionCreated)
+	}
+	return a.Session < b.Session
+}
+
+// synchronizingSessions returns one live registration for each session among
 // candidates whose roots contain the submission directory, most specific
-// first. Dead registrations are pruned, while registrations whose liveness
-// can't be determined are assumed to be live. Registrations are only probed
-// for liveness, without a version handshake, so registrations by other
-// versions of Mutagen are included.
-func synchronizing(ctx context.Context, candidates []*candidate) ([]string, error) {
+// first, and then in the order of preference (see precedes). Dead
+// registrations are pruned, while registrations whose liveness can't be
+// determined are assumed to be live. Registrations are only probed for
+// liveness, without a version handshake, so registrations by other versions of
+// Mutagen are included.
+func synchronizingSessions(ctx context.Context, candidates []*candidate) ([]*candidate, error) {
 	candidates = filter(candidates, containing)
 	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].depth > candidates[j].depth
+		if candidates[i].depth != candidates[j].depth {
+			return candidates[i].depth > candidates[j].depth
+		}
+		return precedes(candidates[i], candidates[j])
 	})
-	var result []string
-	described := make(map[string]bool)
+	var result []*candidate
+	found := make(map[string]bool)
 	for _, c := range candidates {
-		if described[c.Session] {
+		if found[c.Session] {
 			continue
 		}
 		connection, err := dialRegistration(ctx, c.base+socketExtension)
@@ -456,10 +512,44 @@ func synchronizing(ctx context.Context, candidates []*candidate) ([]string, erro
 			c.remove()
 			continue
 		}
-		described[c.Session] = true
-		result = append(result, describe(c.Session, c.Name))
+		found[c.Session] = true
+		result = append(result, c)
 	}
 	return result, nil
+}
+
+// synchronizing describes the sessions that synchronizingSessions returns.
+func synchronizing(ctx context.Context, candidates []*candidate) ([]string, error) {
+	sessions, err := synchronizingSessions(ctx, candidates)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, len(sessions))
+	for s, c := range sessions {
+		result[s] = describe(c.Session, c.Name)
+	}
+	return result, nil
+}
+
+// labeler returns a function that labels sessions by name, or by identifier if
+// they're unnamed or another session among the candidates shares their name,
+// so that labels select sessions unambiguously (see matching).
+func labeler(candidates []*candidate) func(*candidate) string {
+	named := make(map[string]map[string]bool)
+	for _, c := range candidates {
+		if c.Name != "" {
+			if named[c.Name] == nil {
+				named[c.Name] = make(map[string]bool)
+			}
+			named[c.Name][c.Session] = true
+		}
+	}
+	return func(c *candidate) string {
+		if c.Name != "" && len(named[c.Name]) == 1 {
+			return c.Name
+		}
+		return c.Session
+	}
 }
 
 // relativePath determines whether a directory is inside a root and, if so,
@@ -516,24 +606,21 @@ func Dial(ctx context.Context, directory, session string, operation Operation) (
 	return selection.Dial(ctx, directory, operation)
 }
 
-// Dial submits the specified operation through the registered endpoint whose
-// root most specifically contains the specified directory, subject to the
-// selection. The returned connection is suitable for Execute, Flush, or the
-// other functions that complete the operation, and the returned target
-// describes the endpoint, which can pin subsequent selections.
-func (s *Selection) Dial(ctx context.Context, directory string, operation Operation) (net.Conn, *Target, error) {
+// relate loads the registrations and relates each one to the specified
+// directory, returning the directory with symbolic links resolved and the
+// candidates registered by this version of Mutagen and by other versions.
+// Registrations by other versions can't be used, but they can still indicate
+// that the directory is synchronized, and they're mentioned if no route is
+// found.
+func relate(directory string) (string, []*candidate, []*candidate, error) {
 	registry, err := filesystem.Mutagen(false, registryDirectoryName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("unable to compute command registry directory: %w", err)
+		return "", nil, nil, fmt.Errorf("unable to compute command registry directory: %w", err)
 	}
 	registrations, err := loadRegistrations(registry)
 	if err != nil {
-		return nil, nil, err
+		return "", nil, nil, err
 	}
-
-	// Relate each registration to the directory. Registrations by other
-	// versions of Mutagen can't be used, but they can still indicate that the
-	// directory is synchronized, and they're mentioned if no route is found.
 	directory = resolveSymbolicLinks(directory)
 	var compatible, incompatible []*candidate
 	for _, r := range registrations {
@@ -550,6 +637,19 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 			incompatible = append(incompatible, c)
 		}
 	}
+	return directory, compatible, incompatible, nil
+}
+
+// Dial submits the specified operation through the registered endpoint whose
+// root most specifically contains the specified directory, subject to the
+// selection. The returned connection is suitable for Execute, Flush, or the
+// other functions that complete the operation, and the returned target
+// describes the endpoint, which can pin subsequent selections.
+func (s *Selection) Dial(ctx context.Context, directory string, operation Operation) (net.Conn, *Target, error) {
+	directory, compatible, incompatible, err := relate(directory)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// Locate the endpoint.
 	endpoint, err := s.locate(ctx, directory, compatible, incompatible)
@@ -564,6 +664,26 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 		if excluded := c.Ignores.excluded(c.path); excluded != "" {
 			connection.Close()
 			return nil, nil, excludedError(directory, c, excluded)
+		}
+	}
+
+	// Label the sessions that synchronize the directory if there are several
+	// and the session wasn't selected (see Target.Overlapping).
+	var overlapping []string
+	if s.Target == nil && s.Session == "" && c.contained && (s.Default == "" || !matching(s.Default)(c)) {
+		all := slices.Concat(compatible, incompatible)
+		others, err := synchronizingSessions(ctx, filter(all, func(other *candidate) bool {
+			return other.Session != c.Session && other.Ignores.excluded(other.path) == ""
+		}))
+		if err != nil {
+			connection.Close()
+			return nil, nil, err
+		} else if len(others) > 0 {
+			label := labeler(all)
+			overlapping = append(overlapping, label(c))
+			for _, other := range others {
+				overlapping = append(overlapping, label(other))
+			}
 		}
 	}
 
@@ -583,13 +703,92 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 		return nil, nil, fmt.Errorf("unable to handshake with session %s: %w", describe(c.Session, c.Name), err)
 	}
 	return connection, &Target{
-		Session:   c.Session,
-		Name:      c.Name,
-		Alpha:     c.Alpha,
-		Root:      c.Root,
-		Path:      c.path,
-		Contained: c.contained,
+		Session:     c.Session,
+		Name:        c.Name,
+		Alpha:       c.Alpha,
+		Root:        c.Root,
+		Path:        c.path,
+		Contained:   c.contained,
+		Overlapping: overlapping,
 	}, nil
+}
+
+// Sessions lists the endpoints on this system through which operations can be
+// submitted, including those registered by other versions of Mutagen, relating
+// each to the specified directory: endpoints whose roots contain it come
+// first, most specific first and then in the order of preference (see
+// precedes), followed by the others, ordered by root. The endpoint that the
+// selection locates for the directory, if it locates one, is marked as
+// selected, though ignores that exclude the directory would prevent operations
+// corresponding to it. Dead registrations are pruned, while registrations
+// whose liveness can't be determined are assumed to be live.
+func (s *Selection) Sessions(ctx context.Context, directory string) ([]Session, error) {
+	directory, compatible, incompatible, err := relate(directory)
+	if err != nil {
+		return nil, err
+	}
+
+	// Probe the newest registration of each endpoint, falling back to older
+	// ones as dead registrations are pruned, as probeTier does.
+	candidates := slices.Concat(compatible, incompatible)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].Created.After(candidates[j].Created)
+	})
+	var live []*candidate
+	resolved := make(map[string]bool)
+	for _, c := range candidates {
+		key := fmt.Sprintf("%s/%t", c.Session, c.Alpha)
+		if resolved[key] {
+			continue
+		}
+		connection, err := dialRegistration(ctx, c.base+socketExtension)
+		if err == nil {
+			connection.Close()
+		} else if ctx.Err() != nil {
+			return nil, ctx.Err()
+		} else if isDead(err) {
+			c.remove()
+			continue
+		}
+		resolved[key] = true
+		live = append(live, c)
+	}
+	sort.SliceStable(live, func(i, j int) bool {
+		if live[i].contained != live[j].contained {
+			return live[i].contained
+		} else if live[i].depth != live[j].depth {
+			return live[i].depth > live[j].depth
+		} else if !live[i].contained && live[i].Root != live[j].Root {
+			return live[i].Root < live[j].Root
+		}
+		return precedes(live[i], live[j])
+	})
+
+	// Determine the endpoint that the selection locates. Failures to locate one,
+	// such as ambiguity, leave every endpoint unselected.
+	var selected *candidate
+	if endpoint, err := s.locate(ctx, directory, compatible, incompatible); err == nil {
+		endpoint.connection.Close()
+		selected = endpoint.candidate
+	} else if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	label := labeler(candidates)
+	result := make([]Session, len(live))
+	for l, c := range live {
+		result[l] = Session{
+			Session:   c.Session,
+			Name:      c.Name,
+			Label:     label(c),
+			Alpha:     c.Alpha,
+			Root:      c.Root,
+			Version:   c.Version,
+			Contained: c.contained,
+			Excluded:  c.contained && c.Ignores.excluded(c.path) != "",
+			Selected:  selected != nil && c.Session == selected.Session && c.Alpha == selected.Alpha,
+		}
+	}
+	return result, nil
 }
 
 // locate connects to the endpoint through which to submit an operation from the
@@ -617,10 +816,23 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 		}
 	}
 
-	// containedAmbiguity reports ambiguity among sessions whose roots contain
-	// the directory equally specifically.
-	containedAmbiguity := func(sessions []string) error {
-		return fmt.Errorf("multiple sessions contain %s (%s); use --session to select one", directory, strings.Join(sessions, ", "))
+	// first returns the preferred live endpoint among those whose roots
+	// contain the directory equally specifically (see precedes), rather than
+	// report ambiguity, since Dial labels the other sessions for a warning
+	// (see Target.Overlapping).
+	first := func(live []liveEndpoint) *liveEndpoint {
+		best := 0
+		for l := range live {
+			if precedes(live[l].candidate, live[best].candidate) {
+				best = l
+			}
+		}
+		for l := range live {
+			if l != best {
+				live[l].connection.Close()
+			}
+		}
+		return &live[best]
 	}
 
 	// mismatched explains a failure to locate an endpoint if registrations by
@@ -686,14 +898,14 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 			return nil, err
 		} else if len(live) == 0 {
 			return nil, mismatched(filter(incompatible, selected),
-				fmt.Errorf("no connected session matching %q has remote commands enabled on this system", s.Session))
+				fmt.Errorf("no connected session matching %q has remote commands enabled on this system (remote --sessions lists them)", s.Session))
 		}
 		return single(live, selectedAmbiguity(fmt.Sprintf("%q", s.Session)))
 	}
 
 	// A default session only selects among the sessions whose roots contain
-	// the directory, if there are any. Ambiguity among containing sessions
-	// that don't match it is still reported, rather than resolved by it.
+	// the directory, if there are any. If none of them matches it, then the
+	// preferred one among the most specific is used, as without a default.
 	if s.Default != "" {
 		preferred := matching(s.Default)
 		label := fmt.Sprintf("%s=%q", SessionVariable, s.Default)
@@ -706,7 +918,7 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 		if err != nil {
 			return nil, err
 		} else if len(live) > 0 {
-			return single(live, containedAmbiguity)
+			return first(live), nil
 		}
 
 		// Outside every root, the default selects a session as an explicit
@@ -725,7 +937,7 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 			return c.contained || preferred(c)
 		})
 		return nil, mismatched(considered,
-			fmt.Errorf("no connected session with remote commands enabled contains %s or matches %s", directory, label))
+			fmt.Errorf("no connected session with remote commands enabled contains %s or matches %s (remote --sessions lists them)", directory, label))
 	}
 
 	// Otherwise, the most specific containing root is used.
@@ -734,7 +946,7 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 		return nil, err
 	} else if len(live) == 0 {
 		return nil, mismatched(filter(incompatible, containing),
-			fmt.Errorf("no connected session with remote commands enabled contains %s", directory))
+			fmt.Errorf("no connected session with remote commands enabled contains %s (remote --sessions lists them)", directory))
 	}
-	return single(live, containedAmbiguity)
+	return first(live), nil
 }

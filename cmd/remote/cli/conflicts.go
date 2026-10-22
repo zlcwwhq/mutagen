@@ -838,7 +838,7 @@ func appliedNote(backup string) string {
 func runConflicts(ctx context.Context, directory string, o *options, output, errorOutput io.Writer) error {
 	pruneWorkspaces()
 	if o.conflicts {
-		return printConflicts(ctx, directory, o, output)
+		return printConflicts(ctx, directory, o, output, errorOutput)
 	}
 	p := &printer{output: output, errors: errorOutput, json: o.json, headings: len(o.arguments) > 1}
 	var err error
@@ -941,11 +941,12 @@ func localSides(conflict *remote.ConflictRoot, target *remote.Target) []string {
 // checkouts (see releaseAbandoned). Paths are local paths, which are relative
 // to the working directory if it's inside the root, as other operations
 // expect.
-func printConflicts(ctx context.Context, directory string, o *options, output io.Writer) error {
+func printConflicts(ctx context.Context, directory string, o *options, output, errorOutput io.Writer) error {
 	listing, target, err := listConflicts(ctx, directory, o.session)
 	if err != nil {
 		return err
 	}
+	warnOverlapping(errorOutput, target)
 	l := newLocator(target)
 	workspaces := sessionWorkspaces(target)
 	holders := make(map[string]bool)
@@ -1076,6 +1077,7 @@ func checkoutAll(ctx context.Context, directory string, o *options, p *printer) 
 	if err != nil {
 		return err
 	}
+	warnOverlapping(p.errors, target)
 	for _, argument := range o.arguments {
 		result, err := checkout(ctx, directory, o, listing, target, argument)
 		p.print(argument, result, err)

@@ -139,14 +139,15 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 	var maintainers sync.WaitGroup
 	for index, url := range []*urlpkg.URL{c.session.Alpha, c.session.Beta} {
 		endpoint := &remote.Endpoint{
-			Session:  c.session.Identifier,
-			Name:     c.session.Name,
-			Root:     url.Path,
-			Alpha:    index == 0,
-			Submit:   (index == 0 && betaExecutes) || (index == 1 && alphaExecutes),
-			Execute:  (index == 0 && alphaExecutes) || (index == 1 && betaExecutes),
-			Prologue: prologues[index],
-			Ignores:  ignores,
+			Session:        c.session.Identifier,
+			Name:           c.session.Name,
+			Root:           url.Path,
+			Alpha:          index == 0,
+			SessionCreated: c.session.CreationTime.AsTime(),
+			Submit:         (index == 0 && betaExecutes) || (index == 1 && alphaExecutes),
+			Execute:        (index == 0 && alphaExecutes) || (index == 1 && betaExecutes),
+			Prologue:       prologues[index],
+			Ignores:        ignores,
 		}
 		maintainers.Add(1)
 		go func() {
