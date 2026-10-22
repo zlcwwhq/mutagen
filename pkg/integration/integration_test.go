@@ -1,8 +1,11 @@
 package integration
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -12,7 +15,9 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/daemon"
 	"github.com/mutagen-io/mutagen/pkg/forwarding"
 	"github.com/mutagen-io/mutagen/pkg/grpcutil"
+	"github.com/mutagen-io/mutagen/pkg/identifier"
 	"github.com/mutagen-io/mutagen/pkg/ipc"
+	"github.com/mutagen-io/mutagen/pkg/logging"
 	daemonsvc "github.com/mutagen-io/mutagen/pkg/service/daemon"
 	forwardingsvc "github.com/mutagen-io/mutagen/pkg/service/forwarding"
 	promptingsvc "github.com/mutagen-io/mutagen/pkg/service/prompting"
@@ -39,6 +44,54 @@ var forwardingManager *forwarding.Manager
 // at the API level (as opposed to the gRPC or command line level).
 var synchronizationManager *synchronization.Manager
 
+// lockedBuffer is a buffer that can be read while it's written.
+type lockedBuffer struct {
+	// lock serializes access to buffer.
+	lock sync.Mutex
+	// buffer is the underlying buffer.
+	buffer bytes.Buffer
+}
+
+// Write implements io.Writer.Write.
+func (b *lockedBuffer) Write(data []byte) (int, error) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	return b.buffer.Write(data)
+}
+
+// String returns the buffer's contents.
+func (b *lockedBuffer) String() string {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	return b.buffer.String()
+}
+
+// synchronizationLog records the synchronization manager's log at the debug
+// level, so that tests can show their sessions' logs if they fail (see
+// logSessionOnFailure).
+var synchronizationLog lockedBuffer
+
+// logSessionOnFailure adds the synchronization manager's log of a session,
+// whose scopes start with its truncated identifier, to a test's output if the
+// test fails, such as to show why the session stopped synchronizing. The log
+// extends until cleanups registered before this call, such as the session's
+// termination, run.
+func logSessionOnFailure(t *testing.T, session string) {
+	scope := "[" + identifier.Truncated(session)
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		var log strings.Builder
+		for line := range strings.Lines(synchronizationLog.String()) {
+			if strings.Contains(line, scope+"]") || strings.Contains(line, scope+".") {
+				log.WriteString(line)
+			}
+		}
+		t.Logf("synchronization log of session %s:\n%s", session, log.String())
+	})
+}
+
 // TestMain is the entry point for integration tests. It replaces the default
 // test entry point so that it can copy the mutagen executable to a well-known
 // path, set up the agent bundle to work during testing, set up a functionally
@@ -62,8 +115,9 @@ func TestMain(m *testing.M) {
 	}
 	defer forwardingManager.Shutdown()
 
-	// Create a session manager and defer its shutdown.
-	synchronizationManager, err = synchronization.NewManager(nil)
+	// Create a session manager and defer its shutdown. Its log is recorded for
+	// failing tests (see logSessionOnFailure).
+	synchronizationManager, err = synchronization.NewManager(logging.NewLogger(logging.LevelDebug, &synchronizationLog))
 	if err != nil {
 		cmd.Fatal(fmt.Errorf("unable to create synchronization session manager: %w", err))
 	}

@@ -126,6 +126,7 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 		t.Fatal("unable to create session:", err)
 	}
 	defer synchronizationManager.Terminate(ctx, &selection.Selection{Specifications: []string{sessionID}}, "")
+	logSessionOnFailure(t, sessionID)
 	if _, err := flushRemote(alphaRoot); err != nil {
 		t.Fatal("unable to perform initial synchronization:", err)
 	}
@@ -300,6 +301,7 @@ func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaEx
 			t.Error("unable to terminate session:", err)
 		}
 	})
+	logSessionOnFailure(t, sessionID)
 	readyContext, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {

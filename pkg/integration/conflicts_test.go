@@ -48,6 +48,7 @@ func createConflictSessionWithCommands(t *testing.T, commands synchronization.Re
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { synchronizationManager.Terminate(ctx, &selection.Selection{Specifications: []string{id}}, "") })
+	logSessionOnFailure(t, id)
 	return roots
 }
 

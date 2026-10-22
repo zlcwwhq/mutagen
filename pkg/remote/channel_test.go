@@ -237,6 +237,57 @@ func registerIncompatible(t *testing.T, registry, session, root string) {
 	}
 }
 
+func TestDialRegistrationRefusals(t *testing.T) {
+	// Named pipes have no backlog that refuses connections.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+
+	// Where connections to a full backlog are refused, a refusal is only
+	// reported once it persists, so that live registrations aren't pruned.
+	// Sockets whose listeners are closed without removing them refuse
+	// connections on all systems.
+	ambiguous := ambiguousRefusals
+	ambiguousRefusals = true
+	t.Cleanup(func() { ambiguousRefusals = ambiguous })
+	directory := filepath.Dir(useTestRegistry(t))
+	path := filepath.Join(directory, "refused")
+	stale, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.(*net.UnixListener).SetUnlinkOnClose(false)
+	stale.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := dialRegistration(ctx, path); !isDead(err) {
+		t.Fatal("persistent refusal not reported:", err)
+	} else if time.Since(start) < refusalConfirmationTimeout {
+		t.Fatal("refusal reported without retrying")
+	}
+
+	// A listener that accepts connections before the refusal persists is
+	// reached. It's renamed into place, so that the path never goes missing.
+	live, err := net.Listen("unix", filepath.Join(directory, "live"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	renamed := make(chan error, 1)
+	time.AfterFunc(refusalConfirmationTimeout/5, func() {
+		renamed <- os.Rename(filepath.Join(directory, "live"), path)
+	})
+	if connection, err := dialRegistration(ctx, path); err != nil {
+		t.Fatal("transient refusal reported:", err)
+	} else {
+		connection.Close()
+	}
+	if err := <-renamed; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDialSessionDefault(t *testing.T) {
 	registry := useTestRegistry(t)
 	base := resolveSymbolicLinks(t.TempDir())

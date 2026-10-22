@@ -530,7 +530,10 @@ func ReplaceFile(ctx context.Context, directory string, replacement *Replacement
 	// it, since staging may take a while, unless the entry is stale or already
 	// has the result. Stale replacements thus fail without reading their
 	// input, but they're still admitted first, like those that find the result
-	// present, so that no earlier replacement is admitted after them.
+	// present, so that no earlier replacement is admitted after them. Failures
+	// to check the entry are left to the check after locking, since an earlier
+	// replacement that's still running may be writing the entry meanwhile,
+	// which makes reading it fail, until it unlocks the entry.
 	var staged string
 	defer func() {
 		if staged != "" {
@@ -546,18 +549,16 @@ func ReplaceFile(ctx context.Context, directory string, replacement *Replacement
 		}
 		return stageFile(ctx, root, path, staged, result, input)
 	}
-	if done, err := replacement.check(ctx, root, path); err != nil && !errors.Is(err, ErrStale) {
-		return err
-	} else if err == nil && !done && result.Kind != EntryMissing {
+	if done, err := replacement.check(ctx, root, path); err == nil && !done && result.Kind != EntryMissing {
 		if err := stage(); err != nil {
 			return err
 		}
 	}
 
 	// Lock the entry and admit the replacement before checking the entry
-	// again. An entry that was stale or had the result when it was first
-	// checked, but is now one of the expected entries, gets its result staged
-	// now and is checked once more.
+	// again. An entry that was stale, had the result, or couldn't be checked
+	// when it was first checked, but is now one of the expected entries, gets
+	// its result staged now and is checked once more.
 	if ReplaceHook != nil {
 		ReplaceHook("locking", directory, replacement.Path)
 	}

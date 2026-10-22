@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -33,7 +34,20 @@ const (
 	socketExtension = ".sock"
 	// probeTimeout bounds liveness probes of registered sockets.
 	probeTimeout = 5 * time.Second
+	// refusalConfirmationTimeout is how long refused connections to a
+	// registered socket are retried, where refusals are ambiguous (see
+	// ambiguousRefusals), before the refusal is reported.
+	refusalConfirmationTimeout = 250 * time.Millisecond
+	// refusalRetryInterval is the interval between those retries.
+	refusalRetryInterval = 10 * time.Millisecond
 )
+
+// ambiguousRefusals indicates whether connections to a Unix domain socket
+// whose listener's backlog is full are refused, as on systems derived from BSD,
+// including macOS, which then can't be told apart from connections to a socket
+// that no process listens on. Linux fails with EAGAIN instead. It's a variable
+// so that tests can enable it on other systems.
+var ambiguousRefusals = slices.Contains([]string{"darwin", "ios", "freebsd", "netbsd", "openbsd", "dragonfly"}, runtime.GOOS)
 
 // record is the on-disk description of a registered endpoint.
 type record struct {
@@ -81,9 +95,31 @@ func (l *registeredListener) Close() error {
 }
 
 // isDead determines whether a dialing error indicates that no process is
-// listening, as opposed to a transient failure.
+// listening, as opposed to a transient failure. Refusals are only conclusive
+// once they persist (see dialRegistration).
 func isDead(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED)
+}
+
+// dialRegistration connects to a registered socket. Where refusals are
+// ambiguous (see ambiguousRefusals), refused connections are retried until
+// refusalConfirmationTimeout elapses, since a full backlog, such as while many
+// submissions connect at once, drains as the listener accepts connections,
+// and a live registration would otherwise be removed as dead (see isDead).
+// Cancellation during the retries is reported instead of the refusal.
+func dialRegistration(ctx context.Context, path string) (net.Conn, error) {
+	deadline := time.Now().Add(refusalConfirmationTimeout)
+	for {
+		connection, err := ipc.DialContext(ctx, path)
+		if err == nil || !ambiguousRefusals || !errors.Is(err, syscall.ECONNREFUSED) || !time.Now().Before(deadline) {
+			return connection, err
+		}
+		select {
+		case <-time.After(refusalRetryInterval):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 // loadRegistrations reads all parseable registration records.
@@ -118,7 +154,7 @@ func prune(directory string) {
 	registrations, _ := loadRegistrations(directory)
 	for _, r := range registrations {
 		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-		connection, err := ipc.DialContext(ctx, r.base+socketExtension)
+		connection, err := dialRegistration(ctx, r.base+socketExtension)
 		cancel()
 		if err == nil {
 			connection.Close()
@@ -351,7 +387,7 @@ func probeTier(ctx context.Context, tier []*candidate) ([]liveEndpoint, error) {
 		if resolved[key] {
 			continue
 		}
-		connection, err := ipc.DialContext(ctx, c.base+socketExtension)
+		connection, err := dialRegistration(ctx, c.base+socketExtension)
 		if err != nil {
 			if isDead(err) {
 				c.remove()
@@ -411,7 +447,7 @@ func synchronizing(ctx context.Context, candidates []*candidate) ([]string, erro
 		if described[c.Session] {
 			continue
 		}
-		connection, err := ipc.DialContext(ctx, c.base+socketExtension)
+		connection, err := dialRegistration(ctx, c.base+socketExtension)
 		if err == nil {
 			connection.Close()
 		} else if ctx.Err() != nil {
