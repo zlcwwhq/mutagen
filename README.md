@@ -87,6 +87,14 @@ You can find
 [installation instructions](https://mutagen.io/documentation/introduction/installation)
 in the [Mutagen documentation](https://mutagen.io/documentation).
 
+Releases of this fork, which include `remote`, are available on its
+[releases page](https://github.com/zlcwwhq/mutagen/releases). Each bundle
+contains `mutagen`, `remote`, and `mutagen-agents.tar.gz`, which `mutagen` needs
+to install agents on endpoints: keep it in the same directory as `mutagen`, or
+in `../libexec` if `mutagen` is in a `bin` directory. Only the daemon's system
+needs an installation. The `mutagen-setup` agent skill (see below) automates
+this.
+
 
 ## Remote commands
 
@@ -459,19 +467,32 @@ endpoints whose systems you trust as much as the executing endpoint itself.
 
 The [mutagen-remote](https://github.com/zlcwwhq/mutagen-remote-skill) agent
 skill teaches coding agents to use `remote`, covering synchronization, quoting,
-prologues, exit statuses, long-running jobs, and conflicts. Its repository is
-also a Claude Code plugin marketplace. On each system where agents submit
-commands, install it in Claude Code with:
+prologues, exit statuses, long-running jobs, and conflicts. Its plugin also
+includes the `mutagen-setup` skill, which sets Mutagen up for a project: it
+installs or upgrades this fork from its latest release, starts the daemon,
+writes `mutagen.yml` with the alpha and beta endpoints, starts the sessions,
+and makes `remote` available on the endpoints. On each system where agents
+submit commands or set up Mutagen, install the plugin in Claude Code:
 
 ```
 /plugin marketplace add zlcwwhq/mutagen-remote-skill
 /plugin install mutagen-remote@mutagen-remote-skill
 ```
 
-To keep it updated, enable auto-update for the marketplace in `/plugin`. The
-skill's README describes the alternatives and how its versions relate to
-`remote`. This repository references the matching version of the skill as the
-`skills/mutagen-remote` Git submodule.
+Or in Codex:
+
+```sh
+codex plugin marketplace add zlcwwhq/mutagen-remote-skill
+codex plugin add mutagen-remote@mutagen-remote-skill
+```
+
+To keep it updated, enable auto-update for the marketplace in Claude Code's
+`/plugin`; Codex updates it automatically when it starts. In Codex's default
+sandbox, `remote` can't connect to the daemon unless the sandbox allows network
+access. The skill's README describes the sandbox setting, the alternatives, an
+example of setting Mutagen up with `mutagen-setup`, and how its versions relate
+to `remote`. This repository references the matching version of the skills as
+the `skills/mutagen-remote` Git submodule.
 
 
 ## Community

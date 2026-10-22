@@ -79,10 +79,11 @@ follow the code and update this file.
 - `tools/` contains standalone developer utilities such as
   `scan_bench` and `watch_demo`.
 - `skills/mutagen-remote` is a Git submodule of
-  `zlcwwhq/mutagen-remote-skill`, the agent skill that teaches agents
-  to use `remote` and the Claude Code plugin marketplace that
-  distributes it. It pins the skill version matching this code; run
-  `git submodule update --init` to check it out.
+  `zlcwwhq/mutagen-remote-skill`, which holds the agent skills that
+  teach agents to use `remote` (`mutagen-remote`) and to set up
+  Mutagen (`mutagen-setup`), and the Claude Code plugin marketplace
+  that distributes them. It pins the skill version matching this
+  code; run `git submodule update --init` to check it out.
 - `sspl/` contains optional SSPL-licensed code paths.
 
 ## Build And Test
@@ -167,7 +168,9 @@ compliance before committing:
   `CLAUDE.md`, and point the `skills/mutagen-remote` submodule at
   them. Installations update from the skill's `main` branch, so
   changes for unreleased behavior go on another branch until the fork
-  release that supports them is published.
+  release that supports them is published. Likewise, update the
+  `mutagen-setup` skill when release assets, the installation layout,
+  project configuration, or daemon commands change.
 - External pull requests are not accepted for code under `sspl/`.
 - Public docs in this repository should not describe local scratch
   files, untracked helper scripts, or internal-only workflow
