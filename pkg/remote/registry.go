@@ -251,6 +251,9 @@ type Target struct {
 	// may then have been meant for another one. It's empty otherwise, and for
 	// pinned selections.
 	Overlapping []string
+	// Ignores are the session's ignores, if known (see Endpoint.Ignores), which
+	// determine the paths that the session doesn't synchronize.
+	Ignores *Ignores
 }
 
 // Session describes a session endpoint on this system through which
@@ -497,6 +500,13 @@ func synchronizingSessions(ctx context.Context, candidates []*candidate) ([]*can
 		}
 		return precedes(candidates[i], candidates[j])
 	})
+	return liveSessions(ctx, candidates)
+}
+
+// liveSessions returns one live registration for each session among
+// candidates, in their order. Dead registrations are pruned, while
+// registrations whose liveness can't be determined are assumed to be live.
+func liveSessions(ctx context.Context, candidates []*candidate) ([]*candidate, error) {
 	var result []*candidate
 	found := make(map[string]bool)
 	for _, c := range candidates {
@@ -585,7 +595,7 @@ func describe(session, name string) string {
 // excludedError reports that an operation corresponding to a directory can't
 // be submitted through the session of a candidate whose ignores exclude it,
 // given the excluded slash-separated path relative to the session's root (see
-// Ignores.excluded).
+// Ignores.Excluded).
 func excludedError(directory string, c *candidate, excluded string) error {
 	session := describe(c.Session, c.Name)
 	excludedDirectory := filepath.Join(resolveSymbolicLinks(c.Root), filepath.FromSlash(excluded))
@@ -661,7 +671,7 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 	// Refuse operations corresponding to a directory that the session doesn't
 	// synchronize (see Selection.Corresponding).
 	if s.Target == nil && s.Corresponding && c.contained {
-		if excluded := c.Ignores.excluded(c.path); excluded != "" {
+		if excluded := c.Ignores.Excluded(c.path, true); excluded != "" {
 			connection.Close()
 			return nil, nil, excludedError(directory, c, excluded)
 		}
@@ -673,7 +683,7 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 	if s.Target == nil && s.Session == "" && c.contained && (s.Default == "" || !matching(s.Default)(c)) {
 		all := slices.Concat(compatible, incompatible)
 		others, err := synchronizingSessions(ctx, filter(all, func(other *candidate) bool {
-			return other.Session != c.Session && other.Ignores.excluded(other.path) == ""
+			return other.Session != c.Session && other.Ignores.Excluded(other.path, true) == ""
 		}))
 		if err != nil {
 			connection.Close()
@@ -702,7 +712,13 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 		connection.Close()
 		return nil, nil, fmt.Errorf("unable to handshake with session %s: %w", describe(c.Session, c.Name), err)
 	}
-	return connection, &Target{
+	return connection, c.target(overlapping), nil
+}
+
+// target describes the endpoint of a candidate as a target, with the specified
+// overlapping sessions (see Target.Overlapping).
+func (c *candidate) target(overlapping []string) *Target {
+	return &Target{
 		Session:     c.Session,
 		Name:        c.Name,
 		Alpha:       c.Alpha,
@@ -710,7 +726,66 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 		Path:        c.path,
 		Contained:   c.contained,
 		Overlapping: overlapping,
-	}, nil
+		Ignores:     c.Ignores,
+	}
+}
+
+// Locate locates the endpoint through which the selection would submit an
+// operation from the specified directory, as Dial does, but without submitting
+// one, such as to inspect the session's ignores. Since nothing is submitted,
+// ignores that exclude the directory don't prevent it from being located (see
+// Selection.Corresponding), and overlapping sessions aren't labeled.
+func (s *Selection) Locate(ctx context.Context, directory string) (*Target, error) {
+	directory, compatible, incompatible, err := relate(directory)
+	if err != nil {
+		return nil, err
+	}
+	endpoint, err := s.locate(ctx, directory, compatible, incompatible)
+	if err != nil {
+		return nil, err
+	}
+	endpoint.connection.Close()
+	return endpoint.candidate.target(nil), nil
+}
+
+// Synchronizing describes the sessions, other than that of the specified
+// target, that synchronize content at the specified path, which is a directory
+// if directory is true: those whose roots on this system contain the path and
+// whose ignores don't exclude it, and, for a directory, those whose roots lie
+// beneath it. Writing content that such a session synchronizes, such as that of
+// a session whose root is nested inside the target's root, would race with its
+// synchronization. Only sessions registered for remote commands on this system
+// (by any version of Mutagen) are known, and dead registrations are pruned.
+func Synchronizing(ctx context.Context, path string, directory bool, except *Target) ([]string, error) {
+	path, compatible, incompatible, err := relate(path)
+	if err != nil {
+		return nil, err
+	}
+	others := filter(slices.Concat(compatible, incompatible), func(c *candidate) bool {
+		return c.Session != except.Session
+	})
+	sessions, err := synchronizingSessions(ctx, filter(others, func(c *candidate) bool {
+		return c.Ignores.Excluded(c.path, directory) == ""
+	}))
+	if err != nil {
+		return nil, err
+	} else if directory {
+		nested, err := liveSessions(ctx, filter(others, func(c *candidate) bool {
+			_, inside := relativePath(path, resolveSymbolicLinks(c.Root))
+			return !c.contained && inside && !slices.ContainsFunc(sessions, func(s *candidate) bool {
+				return s.Session == c.Session
+			})
+		}))
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, nested...)
+	}
+	result := make([]string, len(sessions))
+	for s, c := range sessions {
+		result[s] = describe(c.Session, c.Name)
+	}
+	return result, nil
 }
 
 // Sessions lists the endpoints on this system through which operations can be
@@ -784,7 +859,7 @@ func (s *Selection) Sessions(ctx context.Context, directory string) ([]Session, 
 			Root:      c.Root,
 			Version:   c.Version,
 			Contained: c.contained,
-			Excluded:  c.contained && c.Ignores.excluded(c.path) != "",
+			Excluded:  c.contained && c.Ignores.Excluded(c.path, true) != "",
 			Selected:  selected != nil && c.Session == selected.Session && c.Alpha == selected.Alpha,
 		}
 	}

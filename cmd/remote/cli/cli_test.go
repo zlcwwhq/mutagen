@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -131,7 +132,7 @@ func TestHelp(t *testing.T) {
 		t.Fatal("help failed:", code)
 	}
 	help := output.String()
-	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--diff"} {
+	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--diff", "--script FILE", "--detach", "--log FILE", "--wait ID", "--kill ID", "--jobs", "--ignores", "--pull"} {
 		if !strings.Contains(help, expected) {
 			t.Errorf("help is missing %q", expected)
 		}
@@ -148,6 +149,8 @@ func TestHelp(t *testing.T) {
 	expectations := map[string][]string{
 		"sessions":    {"MUTAGEN_REMOTE_SESSION"},
 		"termination": {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second)},
+		"jobs":        {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second), "--log FILE"},
+		"scripts":     {fmt.Sprintf("limited to %d KiB", remote.MaximumScriptSize/1024), "or with " + remote.DefaultScriptInterpreter + " if it has none"},
 		"conflicts":   {"--conflict-checkout", "--take SIDE", "--base FILE", "--json"},
 	}
 	for _, topic := range helpTopics {
@@ -220,5 +223,87 @@ func TestLoadEnvironment(t *testing.T) {
 	}
 	if _, err := loadEnvironment([]string{path}, nil); err == nil {
 		t.Fatal("invalid file accepted")
+	}
+}
+
+func TestParseModes(t *testing.T) {
+	// Each mode accepts its own options and arguments.
+	for _, arguments := range [][]string{
+		{"--jobs"},
+		{"-s", "name", "--jobs"},
+		{"--wait", "0123abcd"},
+		{"--wait", "0123abcd", "--timeout", "10", "--no-flush", "-s", "name"},
+		{"--kill", "0123abcd", "--timeout", "10"},
+		{"--ignores"},
+		{"--ignores", "results", "a.log"},
+		{"--pull", "results", "a.log"},
+		{"-s", "name", "--timeout", "1m", "--pull", "results"},
+		{"--detach", "python", "train.py"},
+		{"--detach", "--log", "train.log", "-C", "sub", "-e", "X=1", "--no-flush", "--no-prologue", "python"},
+		{"--script", "-"},
+		{"--script", "sweep.sh", "a", "--help"},
+		{"--script", "-", "--detach", "--log", "sweep.log", "--timeout", "0"},
+		{"--script", "-", "--timeout", "10m", "-C", "/tmp", "--flush"},
+	} {
+		if _, err := parse(arguments); err != nil {
+			t.Errorf("valid arguments %v rejected: %v", arguments, err)
+		}
+	}
+	// The arguments that follow a script are its own, even if they look like
+	// options.
+	for _, test := range []struct {
+		arguments, expected []string
+	}{
+		{[]string{"--script", "sweep.sh", "--help", "x"}, []string{"--help", "x"}},
+		{[]string{"--script=sweep.sh", "--lr", "3e-4"}, []string{"--lr", "3e-4"}},
+		{[]string{"-e", "--script", "--script", "-", "-e", "X"}, []string{"-e", "X"}},
+		{[]string{"-sname", "-C", "sub", "--no-flush", "--script", "-"}, nil},
+		{[]string{"--script", "-", "--", "x"}, []string{"--", "x"}},
+	} {
+		options, err := parse(test.arguments)
+		if err == nil && options.script == "" {
+			err = errors.New("no script")
+		}
+		if err != nil || options.help || len(options.arguments)+len(test.expected) > 0 && !reflect.DeepEqual(options.arguments, test.expected) {
+			t.Errorf("script arguments %v parsed incorrectly: %#v, %v", test.arguments, options, err)
+		}
+	}
+	if options, err := parse([]string{"-e", "--script", "true"}); err != nil || options.script != "" || !reflect.DeepEqual(options.arguments, []string{"true"}) {
+		t.Errorf("option value mistaken for --script: %+v, %v", options, err)
+	}
+
+	// Modes are mutually exclusive, and accept only some options.
+	for _, arguments := range [][]string{
+		{"--jobs", "x"},
+		{"--jobs", "--wait", "0123abcd"},
+		{"--jobs", "--flush"},
+		{"--jobs", "--conflicts"},
+		{"--wait"},
+		{"--wait", ""},
+		{"--wait", "0123abcd", "x"},
+		{"--wait", "0123abcd", "-C", "sub"},
+		{"--kill", "0123abcd", "--no-flush"},
+		{"--kill", "0123abcd", "--wait", "0123abcd"},
+		{"--ignores", "--timeout", "10"},
+		{"--ignores", "--diff"},
+		{"--ignores", "a", "-b"},
+		{"--pull"},
+		{"--pull", "--flush", "a"},
+		{"--pull", "-e", "X=1", "a"},
+		{"--pull", "a", "-b"},
+		{"--sessions", "--jobs"},
+		{"--log", "train.log", "python"},
+		{"--detach"},
+		{"--detach", "--timeout", "10", "python"},
+		{"--detach", "--diff"},
+		{"--script", "", "x"},
+		{"--diff", "--script", "-"},
+		{"--conflicts", "--script", "-"},
+		{"--detach", "--conflict-discard", "a"},
+		{"--jobs", "--script", "-"},
+	} {
+		if _, err := parse(arguments); err == nil {
+			t.Errorf("invalid arguments %v accepted", arguments)
+		}
 	}
 }

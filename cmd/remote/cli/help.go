@@ -13,8 +13,12 @@ import (
 // that people and agents unfamiliar with remote can read it in full. Details
 // are left to help topics.
 const usage = `Usage: remote [options] <command> [<args>...]
+       remote [options] --script <file>|- [<args>...]
+       remote [options] --detach [--log <file>] <command> [<args>...]
        remote [options] --flush
        remote [options] --diff [<path>...]
+       remote [-s <session>] --jobs | --wait <id> | --kill <id>
+       remote [-s <session>] --ignores [<path>...] | --pull <path>...
        remote --sessions
 
 Run a command on the opposite endpoint of the Mutagen synchronization session
@@ -25,14 +29,22 @@ after it, so that its changes are present locally when remote exits.
 
 Examples:
   remote pytest -x tests/
-  remote sh -c 'make && ./bin/app'      (shell syntax needs an explicit shell)
+  remote sh -c 'make && ./bin/app'      (shell syntax needs a shell or --script)
   remote -e CONDA_ENV=torch python train.py
   remote --timeout 600 make bench       (terminate it after 10 minutes)
+  remote --detach --log train.log python train.py
+                                        (run it in the background: prints an ID)
+  remote --wait <id>                    (wait for that job, then synchronize)
   remote --flush                        (only synchronize)
+  remote --script - <<'EOF'             (run shell code as written, with bash)
+  for p in a b; do python run.py --preset "$p"; done
+  EOF
 
 Your local shell expands variables, globs, and ~ before remote sees them, and
 no remote shell interprets the arguments, so use sh -c '...' for anything that
-should be expanded remotely. Options must precede the command. No terminal is
+should be expanded remotely, or --script - with a quoted here-document
+(<<'EOF'), which your shell passes unchanged. Options must precede the command;
+the arguments after --script's file are the script's. No terminal is
 allocated, so interactive programs don't work.
 
 Exit status is the command's own, or:
@@ -41,7 +53,9 @@ Exit status is the command's own, or:
   127  command not found
   126  command couldn't be started, or the prologue failed
   124  --timeout expired
-With --diff, it's 0 if the copies are identical and 1 if they differ.
+With --wait, it's the job's status. With --diff, it's 0 if the copies are
+identical and 1 if they differ, and with --ignores, it's 1 if any given path
+is ignored.
 
 Options:
 `
@@ -77,7 +91,8 @@ and those whose roots contain the current directory.
   - Commands don't run in a directory that the session ignores (or inside
     one), since the session doesn't synchronize it, unless --cwd is given:
     --cwd . runs them in the corresponding directory anyway, such as in an
-    ignored build directory that exists on both endpoints.
+    ignored build directory that exists on both endpoints. remote --ignores
+    lists the session's ignores.
   - Sessions that are paused, disconnected, or don't run commands submitted
     from this side can't be found, so inside the root of such a session that
     is nested in another session's root, the enclosing session is used: if it
@@ -87,18 +102,34 @@ and those whose roots contain the current directory.
   - Once remote has located the session, it doesn't switch to another, even
     if that one disconnects.
 `},
-	{"sync", "synchronization, warnings, and --diff", `  - The session is synchronized before and after the command. Failure to
-    synchronize only produces a warning. --no-flush skips both
-    synchronizations, such as for commands that don't touch synchronized
-    files, and --flush without a command only synchronizes. --timeout includes
-    the time spent synchronizing.
+	{"sync", "synchronization, ignored paths, --pull, and --diff", `  - The session is synchronized before and after the command. Failure to
+    synchronize only produces a warning. Keep these synchronizations: without
+    the first, a command can silently run outdated code, while an unneeded one
+    only costs a rescan of both roots, which typically takes well under a
+    second, but longer for very large trees and slow connections. --no-flush
+    skips both, so use it only for commands that neither read nor write
+    synchronized files, such as nvidia-smi or reading an ignored log; when
+    unsure, synchronize. --flush without a command only synchronizes. --timeout
+    includes the time spent synchronizing.
+  - --detach synchronizes only before starting the job, and --wait only after
+    the job ends. --jobs, --kill, --ignores, and --pull don't synchronize.
   - After synchronizing, remote warns about conflicts (files modified on both
     endpoints, which stay unsynchronized until resolved; see
     remote --help conflicts) and other content that couldn't be synchronized,
     such as because of permission errors. Ignored paths are never synchronized
     and aren't reported.
-  - Files that a detached command writes later arrive through the session's
-    regular synchronization, which remote --flush performs on demand.
+  - Files that a detached job writes arrive through the session's regular
+    synchronization, which remote --wait performs once the job ends, and
+    remote --flush on demand.
+  - Content written to ignored paths exists only on the endpoint that wrote
+    it. remote --ignores lists the session's ignores, and
+    remote --ignores <path>... shows whether each path is ignored, as the kind
+    of entry that it is locally (exit status 1 if any is). remote --pull
+    <path>... copies ignored files, directories, and symbolic links from the
+    opposite endpoint, replacing local files that differ but never deleting
+    local content. It refuses the root, paths that the session (or another
+    session) synchronizes, which synchronization updates instead, and
+    directories with synchronized content beneath them.
   - remote --diff shows how the remote copies of the given paths, or of the
     conflicting files, differ from the local copies, as a unified diff
     (- local, + remote). For a single-file session, use --session from outside
@@ -125,6 +156,7 @@ and those whose roots contain the current directory.
     identifying the executing endpoint. Use it to branch in a shared script.
     This overrides inherited values and those passed with -e or --env-file,
     even with --no-prologue or when submitting from outside the root.
+    Detached jobs also receive MUTAGEN_REMOTE_JOB, set to their ID.
 
 Example .remote-prologue.sh, activating a conda environment on beta only:
   case "$MUTAGEN_REMOTE_ENDPOINT" in
@@ -142,9 +174,77 @@ connection to the executing endpoint was lost and exits with status 255,
 without synchronizing afterwards; files that the command was writing may be
 incomplete. Statuses 128+N mean that the command was killed by signal N.
 
-remote waits for every process holding its output, so detach jobs that should
-keep running, with all output redirected:
-  remote sh -c 'nohup ./train.sh > train.log 2>&1 < /dev/null &'
+remote waits for every process holding its output. Run commands that should
+keep running after remote exits, or after the session stops synchronizing, as
+detached jobs (see remote --help jobs), rather than in the background with
+nohup.
+`},
+	{"scripts", "running shell code and other scripts with --script", `Usage: remote [options] --script <file>|- [<args>...]
+
+--script runs a script instead of a command. remote reads it from a local file,
+or from standard input for -, typically a here-document, whose contents your
+shell passes unchanged if its delimiter is quoted:
+  remote --script - --preset a <<'EOF'
+  for seed in 1 2 3; do python train.py "$1" "$2" --seed "$seed"; done
+  EOF
+
+  - The opposite endpoint runs the script with the interpreter named by its #!
+    line (such as #!/usr/bin/env python3), or with bash if it has none, looked
+    up after the prologue is sourced. The arguments after the file, even ones
+    that look like options, become the script's arguments ($1, $2, ...).
+  - The script is copied to a temporary file there, which is removed when the
+    script exits, so $0 doesn't name the original file. Run scripts that are
+    in the synchronized directory with remote bash <path> instead.
+  - With -, the script consumes standard input, so its commands receive none;
+    with a file, input is forwarded as for commands. remote bash -s <<'EOF'
+    also reads a script from standard input, but commands in it that read
+    input then consume the rest of the script, and it can't run detached.
+  - Scripts are limited to 512 KiB and aren't supported on Windows endpoints.
+`},
+	{"jobs", "detached jobs: --detach, --jobs, --wait, and --kill", `Usage: remote [options] --detach [--log <file>] <command> [<args>...]
+       remote [options] --detach [--log <file>] --script <file>|- [<args>...]
+       remote --jobs
+       remote --wait <id> [--timeout <duration>] [--no-flush]
+       remote --kill <id>
+
+--detach synchronizes the session, starts the command (or script) as a detached
+job on the opposite endpoint, prints the job's ID on standard output, and
+exits:
+  id=$(remote --detach --log train.log python train.py)
+  remote --wait "$id"
+
+  - Jobs keep running when remote exits and when the session stops
+    synchronizing (such as when it's paused or reconnects, or the daemon
+    stops), unlike other commands. They run in the directory and environment
+    that other commands would, prologue included, in a new session and process
+    group, with no standard input.
+  - Output goes to --log FILE (relative to the command's directory; absolute
+    and ~ paths are on the opposite endpoint), which is truncated first, or
+    else to a log kept with the job's state in the Mutagen data directory
+    there. remote warns if the session ignores the log, which then isn't
+    synchronized (see remote --help sync).
+  - remote --jobs lists the jobs started at the session's root on the opposite
+    endpoint, newest first, with their state (running, exited N, killed N, or
+    lost), running time, log, and command.
+  - remote --wait ID waits for the job to end, synchronizes the session
+    (unless --no-flush), and exits with the job's status. --timeout stops
+    waiting (status 124) without affecting the job. If the connection to the
+    executing endpoint is lost while waiting, remote retries for a minute. A
+    job whose status couldn't be recorded, such as because it was killed with
+    SIGKILL or its system restarted, is lost (status 255).
+  - remote --kill ID terminates the job: its process group receives SIGTERM,
+    then SIGKILL 5 seconds later if any of it remains. Processes that leave
+    the group, such as daemons, aren't terminated.
+  - Job state is kept for 7 days after jobs end. Logs given with --log are
+    never removed.
+  - Jobs end with the system or container that runs them, and can end with the
+    processes that run the session's endpoint there: for example, when the
+    Mutagen daemon runs as a systemd service, stopping the service terminates
+    the jobs that the daemon runs, and on systems where logind's
+    KillUserProcesses is enabled, jobs on SSH endpoints end with the SSH
+    connection.
+  - --timeout can't be combined with --detach; run the command with timeout
+    instead. Detached jobs aren't supported on Windows endpoints.
 `},
 	{"conflicts", "resolving files modified on both endpoints", `Usage: remote --conflicts [--json]
        remote --conflict-checkout [--base <file>] [--json] <path>...

@@ -49,6 +49,16 @@ func TestRemoteHelper(t *testing.T) {
 	case "wait":
 		fmt.Fprint(os.Stdout, "ready")
 		time.Sleep(time.Hour)
+	case "start-job":
+		// Start a detached job in the working directory, which serves as the
+		// root, and exit at once, as an executor may.
+		root, _ := os.Getwd()
+		response := startJob(root, "", false, &Request{Arguments: arguments[1:], Job: &JobRequest{Operation: JobStart}})
+		if response.Job == nil {
+			fmt.Fprint(os.Stderr, response.Error)
+			os.Exit(1)
+		}
+		fmt.Fprint(os.Stdout, response.Job.ID)
 	default:
 		os.Exit(2)
 	}
