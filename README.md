@@ -88,12 +88,14 @@ You can find
 in the [Mutagen documentation](https://mutagen.io/documentation).
 
 Releases of this fork, which include `remote`, are available on its
-[releases page](https://github.com/zlcwwhq/mutagen/releases). Each bundle
-contains `mutagen`, `remote`, and `mutagen-agents.tar.gz`, which `mutagen` needs
-to install agents on endpoints: keep it in the same directory as `mutagen`, or
-in `../libexec` if `mutagen` is in a `bin` directory. Only the daemon's system
-needs an installation. The `mutagen-setup` agent skill (see below) automates
-this.
+[releases page](https://github.com/zlcwwhq/mutagen/releases). Each platform's
+bundle contains `mutagen` and `remote`. The agents that `mutagen` installs on
+endpoints are released once for all platforms, as
+`mutagen-agents_v<version>.tar.gz`: save it as `mutagen-agents.tar.gz` in the
+same directory as `mutagen`, or in `../libexec` if `mutagen` is in a `bin`
+directory. Releases up to v0.19.0-zlcwwhq.0.0.7 include `mutagen-agents.tar.gz`
+in each bundle instead. Only the daemon's system needs an installation. The
+`mutagen-setup` agent skill (see below) automates this.
 
 
 ## Remote commands

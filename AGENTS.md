@@ -95,7 +95,8 @@ follow the code and update this file.
   `release-slim` builds continue without cgo-enabled macOS agents.
 - The agent bundle is a separate `mutagen-agents.tar.gz` artifact.
   It ships alongside the CLI or in `libexec`; it is not embedded in
-  the CLI.
+  the CLI. Releases publish it once, as its own asset, rather than
+  in each platform bundle.
 - Sidecar binaries and images are built via `cmd/mutagen-sidecar`,
   `scripts/ci/build.sh`, and `images/sidecar/linux/Dockerfile`.
 - Run package tests sequentially with `go test -p 1 ./pkg/...`.

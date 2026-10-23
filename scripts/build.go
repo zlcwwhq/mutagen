@@ -527,9 +527,10 @@ The mode flag accepts four values: 'local', 'slim', 'release', and
 'release-slim'. 'local' will build CLI and agent binaries only for the current
 platform. 'slim' will build the CLI binary for only the current platform and
 agents for a common subset of platforms. 'release' will build CLI and agent
-binaries for all platforms and package for release. 'release-slim' is the same
-as release but only builds release bundles for a small subset of platforms. The
-default mode is 'slim'.
+binaries for all platforms and package for release, with a release bundle of
+the CLI and remote executables for each platform and the agent bundle released
+separately. 'release-slim' is the same as release but only builds release
+bundles for a small subset of platforms. The default mode is 'slim'.
 
 If --sspl is specified, then SSPL-licensed enhancements will be included in the
 build output. By default, only MIT-licensed code is included in builds.
@@ -721,8 +722,21 @@ func build() error {
 		return fmt.Errorf("unable to finalize agent bundle: %w", err)
 	}
 
-	// Build release bundles if necessary.
+	// Build release bundles if necessary. Each platform's release bundle only
+	// contains the CLI and remote executables. The agent bundle, which covers
+	// every agent platform and is thus several times larger than the rest of a
+	// bundle, is released once, alongside the platform bundles, rather than in
+	// each of them, with the version in its name like theirs.
 	if mode == "release" || mode == "release-slim" {
+		log.Println("Copying agent bundle for release...")
+		releaseAgentBundlePath := filepath.Join(
+			releaseBuildSubdirectoryPath,
+			fmt.Sprintf("%s_v%s.tar.gz", strings.TrimSuffix(agent.BundleName, ".tar.gz"), mutagen.Version),
+		)
+		if err := copyFile(agentBundlePath, releaseAgentBundlePath); err != nil {
+			return fmt.Errorf("unable to copy agent bundle for release: %w", err)
+		}
+
 		log.Println("Building release bundles...")
 		for _, target := range cliTargets {
 			// Update status.
@@ -745,9 +759,6 @@ func build() error {
 			} else if err = releaseBundle.Add(target.ExecutableName(remoteBaseName), remoteBuildPath, 0755); err != nil {
 				releaseBundle.Close()
 				return fmt.Errorf("unable to add remote executable to release bundle: %w", err)
-			} else if err = releaseBundle.Add("", agentBundlePath, 0644); err != nil {
-				releaseBundle.Close()
-				return fmt.Errorf("unable to add agent bundle to release bundle: %w", err)
 			} else if err = releaseBundle.Close(); err != nil {
 				return fmt.Errorf("unable to finalize release bundle: %w", err)
 			}
