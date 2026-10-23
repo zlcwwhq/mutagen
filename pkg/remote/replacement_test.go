@@ -84,12 +84,147 @@ func TestReplaceOrdering(t *testing.T) {
 	}
 }
 
+func TestReplaceOrderingAcrossRoots(t *testing.T) {
+	// Nested sessions' roots may both contain an entry, if the outer session
+	// doesn't ignore the inner root, and a file may be a root itself, so
+	// replacements of an entry are ordered together whichever root they reach
+	// it through: an earlier replacement through the outer root fails once a
+	// later one through the inner root was admitted, rather than overwrite its
+	// result.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	for _, test := range []struct {
+		name string
+		// later is the root and path through which the later replacement
+		// reaches the entry, given the outer root.
+		later func(outer string) (string, string)
+	}{
+		{"directory root", func(outer string) (string, string) {
+			return filepath.Join(outer, "sub"), "file"
+		}},
+		{"file root", func(outer string) (string, string) {
+			return filepath.Join(outer, "sub", "file"), "."
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			outer := t.TempDir()
+			path := filepath.Join(outer, "sub", "file")
+			if err := os.Mkdir(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			} else if err := os.WriteFile(path, []byte("remote\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			paused, resume := pauseReplacement(t, "locking")
+			stale := make(chan error, 1)
+			go func() {
+				stale <- replaceContents(ctx, outer, "sub/file", "merged\n", 1, "local\n", "remote\n")
+			}()
+			<-paused
+			root, relative := test.later(outer)
+			if err := replaceContents(ctx, root, relative, "local\n", 2, "local\n", "remote\n", "merged\n"); err != nil {
+				t.Fatal(err)
+			}
+			resume()
+			if err := <-stale; !errors.Is(err, ErrSuperseded) || errors.Is(err, ErrStale) {
+				t.Fatal("earlier replacement through the outer root not rejected as superseded:", err)
+			} else if data, _ := os.ReadFile(path); string(data) != "local\n" {
+				t.Fatalf("later replacement through the inner root overwritten: %q", data)
+			}
+		})
+	}
+}
+
+func TestReplacementLockTargets(t *testing.T) {
+	// Replacements are locked and ordered by the entries that they reach,
+	// rather than by the roots and paths through which they reach them, since
+	// nested sessions' roots may both contain an entry, a file may be a root
+	// itself, and roots may be reached through symbolic links. Links are
+	// resolved like opening the roots (or their parents) resolves them, except
+	// for the entry itself, which replacements replace rather than follow,
+	// while different entries at the same path relative to different roots are
+	// locked separately.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	base := t.TempDir()
+	outer := filepath.Join(base, "outer")
+	inner := filepath.Join(outer, "sub")
+	other := filepath.Join(base, "other")
+	alias := filepath.Join(base, "alias")
+	for _, directory := range []string{inner, other} {
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, directory := range []string{outer, inner, other} {
+		if err := os.WriteFile(filepath.Join(directory, "file"), []byte("remote\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	links := os.Symlink(outer, alias)
+	if links == nil {
+		links = os.Symlink("file", filepath.Join(inner, "link"))
+	}
+	type location struct {
+		root, path string
+	}
+	for _, test := range []struct {
+		name          string
+		first, second location
+		shared, links bool
+	}{
+		{"nested root", location{outer, "sub/file"}, location{inner, "file"}, true, false},
+		{"file root", location{filepath.Join(inner, "file"), "."}, location{outer, "sub/file"}, true, false},
+		{"nested root itself", location{inner, "."}, location{outer, "sub"}, true, false},
+		{"same path in the outer root", location{outer, "file"}, location{inner, "file"}, false, false},
+		{"same path in another root", location{other, "file"}, location{inner, "file"}, false, false},
+		{"linked root", location{filepath.Join(alias, "sub"), "file"}, location{inner, "file"}, true, true},
+		{"linked outer root", location{alias, "sub/file"}, location{filepath.Join(inner, "file"), "."}, true, true},
+		{"linked file root", location{filepath.Join(alias, "sub", "file"), "."}, location{outer, "sub/file"}, true, true},
+		{"link root", location{filepath.Join(inner, "link"), "."}, location{outer, "sub/link"}, true, true},
+		{"link root and its target", location{filepath.Join(inner, "link"), "."}, location{inner, "file"}, false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.links && links != nil {
+				t.Skip("symbolic links unavailable:", links)
+			}
+			first, err := lockReplacement(ctx, test.first.root, test.first.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waiting, stop := context.WithTimeout(ctx, 100*time.Millisecond)
+			second, err := lockReplacement(waiting, test.second.root, test.second.path)
+			stop()
+			if err == nil {
+				defer second.unlock()
+			}
+			first.unlock()
+			if test.shared {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatal("replacement of the entry through another root not excluded:", err)
+				} else if second, err = lockReplacement(ctx, test.second.root, test.second.path); err != nil {
+					t.Fatal(err)
+				}
+				defer second.unlock()
+				if second.record != first.record {
+					t.Fatalf("replacements of the entry recorded separately: %s, %s", first.record, second.record)
+				}
+			} else if err != nil {
+				t.Fatal("replacement of another entry excluded:", err)
+			} else if second.record == first.record {
+				t.Fatal("replacements of different entries recorded together:", first.record)
+			}
+		})
+	}
+}
+
 func TestReplaceSequences(t *testing.T) {
 	// A replacement is refused, without changing its entry, once a replacement
 	// with a later sequence number was admitted for the entry, even if the
 	// entry is one of its expected entries, whether the later one replaced the
 	// entry, found that it already had its result, or found it stale. Sequence
-	// numbers are recorded by root and path in the Mutagen data directory.
+	// numbers are recorded by entry in the Mutagen data directory, along with
+	// the root and path through which the latest admitted replacement reached
+	// the entry.
 	data := t.TempDir()
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
 	ctx := context.Background()
