@@ -312,13 +312,18 @@ kept with the job's state in the executing endpoint's Mutagen data directory.
 <id>` waits for a job to end, flushes, and exits with its status (`--timeout`
 stops waiting without affecting the job), and `remote --kill <id>` sends
 SIGTERM to its process group, and SIGKILL 5 seconds later to any processes that
-remain. A job whose status couldn't be recorded, such as because it was killed
-with SIGKILL or its system restarted, is reported as lost. Job state is kept for
-7 days after jobs end. Jobs end with the system or container that runs them,
-and can end with the processes that run the endpoint, such as when a daemon
-running as a systemd service is stopped, or, on systems where logind's
-`KillUserProcesses` is enabled, with the SSH connection. Detached jobs aren't
-supported on Windows or AIX endpoints.
+remain, even if `remote --kill` is interrupted meanwhile; repeating it while
+the job is being terminated doesn't send SIGTERM again. A job ends when its
+command exits: processes that the command leaves running in the background
+aren't part of the job afterwards, so `--wait` doesn't wait for them and
+`--kill` doesn't terminate them, and scripts that start background processes
+should `wait` for them. A job whose status couldn't be recorded, such as
+because it was killed with SIGKILL or its system restarted, is reported as
+lost. Job state is kept for 7 days after jobs end. Jobs end with the system or
+container that runs them, and can end with the processes that run the
+endpoint, such as when a daemon running as a systemd service is stopped, or,
+on systems where logind's `KillUserProcesses` is enabled, with the SSH
+connection. Detached jobs aren't supported on Windows or AIX endpoints.
 
 Content that commands write to ignored paths exists only on the executing
 endpoint. `remote --ignores <path>...` shows whether the session ignores each

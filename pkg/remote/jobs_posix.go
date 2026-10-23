@@ -3,7 +3,6 @@
 package remote
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -270,37 +269,60 @@ func jobGroupRemains(pid int) bool {
 
 // waitForJobExit waits until a job's lock is free and no process remains in its
 // process group, which its supervisor, with the specified process identifier,
-// leads, or until the specified duration elapses or the context is cancelled,
-// and returns whether the job exited.
-func waitForJobExit(ctx context.Context, lock string, pid int, duration time.Duration) bool {
-	deadline := time.Now().Add(duration)
+// leads, or until the specified deadline passes, and returns whether the job
+// exited. It doesn't take a context, since termination isn't abandoned once it
+// has started (see terminateJob), so it only returns early if the job exits.
+func waitForJobExit(lock string, pid int, deadline time.Time) bool {
 	for {
 		if running, err := jobLockHeld(lock); err == nil && !running && !jobGroupRemains(pid) {
 			return true
 		} else if !time.Now().Before(deadline) {
 			return false
 		}
-		select {
-		case <-time.After(terminationPollInterval):
-		case <-ctx.Done():
-			return false
-		}
+		time.Sleep(terminationPollInterval)
 	}
 }
 
 // terminateJob terminates a running job, whose supervisor has the specified
 // process identifier and leads the job's process group, and returns the job's
-// state afterward. It sends SIGTERM to the group, waits for the supervisor to
-// release the lock and for every process in the group to exit, and sends
-// SIGKILL to the group if any process remains once the termination grace
-// period expires. The supervisor releases the lock once the command exits, so
-// waiting for the group as well ensures that processes that ignore SIGTERM,
-// such as a command's workers, don't outlive a job reported as killed.
-// Processes that leave the group, such as with setsid, aren't terminated.
-// Zombies remain in the group until they're reaped, so where orphans aren't
-// reaped, such as in a container whose PID 1 doesn't reap them, terminating a
-// job can take the full grace period (and the wait after SIGKILL) even if its
-// processes exit at once. The wait is bounded, so that only delays the result.
+// state afterward. It marks the job as killed, sends SIGTERM to the group,
+// waits for the supervisor to release the lock and for every process in the
+// group to exit, and sends SIGKILL to the group if any process remains once the
+// termination grace period expires. The supervisor releases the lock once the
+// command exits, so waiting for the group as well ensures that processes that
+// ignore SIGTERM, such as a command's workers, don't outlive a job reported as
+// killed. Processes that leave the group, such as with setsid, aren't
+// terminated, and neither are processes that the command left running once
+// the job has ended, since a job that has ended isn't terminated (see
+// serveJob). Zombies remain in the group until they're reaped, so where
+// orphans aren't reaped, such as in a container whose PID 1 doesn't reap them,
+// terminating a job can take the full grace period (and the wait after
+// SIGKILL) even if its processes exit at once. The wait is bounded, so that
+// only delays the result.
+//
+// Termination runs to completion once it has started, even if the request for
+// it is cancelled, such as because remote was interrupted or timed out, or the
+// executor is closing: abandoning it during the grace period would leave a job
+// that ignores SIGTERM running, and sending SIGKILL at once instead would cut
+// short the cleanup of a job that handles SIGTERM. It takes at most the grace
+// period and the wait after SIGKILL, for which the executor's channel waits
+// when it closes, as it does for the termination of foreground commands (see
+// runForeground).
+//
+// The file that marks the job as killed is created exclusively, so that only
+// the first termination of a job sends SIGTERM. A later termination that finds
+// the job already marked, such as one requested again or concurrently, doesn't
+// send SIGTERM again, which would interrupt the cleanup of a job that handles
+// it. It instead waits for the grace period that began when the job was
+// marked, as recorded by the marker's modification time, and sends SIGKILL if
+// any process remains once that expires, at once if it already has, such as
+// because the executor of the first termination exited during the grace
+// period. A later termination thus neither extends the first's grace period
+// nor cuts it short, except by the precision of file timestamps, since the
+// first termination creates the marker just before it sends SIGTERM. Its
+// deadline is never more than the grace period away, so that a timestamp in
+// the future, such as one set by the server of a network file system whose
+// clock is ahead, can't delay SIGKILL further.
 //
 // The group is signaled by its identifier, which the system can reuse for a
 // new process group once the job's group has ended. The system doesn't reuse a
@@ -312,21 +334,35 @@ func waitForJobExit(ctx context.Context, lock string, pid int, duration time.Dur
 // group's last member exited and was reaped and the system assigned the
 // identifier to a new group, which would require it to reuse process
 // identifiers within that interval.
-func terminateJob(ctx context.Context, directory string, pid int) (*Job, error) {
-	if err := os.WriteFile(filepath.Join(directory, jobKilledName), nil, 0600); err != nil {
+func terminateJob(directory string, pid int) (*Job, error) {
+	// Mark the job as killed and, if this termination marked it, send SIGTERM.
+	// Either way, determine when the grace period expires.
+	lock, killed := filepath.Join(directory, jobLockName), filepath.Join(directory, jobKilledName)
+	var deadline time.Time
+	if marker, err := os.OpenFile(killed, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600); err == nil {
+		marker.Close()
+		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+			return nil, err
+		}
+		deadline = time.Now().Add(terminationGracePeriod)
+	} else if !os.IsExist(err) {
 		return nil, fmt.Errorf("unable to mark job as killed: %w", err)
+	} else if info, err := os.Lstat(killed); err != nil {
+		return nil, fmt.Errorf("unable to determine when the job was marked as killed: %w", err)
+	} else {
+		deadline = info.ModTime().Add(terminationGracePeriod)
+		if latest := time.Now().Add(terminationGracePeriod); deadline.After(latest) {
+			deadline = latest
+		}
 	}
-	lock := filepath.Join(directory, jobLockName)
-	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
-		return nil, err
-	} else if !waitForJobExit(ctx, lock, pid, terminationGracePeriod) {
+
+	// Wait for the job to exit, and kill whatever remains of it once the grace
+	// period expires.
+	if !waitForJobExit(lock, pid, deadline) {
 		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 			return nil, err
 		}
-		waitForJobExit(ctx, lock, pid, time.Second)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+		waitForJobExit(lock, pid, time.Now().Add(time.Second))
 	}
 	_, job, err := loadJob(directory)
 	return job, err

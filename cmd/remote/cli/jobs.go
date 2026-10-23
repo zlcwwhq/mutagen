@@ -242,7 +242,7 @@ func killJob(router *router, id string) error {
 	case remote.JobKilled:
 		fmt.Fprintf(router.stderr, "remote: terminated job %s (status %d)\n", id, job.ExitCode)
 	case remote.JobExited:
-		fmt.Fprintf(router.stderr, "remote: job %s had already exited with status %d\n", id, job.ExitCode)
+		fmt.Fprintf(router.stderr, "remote: job %s had already exited with status %d; processes that it left running aren't terminated\n", id, job.ExitCode)
 	case remote.JobLost:
 		fmt.Fprintf(router.stderr, "remote: job %s had already ended without recording its exit status\n", id)
 	default:

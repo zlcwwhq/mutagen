@@ -350,7 +350,7 @@ func serveJob(ctx context.Context, root string, request *JobRequest, output io.W
 		} else if host, err := os.Hostname(); err != nil || host != record.Host {
 			return result{Error: fmt.Sprintf("job %s was started on %s, not on this system", request.ID, record.Host)}
 		}
-		job, err = terminateJob(ctx, filepath.Join(directory, request.ID), record.PID)
+		job, err = terminateJob(filepath.Join(directory, request.ID), record.PID)
 		if err != nil {
 			return result{Error: fmt.Sprintf("unable to terminate job %s: %v", request.ID, err)}
 		}
@@ -439,7 +439,12 @@ func WaitJob(ctx context.Context, connection io.ReadWriteCloser, id string) (*Jo
 // opposite endpoint's root, over an established route (see Dial), and returns
 // the job. It owns and closes the connection. The job's process group receives
 // SIGTERM, and then SIGKILL if any of its processes remain once
-// TerminationGracePeriod expires.
+// TerminationGracePeriod expires. Cancellation abandons waiting for the result,
+// but not the termination, which the executing endpoint completes. A job that
+// is already being terminated doesn't receive SIGTERM again, and receives
+// SIGKILL once the first termination's grace period expires. A job that has
+// already ended is returned as it is: processes that its command left running
+// aren't part of it any more and aren't terminated.
 func KillJob(ctx context.Context, connection io.ReadWriteCloser, id string) (*Job, error) {
 	return operateJob(ctx, connection, JobKill, id)
 }

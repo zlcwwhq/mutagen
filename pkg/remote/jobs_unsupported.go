@@ -2,10 +2,6 @@
 
 package remote
 
-import (
-	"context"
-)
-
 // jobsSupported indicates whether detached jobs are supported on this system.
 // They aren't supported on Windows, which lacks the POSIX shell, sessions, and
 // process groups that their supervisors rely on (see jobs_posix.go), or on AIX,
@@ -29,6 +25,6 @@ func startJob(_, _ string, _ bool, _ *Request) result {
 
 // terminateJob terminates a running job. Detached jobs aren't supported on
 // this system.
-func terminateJob(_ context.Context, _ string, _ int) (*Job, error) {
+func terminateJob(_ string, _ int) (*Job, error) {
 	return nil, errJobsUnsupported
 }

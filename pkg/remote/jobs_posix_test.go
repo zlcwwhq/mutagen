@@ -45,6 +45,89 @@ func jobRoute(ctx context.Context, root string) net.Conn {
 	return client
 }
 
+// trackedJobRoute opens a route to an executor with the specified root, like
+// jobRoute, and waits for the executor to return when the test ends, so that an
+// executor that outlives its request, such as one terminating a job whose kill
+// request was cancelled, neither uses state that the test restores nor
+// outlives the test.
+func trackedJobRoute(t *testing.T, ctx context.Context, root string) net.Conn {
+	t.Helper()
+	client, server := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		Serve(ctx, server, root, "", false)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("executor didn't return")
+		}
+	})
+	return client
+}
+
+// waitForLines waits until the file at the specified path has at least the
+// specified number of complete lines, failing the test if that takes longer
+// than 10 seconds, and returns its contents.
+func waitForLines(t *testing.T, path string, lines int) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if data, err := os.ReadFile(path); err == nil && strings.Count(string(data), "\n") >= lines {
+			return string(data)
+		} else if time.Now().After(deadline) {
+			t.Fatalf("%s didn't reach %d lines: %q, %v", path, lines, data, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// killTestJob starts terminating a job started in the specified root through
+// a tracked route (see trackedJobRoute) with the specified request context and
+// returns a channel that receives the result.
+func killTestJob(t *testing.T, ctx context.Context, root, id string) <-chan killOutcome {
+	t.Helper()
+	route := trackedJobRoute(t, context.Background(), root)
+	outcome := make(chan killOutcome, 1)
+	go func() {
+		job, err := KillJob(ctx, route, id)
+		outcome <- killOutcome{job, err, time.Now()}
+	}()
+	return outcome
+}
+
+// killOutcome is the result of a kill request started by killTestJob.
+type killOutcome struct {
+	// job is the job returned by the request, if any.
+	job *Job
+	// err is the error returned by the request, if any.
+	err error
+	// returned is the time at which the request returned.
+	returned time.Time
+}
+
+// receiveKill waits for the result of a kill request started by killTestJob,
+// failing the test if it doesn't return within 10 seconds.
+func receiveKill(t *testing.T, outcome <-chan killOutcome) killOutcome {
+	t.Helper()
+	select {
+	case result := <-outcome:
+		return result
+	case <-time.After(10 * time.Second):
+		t.Fatal("kill request didn't return")
+		return killOutcome{}
+	}
+}
+
+// termCountingJob is a job command that appends a line to the file given as its
+// first argument whenever it receives SIGTERM, but otherwise ignores it, and
+// that creates the file with a .ready suffix once it does so. The sleep that it
+// runs receives SIGTERM with the job's process group and exits, which lets the
+// trap run at once.
+const termCountingJob = `trap 'echo term >> "$1"' TERM; echo > "$1.ready"; while :; do sleep 0.1; done`
+
 // startTestJob starts a job running the specified command in the specified
 // root.
 func startTestJob(t *testing.T, root, log string, arguments ...string) *Job {
@@ -227,8 +310,6 @@ func TestJobKillAtStart(t *testing.T) {
 	directory := useTestJobs(t)
 	useTerminationGracePeriod(t, 2*time.Second)
 	root := t.TempDir()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
 
 	// A job killed as soon as it has started is terminated by SIGTERM, which
 	// reaches its command, rather than killing its supervisor before it
@@ -246,7 +327,7 @@ func TestJobKillAtStart(t *testing.T) {
 		if err != nil {
 			t.Fatal("unable to load job:", err)
 		}
-		if killed, err := terminateJob(ctx, jobDirectory, record.PID); err != nil {
+		if killed, err := terminateJob(jobDirectory, record.PID); err != nil {
 			t.Fatal("unable to kill job:", err)
 		} else if killed.State != JobKilled || killed.ExitCode != 143 {
 			t.Fatalf("incorrect job killed at start (attempt %d): %+v", attempt, killed)
@@ -291,6 +372,128 @@ func TestJobKillTerminatesGroup(t *testing.T) {
 		t.Fatal("job reported as killed before the grace period expired:", elapsed)
 	} else if err := syscall.Kill(child, 0); err != syscall.ESRCH {
 		t.Fatal("child survived the job:", err)
+	}
+}
+
+func TestJobKillOutlivesCancellation(t *testing.T) {
+	useTestJobs(t)
+	useTerminationGracePeriod(t, 2*time.Second)
+	root := t.TempDir()
+
+	// Start a job that takes a while to exit once it receives SIGTERM. The
+	// checkpoint's sleep is a process in the job's group, so the checkpoint
+	// only completes if the group receives no further signal.
+	marker := filepath.Join(t.TempDir(), "checkpoint")
+	script := `trap 'echo > "$1.term"; sleep 0.4; echo done > "$1"; exit 5' TERM; echo > "$1.ready"; while :; do sleep 0.1; done`
+	job := startTestJob(t, root, "", "sh", "-c", script, "sh", marker)
+	waitForLines(t, marker+".ready", 1)
+
+	// Cancel the kill request once the job has received SIGTERM. The request
+	// returns, while termination continues on the executing endpoint, so the
+	// job exits on its own, with its own status, rather than being killed with
+	// SIGKILL.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	outcome := killTestJob(t, ctx, root, job.ID)
+	waitForLines(t, marker+".term", 1)
+	cancel()
+	receiveKill(t, outcome)
+	if ended := waitTestJob(t, root, job.ID); ended.State != JobKilled || ended.ExitCode != 5 {
+		t.Fatalf("incorrect job killed by a cancelled request: %+v", ended)
+	} else if data, err := os.ReadFile(marker); err != nil || string(data) != "done\n" {
+		t.Fatalf("job's checkpoint didn't complete: %q, %v", data, err)
+	}
+
+	// A job that ignores SIGTERM is still killed with SIGKILL once the grace
+	// period expires, and not before.
+	terms := filepath.Join(t.TempDir(), "terms")
+	job = startTestJob(t, root, "", "sh", "-c", termCountingJob, "sh", terms)
+	waitForLines(t, terms+".ready", 1)
+	ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	outcome = killTestJob(t, ctx, root, job.ID)
+	waitForLines(t, terms, 1)
+	cancel()
+	receiveKill(t, outcome)
+	ended := waitTestJob(t, root, job.ID)
+	if elapsed := time.Since(start); ended.State != JobKilled || ended.ExitCode != 137 {
+		t.Fatalf("incorrect job killed by a cancelled request: %+v", ended)
+	} else if elapsed < 2*time.Second {
+		t.Fatal("job killed before the grace period expired:", elapsed)
+	} else if elapsed > 7*time.Second {
+		t.Fatal("job killed long after the grace period expired:", elapsed)
+	}
+}
+
+func TestJobKillConcurrent(t *testing.T) {
+	useTestJobs(t)
+	useTerminationGracePeriod(t, time.Second)
+	root := t.TempDir()
+
+	// Kill a job that ignores SIGTERM twice, starting the second kill once the
+	// job has handled the first kill's SIGTERM, with which another SIGTERM
+	// could otherwise coalesce.
+	terms := filepath.Join(t.TempDir(), "terms")
+	job := startTestJob(t, root, "", "sh", "-c", termCountingJob, "sh", terms)
+	waitForLines(t, terms+".ready", 1)
+	start := time.Now()
+	first := killTestJob(t, context.Background(), root, job.ID)
+	waitForLines(t, terms, 1)
+	second := killTestJob(t, context.Background(), root, job.ID)
+
+	// Both kills report the job as killed with SIGKILL once the first kill's
+	// grace period expires, and the job only receives SIGTERM once. The second
+	// kill's deadline is computed from the timestamp of the file that marks the
+	// job as killed, which can lag the clock slightly where timestamps are
+	// coarse, so its return is allowed a little leeway.
+	for _, outcome := range []<-chan killOutcome{first, second} {
+		result := receiveKill(t, outcome)
+		if result.err != nil || result.job.State != JobKilled || result.job.ExitCode != 137 {
+			t.Fatalf("incorrect concurrent kill: %+v, %v", result.job, result.err)
+		} else if elapsed := result.returned.Sub(start); elapsed < time.Second-100*time.Millisecond {
+			t.Fatal("concurrent kill returned before the grace period expired:", elapsed)
+		}
+	}
+	if data, err := os.ReadFile(terms); err != nil || string(data) != "term\n" {
+		t.Fatalf("incorrect SIGTERMs received by a job killed concurrently: %q, %v", data, err)
+	}
+}
+
+func TestJobKillAfterInterruptedKill(t *testing.T) {
+	directory := useTestJobs(t)
+	useTerminationGracePeriod(t, 2*time.Second)
+	root := t.TempDir()
+
+	// A kill that finds a job already marked as killed, such as by a kill whose
+	// executor exited while terminating the job, doesn't send SIGTERM again,
+	// and sends SIGKILL once the grace period that started when the job was
+	// marked expires: at once if it already has.
+	for _, test := range []struct {
+		age, minimum, maximum time.Duration
+	}{
+		{time.Second, 900 * time.Millisecond, 1900 * time.Millisecond},
+		{time.Minute, 0, 900 * time.Millisecond},
+	} {
+		terms := filepath.Join(t.TempDir(), "terms")
+		job := startTestJob(t, root, "", "sh", "-c", termCountingJob, "sh", terms)
+		waitForLines(t, terms+".ready", 1)
+		marked := time.Now().Add(-test.age)
+		killed := filepath.Join(directory, job.ID, jobKilledName)
+		if err := os.WriteFile(killed, nil, 0600); err != nil {
+			t.Fatal(err)
+		} else if err := os.Chtimes(killed, marked, marked); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		result := receiveKill(t, killTestJob(t, context.Background(), root, job.ID))
+		if result.err != nil || result.job.State != JobKilled || result.job.ExitCode != 137 {
+			t.Fatalf("incorrect kill of a marked job: %+v, %v", result.job, result.err)
+		} else if elapsed := result.returned.Sub(start); elapsed < test.minimum || elapsed > test.maximum {
+			t.Fatalf("incorrect time to kill a job marked %v ago: %v", test.age, elapsed)
+		} else if _, err := os.Stat(terms); !os.IsNotExist(err) {
+			t.Fatal("job marked as killed received SIGTERM again:", err)
+		}
 	}
 }
 

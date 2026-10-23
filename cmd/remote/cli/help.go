@@ -223,6 +223,10 @@ exits:
     stops), unlike other commands. They run in the directory and environment
     that other commands would, prologue included, in a new session and process
     group, with no standard input.
+  - A job ends when its command exits. Processes that the command leaves
+    running in the background aren't part of the job afterwards: remote --wait
+    doesn't wait for them, and remote --kill doesn't terminate them. Scripts
+    that start background processes should wait for them.
   - Output goes to --log FILE (relative to the command's directory; absolute
     and ~ paths are on the opposite endpoint), which is truncated first, or
     else to a log kept with the job's state in the Mutagen data directory
@@ -238,8 +242,10 @@ exits:
     job whose status couldn't be recorded, such as because it was killed with
     SIGKILL or its system restarted, is lost (status 255).
   - remote --kill ID terminates the job: its process group receives SIGTERM,
-    then SIGKILL 5 seconds later if any of it remains. Processes that leave
-    the group, such as daemons, aren't terminated.
+    then SIGKILL 5 seconds later if any of it remains, even if remote --kill
+    is interrupted meanwhile. Repeating it while the job is being terminated
+    doesn't send SIGTERM again. Processes that leave the group, such as
+    daemons, aren't terminated.
   - Job state is kept for 7 days after jobs end. Logs given with --log are
     never removed.
   - Jobs end with the system or container that runs them, and can end with the
