@@ -306,8 +306,10 @@ that must outlive these events can run as detached jobs.
 running when `remote` exits and when the session stops synchronizing, and
 prints its ID. Jobs run in the directory and environment that commands would,
 in a new session and process group, without input, and write their output to
-the file given with `--log` (relative to the command's directory) or to a log
-kept with the job's state in the executing endpoint's Mutagen data directory.
+the file given with `--log` (relative to the command's directory), which must
+be a regular file (truncated first) or a character device such as `/dev/null`,
+not a FIFO, or to a log kept with the job's state in the executing endpoint's
+Mutagen data directory.
 `remote --jobs` lists the jobs started at the session's root, `remote --wait
 <id>` waits for a job to end, flushes, and exits with its status (`--timeout`
 stops waiting without affecting the job), and `remote --kill <id>` sends

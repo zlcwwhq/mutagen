@@ -150,7 +150,7 @@ func parse(arguments []string) (*options, error) {
 	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize before and after the command (only for commands that use no synchronized files)")
 	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
 	flags.BoolVar(&result.detach, "detach", false, "Run the command as a detached job, which keeps running after remote exits, and print its identifier")
-	flags.StringVar(&result.log, "log", "", "With --detach, write the job's output to `FILE` (relative to the command's directory)")
+	flags.StringVar(&result.log, "log", "", "With --detach, write the job's output to `FILE` (relative to the command's directory), a regular file or character device")
 	flags.BoolVar(&result.jobs, "jobs", false, "List the detached jobs started at the session's root on the opposite endpoint")
 	flags.StringVar(&result.wait, "wait", "", "Wait for the detached job `ID` to end, synchronize, and exit with its status")
 	flags.StringVar(&result.kill, "kill", "", "Terminate the detached job `ID`")

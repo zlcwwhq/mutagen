@@ -96,9 +96,101 @@ func jobLockHeld(path string) (bool, error) {
 	return false, nil
 }
 
+// checkLogType returns an error, naming the file's type, unless a file with the
+// specified mode (as reported by stat) can serve as a job's log (see openLog).
+func checkLogType(path string, mode uint32) error {
+	var kind string
+	switch mode & unix.S_IFMT {
+	case unix.S_IFREG, unix.S_IFCHR:
+		return nil
+	case unix.S_IFIFO:
+		kind = "a FIFO"
+	case unix.S_IFSOCK:
+		kind = "a socket"
+	case unix.S_IFDIR:
+		kind = "a directory"
+	case unix.S_IFBLK:
+		kind = "a block device"
+	default:
+		kind = "a special file"
+	}
+	return fmt.Errorf("%s is %s, not a regular file or character device", path, kind)
+}
+
+// openLog opens a job's log, creating it with the specified permissions
+// (subject to the umask) if it doesn't exist, and truncating it if it's a
+// regular file, as a shell does with the files to which it redirects output.
+// Logs must be regular files or character devices, such as /dev/null, and
+// files of other types are refused: opening a FIFO that no process reads
+// would block until one does, holding up the executor, and with it the
+// closing of its channel, indefinitely, while output written to a FIFO or
+// socket with a reader goes to whichever process reads it. On an agent, for
+// example, /dev/stdout can name the agent's connection to the daemon.
+//
+// The log is therefore opened without blocking, which makes opening a FIFO
+// without a reader fail at once (with ENXIO), and without O_TRUNC: it's only
+// truncated once the open descriptor has been found to refer to a regular
+// file, so that the check applies to the file that was opened, even if the
+// path is replaced meanwhile. A log that can't be opened, such as a FIFO
+// without a reader or a socket, is reported by its type if that's one that
+// isn't supported. The descriptor is returned in blocking mode, which the
+// job's processes, which share its open file description, expect, and is
+// close-on-exec, as descriptors opened by Go are, so that only the supervisor,
+// to which it's passed explicitly, inherits it.
+func openLog(path string, permissions os.FileMode) (*os.File, error) {
+	// Open the log without blocking, retrying if interrupted.
+	var descriptor int
+	var err error
+	for {
+		descriptor, err = unix.Open(path, unix.O_WRONLY|unix.O_CREAT|unix.O_APPEND|unix.O_NONBLOCK|unix.O_CLOEXEC, uint32(permissions.Perm()))
+		if err != unix.EINTR {
+			break
+		}
+	}
+	if err != nil {
+		var metadata unix.Stat_t
+		if unix.Stat(path, &metadata) == nil {
+			if typeErr := checkLogType(path, uint32(metadata.Mode)); typeErr != nil {
+				return nil, typeErr
+			}
+		}
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	opened := false
+	defer func() {
+		if !opened {
+			unix.Close(descriptor)
+		}
+	}()
+
+	// Check the type of the opened file, and truncate it if it's a regular
+	// file. Character devices can't be truncated, and are used as they are.
+	var metadata unix.Stat_t
+	if err := unix.Fstat(descriptor, &metadata); err != nil {
+		return nil, &os.PathError{Op: "fstat", Path: path, Err: err}
+	} else if err := checkLogType(path, uint32(metadata.Mode)); err != nil {
+		return nil, err
+	} else if metadata.Mode&unix.S_IFMT == unix.S_IFREG {
+		if err := unix.Ftruncate(descriptor, 0); err != nil {
+			return nil, &os.PathError{Op: "truncate", Path: path, Err: err}
+		}
+	}
+
+	// Restore blocking mode. It's restored before the descriptor is wrapped,
+	// so that the file isn't registered with Go's poller.
+	if err := unix.SetNonblock(descriptor, false); err != nil {
+		return nil, &os.PathError{Op: "fcntl", Path: path, Err: err}
+	}
+	opened = true
+	return os.NewFile(uintptr(descriptor), path), nil
+}
+
 // startJob starts a requested command (or script) as a detached job, which runs
 // in a new session, with no standard input and with its output written to its
-// log, and which outlives the executor. Failures are reported as results.
+// log, and which outlives the executor. Failures are reported as results. It
+// doesn't block on the log, which must be a regular file or character device
+// (see openLog), so that it only waits for the job's supervisor to report that
+// the command is starting, for at most jobStartTimeout.
 func startJob(root, prologue string, alpha bool, request *Request) result {
 	directory, err := filesystem.Mutagen(true, jobsDirectoryName)
 	if err != nil {
@@ -138,7 +230,8 @@ func startJob(root, prologue string, alpha bool, request *Request) result {
 	}
 
 	// Open the log. A requested log is created like a file to which a shell
-	// redirects output, while the default one is private.
+	// redirects output, while the default one is private. Logs that aren't
+	// regular files or character devices are refused (see openLog).
 	logPath, permissions := filepath.Join(jobDirectory, jobLogName), os.FileMode(0600)
 	if request.Job.Log != "" {
 		if logPath, err = resolveLog(command.directory, request.Job.Log); err != nil {
@@ -146,7 +239,7 @@ func startJob(root, prologue string, alpha bool, request *Request) result {
 		}
 		permissions = 0666
 	}
-	log, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_APPEND, permissions)
+	log, err := openLog(logPath, permissions)
 	if err != nil {
 		return result{ExitCode: 126, Error: fmt.Sprintf("unable to open log: %v", err)}
 	}

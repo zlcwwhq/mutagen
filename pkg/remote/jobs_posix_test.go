@@ -235,6 +235,89 @@ func TestJobLogs(t *testing.T) {
 	if _, code, err := StartJob(ctx, jobRoute(ctx, root), request); code != 126 || err == nil || !strings.Contains(err.Error(), "log") {
 		t.Fatalf("incorrect result for an inaccessible log: %d, %v", code, err)
 	}
+
+	// Default logs are private, while requested logs are created as a shell
+	// would create a file to which it redirects output, subject to the umask,
+	// as the reference file is.
+	reference := filepath.Join(root, "reference")
+	if file, err := os.OpenFile(reference, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666); err != nil {
+		t.Fatal(err)
+	} else {
+		file.Close()
+	}
+	job = startTestJob(t, root, "", "true")
+	requested := startTestJob(t, root, "new.log", "true")
+	for _, test := range []struct {
+		path, expected string
+	}{{job.Log, ""}, {requested.Log, reference}} {
+		expected := os.FileMode(0600)
+		if test.expected != "" {
+			info, err := os.Stat(test.expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected = info.Mode().Perm()
+		}
+		if info, err := os.Stat(test.path); err != nil {
+			t.Fatal(err)
+		} else if info.Mode().Perm() != expected {
+			t.Errorf("incorrect permissions for %s: %v instead of %v", test.path, info.Mode().Perm(), expected)
+		}
+	}
+
+	// Character devices, such as /dev/null, can serve as logs.
+	if job := startTestJob(t, root, "/dev/null", "echo", "discarded"); job.Log != "/dev/null" {
+		t.Fatal("incorrect log:", job.Log)
+	} else if ended := waitTestJob(t, root, job.ID); ended.State != JobExited || ended.ExitCode != 0 {
+		t.Fatalf("incorrect job logging to /dev/null: %+v", ended)
+	}
+}
+
+func TestJobLogTypes(t *testing.T) {
+	directory := useTestJobs(t)
+	root := t.TempDir()
+	fifo := filepath.Join(root, "fifo")
+	if err := mkfifo(fifo); err != nil {
+		t.Fatal(err)
+	} else if err := os.Symlink("fifo", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Logs that are neither regular files nor character devices are refused
+	// at once, without starting the job or leaving its directory behind:
+	// opening a FIFO without a reader would block, and output written to a
+	// FIFO with one would go to whichever process reads it.
+	for _, test := range []struct {
+		description, log string
+		reader           bool
+	}{
+		{"FIFO without a reader", "fifo", false},
+		{"FIFO with a reader", "fifo", true},
+		{"symbolic link to a FIFO", "link", false},
+	} {
+		var reader *os.File
+		if test.reader {
+			var err error
+			if reader, err = os.OpenFile(fifo, os.O_RDONLY|syscall.O_NONBLOCK, 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		request := &Request{Arguments: []string{"echo", "hi"}, Job: &JobRequest{Operation: JobStart, Log: test.log}}
+		start := time.Now()
+		_, code, err := StartJob(ctx, jobRoute(ctx, root), request)
+		elapsed := time.Since(start)
+		cancel()
+		if reader != nil {
+			reader.Close()
+		}
+		if code != 126 || err == nil || !strings.Contains(err.Error(), "regular file or character device") {
+			t.Errorf("incorrect result for a log that's a %s: %d, %v (after %v)", test.description, code, err, elapsed)
+		}
+		if entries, err := os.ReadDir(directory); err != nil || len(entries) != 0 {
+			t.Errorf("job directories left behind for a log that's a %s: %v, %v", test.description, entries, err)
+		}
+	}
 }
 
 func TestJobStartFailures(t *testing.T) {

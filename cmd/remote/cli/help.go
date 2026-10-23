@@ -228,7 +228,8 @@ exits:
     doesn't wait for them, and remote --kill doesn't terminate them. Scripts
     that start background processes should wait for them.
   - Output goes to --log FILE (relative to the command's directory; absolute
-    and ~ paths are on the opposite endpoint), which is truncated first, or
+    and ~ paths are on the opposite endpoint), which must be a regular file
+    (truncated first) or a character device such as /dev/null, not a FIFO, or
     else to a log kept with the job's state in the Mutagen data directory
     there. remote warns if the session ignores the log, which then isn't
     synchronized (see remote --help sync).
