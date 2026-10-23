@@ -261,15 +261,23 @@ type scopeRegistration struct {
 	listener net.Listener
 	// cancel cancels the registration's pruning of the scope registry, if any.
 	cancel context.CancelFunc
-	// tasks tracks accepting connections and pruning.
-	tasks sync.WaitGroup
+	// pruning tracks pruning the scope registry.
+	pruning sync.WaitGroup
+	// accepting tracks accepting connections.
+	accepting sync.WaitGroup
 }
 
-// Close implements io.Closer.Close, removing the registration.
+// Close implements io.Closer.Close, removing the registration. Pruning is
+// stopped before the record is removed, since pruning reads the registry's
+// records, and Windows doesn't remove files while they're open, so removing
+// the record while pruning read it would leave it in place until another
+// process pruned it. The listener stays open until then, since pruning probes
+// this registration too.
 func (r *scopeRegistration) Close() error {
 	r.cancel()
+	r.pruning.Wait()
 	err := r.listener.Close()
-	r.tasks.Wait()
+	r.accepting.Wait()
 	return err
 }
 
@@ -300,9 +308,9 @@ func RegisterScope(session string, alpha bool, root string, ignores *Ignores) (i
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	registration := &scopeRegistration{listener: listener, cancel: cancel}
-	registration.tasks.Add(1)
+	registration.accepting.Add(1)
 	go func() {
-		defer registration.tasks.Done()
+		defer registration.accepting.Done()
 		for {
 			connection, err := listener.Accept()
 			if err != nil {
@@ -312,9 +320,9 @@ func RegisterScope(session string, alpha bool, root string, ignores *Ignores) (i
 		}
 	}()
 	if pruningScopes.CompareAndSwap(false, true) {
-		registration.tasks.Add(1)
+		registration.pruning.Add(1)
 		go func() {
-			defer registration.tasks.Done()
+			defer registration.pruning.Done()
 			defer pruningScopes.Store(false)
 			prune(ctx, directory)
 		}()
