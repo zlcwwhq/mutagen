@@ -83,10 +83,17 @@ func normalizeSymbolicLinkAndEnsurePortable(path, target string) (string, error)
 	// references a location outside of the synchronization root. Note that we
 	// don't add 1 to our calculation of pathDepth because the act of
 	// dereferencing the symbolic link removes one element of path depth.
+	//
+	// Empty components (which result from repeated or trailing separators) are
+	// treated like "." because path resolution collapses repeated separators.
+	// Counting them as names would allow targets such as "child//../../x" to
+	// escape the root without the depth ever going negative. We don't rewrite
+	// such targets, though, because the transitioner requires that portable
+	// targets that it creates are returned unchanged.
 	pathDepth := strings.Count(path, "/")
 	for _, component := range strings.Split(target, "/") {
 		// Update the depth.
-		if component == "." {
+		if component == "" || component == "." {
 			// No change to depth.
 		} else if component == ".." {
 			pathDepth--

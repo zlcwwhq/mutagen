@@ -810,3 +810,89 @@ func TestTransition(t *testing.T) {
 		}
 	}
 }
+
+// TestTransitionPortableSymbolicLinkEmptyComponents tests that Transition in
+// portable symbolic link mode refuses to create a symbolic link whose target
+// escapes the synchronization root through empty components (leaving nothing
+// on disk), while still creating a symbolic link whose target contains empty
+// components but stays within the root.
+func TestTransitionPortableSymbolicLinkEmptyComponents(t *testing.T) {
+	// Create an empty synchronization root.
+	root := t.TempDir()
+
+	// Create an ignorer that doesn't ignore anything.
+	ignorer, err := mutagenignore.NewIgnorer(nil)
+	if err != nil {
+		t.Fatal("unable to create ignorer:", err)
+	}
+
+	// Perform a scan to extract filesystem behavior and a cache.
+	snapshot, cache, _, err := Scan(
+		context.Background(),
+		root,
+		nil, nil,
+		newTestingHasher(), nil,
+		ignorer, nil,
+		behavior.ProbeMode_ProbeModeProbe,
+		SymbolicLinkMode_SymbolicLinkModePortable,
+		PermissionsMode_PermissionsModePortable,
+	)
+	if err != nil {
+		t.Fatal("unable to perform scan of baseline:", err)
+	}
+
+	// Attempt to create both symbolic links.
+	escape := &Entry{Kind: EntryKind_SymbolicLink, Target: "child//../../outside"}
+	inside := &Entry{Kind: EntryKind_SymbolicLink, Target: "child//../inside"}
+	provider := &testingProvider{
+		storage: t.TempDir(),
+		hasher:  newTestingHasher(),
+	}
+	results, problems, missingFiles := Transition(
+		context.Background(),
+		root,
+		[]*Change{
+			{Path: "escape", New: escape},
+			{Path: "inside", New: inside},
+		},
+		cache,
+		SymbolicLinkMode_SymbolicLinkModePortable,
+		0600,
+		0700,
+		nil,
+		snapshot.DecomposesUnicode,
+		provider,
+	)
+
+	// Check results.
+	if len(results) != 2 {
+		t.Fatalf("length of results does not match expected: %d != 2", len(results))
+	}
+	if !results[0].Equal(nil, true) {
+		t.Error("escaping symbolic link creation result not empty:", results[0])
+	}
+	if !results[1].Equal(inside, true) {
+		t.Errorf("non-escaping symbolic link creation result does not match expected: %v != %v",
+			results[1], inside,
+		)
+	}
+
+	// Check problems.
+	if !testingProblemListsEqual(problems, []*Problem{{Path: "escape", Error: "*"}}) {
+		t.Error("problems do not match expected:", problems)
+	}
+
+	// Check missing file status.
+	if missingFiles {
+		t.Error("unexpectedly missing staged files")
+	}
+
+	// Verify that the escaping symbolic link wasn't created on disk and that
+	// the non-escaping one was.
+	if _, err := os.Lstat(filepath.Join(root, "escape")); !os.IsNotExist(err) {
+		t.Error("escaping symbolic link exists on disk or can't be checked:", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "inside")); err != nil {
+		t.Error("unable to find non-escaping symbolic link on disk:", err)
+	}
+}
