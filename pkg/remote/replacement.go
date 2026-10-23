@@ -70,9 +70,12 @@ type replacementLock struct {
 // replaced may still be finishing a replacement, and those that resolutions'
 // clients make of their local copies, which share the data directory with the
 // executors of their endpoints, since they locate them through its command
-// registry. Lock files are identified by the root and path, and they're kept,
-// since removing one that another process is about to lock would let both
-// hold their locks.
+// registry. Lock files are identified by the entry that they lock (see
+// replacementTarget), rather than by the root and path through which it's
+// reached, so that replacements of an entry that nested sessions' roots both
+// contain exclude each other and are ordered together, and they're kept, since
+// removing one that another process is about to lock would let both hold their
+// locks.
 //
 // Waiting can be cancelled, but a lock that's been acquired, even after its
 // context was cancelled, is only released once its replacement has finished,
@@ -83,7 +86,7 @@ func lockReplacement(ctx context.Context, directory, path string) (*replacementL
 	if err != nil {
 		return nil, fmt.Errorf("unable to create replacements directory: %w", err)
 	}
-	digest := sha256.Sum256([]byte(directory + "\x00" + path))
+	digest := sha256.Sum256([]byte(replacementTarget(directory, path)))
 	name := filepath.Join(base, fmt.Sprintf("%x", digest[:16]))
 
 	// Wait for this process's other replacements of the entry.
@@ -153,19 +156,41 @@ func lockReplacement(ctx context.Context, directory, path string) (*replacementL
 	}, nil
 }
 
+// replacementTarget identifies the entry at a slash-separated path relative to
+// a normalized root (a dot for the root itself) for its replacements (see
+// lockReplacement) by the path of the entry that they open (see openFile),
+// whichever root they reach it through. Opening the root, or its parent for
+// the root itself, follows symbolic links, so the root, or its parent, is
+// resolved, like the registry resolves roots to determine whether they're
+// nested (see resolveSymbolicLinks). The entry itself isn't resolved, since
+// replacements of a symbolic link replace the link rather than its target,
+// which may not even exist, and nor are the directories between the root and
+// the entry, since replacements refuse to traverse links there. Paths that
+// only differ in case, which may identify the same entry on case-insensitive
+// filesystems, identify different entries.
+func replacementTarget(directory, path string) string {
+	if path == "" || path == "." {
+		return filepath.Join(resolveSymbolicLinks(filepath.Dir(directory)), filepath.Base(directory))
+	}
+	return filepath.Join(resolveSymbolicLinks(directory), filepath.FromSlash(path))
+}
+
 // replacementRecord records the latest replacement admitted for an entry (see
 // replacementLock.admit).
 type replacementRecord struct {
-	// Root and Path identify the entry, as for lockReplacement, for reference.
+	// Root and Path are the root and path through which the replacement
+	// reached the entry, for reference. They don't identify the entry, which
+	// other replacements may reach through other roots (see lockReplacement).
 	Root, Path string
 	// Sequence is the replacement's sequence number.
 	Sequence uint64
 }
 
-// admit admits a replacement of the locked entry at a slash-separated path
-// relative to a normalized root (see lockReplacement) with the specified
-// sequence number, failing with ErrSuperseded if a replacement with a later
-// one was admitted for the entry before. Otherwise, it durably records the
+// admit admits a replacement of the locked entry, which it reached through a
+// slash-separated path relative to a normalized root (see lockReplacement),
+// with the specified sequence number, failing with ErrSuperseded if a
+// replacement with a later one was admitted for the entry before, whichever
+// root it reached the entry through. Otherwise, it durably records the
 // sequence number, before the replacement checks or changes the entry, so that
 // a replacement with an earlier one is refused afterward, even if this one
 // fails, or finds that the entry already has its result.

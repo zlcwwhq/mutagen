@@ -136,9 +136,10 @@ type endpoint struct {
 	// concurrent usage), but rather the endpoint's background worker Goroutines
 	// for cache saving and filesystem watching. This lock notably excludes
 	// coverage of scannedSinceLastStageCall, scannedSinceLastTransitionCall,
-	// lastReturnedScanCache, lastReturnedScanSnapshotDecomposesUnicode, which
-	// are only updated by Scan and read by Stage and Transition, thus making
-	// them safe under Endpoint's (non-concurrent) interface.
+	// lastReturnedScanCache, lastReturnedScanSnapshotDecomposesUnicode, and
+	// lastReturnedScanEntryCount, which are only updated by Scan and read by
+	// Stage and Transition, thus making them safe under Endpoint's
+	// (non-concurrent) interface.
 	//
 	// Instead of being implemented as a mutex, this lock is implemented as a
 	// semaphore, allowing for preemption when waiting on its acquisition. This
@@ -189,6 +190,12 @@ type endpoint struct {
 	// likely being the same as the value in the current snapshot, it needs to
 	// be tracked separately for the same reasons as lastReturnedScanCache.
 	lastReturnedScanSnapshotDecomposesUnicode bool
+	// lastReturnedScanEntryCount is the entry count of the last snapshot
+	// returned by Scan. It's tracked separately from lastScanEntryCount (which
+	// background scans may update between Scan and Transition) because
+	// Transition needs the entry count of the snapshot that resulted in its
+	// operations to validate and account for the entries that they remove.
+	lastReturnedScanEntryCount uint64
 	// stager is the staging coordinator. It is not safe for concurrent usage,
 	// but since Endpoint doesn't allow concurrent usage, we know that the
 	// stager will only be used in at most one of Stage or Transition methods at
@@ -1091,6 +1098,7 @@ func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, full bool) (*core.Sn
 	// Store the values corresponding to the snapshot that we'll return.
 	e.lastReturnedScanCache = e.cache
 	e.lastReturnedScanSnapshotDecomposesUnicode = e.snapshot.DecomposesUnicode
+	e.lastReturnedScanEntryCount = e.lastScanEntryCount
 
 	// Success.
 	return e.snapshot, nil, false
@@ -1150,24 +1158,37 @@ func (e *endpoint) Stage(paths []string, digests [][]byte) ([]string, []*rsync.S
 		return nil, nil, nil, nil
 	}
 
-	// Grab the scan lock. We'll need this to verify the last scan entry count
-	// and to generate the reverse lookup map.
+	// Grab the scan lock. We'll need this to generate the reverse lookup map.
 	e.lockScanLock(context.Background())
 
-	// Verify that we've performed a scan since the last staging operation, that
-	// way our count check is valid. If we haven't, then the controller is
-	// either malfunctioning or malicious.
+	// Verify that we've performed a scan since the last staging operation. If
+	// we haven't, then the controller is either malfunctioning or malicious.
 	if !e.scannedSinceLastStageCall {
 		e.unlockScanLock()
 		return nil, nil, nil, errors.New("multiple staging operations performed without scan")
 	}
 	e.scannedSinceLastStageCall = false
 
-	// Verify that the number of paths provided isn't going to put us over the
-	// maximum number of allowed entries.
-	if e.maximumEntryCount != 0 && (e.maximumEntryCount-e.lastScanEntryCount) < uint64(len(paths)) {
+	// Verify that the number of paths provided doesn't exceed the maximum
+	// number of allowed entries. Each staged path becomes a file entry, so a
+	// set of changes that requires staging more paths than that can never be
+	// applied.
+	//
+	// We don't check the number of paths against the capacity remaining after
+	// the last scan, because staged paths don't necessarily correspond to new
+	// entries: they also include content updates to existing files, and the
+	// changes that require them may remove other entries (e.g. by deleting one
+	// file and creating another in the same synchronization cycle). We're only
+	// provided with paths and digests, so we can't compute the resulting entry
+	// count here. Instead, Transition enforces the maximum for each change: it
+	// applies changes that can't increase the entry count first, then admits
+	// the remaining changes only while the resulting entry count stays within
+	// the maximum, and reports a problem for each change that it refuses. The
+	// stager is finalized either way, so refused changes don't leave staged
+	// files behind, and they're staged again in a later synchronization cycle.
+	if e.maximumEntryCount != 0 && uint64(len(paths)) > e.maximumEntryCount {
 		e.unlockScanLock()
-		return nil, nil, nil, errors.New("staging would exceeded allowed entry count")
+		return nil, nil, nil, errors.New("staging would exceed allowed entry count")
 	}
 
 	// Generate a reverse lookup map from the cache, which we'll use shortly to
@@ -1261,6 +1282,136 @@ func (e *endpoint) Supply(paths []string, signatures []*rsync.Signature, receive
 	return rsync.Transmit(e.root, paths, signatures, receiver)
 }
 
+// transition performs transitions on the synchronization root using the
+// endpoint's transition parameters. It returns the results of core.Transition.
+// It doesn't require the scan lock (see Transition).
+func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool) {
+	return core.Transition(
+		ctx,
+		e.root,
+		transitions,
+		e.lastReturnedScanCache,
+		e.symbolicLinkMode,
+		e.defaultFileMode,
+		e.defaultDirectoryMode,
+		e.defaultOwnership,
+		e.lastReturnedScanSnapshotDecomposesUnicode,
+		e.stager,
+	)
+}
+
+// transitionWithinMaximumEntryCount performs transitions on the
+// synchronization root while ensuring that they don't raise the root's entry
+// count above the maximum number of allowed entries, refusing any transition
+// that could. The specified entry count is the root's entry count before the
+// transitions, which must be at least the total number of entries that the
+// transitions remove. Like core.Transition, it returns results in the order of
+// the transitions, problems, and whether or not the stager was missing files.
+// It doesn't require the scan lock (see Transition).
+//
+// core.Transition handles each transition either by swapping file contents in
+// place or by removing the old content at its path and, only if that removal
+// succeeds, creating the new content. If it fails partway through, then the
+// result is part of the old or new content. Thus, a transition leaves at most
+// as many entries at its path as the larger of its old and new content,
+// whether or not it succeeds. Transitions whose new content doesn't have more
+// entries than their old content (e.g. deletions, file content updates, and
+// replacements with smaller content) therefore can't raise the entry count,
+// so we perform them first and without restriction. We then compute the
+// resulting entry count from their results, which accounts for removals that
+// failed (e.g. due to modifications since the last scan), and admit the
+// remaining transitions only while the entry count that would result if they
+// all succeeded remains within the maximum.
+func (e *endpoint) transitionWithinMaximumEntryCount(
+	ctx context.Context,
+	transitions []*core.Change,
+	entryCount uint64,
+) ([]*core.Entry, []*core.Problem, bool) {
+	// Split transitions into those that can't raise the entry count and those
+	// that can, preserving their relative order and recording their original
+	// indices so that we can place their results.
+	var nonIncreasing, increasing []*core.Change
+	var nonIncreasingIndices, increasingIndices []int
+	for t, transition := range transitions {
+		if transition.New.Count() <= transition.Old.Count() {
+			nonIncreasing = append(nonIncreasing, transition)
+			nonIncreasingIndices = append(nonIncreasingIndices, t)
+		} else {
+			increasing = append(increasing, transition)
+			increasingIndices = append(increasingIndices, t)
+		}
+	}
+
+	// Set up results.
+	results := make([]*core.Entry, len(transitions))
+	var problems []*core.Problem
+	var stagerMissingFiles bool
+
+	// Perform the transitions that can't raise the entry count and update the
+	// entry count to reflect their results. We subtract the entries that they
+	// were expected to remove before adding the entries that they left in
+	// place, which can't underflow because the entry count covers all of the
+	// entries that the transitions remove.
+	if len(nonIncreasing) > 0 {
+		phaseResults, phaseProblems, phaseMissingFiles := e.transition(ctx, nonIncreasing)
+		for r, result := range phaseResults {
+			results[nonIncreasingIndices[r]] = result
+		}
+		problems = append(problems, phaseProblems...)
+		stagerMissingFiles = phaseMissingFiles
+		for _, transition := range nonIncreasing {
+			entryCount -= transition.Old.Count()
+		}
+		for _, result := range phaseResults {
+			entryCount += result.Count()
+		}
+	}
+
+	// Admit the transitions that can raise the entry count in their original
+	// order, so long as the entry count remains within the maximum, charging
+	// each admitted transition for the full amount by which it can increase the
+	// entry count. A refused transition leaves its old content in place and
+	// gets a problem of its own, but it doesn't prevent smaller transitions
+	// that follow it from being admitted. Like any other transition that fails,
+	// it will be staged and attempted again in a later synchronization cycle.
+	// We formulate the comparison so that it can't overflow, even if the entry
+	// count already exceeds the maximum (which can happen if a background scan
+	// has observed new content since the scan used by the controller).
+	var admitted []*core.Change
+	var admittedIndices []int
+	var refusals []*core.Problem
+	for i, transition := range increasing {
+		increase := transition.New.Count() - transition.Old.Count()
+		if entryCount > e.maximumEntryCount || increase > e.maximumEntryCount-entryCount {
+			results[increasingIndices[i]] = transition.Old
+			refusals = append(refusals, &core.Problem{
+				Path:  transition.Path,
+				Error: "applying change would exceed allowed entry count",
+			})
+			continue
+		}
+		entryCount += increase
+		admitted = append(admitted, transition)
+		admittedIndices = append(admittedIndices, increasingIndices[i])
+	}
+
+	// Perform the admitted transitions.
+	if len(admitted) > 0 {
+		phaseResults, phaseProblems, phaseMissingFiles := e.transition(ctx, admitted)
+		for r, result := range phaseResults {
+			results[admittedIndices[r]] = result
+		}
+		problems = append(problems, phaseProblems...)
+		stagerMissingFiles = stagerMissingFiles || phaseMissingFiles
+	}
+
+	// Record problems for refused transitions.
+	problems = append(problems, refusals...)
+
+	// Done.
+	return results, problems, stagerMissingFiles
+}
+
 // Transition implements the Transition method for local endpoints.
 func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool, error) {
 	// If we're in a read-only mode, we shouldn't be performing transitions.
@@ -1273,41 +1424,52 @@ func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) (
 	defer e.unlockScanLock()
 
 	// Verify that we've performed a scan since the last transition operation,
-	// that way our count check is valid. If we haven't, then the controller is
-	// either malfunctioning or malicious.
+	// that way our count checks are valid. If we haven't, then the controller
+	// is either malfunctioning or malicious.
 	if !e.scannedSinceLastTransitionCall {
 		return nil, nil, false, errors.New("multiple transition operations performed without scan")
 	}
 	e.scannedSinceLastTransitionCall = false
 
-	// Verify that the number of entries we'll be creating won't put us over the
-	// maximum number of allowed entries. Again, we don't worry too much about
-	// overflow here for the same reasons as in Entry.Count.
-	if e.maximumEntryCount != 0 {
-		// Compute the resulting entry count. If we dip below zero in this
-		// counting process, then the controller is malfunctioning.
-		resultingEntryCount := e.lastScanEntryCount
-		for _, transition := range transitions {
-			if removed := transition.Old.Count(); removed > resultingEntryCount {
-				return nil, nil, false, errors.New("transition requires removing more entries than exist")
-			} else {
-				resultingEntryCount -= removed
-			}
-			resultingEntryCount += transition.New.Count()
-		}
+	// Grab the entry count of the snapshot that resulted in these transitions.
+	// We don't use lastScanEntryCount because background scans may have updated
+	// it since that snapshot was returned (e.g. after content was removed),
+	// whereas the transitions' old content is relative to that snapshot.
+	lastScanEntryCount := e.lastReturnedScanEntryCount
 
-		// If the resulting entry count would be too high, then abort the
-		// transitioning operation, but return the error as a problem, not an
-		// error, since nobody is malfunctioning here.
-		if e.maximumEntryCount < resultingEntryCount {
-			results := make([]*core.Entry, len(transitions))
-			for t, transition := range transitions {
-				results[t] = transition.Old
-			}
-			problems := []*core.Problem{{Error: "transitioning would exceeded allowed entry count"}}
-			return results, problems, false, nil
+	// Verify that the transitions don't remove more entries than existed in
+	// that snapshot. Transitions apply to disjoint paths and remove (at most)
+	// the content that they expect to find there, so the entries that they
+	// remove can't outnumber the snapshot's entries unless the controller is
+	// malfunctioning. This also guarantees that the entry count computations in
+	// transitionWithinMaximumEntryCount can't underflow. While we're at it,
+	// compute the sum of the amounts by which transitions might increase the
+	// entry count (see transitionWithinMaximumEntryCount). Again, we don't
+	// worry too much about overflow here for the same reasons as in
+	// Entry.Count.
+	var removedEntryCount, maximumIncrease uint64
+	for _, transition := range transitions {
+		removed, created := transition.Old.Count(), transition.New.Count()
+		removedEntryCount += removed
+		if created > removed {
+			maximumIncrease += created - removed
 		}
 	}
+	if removedEntryCount > lastScanEntryCount {
+		return nil, nil, false, errors.New("transition requires removing more entries than exist")
+	}
+
+	// Determine whether or not we need to restrict transitions to keep the
+	// entry count within the maximum number of allowed entries. If the entry
+	// count can accommodate the sum of the increases computed above, then the
+	// transitions can't exceed the maximum (even if every removal fails), and
+	// we can perform them as requested, which in practice is always the case at
+	// the default maximum. Otherwise, we have to enforce the maximum on a
+	// per-transition basis, taking into account what the transitions actually
+	// change on disk.
+	restrict := e.maximumEntryCount != 0 &&
+		(lastScanEntryCount > e.maximumEntryCount ||
+			maximumIncrease > e.maximumEntryCount-lastScanEntryCount)
 
 	// Perform the transition. We release the scan lock around this operation
 	// because we want watching Goroutines to be able to pick up events, or at
@@ -1318,18 +1480,16 @@ func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) (
 	// because these aren't updated concurrently and thus don't fall under the
 	// scope of the scan lock.
 	e.unlockScanLock()
-	results, problems, stagerMissingFiles := core.Transition(
-		ctx,
-		e.root,
-		transitions,
-		e.lastReturnedScanCache,
-		e.symbolicLinkMode,
-		e.defaultFileMode,
-		e.defaultDirectoryMode,
-		e.defaultOwnership,
-		e.lastReturnedScanSnapshotDecomposesUnicode,
-		e.stager,
-	)
+	var results []*core.Entry
+	var problems []*core.Problem
+	var stagerMissingFiles bool
+	if restrict {
+		results, problems, stagerMissingFiles = e.transitionWithinMaximumEntryCount(
+			ctx, transitions, lastScanEntryCount,
+		)
+	} else {
+		results, problems, stagerMissingFiles = e.transition(ctx, transitions)
+	}
 	e.lockScanLock(context.Background())
 
 	// Determine whether or not the transition made any changes on disk.

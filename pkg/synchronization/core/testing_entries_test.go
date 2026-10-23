@@ -57,8 +57,12 @@ var tP1 = &Entry{Kind: EntryKind_Problematic, Problem: "something bad happened"}
 // tP2 is an alternate problematic entry for testing.
 var tP2 = &Entry{Kind: EntryKind_Problematic, Problem: "another bad thing happened"}
 
-// tPInvalidUTF8 is a problematic entry indicating non-UTF-8 filename encoding.
-var tPInvalidUTF8 = &Entry{Kind: EntryKind_Problematic, Problem: "non-UTF-8 filename"}
+// tPInvalidUTF8 creates a problematic entry indicating non-UTF-8 filename
+// encoding. The quotedName argument is the raw content name in the escaped and
+// quoted form expected in the problem message (e.g. `"hell\xd6"`).
+func tPInvalidUTF8(quotedName string) *Entry {
+	return &Entry{Kind: EntryKind_Problematic, Problem: "non-UTF-8 filename " + quotedName}
+}
 
 // tPD0 is an empty phantom directory for testing.
 var tPD0 = &Entry{Kind: EntryKind_PhantomDirectory}

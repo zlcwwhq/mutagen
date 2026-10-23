@@ -352,6 +352,13 @@ func waitForCommandStart(ready *os.File) bool {
 	return !errors.Is(err, os.ErrDeadlineExceeded)
 }
 
+// signalJobGroup sends a signal to the process group led by the job supervisor
+// with the specified process identifier. It's a variable so that tests can
+// simulate how other systems report signaling failures (see terminateJob).
+var signalJobGroup = func(pid int, signal syscall.Signal) error {
+	return syscall.Kill(-pid, signal)
+}
+
 // jobGroupRemains determines whether any process remains in the process group
 // led by the job supervisor with the specified process identifier. Zombies
 // remain until they're reaped, and processes that this process isn't allowed
@@ -451,14 +458,26 @@ func waitForJobExit(lock string, pid int, deadline time.Time) bool {
 // group's last member exited and was reaped and the system assigned the
 // identifier to a new group, which would require it to reuse process
 // identifiers within that interval.
+//
+// Signaling the group fails with EPERM if none of its remaining processes can
+// be signaled. That includes processes that this process isn't allowed to
+// signal, but on Darwin, it also includes zombies: a group whose members are
+// all zombies, such as one that a concurrent termination's SIGKILL has just
+// ended, can't be signaled. The supervisor can be signaled while it holds the
+// lock, so EPERM implies that the job has ended or is ending. Termination thus
+// continues as if the signal had been sent and only reports EPERM if the job
+// is still running afterward.
 func terminateJob(directory string, pid int) (*Job, error) {
 	// Mark the job as killed and, if this termination marked it, send SIGTERM.
 	// Either way, determine when the grace period expires.
 	lock, killed := filepath.Join(directory, jobLockName), filepath.Join(directory, jobKilledName)
 	var deadline time.Time
+	var unsignaled error
 	if marker, err := os.OpenFile(killed, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600); err == nil {
 		marker.Close()
-		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+		if err := signalJobGroup(pid, syscall.SIGTERM); err == syscall.EPERM {
+			unsignaled = err
+		} else if err != nil && err != syscall.ESRCH {
 			return nil, err
 		}
 		deadline = time.Now().Add(terminationGracePeriod)
@@ -476,11 +495,16 @@ func terminateJob(directory string, pid int) (*Job, error) {
 	// Wait for the job to exit, and kill whatever remains of it once the grace
 	// period expires.
 	if !waitForJobExit(lock, pid, deadline) {
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		if err := signalJobGroup(pid, syscall.SIGKILL); err == syscall.EPERM {
+			unsignaled = err
+		} else if err != nil && err != syscall.ESRCH {
 			return nil, err
 		}
 		waitForJobExit(lock, pid, time.Now().Add(time.Second))
 	}
 	_, job, err := loadJob(directory)
+	if err == nil && job.State == JobRunning && unsignaled != nil {
+		return nil, unsignaled
+	}
 	return job, err
 }
