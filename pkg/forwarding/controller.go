@@ -13,6 +13,7 @@ import (
 
 	"github.com/mutagen-io/mutagen/pkg/encoding"
 	"github.com/mutagen-io/mutagen/pkg/logging"
+	"github.com/mutagen-io/mutagen/pkg/multiplexing"
 	"github.com/mutagen-io/mutagen/pkg/mutagen"
 	"github.com/mutagen-io/mutagen/pkg/prompting"
 	"github.com/mutagen-io/mutagen/pkg/state"
@@ -730,15 +731,38 @@ func (c *controller) forward(source, destination Endpoint) error {
 			return fmt.Errorf("unable to accept connection: %w", err)
 		}
 
-		// Open the outgoing connection to which we should forward.
+		// Open the outgoing connection to which we should forward. If this fails
+		// because the destination's multiplexer has closed, then the destination
+		// transport has failed (which will also be reported through its
+		// transport error channel), so we terminate forwarding. Any other
+		// failure (e.g. the target refusing the connection or a remote
+		// destination rejecting the stream because its backlog is full) only
+		// affects this connection, so we record the error, close the incoming
+		// connection to indicate failure, and continue accepting connections
+		// without disrupting existing ones. We record the error before closing
+		// the incoming connection so that it's visible to anyone observing the
+		// closure. If the failure is due to the endpoints being shut down, then
+		// the next accept will fail (since the source is also shut down) and
+		// terminate the loop, and since each iteration blocks in accept, this
+		// can't become a busy loop.
 		outgoing, err := destination.Open()
 		if err != nil {
+			if errors.Is(err, multiplexing.ErrMultiplexerClosed) {
+				incoming.Close()
+				return fmt.Errorf("unable to open forwarding connection: %w", err)
+			}
+			c.logger.Warn("Unable to open forwarding connection:", err)
+			c.stateLock.Lock()
+			state.LastError = fmt.Errorf("unable to open forwarding connection: %w", err).Error()
+			c.stateLock.Unlock()
 			incoming.Close()
-			return fmt.Errorf("unable to open forwarding connection: %w", err)
+			continue
 		}
 
-		// Increment the open and total connection counts.
+		// Increment the open and total connection counts and clear any error
+		// recorded by a previous failure to open a forwarding connection.
 		c.stateLock.Lock()
+		state.LastError = ""
 		state.OpenConnections++
 		state.TotalConnections++
 		c.stateLock.Unlock()
