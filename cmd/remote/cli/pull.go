@@ -242,9 +242,12 @@ func checkLanding(target *remote.Target, locator *locator, root, landing string,
 // session ignores them, since synchronization could otherwise replace them.
 // Parents are checked both as given and as the paths that they land at once
 // symbolic links are followed, which are the paths that scans see (see
-// checkLanding), and missing parents that land outside the root are only
-// created if no other session known on this system synchronizes them (see
-// remote.Synchronizing).
+// checkLanding). Missing parents are also only created if no other session
+// known on this system synchronizes them, wherever they land (see
+// remote.Synchronizing), since another session's root may lie in content that
+// the session ignores, and that session would propagate them even if the pull
+// were refused afterwards. Inside the root, the session's own endpoints don't
+// count, since it ignores the parents where they land.
 func prepareParents(ctx context.Context, target *remote.Target, locator *locator, relative string) (string, string, error) {
 	root, err := filepath.EvalSymlinks(target.Root)
 	if err != nil {
@@ -265,13 +268,15 @@ func prepareParents(ctx context.Context, target *remote.Target, locator *locator
 				return "", "", fmt.Errorf("%s doesn't exist locally, but the session synchronizes it, so remote doesn't create it; remote --flush synchronizes it", display)
 			} else if err := checkLanding(target, locator, root, native, true, display, "create it"); err != nil {
 				return "", "", err
-			} else if _, inside := within(root, native); !inside {
-				if sessions, err := remote.Synchronizing(ctx, native, true); err != nil {
-					return "", "", err
-				} else if len(sessions) > 0 {
+			} else if sessions, err := remote.Synchronizing(ctx, native, true); err != nil {
+				return "", "", err
+			} else if len(sessions) > 0 {
+				if physical, inside := within(root, native); !inside || physical != parent {
 					return "", "", fmt.Errorf("%s resolves to %s through a symbolic link, and that's synchronized by %s, so remote doesn't create it",
 						display, describeLanding(locator, root, native), strings.Join(sessions, ", "))
 				}
+				return "", "", fmt.Errorf("%s doesn't exist locally, and it's synchronized by %s, so remote doesn't create it",
+					display, strings.Join(sessions, ", "))
 			}
 			if err := os.Mkdir(native, 0777); err != nil {
 				return "", "", fmt.Errorf("unable to create %s: %w", display, err)

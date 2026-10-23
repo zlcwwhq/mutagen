@@ -296,7 +296,14 @@ func relaySession(t *testing.T, session string, alpha, beta string, ignores *rem
 	})
 }
 
-func TestPullSynchronizedByOtherSession(t *testing.T) {
+// setupPullSessions creates the alpha and beta roots of a session that ignores
+// results, with the specified local and remote files, relays its submissions,
+// and registers its endpoints' scopes, as its endpoints would register them.
+// It returns the alpha root and a function that pulls paths through the
+// session from there, returning the output.
+func setupPullSessions(t *testing.T, local, remoteFiles map[string]string) (string, func(...string) (string, error)) {
+	t.Helper()
+
 	// Avoid the test name and nested directory added by t.TempDir: combined
 	// with macOS's long temporary root, they exceed Unix socket path limits.
 	data, err := os.MkdirTemp("", "mr-")
@@ -310,29 +317,41 @@ func TestPullSynchronizedByOtherSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	alpha, beta := filepath.Join(base, "alpha"), filepath.Join(base, "beta")
-	writeFiles(t, alpha, map[string]string{"results/data": "local\n"})
-	writeFiles(t, beta, map[string]string{"results/data": "remote\n", "results/other": "other\n"})
+	writeFiles(t, alpha, local)
+	writeFiles(t, beta, remoteFiles)
 
-	// The session through which content is pulled ignores results, and its
-	// endpoints' scopes are registered, as its endpoints would register them.
+	// Connect the session and register its scopes.
 	ignores := &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"results"}}
 	relaySession(t, "sync_outer", alpha, beta, ignores)
 	for _, root := range []string{alpha, beta} {
-		scope, err := remote.RegisterScope("sync_outer", root == alpha, root, ignores)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { scope.Close() })
+		registerScope(t, "sync_outer", root == alpha, root, ignores)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	pullPaths := func(paths ...string) (string, error) {
-		t.Helper()
+	t.Cleanup(cancel)
+	return alpha, func(paths ...string) (string, error) {
 		var stderr bytes.Buffer
 		router := &router{ctx: ctx, directory: alpha, selection: &remote.Selection{}, stderr: &stderr}
 		err := pull(router, paths)
 		return stderr.String(), err
 	}
+}
+
+// registerScope registers the scope of a synchronization endpoint for the
+// duration of a test (see remote.RegisterScope).
+func registerScope(t *testing.T, session string, alpha bool, root string, ignores *remote.Ignores) {
+	t.Helper()
+	scope, err := remote.RegisterScope(session, alpha, root, ignores)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { scope.Close() })
+}
+
+func TestPullSynchronizedByOtherSession(t *testing.T) {
+	alpha, pullPaths := setupPullSessions(t,
+		map[string]string{"results/data": "local\n"},
+		map[string]string{"results/data": "remote\n", "results/other": "other\n"},
+	)
 
 	// Content that the session ignores is pulled.
 	if output, err := pullPaths("results/other"); err != nil || output != "remote: pulled results/other (1 added, 0 replaced, 0 unchanged)\n" {
@@ -341,16 +360,31 @@ func TestPullSynchronizedByOtherSession(t *testing.T) {
 
 	// Content that another session synchronizes isn't, even if that session
 	// doesn't run remote commands, and local content is left unchanged.
-	scope, err := remote.RegisterScope("sync_results", true, filepath.Join(alpha, "results"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { scope.Close() })
+	registerScope(t, "sync_results", true, filepath.Join(alpha, "results"), nil)
 	if output, err := pullPaths("results/data"); err == nil ||
 		output != "remote: unable to pull results/data: it's synchronized by sync_results, so remote doesn't write it\n" {
 		t.Errorf("content synchronized by another session pulled: %q, %v", output, err)
 	}
 	if contents, err := os.ReadFile(filepath.Join(alpha, "results", "data")); err != nil || string(contents) != "local\n" {
 		t.Errorf("local content changed: %q, %v", contents, err)
+	}
+}
+
+func TestPullParentSynchronizedByOtherSession(t *testing.T) {
+	alpha, pullPaths := setupPullSessions(t,
+		map[string]string{"results/kept": "local\n"},
+		map[string]string{"results/run1/metrics.json": "1\n"},
+	)
+
+	// A missing parent that the session ignores isn't created if another
+	// session synchronizes it, since that session would propagate it even
+	// though the pull itself is refused.
+	registerScope(t, "sync_results", true, filepath.Join(alpha, "results"), nil)
+	if output, err := pullPaths("results/run1/metrics.json"); err == nil ||
+		output != "remote: unable to pull results/run1/metrics.json: results/run1 doesn't exist locally, and it's synchronized by sync_results, so remote doesn't create it\n" {
+		t.Errorf("parent synchronized by another session not refused: %q, %v", output, err)
+	}
+	if _, err := os.Lstat(filepath.Join(alpha, "results", "run1")); err == nil {
+		t.Error("parent created in content that another session synchronizes")
 	}
 }
