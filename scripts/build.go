@@ -481,6 +481,27 @@ func (b *ArchiveBuilder) Add(name, path string, mode int64) error {
 	return nil
 }
 
+func (b *ArchiveBuilder) AddContents(name string, contents []byte, mode int64) error {
+	// Write the header for the entry.
+	header := &tar.Header{
+		Name:    name,
+		Mode:    mode,
+		Size:    int64(len(contents)),
+		ModTime: time.Now(),
+	}
+	if err := b.archiver.WriteHeader(header); err != nil {
+		return fmt.Errorf("unable to write archive header: %w", err)
+	}
+
+	// Write the contents.
+	if _, err := b.archiver.Write(contents); err != nil {
+		return fmt.Errorf("unable to write archive entry: %w", err)
+	}
+
+	// Success.
+	return nil
+}
+
 // copyFile copies the contents at sourcePath to a newly created file at
 // destinationPath that inherits the permissions of sourcePath.
 func copyFile(sourcePath, destinationPath string) error {
@@ -704,12 +725,17 @@ func build() error {
 		}
 	}
 
-	// Build the agent bundle.
+	// Build the agent bundle. Its first entry records the version of its
+	// agents, which the CLI verifies before extracting an agent.
 	log.Println("Building agent bundle...")
 	agentBundlePath := filepath.Join(buildPath, agent.BundleName)
 	agentBundleBuilder, err := NewArchiveBuilder(agentBundlePath)
 	if err != nil {
 		return fmt.Errorf("unable to create agent bundle archive builder: %w", err)
+	}
+	if err := agentBundleBuilder.AddContents(agent.BundleVersionEntryName, []byte(mutagen.Version), 0644); err != nil {
+		agentBundleBuilder.Close()
+		return fmt.Errorf("unable to add version to agent bundle: %w", err)
 	}
 	for _, target := range agentTargets {
 		agentBuildPath := filepath.Join(agentBuildSubdirectoryPath, target.Name())

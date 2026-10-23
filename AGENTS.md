@@ -96,7 +96,8 @@ follow the code and update this file.
 - The agent bundle is a separate `mutagen-agents.tar.gz` artifact.
   It ships alongside the CLI or in `libexec`; it is not embedded in
   the CLI. Releases publish it once, as its own asset, rather than
-  in each platform bundle.
+  in each platform bundle. Its first entry records the agents'
+  version, and the CLI refuses bundles of other versions.
 - Sidecar binaries and images are built via `cmd/mutagen-sidecar`,
   `scripts/ci/build.sh`, and `images/sidecar/linux/Dockerfile`.
 - Run package tests sequentially with `go test -p 1 ./pkg/...`.
