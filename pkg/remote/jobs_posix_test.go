@@ -543,6 +543,45 @@ func TestJobKillConcurrent(t *testing.T) {
 	}
 }
 
+func TestJobKillUnsignalableGroup(t *testing.T) {
+	useTestJobs(t)
+	useTerminationGracePeriod(t, 500*time.Millisecond)
+	root := t.TempDir()
+	signal := signalJobGroup
+	t.Cleanup(func() { signalJobGroup = signal })
+
+	// On Darwin, signaling a group whose members are all zombies fails with
+	// EPERM, such as when a concurrent kill's SIGKILL has just ended the job,
+	// which we simulate by reporting EPERM once SIGKILL has been delivered. The
+	// job has ended, so it's reported as killed.
+	signalJobGroup = func(pid int, s syscall.Signal) error {
+		if err := signal(pid, s); err != nil || s != syscall.SIGKILL {
+			return err
+		}
+		return syscall.EPERM
+	}
+	terms := filepath.Join(t.TempDir(), "terms")
+	job := startTestJob(t, root, "", "sh", "-c", termCountingJob, "sh", terms)
+	waitForLines(t, terms+".ready", 1)
+	result := receiveKill(t, killTestJob(t, context.Background(), root, job.ID))
+	if result.err != nil || result.job.State != JobKilled || result.job.ExitCode != 137 {
+		t.Fatalf("incorrect kill of a job ended by SIGKILL that failed with EPERM: %+v, %v", result.job, result.err)
+	}
+
+	// If no signal reaches the job, then it's still running afterward, and the
+	// kill reports EPERM.
+	signalJobGroup = func(int, syscall.Signal) error {
+		return syscall.EPERM
+	}
+	terms = filepath.Join(t.TempDir(), "terms")
+	job = startTestJob(t, root, "", "sh", "-c", termCountingJob, "sh", terms)
+	waitForLines(t, terms+".ready", 1)
+	result = receiveKill(t, killTestJob(t, context.Background(), root, job.ID))
+	if result.err == nil || !strings.Contains(result.err.Error(), syscall.EPERM.Error()) {
+		t.Fatalf("incorrect kill of a job that couldn't be signaled: %+v, %v", result.job, result.err)
+	}
+}
+
 func TestJobKillAfterInterruptedKill(t *testing.T) {
 	directory := useTestJobs(t)
 	useTerminationGracePeriod(t, 2*time.Second)
