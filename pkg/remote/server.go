@@ -166,7 +166,7 @@ func terminate(command *exec.Cmd, finished <-chan struct{}, abandon func()) {
 }
 
 // run prepares and executes a command without interpreting its arguments, or
-// performs a requested file operation.
+// performs a requested file or job operation.
 func run(ctx context.Context, root, prologue string, alpha bool, request *Request, stdin io.Reader, stdout, stderr io.Writer) result {
 	if err := request.EnsureValid(); err != nil {
 		return result{Error: err.Error()}
@@ -199,18 +199,57 @@ func run(ctx context.Context, root, prologue string, alpha bool, request *Reques
 			}
 		}
 		return result{}
+	} else if request.Job != nil && request.Job.Operation != JobStart {
+		return serveJob(ctx, root, request.Job, stdout)
+	} else if request.Job != nil {
+		return startJob(root, prologue, alpha, request)
 	}
+	command, failure := prepare(root, prologue, alpha, request, "")
+	if failure != nil {
+		return *failure
+	}
+	defer command.cleanup()
+	return command.runForeground(ctx, stdin, stdout, stderr)
+}
+
+// preparedCommand is a command whose executable, arguments, working directory,
+// and environment have been determined (see prepare).
+type preparedCommand struct {
+	// path is the executable's path.
+	path string
+	// arguments are the command's arguments, starting with the name by which
+	// the executable is invoked.
+	arguments []string
+	// directory is the working directory.
+	directory string
+	// environment contains the entries that override the executing process's
+	// inherited environment.
+	environment []string
+	// script is the path of the file to which the requested script was
+	// written, if any.
+	script string
+	// scriptLock is the open file that holds the lock of the temporary file to
+	// which the requested script was written, if any, until the command has
+	// exited (see lockScript).
+	scriptLock *os.File
+}
+
+// prepare determines how to run a requested command, which must be valid,
+// writing its script, if any, to the specified path, or to a new temporary file
+// if the path is empty. Failures are reported as results, with the exit codes
+// used for commands that can't be found (127) or started (126).
+func prepare(root, prologue string, alpha bool, request *Request, scriptPath string) (*preparedCommand, *result) {
 	directory, err := workingDirectory(root, request)
 	if err != nil {
-		return result{Error: fmt.Sprintf("invalid working directory: %v", err)}
+		return nil, &result{Error: fmt.Sprintf("invalid working directory: %v", err)}
 	}
 	// Check the working directory explicitly, since a missing one (such as an
 	// ignored or not yet synchronized directory) would otherwise be reported as
 	// a missing executable by the operating system.
 	if info, err := os.Stat(directory); err != nil {
-		return result{ExitCode: 126, Error: fmt.Sprintf("unable to access working directory: %v", err)}
+		return nil, &result{ExitCode: 126, Error: fmt.Sprintf("unable to access working directory: %v", err)}
 	} else if !info.IsDir() {
-		return result{ExitCode: 126, Error: fmt.Sprintf("working directory is not a directory: %s", directory)}
+		return nil, &result{ExitCode: 126, Error: fmt.Sprintf("working directory is not a directory: %s", directory)}
 	}
 
 	// The executing endpoint supplies its identity after all user-provided
@@ -226,26 +265,66 @@ func run(ctx context.Context, root, prologue string, alpha bool, request *Reques
 	// without reconnecting the channel. Disabled prologues aren't inspected.
 	if request.Prologue {
 		if prologue, err = selectPrologue(root, prologue); err != nil {
-			return result{ExitCode: 126, Error: err.Error()}
+			return nil, &result{ExitCode: 126, Error: err.Error()}
 		}
+	}
+
+	// Write the script, if any, which its interpreter then runs.
+	command := &preparedCommand{arguments: request.Arguments, directory: directory, environment: environment}
+	if request.Script != nil {
+		if command.script, command.scriptLock, command.arguments, err = writeScript(request.Script, request.Arguments, scriptPath); err != nil {
+			return nil, &result{ExitCode: 126, Error: err.Error()}
+		}
+	}
+	fail := func(failure result) (*preparedCommand, *result) {
+		command.cleanup()
+		return nil, &failure
 	}
 
 	// A prologue may change PATH, so the prologue's shell locates the command
 	// once the prologue has been sourced.
-	arguments := request.Arguments
-	var path string
 	if request.Prologue && prologue != "" {
-		if arguments, err = prologueArguments(prologue, arguments); err != nil {
-			return result{ExitCode: 126, Error: err.Error()}
+		if command.arguments, err = prologueArguments(prologue, command.arguments); err != nil {
+			return fail(result{ExitCode: 126, Error: err.Error()})
 		}
-		path = arguments[0]
-	} else if path, err = lookPath(arguments[0], directory, append(os.Environ(), environment...)); err != nil {
-		return result{ExitCode: 127, Error: fmt.Sprintf("unable to find command: %v", err)}
+		command.path = command.arguments[0]
+	} else if command.path, err = lookPath(command.arguments[0], directory, append(os.Environ(), environment...)); err != nil {
+		if request.Script != nil {
+			return fail(result{ExitCode: 127, Error: fmt.Sprintf("unable to find the script's interpreter: %v", err)})
+		}
+		return fail(result{ExitCode: 127, Error: fmt.Sprintf("unable to find command: %v", err)})
 	}
-	command := exec.Command(path, arguments[1:]...)
-	command.Args[0] = arguments[0]
-	command.Dir = directory
-	command.Env = append(command.Environ(), environment...)
+	return command, nil
+}
+
+// cleanup removes the file to which the command's script was written, if any,
+// and then releases the file's lock, if held, so that the file never remains
+// unlocked. Commands run in the foreground are cleaned up once they've exited
+// or failed to start (see run), and prepare cleans up after failures that
+// follow writing the script. Detached jobs keep their scripts, which aren't
+// locked, in their directories.
+func (c *preparedCommand) cleanup() {
+	if c.script != "" {
+		os.Remove(c.script)
+	}
+	if c.scriptLock != nil {
+		c.scriptLock.Close()
+	}
+}
+
+// command creates the process that runs the command.
+func (c *preparedCommand) command() *exec.Cmd {
+	command := exec.Command(c.path, c.arguments[1:]...)
+	command.Args[0] = c.arguments[0]
+	command.Dir = c.directory
+	command.Env = append(command.Environ(), c.environment...)
+	return command
+}
+
+// runForeground runs the command with its standard streams forwarded, waiting
+// for it to exit and for every process holding its output to close it.
+func (c *preparedCommand) runForeground(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) result {
+	command := c.command()
 	configureProcess(command)
 
 	// Own the output pipes so that termination can interrupt draining even

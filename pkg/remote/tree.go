@@ -196,6 +196,18 @@ var errInvalidArchive = errors.New("invalid archive")
 // is computed as received rather than read back. Extraction is confined to the
 // destination. Extracted files are private.
 func ExtractArchive(ctx context.Context, input io.Reader, destination string) (*Entry, error) {
+	return extractArchive(ctx, input, destination, true)
+}
+
+// ExtractSharedArchive extracts an archive as ExtractArchive does, but with the
+// permissions that programs typically request, which the umask restricts, as
+// for content that the user creates, rather than privately.
+func ExtractSharedArchive(ctx context.Context, input io.Reader, destination string) (*Entry, error) {
+	return extractArchive(ctx, input, destination, false)
+}
+
+// extractArchive implements ExtractArchive and ExtractSharedArchive.
+func extractArchive(ctx context.Context, input io.Reader, destination string, private bool) (*Entry, error) {
 	reader := tar.NewReader(&entryReader{ctx: ctx, reader: input})
 	header, err := reader.Next()
 	if err == io.EOF {
@@ -207,8 +219,8 @@ func ExtractArchive(ctx context.Context, input io.Reader, destination string) (*
 	}
 	var entry *Entry
 	if header.Typeflag == tar.TypeDir {
-		entry, err = extractDirectory(reader, destination)
-	} else if entry, err = extractLeaf(reader, header, nil, destination); err == nil {
+		entry, err = extractDirectory(reader, destination, private)
+	} else if entry, err = extractLeaf(reader, header, nil, destination, private); err == nil {
 		if _, err = reader.Next(); err == io.EOF {
 			err = nil
 		} else if err == nil {
@@ -224,13 +236,17 @@ func ExtractArchive(ctx context.Context, input io.Reader, destination string) (*
 }
 
 // extractLeaf extracts an archive entry other than a directory to a native
-// path relative to a root, or to an absolute path if root is nil.
-func extractLeaf(reader *tar.Reader, header *tar.Header, root *os.Root, path string) (*Entry, error) {
+// path relative to a root, or to an absolute path if root is nil, privately if
+// requested.
+func extractLeaf(reader *tar.Reader, header *tar.Header, root *os.Root, path string, private bool) (*Entry, error) {
 	switch header.Typeflag {
 	case tar.TypeReg:
 		permissions := os.FileMode(0600)
+		if !private {
+			permissions = 0666
+		}
 		if header.Mode&0111 != 0 {
-			permissions = 0700
+			permissions |= (permissions & 0666) >> 1
 		}
 		var file *os.File
 		var err error
@@ -274,9 +290,14 @@ func extractLeaf(reader *tar.Reader, header *tar.Header, root *os.Root, path str
 }
 
 // extractDirectory extracts a directory's contents from an archive, whose
-// directory entry has been read, to a destination path.
-func extractDirectory(reader *tar.Reader, destination string) (*Entry, error) {
-	if err := os.Mkdir(destination, 0700); err != nil {
+// directory entry has been read, to a destination path, privately if
+// requested.
+func extractDirectory(reader *tar.Reader, destination string, private bool) (*Entry, error) {
+	permissions := os.FileMode(0700)
+	if !private {
+		permissions = 0777
+	}
+	if err := os.Mkdir(destination, permissions); err != nil {
 		return nil, err
 	}
 	root, err := os.OpenRoot(destination)
@@ -298,9 +319,9 @@ func extractDirectory(reader *tar.Reader, destination string) (*Entry, error) {
 		native := filepath.FromSlash(header.Name)
 		entry := &Entry{Kind: EntryDirectory}
 		if header.Typeflag == tar.TypeDir {
-			err = root.Mkdir(native, 0700)
+			err = root.Mkdir(native, permissions)
 		} else {
-			entry, err = extractLeaf(reader, header, root, native)
+			entry, err = extractLeaf(reader, header, root, native, private)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("unable to extract %s: %w", header.Name, err)

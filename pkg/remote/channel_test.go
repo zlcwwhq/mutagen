@@ -637,6 +637,75 @@ func TestSessions(t *testing.T) {
 	}
 }
 
+func TestSynchronizing(t *testing.T) {
+	// This test relies on symbolic links.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+	useTestRegistry(t)
+	base := resolveSymbolicLinks(t.TempDir())
+	root, beta, other, outside := filepath.Join(base, "root"), filepath.Join(base, "beta"), filepath.Join(base, "other"), filepath.Join(base, "outside")
+	mkdirs(t, filepath.Join(root, "src"), filepath.Join(root, "cache"), filepath.Join(beta, "src"), filepath.Join(other, "sub"), outside)
+	for link, target := range map[string]string{
+		"results":    "src",
+		"cache/link": "../src",
+		"out-beta":   filepath.Join(beta, "src"),
+		"out-other":  filepath.Join(other, "sub"),
+		"out-plain":  outside,
+		"out-base":   base,
+	} {
+		if err := os.Symlink(target, filepath.Join(root, filepath.FromSlash(link))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var lock sync.Mutex
+	var accepted []string
+	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"results", "cache", "out-*"}}
+	registerTest(t, &Endpoint{Session: "sync_own", Name: "own", Root: root, Alpha: true, Ignores: ignores}, "alpha", &accepted, &lock)
+	registerTest(t, &Endpoint{Session: "sync_own", Name: "own", Root: beta, Ignores: ignores}, "beta", &accepted, &lock)
+	registerTest(t, &Endpoint{Session: "sync_other", Name: "other", Root: other}, "other", &accepted, &lock)
+
+	// Paths are related to the sessions as writes to them land: symbolic
+	// links among their parents are resolved, whether or not the final
+	// component exists, while the final component isn't, so that ignored
+	// symbolic links that lead to synchronized content are replaced rather
+	// than written through. Both endpoints of every session are considered,
+	// including those of the session whose root contains the path as given.
+	for _, test := range []struct {
+		path      string
+		directory bool
+		sessions  []string
+	}{
+		{"cache/data", false, nil},
+		{"cache/data", true, nil},
+		{"results", false, nil},
+		{"cache/link", false, nil},
+		{"src/data", false, []string{"own (sync_own)"}},
+		{"results/data", false, []string{"own (sync_own)"}},
+		{"results/missing", true, []string{"own (sync_own)"}},
+		{"cache/link/data", false, []string{"own (sync_own)"}},
+		{"out-beta/data", false, []string{"own (sync_own)"}},
+		{"out-other/data", false, []string{"other (sync_other)"}},
+		{"out-plain/data", false, nil},
+		{"out-base/root", true, []string{"own (sync_own)"}},
+		{"out-base/outside", true, nil},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		sessions, err := Synchronizing(ctx, filepath.Join(root, filepath.FromSlash(test.path)), test.directory)
+		cancel()
+		if err != nil {
+			t.Errorf("unable to determine the sessions synchronizing %s: %v", test.path, err)
+		} else if strings.Join(sessions, ", ") != strings.Join(test.sessions, ", ") {
+			t.Errorf("incorrect sessions synchronizing %s (directory: %t): %v", test.path, test.directory, sessions)
+		}
+	}
+
+	// Paths whose parents don't exist can't be related.
+	if _, err := Synchronizing(context.Background(), filepath.Join(root, "cache", "missing", "data"), false); err == nil {
+		t.Error("path with a missing parent related")
+	}
+}
+
 // testChannel connects an agent-style channel to an in-memory executor.
 func testChannel(t *testing.T, endpoint *Endpoint, install ExecutableInstaller) Channel {
 	t.Helper()

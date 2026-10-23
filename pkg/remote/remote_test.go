@@ -49,6 +49,16 @@ func TestRemoteHelper(t *testing.T) {
 	case "wait":
 		fmt.Fprint(os.Stdout, "ready")
 		time.Sleep(time.Hour)
+	case "start-job":
+		// Start a detached job in the working directory, which serves as the
+		// root, and exit at once, as an executor may.
+		root, _ := os.Getwd()
+		response := startJob(root, "", false, &Request{Arguments: arguments[1:], Job: &JobRequest{Operation: JobStart}})
+		if response.Job == nil {
+			fmt.Fprint(os.Stderr, response.Error)
+			os.Exit(1)
+		}
+		fmt.Fprint(os.Stdout, response.Job.ID)
 	default:
 		os.Exit(2)
 	}
@@ -69,7 +79,17 @@ func helperRequest(t *testing.T, mode string, arguments ...string) *Request {
 	}
 }
 
-// executeTest uses a real duplex connection and waits for server cleanup.
+// useTerminationGracePeriod sets the termination grace period for a test.
+func useTerminationGracePeriod(t *testing.T, period time.Duration) {
+	t.Helper()
+	previous := terminationGracePeriod
+	terminationGracePeriod = period
+	t.Cleanup(func() { terminationGracePeriod = previous })
+}
+
+// executeTest uses a real duplex connection and waits for server cleanup,
+// which takes up to the termination grace period for cancelled commands, so
+// tests that cancel commands should shorten it (see useTerminationGracePeriod).
 // Requests specify absolute working directories, so no root is needed.
 func executeTest(t *testing.T, ctx context.Context, request *Request, input io.Reader, output, errorOutput io.Writer) (int, error) {
 	t.Helper()

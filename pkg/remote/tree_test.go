@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -129,6 +130,54 @@ func TestExtractionConfinement(t *testing.T) {
 			t.Fatalf("%s accepted", description)
 		} else if _, err := os.Lstat(filepath.Join(outside, "escaped")); err == nil {
 			t.Fatalf("%s escaped", description)
+		}
+	}
+}
+
+func TestExtractArchivePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permissions aren't represented on Windows")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{"dir/plain": "plain\n", "dir/sub/tool": "tool\n"})
+	if err := os.Chmod(filepath.Join(root, "dir", "sub", "tool"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The permissions that the umask leaves of those requested by programs.
+	probe := filepath.Join(t.TempDir(), "probe")
+	if err := os.Mkdir(probe, 0777); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	umasked := info.Mode().Perm()
+
+	// Private extraction ignores the umask, while shared extraction applies it.
+	for _, test := range []struct {
+		extract             func(context.Context, io.Reader, string) (*Entry, error)
+		file, tool, subtree os.FileMode
+	}{
+		{ExtractArchive, 0600, 0700, 0700},
+		{ExtractSharedArchive, umasked & 0666, umasked, umasked},
+	} {
+		var archive bytes.Buffer
+		if _, err := ArchiveEntry(ctx, root, "dir", &archive); err != nil {
+			t.Fatal(err)
+		}
+		destination := filepath.Join(t.TempDir(), "copy")
+		if _, err := test.extract(ctx, &archive, destination); err != nil {
+			t.Fatal(err)
+		}
+		for path, expected := range map[string]os.FileMode{"plain": test.file, "sub/tool": test.tool, "sub": test.subtree, ".": test.subtree} {
+			if info, err := os.Lstat(filepath.Join(destination, filepath.FromSlash(path))); err != nil {
+				t.Fatal(err)
+			} else if info.Mode().Perm() != expected {
+				t.Errorf("incorrect permissions of %s: %v, expected %v", path, info.Mode().Perm(), expected)
+			}
 		}
 	}
 }

@@ -118,7 +118,8 @@ func (o *options) validateConflicts() error {
 	if modes > 1 {
 		return errors.New("--conflicts, --conflict-checkout, --conflict-apply, and --conflict-discard are mutually exclusive")
 	} else if modes == 1 && (o.flush || o.noFlush || o.diff || o.directory != "" ||
-		len(o.environment) != 0 || len(o.environmentFiles) != 0 || o.noPrologue) {
+		len(o.environment) != 0 || len(o.environmentFiles) != 0 || o.noPrologue ||
+		o.script != "" || o.detach || o.log != "") {
 		return errors.New("conflict operations can't be combined with commands or command options")
 	} else if o.conflicts && len(o.arguments) != 0 {
 		return errors.New("--conflicts doesn't accept arguments")
@@ -710,8 +711,17 @@ func writeCopy(path string, copy func(io.Writer) (*remote.Entry, error)) (*remot
 // extractCopy extracts an archive of a copy, written by a function that
 // returns the copy's snapshot as read at its source, to a path, and verifies
 // that the archive describes the snapshot, so that resolutions aren't based on
-// data corrupted in transit.
+// data corrupted in transit. Extracted files are private.
 func extractCopy(ctx context.Context, path string, archive func(io.Writer) (*remote.Entry, error)) (*remote.Entry, error) {
+	return extractVerified(ctx, path, remote.ExtractArchive, archive)
+}
+
+// extractVerified implements extractCopy, extracting the archive with the
+// specified function (see remote.ExtractArchive).
+func extractVerified(ctx context.Context, path string,
+	extract func(context.Context, io.Reader, string) (*remote.Entry, error),
+	archive func(io.Writer) (*remote.Entry, error),
+) (*remote.Entry, error) {
 	reader, writer := io.Pipe()
 	type extraction struct {
 		entry *remote.Entry
@@ -719,7 +729,7 @@ func extractCopy(ctx context.Context, path string, archive func(io.Writer) (*rem
 	}
 	extracted := make(chan extraction, 1)
 	go func() {
-		entry, err := remote.ExtractArchive(ctx, reader, path)
+		entry, err := extract(ctx, reader, path)
 		if err != nil {
 			reader.CloseWithError(err)
 		} else {

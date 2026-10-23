@@ -36,14 +36,6 @@ func TestCancellationTerminatesChildren(t *testing.T) {
 	}
 }
 
-// useTerminationGracePeriod sets the termination grace period for a test.
-func useTerminationGracePeriod(t *testing.T, period time.Duration) {
-	t.Helper()
-	previous := terminationGracePeriod
-	terminationGracePeriod = period
-	t.Cleanup(func() { terminationGracePeriod = previous })
-}
-
 func TestCancellationInterruptsGracefully(t *testing.T) {
 	// Commands are asked to terminate before being killed, so they can clean
 	// up, and output that they write meanwhile, which can no longer be

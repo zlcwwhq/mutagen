@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -15,6 +16,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,6 +30,12 @@ const (
 	// registryDirectoryName is the name of the directory, inside the Mutagen
 	// data directory, where endpoints register local command submission sockets.
 	registryDirectoryName = "remote"
+	// scopeDirectoryName is the name of the directory, inside the Mutagen data
+	// directory, where synchronization endpoints register the content that they
+	// synchronize (see RegisterScope). Scopes are kept apart from command
+	// registrations, since versions of remote that predate them would otherwise
+	// mistake them for endpoints that accept submissions.
+	scopeDirectoryName = "remote-scopes"
 	// recordExtension is the extension of registration records.
 	recordExtension = ".json"
 	// socketExtension is the extension of registration sockets (or named pipe
@@ -49,13 +58,15 @@ const (
 // so that tests can enable it on other systems.
 var ambiguousRefusals = slices.Contains([]string{"darwin", "ios", "freebsd", "netbsd", "openbsd", "dragonfly"}, runtime.GOOS)
 
-// record is the on-disk description of a registered endpoint.
+// record is the on-disk description of a registered endpoint, or of the scope
+// of a synchronization endpoint (see RegisterScope).
 type record struct {
 	// Version is the Mutagen version of the registering process.
 	Version string
 	// Session is the session identifier.
 	Session string
-	// Name is the session name, if any.
+	// Name is the session name, if any. Scopes don't record it, since
+	// synchronization endpoints don't know it.
 	Name string
 	// Root is the normalized synchronization root on this system.
 	Root string
@@ -65,7 +76,8 @@ type record struct {
 	// when an endpoint's previous executor has not yet noticed disconnection.
 	Created time.Time
 	// SessionCreated is the session's creation time (see
-	// Endpoint.SessionCreated).
+	// Endpoint.SessionCreated). Scopes don't record it, since synchronization
+	// endpoints don't know it.
 	SessionCreated time.Time
 	// Ignores are the session's ignores, if known (see Endpoint.Ignores).
 	Ignores *Ignores `json:",omitempty"`
@@ -125,14 +137,15 @@ func dialRegistration(ctx context.Context, path string) (net.Conn, error) {
 	}
 }
 
-// loadRegistrations reads all parseable registration records.
+// loadRegistrations reads all parseable registration records in a registry
+// directory.
 func loadRegistrations(directory string) ([]*registration, error) {
 	entries, err := os.ReadDir(directory)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("unable to read command registry: %w", err)
+		return nil, fmt.Errorf("unable to read registry: %w", err)
 	}
 	var result []*registration
 	for _, entry := range entries {
@@ -152,31 +165,49 @@ func loadRegistrations(directory string) ([]*registration, error) {
 	return result, nil
 }
 
-// prune removes registrations whose listeners no longer exist.
-func prune(directory string) {
+// prune removes the registrations in a registry directory whose listeners no
+// longer exist, until it's done or the context is cancelled.
+func prune(ctx context.Context, directory string) {
 	registrations, _ := loadRegistrations(directory)
 	for _, r := range registrations {
-		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-		connection, err := dialRegistration(ctx, r.base+socketExtension)
+		if ctx.Err() != nil {
+			return
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		connection, err := dialRegistration(probeCtx, r.base+socketExtension)
 		cancel()
 		if err == nil {
 			connection.Close()
-		} else if isDead(err) {
+		} else if ctx.Err() == nil && isDead(err) {
 			r.remove()
 		}
 	}
 }
 
 // register creates a listener for local command submissions from an endpoint
-// with the specified normalized root and records it in the registry. The
-// record is removed when the listener is closed.
+// with the specified normalized root and records it in the command registry,
+// once dead registrations are pruned. The record is removed when the listener
+// is closed.
 func register(endpoint *Endpoint, root string) (net.Listener, error) {
 	directory, err := filesystem.Mutagen(true, registryDirectoryName)
 	if err != nil {
 		return nil, fmt.Errorf("unable to compute command registry directory: %w", err)
 	}
-	prune(directory)
+	prune(context.Background(), directory)
+	return registerIn(directory, &record{
+		Session:        endpoint.Session,
+		Name:           endpoint.Name,
+		Root:           root,
+		Alpha:          endpoint.Alpha,
+		SessionCreated: endpoint.SessionCreated,
+		Ignores:        endpoint.Ignores,
+	})
+}
 
+// registerIn creates a listener in a registry directory and records it there,
+// using the specified record, whose version and registration time it sets.
+// The record is removed when the listener is closed.
+func registerIn(directory string, r *record) (net.Listener, error) {
 	// Use short random names because socket paths have tight length limits.
 	var identifier [8]byte
 	if _, err := rand.Read(identifier[:]); err != nil {
@@ -185,22 +216,14 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 	base := filepath.Join(directory, hex.EncodeToString(identifier[:]))
 	listener, err := ipc.NewListener(base + socketExtension)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create command socket: %w", err)
+		return nil, fmt.Errorf("unable to create registration socket: %w", err)
 	}
 
 	// Write the record only once the listener exists, so a record whose socket
 	// refuses connections is known to be stale. Rename it into place so that
 	// readers never observe a partial record.
-	data, err := json.Marshal(&record{
-		Version:        mutagen.Version,
-		Session:        endpoint.Session,
-		Name:           endpoint.Name,
-		Root:           root,
-		Alpha:          endpoint.Alpha,
-		Created:        time.Now(),
-		SessionCreated: endpoint.SessionCreated,
-		Ignores:        endpoint.Ignores,
-	})
+	r.Version, r.Created = mutagen.Version, time.Now()
+	data, err := json.Marshal(r)
 	if err != nil {
 		listener.Close()
 		return nil, fmt.Errorf("unable to encode registration: %w", err)
@@ -223,6 +246,88 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 		return nil, fmt.Errorf("unable to write registration: %w", err)
 	}
 	return &registeredListener{listener, base + recordExtension}, nil
+}
+
+// pruningScopes indicates whether a scope registration in this process is
+// pruning the scope registry, so that registrations don't prune it
+// concurrently.
+var pruningScopes atomic.Bool
+
+// scopeRegistration is the registration of a synchronization endpoint's scope
+// (see RegisterScope).
+type scopeRegistration struct {
+	// listener is the registration's listener, which accepts connections only
+	// to show that the registration is live.
+	listener net.Listener
+	// cancel cancels the registration's pruning of the scope registry, if any.
+	cancel context.CancelFunc
+	// pruning tracks pruning the scope registry.
+	pruning sync.WaitGroup
+	// accepting tracks accepting connections.
+	accepting sync.WaitGroup
+}
+
+// Close implements io.Closer.Close, removing the registration. Pruning is
+// stopped before the record is removed, since pruning reads the registry's
+// records, and Windows doesn't remove files while they're open, so removing
+// the record while pruning read it would leave it in place until another
+// process pruned it. The listener stays open until then, since pruning probes
+// this registration too.
+func (r *scopeRegistration) Close() error {
+	r.cancel()
+	r.pruning.Wait()
+	err := r.listener.Close()
+	r.accepting.Wait()
+	return err
+}
+
+// RegisterScope registers the scope of a synchronization endpoint on this
+// system, identified by the session identifier and whether the endpoint is
+// alpha, which is the content beneath its root, normalized as for
+// NewLocalChannel, that the session's ignores don't exclude, so that
+// Synchronizing knows the session even if it doesn't run remote commands.
+// Endpoints keep their scopes registered while they're connected, and closing
+// the result removes the registration. Scopes only answer liveness probes,
+// without accepting submissions, and so are kept apart from command
+// registrations. Dead scope registrations, such as those of processes that
+// terminated abruptly, are pruned in the background, so that registration
+// doesn't delay synchronization, while Synchronizing prunes those that it
+// encounters.
+func RegisterScope(session string, alpha bool, root string, ignores *Ignores) (io.Closer, error) {
+	root, err := filesystem.Normalize(root)
+	if err != nil {
+		return nil, fmt.Errorf("unable to normalize synchronization root: %w", err)
+	}
+	directory, err := filesystem.Mutagen(true, scopeDirectoryName)
+	if err != nil {
+		return nil, fmt.Errorf("unable to compute scope registry directory: %w", err)
+	}
+	listener, err := registerIn(directory, &record{Session: session, Root: root, Alpha: alpha, Ignores: ignores})
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	registration := &scopeRegistration{listener: listener, cancel: cancel}
+	registration.accepting.Add(1)
+	go func() {
+		defer registration.accepting.Done()
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connection.Close()
+		}
+	}()
+	if pruningScopes.CompareAndSwap(false, true) {
+		registration.pruning.Add(1)
+		go func() {
+			defer registration.pruning.Done()
+			defer pruningScopes.Store(false)
+			prune(ctx, directory)
+		}()
+	}
+	return registration, nil
 }
 
 // Target describes the endpoint from which a command is submitted.
@@ -251,6 +356,9 @@ type Target struct {
 	// may then have been meant for another one. It's empty otherwise, and for
 	// pinned selections.
 	Overlapping []string
+	// Ignores are the session's ignores, if known (see Endpoint.Ignores), which
+	// determine the paths that the session doesn't synchronize.
+	Ignores *Ignores
 }
 
 // Session describes a session endpoint on this system through which
@@ -274,8 +382,10 @@ type Session struct {
 	// Contained indicates whether Root contains the directory.
 	Contained bool
 	// Excluded indicates whether the session's ignores exclude the directory,
-	// or a parent of it inside Root, so that the session doesn't synchronize
-	// it (see Selection.Corresponding).
+	// or a parent of it inside Root, in any form in which scans could see it
+	// (see Ignores.ExcludedInAnyForm), so that the session may not synchronize
+	// it, and operations corresponding to it are refused (see
+	// Selection.Corresponding).
 	Excluded bool
 	// Selected indicates whether the selection locates the endpoint for the
 	// directory.
@@ -497,6 +607,13 @@ func synchronizingSessions(ctx context.Context, candidates []*candidate) ([]*can
 		}
 		return precedes(candidates[i], candidates[j])
 	})
+	return liveSessions(ctx, candidates)
+}
+
+// liveSessions returns one live registration for each session among
+// candidates, in their order. Dead registrations are pruned, while
+// registrations whose liveness can't be determined are assumed to be live.
+func liveSessions(ctx context.Context, candidates []*candidate) ([]*candidate, error) {
 	var result []*candidate
 	found := make(map[string]bool)
 	for _, c := range candidates {
@@ -585,7 +702,7 @@ func describe(session, name string) string {
 // excludedError reports that an operation corresponding to a directory can't
 // be submitted through the session of a candidate whose ignores exclude it,
 // given the excluded slash-separated path relative to the session's root (see
-// Ignores.excluded).
+// Ignores.ExcludedInAnyForm).
 func excludedError(directory string, c *candidate, excluded string) error {
 	session := describe(c.Session, c.Name)
 	excludedDirectory := filepath.Join(resolveSymbolicLinks(c.Root), filepath.FromSlash(excluded))
@@ -613,15 +730,23 @@ func Dial(ctx context.Context, directory, session string, operation Operation) (
 // that the directory is synchronized, and they're mentioned if no route is
 // found.
 func relate(directory string) (string, []*candidate, []*candidate, error) {
-	registry, err := filesystem.Mutagen(false, registryDirectoryName)
+	directory = resolveSymbolicLinks(directory)
+	compatible, incompatible, err := relateResolved(registryDirectoryName, directory)
+	return directory, compatible, incompatible, err
+}
+
+// relateResolved relates the registrations in the registry with the specified
+// directory name to the specified path, whose symbolic links have been
+// resolved as needed, as relate does, without resolving it further.
+func relateResolved(name, directory string) ([]*candidate, []*candidate, error) {
+	registry, err := filesystem.Mutagen(false, name)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("unable to compute command registry directory: %w", err)
+		return nil, nil, fmt.Errorf("unable to compute registry directory: %w", err)
 	}
 	registrations, err := loadRegistrations(registry)
 	if err != nil {
-		return "", nil, nil, err
+		return nil, nil, err
 	}
-	directory = resolveSymbolicLinks(directory)
 	var compatible, incompatible []*candidate
 	for _, r := range registrations {
 		root := resolveSymbolicLinks(r.Root)
@@ -637,7 +762,7 @@ func relate(directory string) (string, []*candidate, []*candidate, error) {
 			incompatible = append(incompatible, c)
 		}
 	}
-	return directory, compatible, incompatible, nil
+	return compatible, incompatible, nil
 }
 
 // Dial submits the specified operation through the registered endpoint whose
@@ -659,21 +784,24 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 	connection, c := endpoint.connection, endpoint.candidate
 
 	// Refuse operations corresponding to a directory that the session doesn't
-	// synchronize (see Selection.Corresponding).
+	// synchronize (see Selection.Corresponding), or that it might not, since
+	// running them anyway could run them in an outdated or missing directory.
 	if s.Target == nil && s.Corresponding && c.contained {
-		if excluded := c.Ignores.excluded(c.path); excluded != "" {
+		if excluded := c.Ignores.ExcludedInAnyForm(c.path, true); excluded != "" {
 			connection.Close()
 			return nil, nil, excludedError(directory, c, excluded)
 		}
 	}
 
 	// Label the sessions that synchronize the directory if there are several
-	// and the session wasn't selected (see Target.Overlapping).
+	// and the session wasn't selected (see Target.Overlapping). Sessions whose
+	// ignores exclude the directory in some form aren't labeled, since
+	// selecting them would be refused, as for the located session.
 	var overlapping []string
 	if s.Target == nil && s.Session == "" && c.contained && (s.Default == "" || !matching(s.Default)(c)) {
 		all := slices.Concat(compatible, incompatible)
 		others, err := synchronizingSessions(ctx, filter(all, func(other *candidate) bool {
-			return other.Session != c.Session && other.Ignores.excluded(other.path) == ""
+			return other.Session != c.Session && other.Ignores.ExcludedInAnyForm(other.path, true) == ""
 		}))
 		if err != nil {
 			connection.Close()
@@ -702,7 +830,13 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 		connection.Close()
 		return nil, nil, fmt.Errorf("unable to handshake with session %s: %w", describe(c.Session, c.Name), err)
 	}
-	return connection, &Target{
+	return connection, c.target(overlapping), nil
+}
+
+// target describes the endpoint of a candidate as a target, with the specified
+// overlapping sessions (see Target.Overlapping).
+func (c *candidate) target(overlapping []string) *Target {
+	return &Target{
 		Session:     c.Session,
 		Name:        c.Name,
 		Alpha:       c.Alpha,
@@ -710,7 +844,100 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 		Path:        c.path,
 		Contained:   c.contained,
 		Overlapping: overlapping,
-	}, nil
+		Ignores:     c.Ignores,
+	}
+}
+
+// Locate locates the endpoint through which the selection would submit an
+// operation from the specified directory, as Dial does, but without submitting
+// one, such as to inspect the session's ignores. Since nothing is submitted,
+// ignores that exclude the directory don't prevent it from being located (see
+// Selection.Corresponding), and overlapping sessions aren't labeled.
+func (s *Selection) Locate(ctx context.Context, directory string) (*Target, error) {
+	directory, compatible, incompatible, err := relate(directory)
+	if err != nil {
+		return nil, err
+	}
+	endpoint, err := s.locate(ctx, directory, compatible, incompatible)
+	if err != nil {
+		return nil, err
+	}
+	endpoint.connection.Close()
+	return endpoint.candidate.target(nil), nil
+}
+
+// Synchronizing describes the sessions that may synchronize content written to
+// the specified path, which is a directory if directory is true: those whose
+// roots on this system contain the path and whose ignores don't exclude it in
+// every form in which scans could see it (see Ignores.ExcludedInEveryForm),
+// and, for a directory, those whose roots lie beneath it. Writing content that
+// such a session synchronizes, such as that of a session whose root is nested
+// inside the writer's root, would race with its synchronization. Sessions are
+// related to the path as writes to it land: symbolic links among its parents,
+// which must exist, are resolved, since writes follow them, but its final
+// component isn't, since writes replace it rather than following it. Both
+// endpoints of every session are considered, including those of the session
+// through which the content is written, whose ignores apply to the path that
+// writes land at, rather than the one given.
+//
+// Sessions are known from the scopes that their synchronization endpoints on
+// this system register while they're connected (see RegisterScope), whether
+// or not the sessions run remote commands, and from command registrations, by
+// any version of Mutagen. Sessions whose endpoints on this system aren't
+// connected, such as paused or reconnecting sessions, aren't known, and
+// neither are sessions run by versions of Mutagen that predate scopes, unless
+// they register endpoints for remote commands. Sessions are described by name
+// if a command registration of the session provides one, since scopes don't
+// record names, and by identifier otherwise. Dead registrations are pruned.
+func Synchronizing(ctx context.Context, path string, directory bool) ([]string, error) {
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("unable to resolve symbolic links: %w", err)
+	}
+	path = filepath.Join(parent, filepath.Base(path))
+	compatible, incompatible, err := relateResolved(registryDirectoryName, path)
+	if err != nil {
+		return nil, err
+	}
+	registered := slices.Concat(compatible, incompatible)
+	compatible, incompatible, err = relateResolved(scopeDirectoryName, path)
+	if err != nil {
+		return nil, err
+	}
+	scopes := slices.Concat(compatible, incompatible)
+
+	// Scopes don't record session names or creation times, so take them from
+	// command registrations of the same sessions, if any, to describe and
+	// order the sessions as Dial does. Registrations of the same session are
+	// then filtered alike and only described once.
+	for _, s := range scopes {
+		if r := slices.IndexFunc(registered, func(c *candidate) bool { return c.Session == s.Session }); r >= 0 {
+			s.Name, s.SessionCreated = registered[r].Name, registered[r].SessionCreated
+		}
+	}
+	all := slices.Concat(registered, scopes)
+	sessions, err := synchronizingSessions(ctx, filter(all, func(c *candidate) bool {
+		return c.Ignores.ExcludedInEveryForm(c.path, directory) == ""
+	}))
+	if err != nil {
+		return nil, err
+	} else if directory {
+		nested, err := liveSessions(ctx, filter(all, func(c *candidate) bool {
+			_, inside := relativePath(path, resolveSymbolicLinks(c.Root))
+			return !c.contained && inside && !slices.ContainsFunc(sessions, func(s *candidate) bool {
+				return s.Session == c.Session
+			})
+		}))
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, nested...)
+	}
+	result := make([]string, len(sessions))
+	for s, c := range sessions {
+		result[s] = describe(c.Session, c.Name)
+	}
+	return result, nil
 }
 
 // Sessions lists the endpoints on this system through which operations can be
@@ -784,7 +1011,7 @@ func (s *Selection) Sessions(ctx context.Context, directory string) ([]Session, 
 			Root:      c.Root,
 			Version:   c.Version,
 			Contained: c.contained,
-			Excluded:  c.contained && c.Ignores.excluded(c.path) != "",
+			Excluded:  c.contained && c.Ignores.ExcludedInAnyForm(c.path, true) != "",
 			Selected:  selected != nil && c.Session == selected.Session && c.Alpha == selected.Alpha,
 		}
 	}

@@ -125,6 +125,11 @@ cd ~/project/service
 remote go test ./...                    # runs in ~/project/service on server
 remote -e NODE_ENV=test --env-file .env.remote npm test
 remote --timeout 2m sh -c 'make build && make test'
+remote --script - <<'EOF'               # shell code as written, run with bash
+for p in a b; do python run.py --preset "$p"; done
+EOF
+id=$(remote --detach --log train.log python train.py)   # a detached job
+remote --wait "$id"                     # waits for it, then synchronizes
 ```
 
 On the daemon's system, `remote` is installed alongside `mutagen`. On SSH and
@@ -162,7 +167,7 @@ their names, as `--session` accepts them.
 Commands don't run in a directory that the session ignores, or inside one, since
 the session doesn't synchronize it, unless `--cwd` is given: `--cwd .` runs them
 in the corresponding directory anyway, such as in an ignored build directory
-that exists on both endpoints.
+that exists on both endpoints. `remote --ignores` lists the session's ignores.
 
 `remote` can't find sessions that are paused, disconnected, or that don't run
 commands submitted from the current endpoint. Inside the root of such a session
@@ -182,6 +187,7 @@ daemon's system, of the daemon).
 Every command receives `MUTAGEN_REMOTE_ENDPOINT=alpha` or `beta`, identifying
 the endpoint where it executes. This value overrides inherited values and
 those submitted with `-e` or `--env-file`, including when prologues are skipped.
+Detached jobs also receive `MUTAGEN_REMOTE_JOB`, set to their ID.
 
 The `remotePrologue` configuration parameter (or the `--remote-prologue` flag of
 `mutagen sync create`) names a POSIX shell script that the executing endpoint
@@ -253,14 +259,23 @@ script; use `--no-prologue` to run commands while repairing it.
 Prologues aren't supported on Windows endpoints.
 
 Options must precede the command, and arguments are passed without shell
-interpretation, so shell syntax requires an explicit shell. Standard streams and
-the exit status are preserved (255 indicates that the command couldn't be
-routed, or that the connection was lost while it ran), but no pseudo-terminal is
-allocated. Commands can only be routed while the session is connected, and the
-daemon connects command channels in the background, so SSH authentication must
-work non-interactively. `remote --help` summarizes usage, and
-`remote --help <topic>` covers sessions, synchronization, environment setup,
-termination, and conflicts in detail.
+interpretation, so shell syntax requires an explicit shell or `--script`.
+Standard streams and the exit status are preserved (255 indicates that the
+command couldn't be routed, or that the connection was lost while it ran), but
+no pseudo-terminal is allocated. Commands can only be routed while the session
+is connected, and the daemon connects command channels in the background, so
+SSH authentication must work non-interactively. `remote --help` summarizes
+usage, and `remote --help <topic>` covers sessions, synchronization, scripts,
+detached jobs, environment setup, termination, and conflicts in detail.
+
+`remote --script <file>` runs a local script, or one read from standard input
+with `-`, such as a here-document whose quoted delimiter (`<<'EOF'`) keeps the
+local shell from expanding anything in it. The executing endpoint copies it to
+a temporary file and runs it with the interpreter named by its `#!` line, or
+with `bash` if it has none, which is looked up after the prologue is sourced.
+The arguments after the file are the script's, even ones that look like
+options. A script read from standard input leaves its commands no input.
+Scripts are limited to 512 KiB and aren't supported on Windows endpoints.
 
 `remote` flushes the session (as `mutagen sync flush` does) before the command,
 so that it sees local changes, and after it, so that its changes are present
@@ -268,7 +283,12 @@ locally when `remote` exits. This works from either endpoint, since the daemon
 performs the flush. If flushing fails, then `remote` prints a warning and
 continues with the command's exit status; `--no-flush` skips both flushes, and
 `remote --flush` only flushes. `--timeout` takes seconds, or a duration with a
-unit such as `10m`, and includes the time spent flushing.
+unit such as `10m`, and includes the time spent flushing. Skipping the flush
+before a command can silently run outdated code, while an unneeded flush only
+costs a rescan of both roots, so use `--no-flush` only for commands that
+neither read nor write synchronized files. `--detach` flushes only before
+starting a job and `--wait` only after it ends, while `--jobs`, `--kill`,
+`--ignores`, and `--pull` don't flush.
 
 Commands are terminated when `--timeout` expires, when `remote` is interrupted,
 and when the session stops synchronizing, such as when it's paused, reconnects
@@ -279,8 +299,52 @@ that processes can exit cleanly, and SIGKILL 5 seconds later to any that remain.
 processes.) When the session stops synchronizing, `remote` reports that the
 connection to the executing endpoint was lost and exits with status 255 without
 synchronizing afterwards; files that the command was writing may be left
-incomplete, and are synchronized as such once synchronization resumes. Detach
-jobs that must outlive these events, with their output redirected.
+incomplete, and are synchronized as such once synchronization resumes. Commands
+that must outlive these events can run as detached jobs.
+
+`remote --detach` starts the command (or script) as a detached job, which keeps
+running when `remote` exits and when the session stops synchronizing, and
+prints its ID. Jobs run in the directory and environment that commands would,
+in a new session and process group, without input, and write their output to
+the file given with `--log` (relative to the command's directory), which must
+be a regular file (truncated first) or a character device such as `/dev/null`,
+not a FIFO, or to a log kept with the job's state in the executing endpoint's
+Mutagen data directory.
+`remote --jobs` lists the jobs started at the session's root, `remote --wait
+<id>` waits for a job to end, flushes, and exits with its status (`--timeout`
+stops waiting without affecting the job), and `remote --kill <id>` sends
+SIGTERM to its process group, and SIGKILL 5 seconds later to any processes that
+remain, even if `remote --kill` is interrupted meanwhile; repeating it while
+the job is being terminated doesn't send SIGTERM again. A job ends when its
+command exits: processes that the command leaves running in the background
+aren't part of the job afterwards, so `--wait` doesn't wait for them and
+`--kill` doesn't terminate them, and scripts that start background processes
+should `wait` for them. On Linux endpoints, `--jobs`, `--wait`, and `--kill`
+list those that remain in an ended job's process group, which `remote -- kill
+<pid>...` terminates; on other endpoints, they only report that the group may
+still have processes. A job whose status couldn't be recorded, such as because
+it was killed with SIGKILL or its system restarted, is reported as lost. Job
+state is kept for 7 days after jobs end. Jobs end with the system or container
+that runs them, and can end with the processes that run the endpoint, such as
+when a daemon running as a systemd service is stopped, or, on systems where
+logind's `KillUserProcesses` is enabled, with the SSH connection. Detached jobs
+aren't supported on Windows or AIX endpoints.
+
+Content that commands write to ignored paths exists only on the executing
+endpoint. `remote --ignores <path>...` shows whether the session ignores each
+path, and `remote --pull <path>...` copies ignored files, directories, and
+symbolic links from the opposite endpoint, replacing local files that differ
+but never deleting local content. It refuses paths that the session (or
+another session) synchronizes, and directories with synchronized content
+beneath them. Other sessions are recognized whether or not they run remote
+commands, but only while their endpoints on this system are connected and run
+by this version of Mutagen or a later one: `--pull` can't tell whether paused
+or reconnecting sessions, or sessions of earlier versions, synchronize a path.
+Both options count a path as ignored only if the session ignores it in every
+Unicode normalization form, and, if symbolic links among its local parents lead
+elsewhere in the root, only if the session also ignores where they lead.
+`--pull` only follows links that the session ignores, and never one at the path
+itself, which a pulled file or link replaces.
 
 After each flush, `remote` also warns about content that the session couldn't
 synchronize: conflicts (paths modified on both endpoints, which aren't

@@ -37,9 +37,9 @@ follow the code and update this file.
   commands on a session's opposite endpoint, shipped alongside the
   CLI. Its command line lives in `cmd/remote/cli`, which agents also
   run when invoked as `remote` (endpoints link `remote` to the agent).
-  `pkg/remote` contains its protocol, registry, and agent executor
-  channel; `pkg/synchronization/commands.go` relays commands in the
-  daemon.
+  `pkg/remote` contains its protocol, registry, agent executor channel,
+  and the executor's detached jobs and scripts;
+  `pkg/synchronization/commands.go` relays commands in the daemon.
 - `cmd/mutagen-sidecar` is the sidecar entry point. It is built
   separately from the main `scripts/build.go` flow.
 - `cmd/external` is the exported Go API entry point for

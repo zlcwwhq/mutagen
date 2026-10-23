@@ -691,3 +691,326 @@ func TestRemoteDiffTypeConflict(t *testing.T) {
 		})
 	}
 }
+
+// runRemoteWithInput runs the remote command line in the specified directory
+// with the specified input.
+func runRemoteWithInput(t *testing.T, directory, input string, arguments ...string) (int, string, string) {
+	t.Helper()
+	t.Chdir(directory)
+	var output, errorOutput strings.Builder
+	code := cli.Run(arguments, strings.NewReader(input), &output, &errorOutput)
+	return code, output.String(), errorOutput.String()
+}
+
+// waitForFile waits for a file to exist.
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	for deadline := time.Now().Add(30 * time.Second); ; {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if time.Now().After(deadline) {
+			t.Fatal("file didn't appear:", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRemoteDetachedJobs(t *testing.T) {
+	// Jobs rely on a POSIX shell, and on flock locks, which AIX lacks.
+	if runtime.GOOS == "windows" || runtime.GOOS == "aix" {
+		t.Skip()
+	}
+
+	// Jobs are executed by an agent-style executor on beta, and by the daemon
+	// itself on alpha.
+	for _, alphaExecutes := range []bool{false, true} {
+		name := "agent executor"
+		if alphaExecutes {
+			name = "daemon executor"
+		}
+		t.Run(name, func(t *testing.T) {
+			directory, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			alphaRoot, betaRoot := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta")
+			if err := os.Mkdir(alphaRoot, 0700); err != nil {
+				t.Fatal(err)
+			}
+			sessionID := createRemoteSession(t, "jobs", alphaRoot, betaRoot, alphaExecutes)
+			submitting := alphaRoot
+			if alphaExecutes {
+				submitting = betaRoot
+			}
+
+			// Start a job that waits for a release marker, keeping its markers
+			// outside the roots. Only its identifier is printed.
+			started, release := filepath.Join(directory, "started"), filepath.Join(directory, "release")
+			script := `echo > "$1"; while [ ! -e "$2" ]; do sleep 0.1; done; echo done; exit 3`
+			code, output, errorOutput := runRemote(t, submitting, "--detach", "--log", "out.log", "sh", "-c", script, "sh", started, release)
+			id := strings.TrimSpace(output)
+			if code != 0 || len(id) != 8 || !strings.Contains(errorOutput, "remote --wait "+id) {
+				t.Fatalf("unable to start job: %d, %q, %q", code, output, errorOutput)
+			}
+			waitForFile(t, started)
+			if code, output, _ := runRemote(t, submitting, "--jobs"); code != 0 || !strings.Contains(output, id+"  running") || !strings.Contains(output, "out.log") {
+				t.Fatalf("incorrect job listing: %d, %q", code, output)
+			}
+
+			// The job keeps running while the session is paused, unlike
+			// commands.
+			specification := &selection.Selection{Specifications: []string{sessionID}}
+			if err := synchronizationManager.Pause(context.Background(), specification, ""); err != nil {
+				t.Fatal("unable to pause session:", err)
+			} else if err := synchronizationManager.Resume(context.Background(), specification, ""); err != nil {
+				t.Fatal("unable to resume session:", err)
+			} else if _, err := flushRemote(submitting); err != nil {
+				t.Fatal("unable to synchronize after resuming:", err)
+			}
+			if err := os.WriteFile(release, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			// Waiting returns the job's status, once the session has been
+			// synchronized, so the log is present locally.
+			if code, _, errorOutput := runRemote(t, submitting, "--wait", id); code != 3 || !strings.Contains(errorOutput, "exited with status 3") {
+				t.Fatalf("incorrect wait result: %d, %q", code, errorOutput)
+			} else if data, err := os.ReadFile(filepath.Join(submitting, "out.log")); err != nil || string(data) != "done\n" {
+				t.Fatalf("log not synchronized: %q, %v", data, err)
+			}
+
+			// Killing a job terminates it, and waiting for it reports the
+			// status with which it was terminated.
+			code, output, errorOutput = runRemote(t, submitting, "--detach", "sleep", "60")
+			if code != 0 {
+				t.Fatalf("unable to start job: %d, %q", code, errorOutput)
+			}
+			id = strings.TrimSpace(output)
+			if code, _, errorOutput := runRemote(t, submitting, "--kill", id); code != 0 || !strings.Contains(errorOutput, "terminated job "+id+" (status 143)") {
+				t.Fatalf("incorrect kill result: %d, %q", code, errorOutput)
+			} else if code, _, errorOutput := runRemote(t, submitting, "--wait", id, "--no-flush"); code != 143 || !strings.Contains(errorOutput, "terminated by remote --kill") {
+				t.Fatalf("incorrect wait result for a killed job: %d, %q", code, errorOutput)
+			} else if code, _, errorOutput := runRemote(t, submitting, "--wait", "00000000"); code != 255 || !strings.Contains(errorOutput, "no job 00000000") {
+				t.Fatalf("incorrect wait result for a nonexistent job: %d, %q", code, errorOutput)
+			}
+		})
+	}
+}
+
+func TestRemoteScript(t *testing.T) {
+	// Scripts rely on POSIX shells.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaRoot, betaRoot := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta")
+	if err := os.MkdirAll(filepath.Join(alphaRoot, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	createRemoteSession(t, "scripts", alphaRoot, betaRoot, false)
+	submitting := filepath.Join(alphaRoot, "sub")
+
+	// Scripts read from standard input run with bash by default, in the
+	// corresponding directory, receive the arguments that follow them, even
+	// ones that look like options, and nothing is expanded locally.
+	script := `if [[ $1 == --name ]]; then echo "name $2"; fi
+echo "$PWD" "$MUTAGEN_REMOTE_ENDPOINT"
+cat
+`
+	code, output, errorOutput := runRemoteWithInput(t, submitting, script, "--script", "-", "--name", "a b")
+	if code != 0 || output != "name a b\n"+filepath.Join(betaRoot, "sub")+" beta\n" {
+		t.Fatalf("incorrect script result: %d, %q, %q", code, output, errorOutput)
+	}
+
+	// A #! line selects the interpreter, and the exit status is the script's.
+	if code, output, _ := runRemoteWithInput(t, submitting, "#!/bin/sh\necho sh\nexit 4\n", "--script", "-"); code != 4 || output != "sh\n" {
+		t.Fatalf("incorrect script result: %d, %q", code, output)
+	}
+
+	// Scripts can run as detached jobs.
+	code, output, errorOutput = runRemoteWithInput(t, submitting, "for p in a b; do echo \"$p$1\"; done\n", "--detach", "--log", "sweep.log", "--script", "-", "!")
+	if code != 0 {
+		t.Fatalf("unable to start script job: %d, %q", code, errorOutput)
+	}
+	id := strings.TrimSpace(output)
+	if code, _, errorOutput := runRemote(t, submitting, "--wait", id); code != 0 {
+		t.Fatalf("incorrect wait result: %d, %q", code, errorOutput)
+	} else if data, err := os.ReadFile(filepath.Join(submitting, "sweep.log")); err != nil || string(data) != "a!\nb!\n" {
+		t.Fatalf("incorrect script job log: %q, %v", data, err)
+	} else if code, output, _ := runRemote(t, submitting, "--jobs"); code != 0 || !strings.Contains(output, "--script - '!'") {
+		t.Fatalf("incorrect listing of a script job: %q", output)
+	}
+}
+
+func TestRemotePullIgnored(t *testing.T) {
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaRoot, betaRoot := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta")
+	if err := os.Mkdir(alphaRoot, 0700); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(filepath.Join(alphaRoot, "train.py"), []byte("train\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	createRemoteSession(t, "pull", alphaRoot, betaRoot, false, "results/", "*.log")
+
+	// Content that the session ignores exists only on beta.
+	write := func(path, data string) {
+		t.Helper()
+		path = filepath.Join(betaRoot, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		} else if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("results/run1/metrics.json", "1\n")
+	write("train.log", "log\n")
+
+	// The ignores show which paths aren't synchronized.
+	code, output, _ := runRemote(t, alphaRoot, "--ignores", "results/run1", "train.log", "train.py")
+	expected := "results/run1: ignored (inside results, which the session ignores)\ntrain.log: ignored\ntrain.py: synchronized\n"
+	if code != 1 || output != expected {
+		t.Fatalf("incorrect ignores: %d, %q", code, output)
+	} else if code, output, _ := runRemote(t, alphaRoot, "--ignores"); code != 0 || !strings.Contains(output, "results/") {
+		t.Fatalf("incorrect ignore listing: %d, %q", code, output)
+	}
+
+	// Ignored paths are pulled.
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results", "train.log"); code != 0 ||
+		errorOutput != "remote: pulled results (1 added, 0 replaced, 0 unchanged)\nremote: pulled train.log (1 added, 0 replaced, 0 unchanged)\n" {
+		t.Fatalf("incorrect pull result: %d, %q", code, errorOutput)
+	}
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(alphaRoot, filepath.FromSlash(path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	if read("results/run1/metrics.json") != "1\n" || read("train.log") != "log\n" {
+		t.Fatal("incorrect pulled contents")
+	}
+
+	// Pulling again replaces changed files and keeps local ones.
+	write("results/run1/metrics.json", "2\n")
+	write("results/run2/metrics.json", "3\n")
+	if err := os.WriteFile(filepath.Join(alphaRoot, "results", "local"), []byte("local\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results"); code != 0 || errorOutput != "remote: pulled results (1 added, 1 replaced, 0 unchanged)\n" {
+		t.Fatalf("incorrect pull result: %d, %q", code, errorOutput)
+	} else if read("results/run1/metrics.json") != "2\n" || read("results/run2/metrics.json") != "3\n" || read("results/local") != "local\n" {
+		t.Fatal("incorrect merged contents")
+	}
+
+	// Synchronized and missing paths aren't pulled.
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "train.py"); code != 255 || !strings.Contains(errorOutput, "the session synchronizes it") {
+		t.Fatalf("synchronized path pulled: %d, %q", code, errorOutput)
+	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "missing.log"); code != 255 || !strings.Contains(errorOutput, "doesn't exist on the opposite endpoint") {
+		t.Fatalf("missing path pulled: %d, %q", code, errorOutput)
+	}
+}
+
+func TestRemotePullSynchronizedContent(t *testing.T) {
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaRoot, betaRoot, outside := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta"), filepath.Join(directory, "outside")
+	write := func(root, path, data string) {
+		t.Helper()
+		path = filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		} else if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	composed, decomposed := "caf\u00e9.txt", "cafe\u0301.txt"
+	write(alphaRoot, "src/data", "synchronized\n")
+	write(alphaRoot, decomposed, "synchronized\n")
+	if err := os.MkdirAll(outside, 0700); err != nil {
+		t.Fatal(err)
+	}
+	createRemoteSession(t, "pull-synchronized", alphaRoot, betaRoot, false, "results", "cache", "scratch", "link-*", composed)
+
+	// A literal pattern for one Unicode normalization form of a name doesn't
+	// ignore the other forms, which name distinct entries on filesystems that
+	// store names as given, so a synchronized file in another form isn't
+	// pulled over local edits. Since scans may see names in either form, the
+	// form that the pattern matches isn't pulled either.
+	write(alphaRoot, decomposed, "local edit\n")
+	write(betaRoot, decomposed, "remote\n")
+	write(betaRoot, composed, "remote\n")
+	for _, name := range []string{decomposed, composed} {
+		if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", name); code != 255 || !strings.Contains(errorOutput, "only some Unicode normalization forms") {
+			t.Fatalf("partially ignored name pulled: %d, %q", code, errorOutput)
+		}
+	}
+	if read(filepath.Join(alphaRoot, decomposed)) != "local edit\n" {
+		t.Fatal("synchronized file overwritten")
+	} else if code, output, _ := runRemote(t, alphaRoot, "--ignores", decomposed); code != 0 || !strings.Contains(output, "possibly synchronized") {
+		t.Fatalf("incorrect ignores: %d, %q", code, output)
+	}
+
+	// Ignored symbolic links among a path's parents are followed, but not to
+	// content that the session synchronizes, whether or not that content
+	// exists yet, while links to ignored content or outside the root are.
+	if runtime.GOOS == "windows" {
+		return
+	}
+	for link, target := range map[string]string{"results": "src", "link-cache": "cache", "scratch": outside} {
+		if err := os.Symlink(target, filepath.Join(alphaRoot, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(alphaRoot, "cache"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"results/data", "results/new", "results/run1/metrics.json", "link-cache/data", "scratch/data"} {
+		write(betaRoot, path, "remote\n")
+	}
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/data"); code != 255 ||
+		!strings.Contains(errorOutput, "it resolves to src/data through a symbolic link, and the session synchronizes that") {
+		t.Fatalf("synchronized file pulled through a symbolic link: %d, %q", code, errorOutput)
+	} else if read(filepath.Join(alphaRoot, "src", "data")) != "synchronized\n" {
+		t.Fatal("synchronized file overwritten through a symbolic link")
+	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/new"); code != 255 || !strings.Contains(errorOutput, "resolves to src/new") {
+		t.Fatalf("new file pulled into synchronized content: %d, %q", code, errorOutput)
+	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/run1/metrics.json"); code != 255 || !strings.Contains(errorOutput, "results/run1 resolves to src/run1") {
+		t.Fatalf("parent created in synchronized content: %d, %q", code, errorOutput)
+	} else if entries, err := os.ReadDir(filepath.Join(alphaRoot, "src")); err != nil || len(entries) != 1 {
+		t.Fatalf("synchronized content modified: %v, %v", entries, err)
+	} else if code, output, _ := runRemote(t, alphaRoot, "--ignores", "results/data"); code != 0 || output != "results/data: synchronized as src/data (through a symbolic link)\n" {
+		t.Fatalf("incorrect ignores: %d, %q", code, output)
+	}
+
+	// A symbolic link that's pulled over is replaced rather than followed,
+	// so a directory isn't merged through it.
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results"); code != 255 || !strings.Contains(errorOutput, "exists locally but isn't a directory") {
+		t.Fatalf("directory merged through a symbolic link: %d, %q", code, errorOutput)
+	} else if target, err := os.Readlink(filepath.Join(alphaRoot, "results")); err != nil || target != "src" {
+		t.Fatalf("symbolic link modified: %q, %v", target, err)
+	}
+
+	// Links to ignored content and outside the root are followed.
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "link-cache/data", "scratch/data"); code != 0 {
+		t.Fatalf("pull through ignored symbolic links failed: %d, %q", code, errorOutput)
+	} else if read(filepath.Join(alphaRoot, "cache", "data")) != "remote\n" || read(filepath.Join(outside, "data")) != "remote\n" {
+		t.Fatal("incorrect contents pulled through ignored symbolic links")
+	}
+}

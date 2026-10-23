@@ -14,13 +14,58 @@ import (
 // maximumMessageSize bounds command metadata independently of streamed I/O.
 const maximumMessageSize = 1024 * 1024
 
-// Request describes a single command, or a request for a file. Arguments are
-// passed directly to the executable, without shell interpretation. Environment
-// entries override the executing process's inherited environment, with later
-// entries taking precedence. The executor sets MUTAGEN_REMOTE_ENDPOINT after
-// these entries to identify itself as alpha or beta.
+// MaximumScriptSize bounds the size of scripts (see Request.Script), so that
+// requests carrying them, whose metadata encodes them in base64, fit into
+// protocol messages alongside their other metadata.
+const MaximumScriptSize = 512 * 1024
+
+// Script is a script that the executing endpoint runs (see Request.Script).
+type Script struct {
+	// Name describes the script's source in diagnostics, such as the path from
+	// which the submitter read it, or - for its standard input.
+	Name string
+	// Contents are the script's contents, which needn't be valid UTF-8.
+	Contents []byte
+}
+
+// JobOperation identifies an operation on detached jobs (see JobRequest).
+type JobOperation string
+
+const (
+	// JobStart starts the requested command as a detached job.
+	JobStart JobOperation = "start"
+	// JobList lists the detached jobs started at the executing root.
+	JobList JobOperation = "list"
+	// JobWait waits for a detached job to finish.
+	JobWait JobOperation = "wait"
+	// JobKill terminates a detached job.
+	JobKill JobOperation = "kill"
+)
+
+// JobRequest requests an operation on detached jobs (see Request.Job).
+type JobRequest struct {
+	// Operation is the requested operation.
+	Operation JobOperation
+	// ID identifies the job for JobWait and JobKill.
+	ID string `json:",omitempty"`
+	// Log optionally specifies the file to which a job started by JobStart
+	// writes its output, which is otherwise kept with the job's state.
+	// Absolute and home-relative paths are interpreted on the executing
+	// system, while other paths are resolved against the command's working
+	// directory.
+	Log string `json:",omitempty"`
+}
+
+// Request describes a single command (or script), which may be run as a
+// detached job, or a request for a file or for another job operation.
+// Arguments are passed directly to the executable, without shell
+// interpretation. Environment entries override the executing process's
+// inherited environment, with later entries taking precedence. The executor
+// sets MUTAGEN_REMOTE_ENDPOINT after these entries to identify itself as alpha
+// or beta.
 type Request struct {
-	// Arguments contains the executable name followed by its arguments.
+	// Arguments contains the executable name followed by its arguments, or the
+	// script's arguments if Script is non-nil.
 	Arguments []string
 	// Environment contains explicit overrides of the remote environment.
 	Environment []string
@@ -51,6 +96,30 @@ type Request struct {
 	// Replace requests replacement or deletion of an entry, with contents read
 	// from input (see ReplaceFile), instead of running a command.
 	Replace *Replacement `json:",omitempty"`
+	// Script, if non-nil, is run instead of an executable: the executing
+	// endpoint writes it to a file and runs the interpreter named by its #!
+	// line (or bash, if it has none) with that file and Arguments, which may
+	// be empty, as arguments.
+	Script *Script `json:",omitempty"`
+	// Job, if non-nil, requests an operation on detached jobs. JobStart runs the
+	// command (or script) as a detached job, while other operations specify no
+	// command.
+	Job *JobRequest `json:",omitempty"`
+}
+
+// validJobID determines whether a value is a valid job identifier, which
+// consists of 8 lowercase hexadecimal digits, so that it also names the job's
+// directory safely.
+func validJobID(value string) bool {
+	if len(value) != 8 {
+		return false
+	}
+	for _, c := range value {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // validRelativePath determines whether a slash-separated path lies inside the
@@ -63,7 +132,11 @@ func validRelativePath(value string) bool {
 // EnsureValid checks that command metadata can be represented losslessly by
 // the protocol and passed to the operating system.
 func (r *Request) EnsureValid() error {
-	if r != nil && (r.Copy != "" || r.Archive != "" || r.Replace != nil) {
+	if r == nil {
+		return errors.New("no command specified")
+	} else if (r.File != "" || r.Copy != "" || r.Archive != "" || r.Replace != nil) && (r.Script != nil || r.Job != nil) {
+		return errors.New("file operations must not specify a script or a job operation")
+	} else if r.Copy != "" || r.Archive != "" || r.Replace != nil {
 		operations, path := 0, ""
 		if r.Copy != "" {
 			operations, path = operations+1, r.Copy
@@ -82,17 +155,45 @@ func (r *Request) EnsureValid() error {
 			return errors.New("the synchronization root can't be archived")
 		}
 		return nil
-	} else if r != nil && r.File != "" {
+	} else if r.File != "" {
 		if len(r.Arguments) > 0 {
 			return errors.New("file requests must not specify a command")
 		} else if !utf8.ValidString(r.File) || strings.IndexByte(r.File, 0) >= 0 || !validRelativePath(r.File) {
 			return errors.New("requested file path must be relative to the synchronization root")
 		}
 		return nil
-	} else if r == nil || len(r.Arguments) == 0 || r.Arguments[0] == "" {
+	} else if r.Job != nil && r.Job.Operation != JobStart {
+		if len(r.Arguments) > 0 || r.Script != nil || r.Job.Log != "" {
+			return errors.New("job operations other than starting a job must not specify a command")
+		}
+		switch r.Job.Operation {
+		case JobList:
+			if r.Job.ID != "" {
+				return errors.New("listing jobs doesn't take a job identifier")
+			}
+		case JobWait, JobKill:
+			if !validJobID(r.Job.ID) {
+				return fmt.Errorf("invalid job identifier %q (job identifiers consist of 8 lowercase hexadecimal digits)", r.Job.ID)
+			}
+		default:
+			return fmt.Errorf("unknown job operation %q", r.Job.Operation)
+		}
+		return nil
+	} else if r.Script == nil && (len(r.Arguments) == 0 || r.Arguments[0] == "") {
 		return errors.New("no command specified")
+	} else if r.Script != nil && len(r.Script.Contents) > MaximumScriptSize {
+		return fmt.Errorf("script exceeds the size limit of %d bytes", MaximumScriptSize)
+	} else if r.Job != nil && r.Job.ID != "" {
+		return errors.New("job identifiers are assigned when jobs start")
 	}
-	for _, value := range append(append([]string{r.Path, r.Directory}, r.Arguments...), r.Environment...) {
+	values := append([]string{r.Path, r.Directory}, r.Arguments...)
+	if r.Script != nil {
+		values = append(values, r.Script.Name)
+	}
+	if r.Job != nil {
+		values = append(values, r.Job.Log)
+	}
+	for _, value := range append(values, r.Environment...) {
 		if !utf8.ValidString(value) || strings.IndexByte(value, 0) >= 0 {
 			return errors.New("command metadata contains invalid UTF-8 or a null byte")
 		}
@@ -170,6 +271,12 @@ type result struct {
 	// Superseded indicates that a replacement failed because a replacement
 	// with a later sequence number was admitted first (see ErrSuperseded).
 	Superseded bool `json:",omitempty"`
+	// Job describes the job started, waited for, or terminated by a job
+	// request.
+	Job *Job `json:",omitempty"`
+	// HiddenJobs is the number of jobs omitted from a job listing because they
+	// were started at other roots.
+	HiddenJobs int `json:",omitempty"`
 }
 
 // writeMessage writes bounded, length-prefixed command metadata.
