@@ -177,7 +177,83 @@ func TestScan(t *testing.T) {
 			PermissionsMode_PermissionsModePortable,
 			false,
 			&Entry{Contents: map[string]*Entry{
-				"hell� (non-UTF-8)": tPInvalidUTF8,
+				"hell� (non-UTF-8)": tPInvalidUTF8(`"hell\xd6"`),
+			}},
+			nil,
+		},
+		{
+			"directory with non-UTF-8 filename colliding with valid filename",
+			func(f testingFilesystem) bool {
+				// See the note in the previous test.
+				return !(runtime.GOOS == "linux" && f.name == "OS")
+			},
+			tD0, nil,
+			func(root string) error {
+				// Create a valid file with the name that the invalid filename
+				// would be recorded under if there were no collision. Both the
+				// file and the invalid filename problem need to be recorded.
+				if err := os.WriteFile(
+					filepath.Join(root, string([]byte{0x68, 0x65, 0x6C, 0x6C, 0xFF})),
+					[]byte(tF2Content),
+					0600,
+				); err != nil {
+					return err
+				}
+				return os.WriteFile(
+					filepath.Join(root, "hell� (non-UTF-8)"),
+					[]byte(tF1Content),
+					0600,
+				)
+			},
+			nil,
+			backgroundCtx,
+			ignore.Syntax_SyntaxMutagen,
+			nil,
+			SymbolicLinkMode_SymbolicLinkModePortable,
+			PermissionsMode_PermissionsModePortable,
+			false,
+			&Entry{Contents: map[string]*Entry{
+				"hell� (non-UTF-8)":   tF1,
+				"hell� (non-UTF-8 2)": tPInvalidUTF8(`"hell\xff"`),
+			}},
+			nil,
+		},
+		{
+			"directory with colliding non-UTF-8 filenames",
+			func(f testingFilesystem) bool {
+				// See the note in the previous tests.
+				return !(runtime.GOOS == "linux" && f.name == "OS")
+			},
+			tD0, nil,
+			func(root string) error {
+				// Create two invalid filenames that map to the same displayed
+				// name, as well as valid files that occupy the first two keys
+				// that the invalid filenames would be recorded under.
+				for _, name := range []string{
+					string([]byte{0x68, 0x65, 0x6C, 0x6C, 0xFF}),
+					string([]byte{0x68, 0x65, 0x6C, 0x6C, 0xFE}),
+				} {
+					if err := os.WriteFile(filepath.Join(root, name), []byte(tF3Content), 0600); err != nil {
+						return err
+					}
+				}
+				if err := os.WriteFile(filepath.Join(root, "hell� (non-UTF-8)"), []byte(tF1Content), 0600); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(root, "hell� (non-UTF-8 2)"), []byte(tF2Content), 0600)
+			},
+			nil,
+			backgroundCtx,
+			ignore.Syntax_SyntaxMutagen,
+			nil,
+			SymbolicLinkMode_SymbolicLinkModePortable,
+			PermissionsMode_PermissionsModePortable,
+			false,
+			&Entry{Contents: map[string]*Entry{
+				"hell� (non-UTF-8)":   tF1,
+				"hell� (non-UTF-8 2)": tF2,
+				"hell� (non-UTF-8 3)": tPInvalidUTF8(`"hell\xfe"`),
+				"hell� (non-UTF-8 4)": tPInvalidUTF8(`"hell\xff"`),
 			}},
 			nil,
 		},
@@ -962,5 +1038,140 @@ func TestScanCrossFilesystemBoundary(t *testing.T) {
 	expected := &Entry{Kind: EntryKind_Problematic, Problem: "scan crossed filesystem boundary"}
 	if !snapshot.Content.Contents[name].Equal(expected, true) {
 		t.Errorf("result does not match expected: %v != %v", snapshot.Content.Contents[name], expected)
+	}
+}
+
+// testingPermutations invokes callback with every ordering of names. Each
+// ordering is provided in a newly allocated slice that callback may modify.
+func testingPermutations(names []string, callback func([]string)) {
+	if len(names) <= 1 {
+		callback(append([]string(nil), names...))
+		return
+	}
+	for i := range names {
+		rest := make([]string, 0, len(names)-1)
+		rest = append(rest, names[:i]...)
+		rest = append(rest, names[i+1:]...)
+		testingPermutations(rest, func(permutation []string) {
+			callback(append([]string{names[i]}, permutation...))
+		})
+	}
+}
+
+// TestRecordNonUTF8Contents tests recordNonUTF8Contents. Unlike the non-UTF-8
+// filename cases in TestScan, it doesn't require a filesystem that allows such
+// filenames, so it runs on every platform. Each test case is run with every
+// ordering of names to verify that key assignment doesn't depend on the order
+// in which the filesystem lists directory contents.
+func TestRecordNonUTF8Contents(t *testing.T) {
+	// Define test cases.
+	tests := []struct {
+		// description is a human readable description of the test case.
+		description string
+		// contents are the directory contents with valid names, which are
+		// recorded before any non-UTF-8 names.
+		contents map[string]*Entry
+		// names are the non-UTF-8 names to record.
+		names []string
+		// ignoreMask is the ignore mask for the directory.
+		ignoreMask bool
+		// expected is the expected content map after recording.
+		expected map[string]*Entry
+	}{
+		{
+			"no collision",
+			map[string]*Entry{"hell": tF1},
+			[]string{"hell\xd6"},
+			false,
+			map[string]*Entry{
+				"hell":              tF1,
+				"hell� (non-UTF-8)": tPInvalidUTF8(`"hell\xd6"`),
+			},
+		},
+		{
+			"valid name occupying key",
+			map[string]*Entry{"hell� (non-UTF-8)": tF1},
+			[]string{"hell\xff"},
+			false,
+			map[string]*Entry{
+				"hell� (non-UTF-8)":   tF1,
+				"hell� (non-UTF-8 2)": tPInvalidUTF8(`"hell\xff"`),
+			},
+		},
+		{
+			"non-UTF-8 names with the same displayed name",
+			nil,
+			[]string{"hell\xff", "hell\x80", "hell\xff\xfe"},
+			false,
+			map[string]*Entry{
+				"hell� (non-UTF-8)":   tPInvalidUTF8(`"hell\x80"`),
+				"hell� (non-UTF-8 2)": tPInvalidUTF8(`"hell\xff"`),
+				"hell� (non-UTF-8 3)": tPInvalidUTF8(`"hell\xff\xfe"`),
+			},
+		},
+		{
+			"non-UTF-8 names with different displayed names",
+			nil,
+			[]string{"b\xff", "a\xff"},
+			false,
+			map[string]*Entry{
+				"a� (non-UTF-8)": tPInvalidUTF8(`"a\xff"`),
+				"b� (non-UTF-8)": tPInvalidUTF8(`"b\xff"`),
+			},
+		},
+		{
+			"consecutive collisions with valid names",
+			map[string]*Entry{
+				"hell� (non-UTF-8)":   tF1,
+				"hell� (non-UTF-8 2)": tF2,
+				"hell� (non-UTF-8 4)": tD0,
+			},
+			[]string{"hell\xff", "hell\xfe"},
+			false,
+			map[string]*Entry{
+				"hell� (non-UTF-8)":   tF1,
+				"hell� (non-UTF-8 2)": tF2,
+				"hell� (non-UTF-8 3)": tPInvalidUTF8(`"hell\xfe"`),
+				"hell� (non-UTF-8 4)": tD0,
+				"hell� (non-UTF-8 5)": tPInvalidUTF8(`"hell\xff"`),
+			},
+		},
+		{
+			"consecutive collisions with valid names (ignore masked)",
+			map[string]*Entry{
+				"hell� (non-UTF-8)":   tF1,
+				"hell� (non-UTF-8 2)": tF2,
+				"hell� (non-UTF-8 4)": tD0,
+			},
+			[]string{"hell\xff", "hell\xfe"},
+			true,
+			map[string]*Entry{
+				"hell� (non-UTF-8)":   tF1,
+				"hell� (non-UTF-8 2)": tF2,
+				"hell� (non-UTF-8 3)": tU,
+				"hell� (non-UTF-8 4)": tD0,
+				"hell� (non-UTF-8 5)": tU,
+			},
+		},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		testingPermutations(test.names, func(names []string) {
+			// Record the names in a copy of the valid contents.
+			contents := make(map[string]*Entry, len(test.contents)+len(names))
+			for name, entry := range test.contents {
+				contents[name] = entry
+			}
+			order := fmt.Sprintf("%q", names)
+			recordNonUTF8Contents(contents, names, test.ignoreMask)
+
+			// Check the result.
+			if !(&Entry{Contents: contents}).Equal(&Entry{Contents: test.expected}, true) {
+				t.Errorf("%s: result for name order %s not equal to expected: %v != %v",
+					test.description, order, contents, test.expected,
+				)
+			}
+		})
 	}
 }

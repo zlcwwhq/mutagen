@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -307,6 +309,59 @@ func (s *scanner) symbolicLink(
 	}, nil
 }
 
+// recordNonUTF8Contents records entries for directory content with names that
+// aren't valid UTF-8 in the directory's content map. The content map must
+// already contain entries for all other content in the directory. Since these
+// names can't be stored in the content map, each entry is stored under a
+// derivative name formed by replacing invalid byte sequences with a replacement
+// character and appending a " (non-UTF-8)" suffix. Because that derivative name
+// may be taken by content with a valid name, or by the derivative name of
+// another non-UTF-8 name (e.g. one that differs only in its invalid bytes), the
+// suffix is numbered (" (non-UTF-8 2)", " (non-UTF-8 3)", etc.) until a name is
+// found that isn't in use. Content with valid names thus always retains its
+// real name. Names are processed in byte order, so the assignment doesn't
+// depend on the order in which the filesystem listed directory contents. The
+// names slice is sorted in-place.
+//
+// Each entry is recorded as either untracked or problematic, depending on the
+// ignore mask. Since the derivative name doesn't identify the original name,
+// problem messages include the original name in escaped (and thus valid UTF-8)
+// form.
+//
+// This only avoids collisions within the content map of a single directory on
+// a single endpoint. A derivative name may still match a real name on the
+// opposite endpoint, in which case reconciliation sees the untracked or
+// problematic entry at that path just as it would for any other content.
+func recordNonUTF8Contents(contents map[string]*Entry, names []string, ignoreMask bool) {
+	// Sort names by their raw bytes.
+	sort.Strings(names)
+
+	// Record entries.
+	for _, name := range names {
+		// Find the first derivative name that isn't in use. This loop must
+		// terminate because each iteration checks a distinct name and the
+		// content map is finite.
+		escapedName := strings.ToValidUTF8(name, "�")
+		key := escapedName + " (non-UTF-8)"
+		for n := 2; ; n++ {
+			if _, ok := contents[key]; !ok {
+				break
+			}
+			key = fmt.Sprintf("%s (non-UTF-8 %d)", escapedName, n)
+		}
+
+		// Record the entry.
+		if ignoreMask {
+			contents[key] = &Entry{Kind: EntryKind_Untracked}
+		} else {
+			contents[key] = &Entry{
+				Kind:    EntryKind_Problematic,
+				Problem: "non-UTF-8 filename " + strconv.Quote(name),
+			}
+		}
+	}
+}
+
 // directory performs processing of a directory entry. Exactly one of parent or
 // directory will be non-nil, depending on whether or not the path represents
 // the synchronization root. If the path represents the synchronization root,
@@ -379,8 +434,10 @@ func (s *scanner) directory(
 		contentPathPrefix = fastpath.Joinable(path)
 	}
 
-	// Compute the entries for the content map.
+	// Compute the entries for the content map, deferring the recording of
+	// content with non-UTF-8 names.
 	contents := make(map[string]*Entry, len(directoryContents))
+	var nonUTF8ContentNames []string
 	for _, contentMetadata := range directoryContents {
 		// Check for cancellation.
 		select {
@@ -413,19 +470,12 @@ func (s *scanner) directory(
 		// are performed using a common encoding and (b) allowing the name to be
 		// encoded with Protocol Buffers (which enforces that strings are UTF-8
 		// encoded when marshaling). Since the file name isn't valid for storing
-		// in the content map, we'll replace all unknown byte sequences with a
-		// replacement character and store the entry with a (hopefully)
-		// non-coliding derivative name.
+		// in the content map, the entry is stored under a derivative name. We
+		// defer recording these entries until all other content has been
+		// recorded so that derivative names can't displace content with valid
+		// names (see recordNonUTF8Contents).
 		if !utf8.ValidString(contentName) {
-			escapedContentName := strings.ToValidUTF8(contentName, "�") + " (non-UTF-8)"
-			if ignoreMask {
-				contents[escapedContentName] = &Entry{Kind: EntryKind_Untracked}
-			} else {
-				contents[escapedContentName] = &Entry{
-					Kind:    EntryKind_Problematic,
-					Problem: "non-UTF-8 filename",
-				}
-			}
+			nonUTF8ContentNames = append(nonUTF8ContentNames, contentName)
 			continue
 		}
 
@@ -617,6 +667,12 @@ func (s *scanner) directory(
 		// Record the content.
 		contents[contentName] = entry
 	}
+
+	// Record content with non-UTF-8 names. At this point, the content map holds
+	// entries under the real names of all other content (excluding temporary
+	// files and content that disappeared during the scan, neither of which we
+	// need to avoid colliding with).
+	recordNonUTF8Contents(contents, nonUTF8ContentNames, ignoreMask)
 
 	// Determine the kind of directory that we'll yield. We could do more
 	// aggressive reification of phantom directories here (converting them to
