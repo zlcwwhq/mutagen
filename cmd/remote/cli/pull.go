@@ -66,9 +66,10 @@ func (s *pullSummary) String() string {
 // deletes local content. The session's root and paths that the session
 // synchronizes, entirely or partially, aren't pulled, since writing them would
 // race with synchronization, as would writing paths that another session
-// synchronizes. Paths are checked both as given and as the paths that writes
-// to them land at, since symbolic links among their parents, which are only
-// followed if the session ignores them (see prepareParents), can lead to
+// synchronizes, which are refused for the sessions known on this system (see
+// remote.Synchronizing). Paths are checked both as given and as the paths that
+// writes to them land at, since symbolic links among their parents, which are
+// only followed if the session ignores them (see prepareParents), can lead to
 // content that the session or another session synchronizes.
 func pullPath(router *router, target *remote.Target, locator *locator, argument string) (*pullSummary, error) {
 	relative, err := locator.resolve(argument)
@@ -117,9 +118,10 @@ func pullPath(router *router, target *remote.Target, locator *locator, argument 
 	// Check that the session ignores the entry as the kind of entry that it
 	// is, both as given and where it lands: a directory must be ignored
 	// entirely, not just content beneath it. Then check that no other session
-	// synchronizes it, and that the session doesn't synchronize it through
-	// another of its endpoints on this system, as both endpoints of local
-	// sessions are.
+	// known on this system synchronizes it, whether or not it runs remote
+	// commands, and that the session doesn't synchronize it through another of
+	// its endpoints on this system, as both endpoints of local sessions are
+	// (see remote.Synchronizing).
 	var directory bool
 	switch entry.Kind {
 	case remote.EntryMissing:
@@ -205,10 +207,10 @@ func describeLanding(locator *locator, root, landing string) string {
 // prepareParents). Inside the root, that's the path at which scans see the
 // entry, whatever path it was written through. Paths that land outside the
 // root may be synchronized by other sessions, which remote.Synchronizing
-// determines, but directories that contain the root are refused, since the
-// session synchronizes content beneath them. If the check fails, the error
-// explains why remote doesn't perform the specified action on the specified
-// subject.
+// determines for the sessions known on this system, but directories that
+// contain the root are refused, since the session synchronizes content
+// beneath them. If the check fails, the error explains why remote doesn't
+// perform the specified action on the specified subject.
 func checkLanding(target *remote.Target, locator *locator, root, landing string, directory bool, subject, action string) error {
 	physical, inside := within(root, landing)
 	if !inside {
@@ -241,7 +243,8 @@ func checkLanding(target *remote.Target, locator *locator, root, landing string,
 // Parents are checked both as given and as the paths that they land at once
 // symbolic links are followed, which are the paths that scans see (see
 // checkLanding), and missing parents that land outside the root are only
-// created if no other session synchronizes them (see remote.Synchronizing).
+// created if no other session known on this system synchronizes them (see
+// remote.Synchronizing).
 func prepareParents(ctx context.Context, target *remote.Target, locator *locator, relative string) (string, string, error) {
 	root, err := filepath.EvalSymlinks(target.Root)
 	if err != nil {

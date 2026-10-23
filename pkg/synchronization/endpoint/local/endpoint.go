@@ -15,6 +15,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/filesystem/behavior"
 	"github.com/mutagen-io/mutagen/pkg/filesystem/watching"
 	"github.com/mutagen-io/mutagen/pkg/logging"
+	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/sidecar"
 	"github.com/mutagen-io/mutagen/pkg/state"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
@@ -95,6 +96,10 @@ type endpoint struct {
 	// "portable" permission propagation. This field is static and thus safe for
 	// concurrent reads.
 	defaultOwnership *filesystem.OwnershipSpecification
+	// scope is the registration of the content that the endpoint synchronizes
+	// (see remote.RegisterScope), or nil if it couldn't be registered. This
+	// field is static and thus safe for concurrent reads.
+	scope io.Closer
 	// workerCancel cancels any background worker Goroutines for the endpoint.
 	// This field is static and thus safe for concurrent invocation.
 	workerCancel context.CancelFunc
@@ -412,6 +417,17 @@ func NewEndpoint(
 		}
 	}
 
+	// Register the content that the endpoint synchronizes, whether or not the
+	// session runs remote commands, so that remote --pull, run on this system,
+	// doesn't write content that the endpoint synchronizes. Registration only
+	// supports that check, so failure to register doesn't prevent
+	// synchronization. Nothing beyond this point fails, so the registration is
+	// always removed by Shutdown.
+	scope, err := remote.RegisterScope(sessionIdentifier, alpha, root, synchronization.EffectiveIgnores(configuration, version))
+	if err != nil {
+		logger.Warn("Unable to register synchronized content for remote --pull:", err)
+	}
+
 	// Create a cancellable context in which the endpoint's background worker
 	// Goroutines will operate.
 	workerCtx, workerCancel := context.WithCancel(context.Background())
@@ -441,6 +457,7 @@ func NewEndpoint(
 		defaultFileMode:              defaultFileMode,
 		defaultDirectoryMode:         defaultDirectoryMode,
 		defaultOwnership:             defaultOwnership,
+		scope:                        scope,
 		workerCancel:                 workerCancel,
 		saveCacheSignal:              saveCacheSignal,
 		saveCacheDone:                saveCacheDone,
@@ -1408,6 +1425,11 @@ func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) (
 
 // Shutdown implements the Shutdown method for local endpoints.
 func (e *endpoint) Shutdown() error {
+	// Remove the registration of the content that the endpoint synchronizes.
+	if e.scope != nil {
+		e.scope.Close()
+	}
+
 	// Signal background worker Goroutines to terminate.
 	e.workerCancel()
 

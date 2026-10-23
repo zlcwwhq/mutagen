@@ -1,12 +1,16 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
@@ -244,5 +248,109 @@ func TestPullChecks(t *testing.T) {
 		} else if test.refusal != "" && (err == nil || !strings.Contains(err.Error(), test.refusal)) {
 			t.Errorf("landing at %s (directory: %t) not refused correctly: %v", test.landing, test.directory, err)
 		}
+	}
+}
+
+// relaySession connects the endpoints of a session whose alpha endpoint, at
+// the specified root, submits commands, and whose beta endpoint, at the other
+// root, executes them, relaying submissions as the daemon would.
+func relaySession(t *testing.T, session string, alpha, beta string, ignores *remote.Ignores) {
+	t.Helper()
+	submitting, err := remote.NewLocalChannel(nil, &remote.Endpoint{Session: session, Root: alpha, Alpha: true, Submit: true, Ignores: ignores})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executing, err := remote.NewLocalChannel(nil, &remote.Endpoint{Session: session, Root: beta, Execute: true, Ignores: ignores})
+	if err != nil {
+		submitting.Close()
+		t.Fatal(err)
+	}
+	var routes sync.WaitGroup
+	routes.Add(1)
+	go func() {
+		defer routes.Done()
+		for {
+			submission, err := submitting.Accept()
+			if err != nil {
+				return
+			}
+			routes.Add(1)
+			go func() {
+				defer routes.Done()
+				if operation, err := remote.ReceiveSubmission(context.Background(), submission); err != nil {
+					remote.Reject(submission, err)
+				} else if operation != remote.OperationExecute {
+					remote.Reject(submission, errors.New("unsupported operation"))
+				} else if execution, err := executing.Open(context.Background()); err != nil {
+					remote.Reject(submission, err)
+				} else {
+					remote.Splice(submission, execution)
+				}
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		submitting.Close()
+		executing.Close()
+		routes.Wait()
+	})
+}
+
+func TestPullSynchronizedByOtherSession(t *testing.T) {
+	// Avoid the test name and nested directory added by t.TempDir: combined
+	// with macOS's long temporary root, they exceed Unix socket path limits.
+	data, err := os.MkdirTemp("", "mr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(data) })
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	alpha, beta := filepath.Join(base, "alpha"), filepath.Join(base, "beta")
+	writeFiles(t, alpha, map[string]string{"results/data": "local\n"})
+	writeFiles(t, beta, map[string]string{"results/data": "remote\n", "results/other": "other\n"})
+
+	// The session through which content is pulled ignores results, and its
+	// endpoints' scopes are registered, as its endpoints would register them.
+	ignores := &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"results"}}
+	relaySession(t, "sync_outer", alpha, beta, ignores)
+	for _, root := range []string{alpha, beta} {
+		scope, err := remote.RegisterScope("sync_outer", root == alpha, root, ignores)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { scope.Close() })
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pullPaths := func(paths ...string) (string, error) {
+		t.Helper()
+		var stderr bytes.Buffer
+		router := &router{ctx: ctx, directory: alpha, selection: &remote.Selection{}, stderr: &stderr}
+		err := pull(router, paths)
+		return stderr.String(), err
+	}
+
+	// Content that the session ignores is pulled.
+	if output, err := pullPaths("results/other"); err != nil || output != "remote: pulled results/other (1 added, 0 replaced, 0 unchanged)\n" {
+		t.Fatalf("ignored content not pulled: %q, %v", output, err)
+	}
+
+	// Content that another session synchronizes isn't, even if that session
+	// doesn't run remote commands, and local content is left unchanged.
+	scope, err := remote.RegisterScope("sync_results", true, filepath.Join(alpha, "results"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { scope.Close() })
+	if output, err := pullPaths("results/data"); err == nil ||
+		output != "remote: unable to pull results/data: it's synchronized by sync_results, so remote doesn't write it\n" {
+		t.Errorf("content synchronized by another session pulled: %q, %v", output, err)
+	}
+	if contents, err := os.ReadFile(filepath.Join(alpha, "results", "data")); err != nil || string(contents) != "local\n" {
+		t.Errorf("local content changed: %q, %v", contents, err)
 	}
 }

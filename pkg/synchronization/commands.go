@@ -133,8 +133,7 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 	// Submissions only run commands in directories that the session
 	// synchronizes. Ignores can't be endpoint-specific, so both endpoints'
 	// merged configurations specify the same ones.
-	ignoreSyntax, ignorePatterns, ignoreVCS := effectiveIgnores(c.mergedAlphaConfiguration, c.session.Version)
-	ignores := &remote.Ignores{Syntax: ignoreSyntax, Patterns: ignorePatterns, VCS: ignoreVCS}
+	ignores := EffectiveIgnores(c.mergedAlphaConfiguration, c.session.Version)
 	ctx, cancel := context.WithCancel(ctx)
 	var maintainers sync.WaitGroup
 	for index, url := range []*urlpkg.URL{c.session.Alpha, c.session.Beta} {

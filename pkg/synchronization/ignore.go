@@ -3,6 +3,7 @@ package synchronization
 import (
 	"fmt"
 
+	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 	dockerignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/docker"
 	mutagenignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/mutagen"
@@ -30,6 +31,16 @@ func effectiveIgnores(configuration *Configuration, version Version) (ignore.Syn
 		ignoreVCSMode = version.DefaultIgnoreVCSMode()
 	}
 	return ignoreSyntax, ignores, ignoreVCSMode == ignore.IgnoreVCSMode_IgnoreVCSModeIgnore
+}
+
+// EffectiveIgnores returns the effective ignores specified by a final (i.e.
+// fully merged) session configuration, as effectiveIgnores computes them, in
+// the form that remote uses to determine the paths that the session
+// synchronizes. Ignores can't be endpoint-specific, so either endpoint's
+// merged configuration yields the same ones.
+func EffectiveIgnores(configuration *Configuration, version Version) *remote.Ignores {
+	syntax, patterns, vcs := effectiveIgnores(configuration, version)
+	return &remote.Ignores{Syntax: syntax, Patterns: patterns, VCS: vcs}
 }
 
 // NewIgnorer creates the ignorer specified by a final (i.e. fully merged)

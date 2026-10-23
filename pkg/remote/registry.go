@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -15,6 +16,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,6 +30,12 @@ const (
 	// registryDirectoryName is the name of the directory, inside the Mutagen
 	// data directory, where endpoints register local command submission sockets.
 	registryDirectoryName = "remote"
+	// scopeDirectoryName is the name of the directory, inside the Mutagen data
+	// directory, where synchronization endpoints register the content that they
+	// synchronize (see RegisterScope). Scopes are kept apart from command
+	// registrations, since versions of remote that predate them would otherwise
+	// mistake them for endpoints that accept submissions.
+	scopeDirectoryName = "remote-scopes"
 	// recordExtension is the extension of registration records.
 	recordExtension = ".json"
 	// socketExtension is the extension of registration sockets (or named pipe
@@ -49,13 +58,15 @@ const (
 // so that tests can enable it on other systems.
 var ambiguousRefusals = slices.Contains([]string{"darwin", "ios", "freebsd", "netbsd", "openbsd", "dragonfly"}, runtime.GOOS)
 
-// record is the on-disk description of a registered endpoint.
+// record is the on-disk description of a registered endpoint, or of the scope
+// of a synchronization endpoint (see RegisterScope).
 type record struct {
 	// Version is the Mutagen version of the registering process.
 	Version string
 	// Session is the session identifier.
 	Session string
-	// Name is the session name, if any.
+	// Name is the session name, if any. Scopes don't record it, since
+	// synchronization endpoints don't know it.
 	Name string
 	// Root is the normalized synchronization root on this system.
 	Root string
@@ -65,7 +76,8 @@ type record struct {
 	// when an endpoint's previous executor has not yet noticed disconnection.
 	Created time.Time
 	// SessionCreated is the session's creation time (see
-	// Endpoint.SessionCreated).
+	// Endpoint.SessionCreated). Scopes don't record it, since synchronization
+	// endpoints don't know it.
 	SessionCreated time.Time
 	// Ignores are the session's ignores, if known (see Endpoint.Ignores).
 	Ignores *Ignores `json:",omitempty"`
@@ -125,14 +137,15 @@ func dialRegistration(ctx context.Context, path string) (net.Conn, error) {
 	}
 }
 
-// loadRegistrations reads all parseable registration records.
+// loadRegistrations reads all parseable registration records in a registry
+// directory.
 func loadRegistrations(directory string) ([]*registration, error) {
 	entries, err := os.ReadDir(directory)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("unable to read command registry: %w", err)
+		return nil, fmt.Errorf("unable to read registry: %w", err)
 	}
 	var result []*registration
 	for _, entry := range entries {
@@ -152,31 +165,49 @@ func loadRegistrations(directory string) ([]*registration, error) {
 	return result, nil
 }
 
-// prune removes registrations whose listeners no longer exist.
-func prune(directory string) {
+// prune removes the registrations in a registry directory whose listeners no
+// longer exist, until it's done or the context is cancelled.
+func prune(ctx context.Context, directory string) {
 	registrations, _ := loadRegistrations(directory)
 	for _, r := range registrations {
-		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-		connection, err := dialRegistration(ctx, r.base+socketExtension)
+		if ctx.Err() != nil {
+			return
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		connection, err := dialRegistration(probeCtx, r.base+socketExtension)
 		cancel()
 		if err == nil {
 			connection.Close()
-		} else if isDead(err) {
+		} else if ctx.Err() == nil && isDead(err) {
 			r.remove()
 		}
 	}
 }
 
 // register creates a listener for local command submissions from an endpoint
-// with the specified normalized root and records it in the registry. The
-// record is removed when the listener is closed.
+// with the specified normalized root and records it in the command registry,
+// once dead registrations are pruned. The record is removed when the listener
+// is closed.
 func register(endpoint *Endpoint, root string) (net.Listener, error) {
 	directory, err := filesystem.Mutagen(true, registryDirectoryName)
 	if err != nil {
 		return nil, fmt.Errorf("unable to compute command registry directory: %w", err)
 	}
-	prune(directory)
+	prune(context.Background(), directory)
+	return registerIn(directory, &record{
+		Session:        endpoint.Session,
+		Name:           endpoint.Name,
+		Root:           root,
+		Alpha:          endpoint.Alpha,
+		SessionCreated: endpoint.SessionCreated,
+		Ignores:        endpoint.Ignores,
+	})
+}
 
+// registerIn creates a listener in a registry directory and records it there,
+// using the specified record, whose version and registration time it sets.
+// The record is removed when the listener is closed.
+func registerIn(directory string, r *record) (net.Listener, error) {
 	// Use short random names because socket paths have tight length limits.
 	var identifier [8]byte
 	if _, err := rand.Read(identifier[:]); err != nil {
@@ -185,22 +216,14 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 	base := filepath.Join(directory, hex.EncodeToString(identifier[:]))
 	listener, err := ipc.NewListener(base + socketExtension)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create command socket: %w", err)
+		return nil, fmt.Errorf("unable to create registration socket: %w", err)
 	}
 
 	// Write the record only once the listener exists, so a record whose socket
 	// refuses connections is known to be stale. Rename it into place so that
 	// readers never observe a partial record.
-	data, err := json.Marshal(&record{
-		Version:        mutagen.Version,
-		Session:        endpoint.Session,
-		Name:           endpoint.Name,
-		Root:           root,
-		Alpha:          endpoint.Alpha,
-		Created:        time.Now(),
-		SessionCreated: endpoint.SessionCreated,
-		Ignores:        endpoint.Ignores,
-	})
+	r.Version, r.Created = mutagen.Version, time.Now()
+	data, err := json.Marshal(r)
 	if err != nil {
 		listener.Close()
 		return nil, fmt.Errorf("unable to encode registration: %w", err)
@@ -223,6 +246,80 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 		return nil, fmt.Errorf("unable to write registration: %w", err)
 	}
 	return &registeredListener{listener, base + recordExtension}, nil
+}
+
+// pruningScopes indicates whether a scope registration in this process is
+// pruning the scope registry, so that registrations don't prune it
+// concurrently.
+var pruningScopes atomic.Bool
+
+// scopeRegistration is the registration of a synchronization endpoint's scope
+// (see RegisterScope).
+type scopeRegistration struct {
+	// listener is the registration's listener, which accepts connections only
+	// to show that the registration is live.
+	listener net.Listener
+	// cancel cancels the registration's pruning of the scope registry, if any.
+	cancel context.CancelFunc
+	// tasks tracks accepting connections and pruning.
+	tasks sync.WaitGroup
+}
+
+// Close implements io.Closer.Close, removing the registration.
+func (r *scopeRegistration) Close() error {
+	r.cancel()
+	err := r.listener.Close()
+	r.tasks.Wait()
+	return err
+}
+
+// RegisterScope registers the scope of a synchronization endpoint on this
+// system, identified by the session identifier and whether the endpoint is
+// alpha, which is the content beneath its root, normalized as for
+// NewLocalChannel, that the session's ignores don't exclude, so that
+// Synchronizing knows the session even if it doesn't run remote commands.
+// Endpoints keep their scopes registered while they're connected, and closing
+// the result removes the registration. Scopes only answer liveness probes,
+// without accepting submissions, and so are kept apart from command
+// registrations. Dead scope registrations, such as those of processes that
+// terminated abruptly, are pruned in the background, so that registration
+// doesn't delay synchronization, while Synchronizing prunes those that it
+// encounters.
+func RegisterScope(session string, alpha bool, root string, ignores *Ignores) (io.Closer, error) {
+	root, err := filesystem.Normalize(root)
+	if err != nil {
+		return nil, fmt.Errorf("unable to normalize synchronization root: %w", err)
+	}
+	directory, err := filesystem.Mutagen(true, scopeDirectoryName)
+	if err != nil {
+		return nil, fmt.Errorf("unable to compute scope registry directory: %w", err)
+	}
+	listener, err := registerIn(directory, &record{Session: session, Root: root, Alpha: alpha, Ignores: ignores})
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	registration := &scopeRegistration{listener: listener, cancel: cancel}
+	registration.tasks.Add(1)
+	go func() {
+		defer registration.tasks.Done()
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connection.Close()
+		}
+	}()
+	if pruningScopes.CompareAndSwap(false, true) {
+		registration.tasks.Add(1)
+		go func() {
+			defer registration.tasks.Done()
+			defer pruningScopes.Store(false)
+			prune(ctx, directory)
+		}()
+	}
+	return registration, nil
 }
 
 // Target describes the endpoint from which a command is submitted.
@@ -626,17 +723,17 @@ func Dial(ctx context.Context, directory, session string, operation Operation) (
 // found.
 func relate(directory string) (string, []*candidate, []*candidate, error) {
 	directory = resolveSymbolicLinks(directory)
-	compatible, incompatible, err := relateResolved(directory)
+	compatible, incompatible, err := relateResolved(registryDirectoryName, directory)
 	return directory, compatible, incompatible, err
 }
 
-// relateResolved relates the registrations to the specified path, whose
-// symbolic links have been resolved as needed, as relate does, without
-// resolving it further.
-func relateResolved(directory string) ([]*candidate, []*candidate, error) {
-	registry, err := filesystem.Mutagen(false, registryDirectoryName)
+// relateResolved relates the registrations in the registry with the specified
+// directory name to the specified path, whose symbolic links have been
+// resolved as needed, as relate does, without resolving it further.
+func relateResolved(name, directory string) ([]*candidate, []*candidate, error) {
+	registry, err := filesystem.Mutagen(false, name)
 	if err != nil {
-		return nil, nil, fmt.Errorf("unable to compute command registry directory: %w", err)
+		return nil, nil, fmt.Errorf("unable to compute registry directory: %w", err)
 	}
 	registrations, err := loadRegistrations(registry)
 	if err != nil {
@@ -773,20 +870,44 @@ func (s *Selection) Locate(ctx context.Context, directory string) (*Target, erro
 // component isn't, since writes replace it rather than following it. Both
 // endpoints of every session are considered, including those of the session
 // through which the content is written, whose ignores apply to the path that
-// writes land at, rather than the one given. Only sessions registered for
-// remote commands on this system (by any version of Mutagen) are known, and
-// dead registrations are pruned.
+// writes land at, rather than the one given.
+//
+// Sessions are known from the scopes that their synchronization endpoints on
+// this system register while they're connected (see RegisterScope), whether
+// or not the sessions run remote commands, and from command registrations, by
+// any version of Mutagen. Sessions whose endpoints on this system aren't
+// connected, such as paused or reconnecting sessions, aren't known, and
+// neither are sessions run by versions of Mutagen that predate scopes, unless
+// they register endpoints for remote commands. Sessions are described by name
+// if a command registration of the session provides one, since scopes don't
+// record names, and by identifier otherwise. Dead registrations are pruned.
 func Synchronizing(ctx context.Context, path string, directory bool) ([]string, error) {
 	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
 	if err != nil {
 		return nil, fmt.Errorf("unable to resolve symbolic links: %w", err)
 	}
 	path = filepath.Join(parent, filepath.Base(path))
-	compatible, incompatible, err := relateResolved(path)
+	compatible, incompatible, err := relateResolved(registryDirectoryName, path)
 	if err != nil {
 		return nil, err
 	}
-	all := slices.Concat(compatible, incompatible)
+	registered := slices.Concat(compatible, incompatible)
+	compatible, incompatible, err = relateResolved(scopeDirectoryName, path)
+	if err != nil {
+		return nil, err
+	}
+	scopes := slices.Concat(compatible, incompatible)
+
+	// Scopes don't record session names or creation times, so take them from
+	// command registrations of the same sessions, if any, to describe and
+	// order the sessions as Dial does. Registrations of the same session are
+	// then filtered alike and only described once.
+	for _, s := range scopes {
+		if r := slices.IndexFunc(registered, func(c *candidate) bool { return c.Session == s.Session }); r >= 0 {
+			s.Name, s.SessionCreated = registered[r].Name, registered[r].SessionCreated
+		}
+	}
+	all := slices.Concat(registered, scopes)
 	sessions, err := synchronizingSessions(ctx, filter(all, func(c *candidate) bool {
 		return c.Ignores.ExcludedInEveryForm(c.path, directory) == ""
 	}))
