@@ -1150,22 +1150,32 @@ func (e *endpoint) Stage(paths []string, digests [][]byte) ([]string, []*rsync.S
 		return nil, nil, nil, nil
 	}
 
-	// Grab the scan lock. We'll need this to verify the last scan entry count
-	// and to generate the reverse lookup map.
+	// Grab the scan lock. We'll need this to generate the reverse lookup map.
 	e.lockScanLock(context.Background())
 
-	// Verify that we've performed a scan since the last staging operation, that
-	// way our count check is valid. If we haven't, then the controller is
-	// either malfunctioning or malicious.
+	// Verify that we've performed a scan since the last staging operation. If
+	// we haven't, then the controller is either malfunctioning or malicious.
 	if !e.scannedSinceLastStageCall {
 		e.unlockScanLock()
 		return nil, nil, nil, errors.New("multiple staging operations performed without scan")
 	}
 	e.scannedSinceLastStageCall = false
 
-	// Verify that the number of paths provided isn't going to put us over the
-	// maximum number of allowed entries.
-	if e.maximumEntryCount != 0 && (e.maximumEntryCount-e.lastScanEntryCount) < uint64(len(paths)) {
+	// Verify that the number of paths provided doesn't exceed the maximum
+	// number of allowed entries. Each staged path becomes a file entry, so a
+	// set of changes that requires staging more paths than that can never be
+	// applied.
+	//
+	// We don't check the number of paths against the capacity remaining after
+	// the last scan, because staged paths don't necessarily correspond to new
+	// entries: they also include content updates to existing files, and the
+	// changes that require them may remove other entries (e.g. by deleting one
+	// file and creating another in the same synchronization cycle). We're only
+	// provided with paths and digests, so we can't compute the resulting entry
+	// count here. Instead, Transition verifies the resulting entry count before
+	// modifying anything on disk and reports a problem if it would exceed the
+	// maximum.
+	if e.maximumEntryCount != 0 && uint64(len(paths)) > e.maximumEntryCount {
 		e.unlockScanLock()
 		return nil, nil, nil, errors.New("staging would exceeded allowed entry count")
 	}
