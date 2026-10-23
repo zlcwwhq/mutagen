@@ -228,6 +228,10 @@ type preparedCommand struct {
 	// script is the path of the file to which the requested script was
 	// written, if any.
 	script string
+	// scriptLock is the open file that holds the lock of the temporary file to
+	// which the requested script was written, if any, until the command has
+	// exited (see lockScript).
+	scriptLock *os.File
 }
 
 // prepare determines how to run a requested command, which must be valid,
@@ -268,7 +272,7 @@ func prepare(root, prologue string, alpha bool, request *Request, scriptPath str
 	// Write the script, if any, which its interpreter then runs.
 	command := &preparedCommand{arguments: request.Arguments, directory: directory, environment: environment}
 	if request.Script != nil {
-		if command.script, command.arguments, err = writeScript(request.Script, request.Arguments, scriptPath); err != nil {
+		if command.script, command.scriptLock, command.arguments, err = writeScript(request.Script, request.Arguments, scriptPath); err != nil {
 			return nil, &result{ExitCode: 126, Error: err.Error()}
 		}
 	}
@@ -293,10 +297,18 @@ func prepare(root, prologue string, alpha bool, request *Request, scriptPath str
 	return command, nil
 }
 
-// cleanup removes the file to which the command's script was written, if any.
+// cleanup removes the file to which the command's script was written, if any,
+// and then releases the file's lock, if held, so that the file never remains
+// unlocked. Commands run in the foreground are cleaned up once they've exited
+// or failed to start (see run), and prepare cleans up after failures that
+// follow writing the script. Detached jobs keep their scripts, which aren't
+// locked, in their directories.
 func (c *preparedCommand) cleanup() {
 	if c.script != "" {
 		os.Remove(c.script)
+	}
+	if c.scriptLock != nil {
+		c.scriptLock.Close()
 	}
 }
 

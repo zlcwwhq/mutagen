@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -19,10 +18,14 @@ const (
 	// data directory, that holds the files of scripts run in the foreground
 	// while they run.
 	scriptsDirectoryName = "remote-scripts"
+	// scriptFilePrefix is the prefix of the names of the files of scripts run
+	// in the foreground, which is followed by a random string.
+	scriptFilePrefix = "script-"
 	// DefaultScriptInterpreter is the interpreter of scripts without a #! line.
 	DefaultScriptInterpreter = "bash"
-	// scriptRetention is the age after which script files left behind, such
-	// as by an executing process that was killed, are removed.
+	// scriptRetention is the age after which the files of scripts run in the
+	// foreground that are no longer in use, such as those left behind by an
+	// executing process that was killed, are removed (see pruneScripts).
 	scriptRetention = 24 * time.Hour
 )
 
@@ -51,63 +54,62 @@ func parseShebang(contents []byte) (interpreter, argument string, found bool, er
 	return text, "", true, nil
 }
 
-// pruneScripts removes script files older than scriptRetention from the
-// specified directory. Removing the file of a script that's still running is
-// harmless, since its interpreter has already opened it.
-func pruneScripts(directory string) {
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if info, err := entry.Info(); err == nil && time.Since(info.ModTime()) > scriptRetention {
-			os.Remove(filepath.Join(directory, entry.Name()))
-		}
-	}
-}
-
 // writeScript writes a script to a new file at the specified path, or to a new
 // temporary file if the path is empty, and returns the file's path along with
 // the arguments that run the script, with the specified arguments, using the
 // interpreter named by its #! line or DefaultScriptInterpreter. The file isn't
 // executable: the interpreter reads it, so it may reside on a filesystem that
-// doesn't permit execution.
-func writeScript(script *Script, arguments []string, path string) (string, []string, error) {
+// doesn't permit execution. For a temporary file, it also returns the open file
+// that holds the file's lock, if it could be locked, which keeps the file from
+// being removed while the script runs (see lockScript). The caller must close
+// it once the script has exited, after removing the file.
+func writeScript(script *Script, arguments []string, path string) (string, *os.File, []string, error) {
 	if runtime.GOOS == "windows" {
-		return "", nil, errors.New("scripts aren't supported on Windows endpoints")
+		return "", nil, nil, errors.New("scripts aren't supported on Windows endpoints")
 	}
 	interpreter, argument, found, err := parseShebang(script.Contents)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	} else if !found {
 		interpreter = DefaultScriptInterpreter
 	}
-	var file *os.File
+
+	// Create the file, locking a temporary file before writing it. Only files
+	// older than scriptRetention are pruned, so the new file can't be removed
+	// before it's locked.
+	var file, lock *os.File
 	if path == "" {
 		var directory string
 		if directory, err = filesystem.Mutagen(true, scriptsDirectoryName); err != nil {
-			return "", nil, fmt.Errorf("unable to compute script directory: %w", err)
+			return "", nil, nil, fmt.Errorf("unable to compute script directory: %w", err)
 		}
 		pruneScripts(directory)
-		file, err = os.CreateTemp(directory, "script-*")
+		if file, err = os.CreateTemp(directory, scriptFilePrefix+"*"); err == nil {
+			lock = lockScript(file.Name())
+		}
 	} else {
 		file, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	}
 	if err != nil {
-		return "", nil, fmt.Errorf("unable to create script file: %w", err)
+		return "", nil, nil, fmt.Errorf("unable to create script file: %w", err)
 	}
+
+	// Write the script.
 	_, err = file.Write(script.Contents)
 	if closeErr := file.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		os.Remove(file.Name())
-		return "", nil, fmt.Errorf("unable to write script file: %w", err)
+		if lock != nil {
+			lock.Close()
+		}
+		return "", nil, nil, fmt.Errorf("unable to write script file: %w", err)
 	}
 	result := []string{interpreter}
 	if argument != "" {
 		result = append(result, argument)
 	}
 	result = append(result, file.Name())
-	return file.Name(), append(result, arguments...), nil
+	return file.Name(), lock, append(result, arguments...), nil
 }
