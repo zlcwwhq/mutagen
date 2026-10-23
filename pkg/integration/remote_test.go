@@ -916,3 +916,101 @@ func TestRemotePullIgnored(t *testing.T) {
 		t.Fatalf("missing path pulled: %d, %q", code, errorOutput)
 	}
 }
+
+func TestRemotePullSynchronizedContent(t *testing.T) {
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaRoot, betaRoot, outside := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta"), filepath.Join(directory, "outside")
+	write := func(root, path, data string) {
+		t.Helper()
+		path = filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		} else if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	composed, decomposed := "caf\u00e9.txt", "cafe\u0301.txt"
+	write(alphaRoot, "src/data", "synchronized\n")
+	write(alphaRoot, decomposed, "synchronized\n")
+	if err := os.MkdirAll(outside, 0700); err != nil {
+		t.Fatal(err)
+	}
+	createRemoteSession(t, "pull-synchronized", alphaRoot, betaRoot, false, "results", "cache", "scratch", "link-*", composed)
+
+	// A literal pattern for one Unicode normalization form of a name doesn't
+	// ignore the other forms, which name distinct entries on filesystems that
+	// store names as given, so a synchronized file in another form isn't
+	// pulled over local edits. Since scans may see names in either form, the
+	// form that the pattern matches isn't pulled either.
+	write(alphaRoot, decomposed, "local edit\n")
+	write(betaRoot, decomposed, "remote\n")
+	write(betaRoot, composed, "remote\n")
+	for _, name := range []string{decomposed, composed} {
+		if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", name); code != 255 || !strings.Contains(errorOutput, "only some Unicode normalization forms") {
+			t.Fatalf("partially ignored name pulled: %d, %q", code, errorOutput)
+		}
+	}
+	if read(filepath.Join(alphaRoot, decomposed)) != "local edit\n" {
+		t.Fatal("synchronized file overwritten")
+	} else if code, output, _ := runRemote(t, alphaRoot, "--ignores", decomposed); code != 0 || !strings.Contains(output, "possibly synchronized") {
+		t.Fatalf("incorrect ignores: %d, %q", code, output)
+	}
+
+	// Ignored symbolic links among a path's parents are followed, but not to
+	// content that the session synchronizes, whether or not that content
+	// exists yet, while links to ignored content or outside the root are.
+	if runtime.GOOS == "windows" {
+		return
+	}
+	for link, target := range map[string]string{"results": "src", "link-cache": "cache", "scratch": outside} {
+		if err := os.Symlink(target, filepath.Join(alphaRoot, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(alphaRoot, "cache"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"results/data", "results/new", "results/run1/metrics.json", "link-cache/data", "scratch/data"} {
+		write(betaRoot, path, "remote\n")
+	}
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/data"); code != 255 ||
+		!strings.Contains(errorOutput, "it resolves to src/data through a symbolic link, and the session synchronizes that") {
+		t.Fatalf("synchronized file pulled through a symbolic link: %d, %q", code, errorOutput)
+	} else if read(filepath.Join(alphaRoot, "src", "data")) != "synchronized\n" {
+		t.Fatal("synchronized file overwritten through a symbolic link")
+	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/new"); code != 255 || !strings.Contains(errorOutput, "resolves to src/new") {
+		t.Fatalf("new file pulled into synchronized content: %d, %q", code, errorOutput)
+	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/run1/metrics.json"); code != 255 || !strings.Contains(errorOutput, "results/run1 resolves to src/run1") {
+		t.Fatalf("parent created in synchronized content: %d, %q", code, errorOutput)
+	} else if entries, err := os.ReadDir(filepath.Join(alphaRoot, "src")); err != nil || len(entries) != 1 {
+		t.Fatalf("synchronized content modified: %v, %v", entries, err)
+	} else if code, output, _ := runRemote(t, alphaRoot, "--ignores", "results/data"); code != 0 || output != "results/data: synchronized as src/data (through a symbolic link)\n" {
+		t.Fatalf("incorrect ignores: %d, %q", code, output)
+	}
+
+	// A symbolic link that's pulled over is replaced rather than followed,
+	// so a directory isn't merged through it.
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results"); code != 255 || !strings.Contains(errorOutput, "exists locally but isn't a directory") {
+		t.Fatalf("directory merged through a symbolic link: %d, %q", code, errorOutput)
+	} else if target, err := os.Readlink(filepath.Join(alphaRoot, "results")); err != nil || target != "src" {
+		t.Fatalf("symbolic link modified: %q, %v", target, err)
+	}
+
+	// Links to ignored content and outside the root are followed.
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "link-cache/data", "scratch/data"); code != 0 {
+		t.Fatalf("pull through ignored symbolic links failed: %d, %q", code, errorOutput)
+	} else if read(filepath.Join(alphaRoot, "cache", "data")) != "remote\n" || read(filepath.Join(outside, "data")) != "remote\n" {
+		t.Fatal("incorrect contents pulled through ignored symbolic links")
+	}
+}

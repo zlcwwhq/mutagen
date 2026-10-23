@@ -129,7 +129,12 @@ and those whose roots contain the current directory.
     opposite endpoint, replacing local files that differ but never deleting
     local content. It refuses the root, paths that the session (or another
     session) synchronizes, which synchronization updates instead, and
-    directories with synchronized content beneath them.
+    directories with synchronized content beneath them. Both options count a
+    path as ignored only if the session ignores it in every Unicode
+    normalization form, and, if symbolic links among its local parents lead
+    elsewhere in the root, only if the session also ignores where they lead.
+    --pull only follows links that the session ignores, and never one at the
+    path itself, which a pulled file or link replaces.
   - remote --diff shows how the remote copies of the given paths, or of the
     conflicting files, differ from the local copies, as a unified diff
     (- local, + remote). For a single-file session, use --session from outside

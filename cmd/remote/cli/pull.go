@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -65,23 +66,38 @@ func (s *pullSummary) String() string {
 // deletes local content. The session's root and paths that the session
 // synchronizes, entirely or partially, aren't pulled, since writing them would
 // race with synchronization, as would writing paths that another session
-// synchronizes.
+// synchronizes. Paths are checked both as given and as the paths that writes
+// to them land at, since symbolic links among their parents, which are only
+// followed if the session ignores them (see prepareParents), can lead to
+// content that the session or another session synchronizes.
 func pullPath(router *router, target *remote.Target, locator *locator, argument string) (*pullSummary, error) {
 	relative, err := locator.resolve(argument)
 	if err != nil {
 		return nil, err
 	} else if relative == "" {
 		return nil, errors.New("the session's root can't be pulled")
-	} else if target.Ignores.Excluded(relative, false) == "" && target.Ignores.Excluded(relative, true) == "" {
-		return nil, errors.New("the session synchronizes it, so remote doesn't write it; remote --flush synchronizes it, and remote --ignores shows what the session ignores")
 	}
-	destination := filepath.Join(target.Root, filepath.FromSlash(relative))
-	if err := prepareParents(target, locator, relative); err != nil {
+
+	// Check that the session ignores the path as some kind of entry before
+	// creating its parents, and check where writes to it land once they
+	// exist, before transferring anything.
+	fileErr, directoryErr := checkIgnored(target.Ignores, relative, false), checkIgnored(target.Ignores, relative, true)
+	if fileErr != nil && directoryErr != nil {
+		if target.Ignores.ExcludedInAnyForm(relative, true) != "" {
+			return nil, directoryErr
+		}
+		return nil, fileErr
+	}
+	root, landing, err := prepareParents(router.ctx, target, locator, relative)
+	if err != nil {
+		return nil, err
+	} else if err := checkLanding(target, locator, root, landing, false, "it", "write it"); err != nil &&
+		checkLanding(target, locator, root, landing, true, "it", "write it") != nil {
 		return nil, err
 	}
 
 	// Transfer the entry.
-	staging, err := os.MkdirTemp(filepath.Dir(destination), filesystem.TemporaryNamePrefix+"pull-")
+	staging, err := os.MkdirTemp(filepath.Dir(landing), filesystem.TemporaryNamePrefix+"pull-")
 	if err != nil {
 		return nil, fmt.Errorf("unable to create staging directory: %w", err)
 	}
@@ -99,7 +115,11 @@ func pullPath(router *router, target *remote.Target, locator *locator, argument 
 	}
 
 	// Check that the session ignores the entry as the kind of entry that it
-	// is: a directory must be ignored entirely, not just content beneath it.
+	// is, both as given and where it lands: a directory must be ignored
+	// entirely, not just content beneath it. Then check that no other session
+	// synchronizes it, and that the session doesn't synchronize it through
+	// another of its endpoints on this system, as both endpoints of local
+	// sessions are.
 	var directory bool
 	switch entry.Kind {
 	case remote.EntryMissing:
@@ -110,58 +130,174 @@ func pullPath(router *router, target *remote.Target, locator *locator, argument 
 	default:
 		return nil, errors.New("it isn't a file, directory, or symbolic link on the opposite endpoint")
 	}
-	if target.Ignores.Excluded(relative, directory) == "" {
-		if directory {
-			return nil, errors.New("the session synchronizes some content beneath it, so remote doesn't pull it as a whole; pull the ignored content beneath it instead")
-		}
-		return nil, errors.New("the session synchronizes it, so remote doesn't write it; remote --flush synchronizes it")
-	} else if sessions, err := remote.Synchronizing(router.ctx, destination, directory, target); err != nil {
+	if err := checkIgnored(target.Ignores, relative, directory); err != nil {
+		return nil, err
+	} else if err := checkLanding(target, locator, root, landing, directory, "it", "write it"); err != nil {
+		return nil, err
+	} else if sessions, err := remote.Synchronizing(router.ctx, landing, directory); err != nil {
 		return nil, err
 	} else if len(sessions) > 0 {
+		if physical, inside := within(root, landing); !inside || physical != relative {
+			return nil, fmt.Errorf("it resolves to %s through a symbolic link, and that's synchronized by %s, so remote doesn't write it",
+				describeLanding(locator, root, landing), strings.Join(sessions, ", "))
+		}
 		return nil, fmt.Errorf("it's synchronized by %s, so remote doesn't write it", strings.Join(sessions, ", "))
 	}
 
 	// Merge the entry into the local path.
 	summary := &pullSummary{}
-	summary.merge(staged, destination, locator.display(relative))
+	summary.merge(staged, landing, locator.display(relative))
 	if len(summary.problems) > 0 {
 		return nil, fmt.Errorf("%s (%s)", strings.Join(summary.problems, "; "), summary)
 	}
 	return summary, nil
 }
 
+// partiallyIgnored explains that the session may synchronize an entry that its
+// ignores exclude in some, but not all, of the forms in which scans could see
+// its path, since scans may see it in a form that the session synchronizes
+// (see remote.Ignores.ExcludedInEveryForm).
+const partiallyIgnored = "the session ignores it in only some Unicode normalization forms of its path and may synchronize it"
+
+// checkIgnored checks that the session ignores the entry at a path relative to
+// the root, which is a directory if directory is true, in every form in which
+// scans could see it (see remote.Ignores.ExcludedInEveryForm), since remote
+// only writes content that the session doesn't synchronize. Otherwise, it
+// explains why remote doesn't write it.
+func checkIgnored(ignores *remote.Ignores, relative string, directory bool) error {
+	if ignores.ExcludedInEveryForm(relative, directory) != "" {
+		return nil
+	} else if ignores.ExcludedInAnyForm(relative, directory) != "" {
+		return errors.New(partiallyIgnored + ", so remote doesn't write it; remote --ignores shows what the session ignores")
+	} else if directory {
+		return errors.New("the session synchronizes some content beneath it, so remote doesn't pull it as a whole; pull the ignored content beneath it instead")
+	}
+	return errors.New("the session synchronizes it, so remote doesn't write it; remote --flush synchronizes it, and remote --ignores shows what the session ignores")
+}
+
+// within determines whether a path lies inside a root, both with symbolic
+// links resolved, and, if so, computes its slash-separated path relative to the
+// root.
+func within(root, path string) (string, bool) {
+	relative, err := filepath.Rel(root, path)
+	if err != nil || filepath.IsAbs(relative) || escapes(relative) {
+		return "", false
+	} else if relative == "." {
+		return "", true
+	}
+	return filepath.ToSlash(relative), true
+}
+
+// describeLanding formats the path that writes land at for display, given the
+// root, both with symbolic links resolved: relative to the working directory if
+// it's inside the root (see locator.display), and absolute otherwise.
+func describeLanding(locator *locator, root, landing string) string {
+	if physical, inside := within(root, landing); inside {
+		return locator.display(physical)
+	}
+	return terminal.NeutralizeControlCharacters(landing)
+}
+
+// checkLanding checks that the session ignores the path that writes to an
+// entry land at, which is a directory if directory is true, in every form in
+// which scans could see it, given that path, with the symbolic links among its
+// parents resolved, and the root, with symbolic links resolved (see
+// prepareParents). Inside the root, that's the path at which scans see the
+// entry, whatever path it was written through. Paths that land outside the
+// root may be synchronized by other sessions, which remote.Synchronizing
+// determines, but directories that contain the root are refused, since the
+// session synchronizes content beneath them. If the check fails, the error
+// explains why remote doesn't perform the specified action on the specified
+// subject.
+func checkLanding(target *remote.Target, locator *locator, root, landing string, directory bool, subject, action string) error {
+	physical, inside := within(root, landing)
+	if !inside {
+		if _, contains := within(landing, root); directory && contains {
+			return fmt.Errorf("%s resolves to %s through a symbolic link, which contains the session's root, so remote doesn't %s",
+				subject, describeLanding(locator, root, landing), action)
+		}
+		return nil
+	} else if target.Ignores.ExcludedInEveryForm(physical, directory) != "" {
+		return nil
+	}
+	at := describeLanding(locator, root, landing)
+	if physical == "" {
+		return fmt.Errorf("%s resolves to the session's root (%s) through a symbolic link, so remote doesn't %s", subject, at, action)
+	} else if target.Ignores.ExcludedInAnyForm(physical, directory) != "" {
+		return fmt.Errorf("%s resolves to %s through a symbolic link, and the session ignores that in only some Unicode normalization forms of its path and may synchronize it, so remote doesn't %s",
+			subject, at, action)
+	}
+	return fmt.Errorf("%s resolves to %s through a symbolic link, and the session synchronizes that, so remote doesn't %s", subject, at, action)
+}
+
 // prepareParents ensures that the parent directories of a path relative to the
-// root exist as directories. Missing parents are only created if the session
-// ignores them, since synchronization creates the others. Symbolic links are
-// only followed if the session ignores them, since synchronization could
-// otherwise replace them.
-func prepareParents(target *remote.Target, locator *locator, relative string) error {
+// root exist as directories, and returns the root and the path that writes to
+// the path land at, both with symbolic links resolved: symbolic links among its
+// parents are resolved, since writes follow them, but its final component
+// isn't, since merging replaces it rather than following it (see merge).
+// Missing parents are only created if the session ignores them, since
+// synchronization creates the others. Symbolic links are only followed if the
+// session ignores them, since synchronization could otherwise replace them.
+// Parents are checked both as given and as the paths that they land at once
+// symbolic links are followed, which are the paths that scans see (see
+// checkLanding), and missing parents that land outside the root are only
+// created if no other session synchronizes them (see remote.Synchronizing).
+func prepareParents(ctx context.Context, target *remote.Target, locator *locator, relative string) (string, string, error) {
+	root, err := filepath.EvalSymlinks(target.Root)
+	if err != nil {
+		return "", "", fmt.Errorf("unable to access the synchronization root: %w", err)
+	}
 	components := strings.Split(relative, "/")
+	resolved := root
 	for c := 1; c < len(components); c++ {
 		parent := strings.Join(components[:c], "/")
-		native := filepath.Join(target.Root, filepath.FromSlash(parent))
+		display := locator.display(parent)
+		native := filepath.Join(resolved, components[c-1])
 		info, err := os.Lstat(native)
 		if errors.Is(err, fs.ErrNotExist) {
-			if target.Ignores.Excluded(parent, true) == "" {
-				return fmt.Errorf("%s doesn't exist locally, but the session synchronizes it, so remote doesn't create it; remote --flush synchronizes it", locator.display(parent))
-			} else if err := os.Mkdir(native, 0777); err != nil {
-				return fmt.Errorf("unable to create %s: %w", locator.display(parent), err)
+			if target.Ignores.ExcludedInEveryForm(parent, true) == "" {
+				if target.Ignores.ExcludedInAnyForm(parent, true) != "" {
+					return "", "", fmt.Errorf("%s doesn't exist locally, and %s, so remote doesn't create it", display, partiallyIgnored)
+				}
+				return "", "", fmt.Errorf("%s doesn't exist locally, but the session synchronizes it, so remote doesn't create it; remote --flush synchronizes it", display)
+			} else if err := checkLanding(target, locator, root, native, true, display, "create it"); err != nil {
+				return "", "", err
+			} else if _, inside := within(root, native); !inside {
+				if sessions, err := remote.Synchronizing(ctx, native, true); err != nil {
+					return "", "", err
+				} else if len(sessions) > 0 {
+					return "", "", fmt.Errorf("%s resolves to %s through a symbolic link, and that's synchronized by %s, so remote doesn't create it",
+						display, describeLanding(locator, root, native), strings.Join(sessions, ", "))
+				}
 			}
+			if err := os.Mkdir(native, 0777); err != nil {
+				return "", "", fmt.Errorf("unable to create %s: %w", display, err)
+			}
+			resolved = native
 			continue
 		} else if err != nil {
-			return fmt.Errorf("unable to access %s: %w", locator.display(parent), err)
+			return "", "", fmt.Errorf("unable to access %s: %w", display, err)
 		} else if info.Mode()&os.ModeSymlink != 0 {
-			if target.Ignores.Excluded(parent, false) == "" {
-				return fmt.Errorf("%s is a symbolic link that the session synchronizes, so remote doesn't write through it", locator.display(parent))
-			} else if info, err = os.Stat(native); err != nil {
-				return fmt.Errorf("unable to access %s: %w", locator.display(parent), err)
+			if target.Ignores.ExcludedInEveryForm(parent, false) == "" {
+				if target.Ignores.ExcludedInAnyForm(parent, false) != "" {
+					return "", "", fmt.Errorf("%s is a symbolic link, and %s, so remote doesn't write through it", display, partiallyIgnored)
+				}
+				return "", "", fmt.Errorf("%s is a symbolic link that the session synchronizes, so remote doesn't write through it", display)
+			} else if err := checkLanding(target, locator, root, native, false, display, "write through it"); err != nil {
+				return "", "", err
+			} else if resolved, err = filepath.EvalSymlinks(native); err != nil {
+				return "", "", fmt.Errorf("unable to access %s: %w", display, err)
+			} else if info, err = os.Stat(resolved); err != nil {
+				return "", "", fmt.Errorf("unable to access %s: %w", display, err)
 			}
+		} else {
+			resolved = native
 		}
 		if !info.IsDir() {
-			return fmt.Errorf("%s isn't a directory locally", locator.display(parent))
+			return "", "", fmt.Errorf("%s isn't a directory locally", display)
 		}
 	}
-	return nil
+	return root, filepath.Join(resolved, components[len(components)-1]), nil
 }
 
 // merge moves a staged entry to a destination, replacing files and symbolic

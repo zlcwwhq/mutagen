@@ -112,8 +112,16 @@ func startJob(ctx context.Context, connection net.Conn, target *remote.Target, r
 	fmt.Fprintf(stderr, "remote: started job %[1]s on %[2]s with output in %[3]s; remote --wait %[1]s waits for it, and remote --kill %[1]s terminates it\n",
 		job.ID, executing(target), describeLog(locator, job))
 	if job.LogPath != "" {
-		if excluded := target.Ignores.Excluded(job.LogPath, false); excluded != "" {
+		// The log isn't synchronized if the session ignores it in every form
+		// in which scans could see its path, and remote --pull copies it
+		// then. If the session ignores it in only some of them, it may not be
+		// synchronized, but remote --pull doesn't write it either (see
+		// remote.Ignores.ExcludedInEveryForm).
+		if excluded := target.Ignores.ExcludedInEveryForm(job.LogPath, false); excluded != "" {
 			fmt.Fprintf(stderr, "remote: warning: the session ignores %s, so the log isn't synchronized; read it with remote cat or copy it with remote --pull\n",
+				locator.display(excluded))
+		} else if excluded := target.Ignores.ExcludedInAnyForm(job.LogPath, false); excluded != "" {
+			fmt.Fprintf(stderr, "remote: warning: the session ignores %s in only some Unicode normalization forms of its path, so the log may not be synchronized; read it with remote cat\n",
 				locator.display(excluded))
 		}
 	}

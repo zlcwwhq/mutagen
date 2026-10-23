@@ -40,7 +40,7 @@ func TestIgnoresExcluded(t *testing.T) {
 		{&Ignores{Patterns: []string{"inner"}}, "inner", ""},
 		{&Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"inner", ""}}, "inner", ""},
 	} {
-		if excluded := test.ignores.Excluded(test.path, true); excluded != test.excluded {
+		if excluded := test.ignores.ExcludedInAnyForm(test.path, true); excluded != test.excluded {
 			t.Errorf("incorrect exclusion of %q by %+v: %q", test.path, test.ignores, excluded)
 		}
 	}
@@ -74,8 +74,60 @@ func TestIgnoresExcludedFiles(t *testing.T) {
 		{docker, "data/keep", ""},
 		{docker, "data/other", "data/other"},
 	} {
-		if excluded := test.ignores.Excluded(test.path, false); excluded != test.excluded {
+		if excluded := test.ignores.ExcludedInAnyForm(test.path, false); excluded != test.excluded {
 			t.Errorf("incorrect exclusion of file %q by %+v: %q", test.path, test.ignores, excluded)
+		}
+	}
+}
+
+func TestIgnoresExcludedForms(t *testing.T) {
+	// Paths are excluded in any form if they're excluded as given, or in their
+	// NFC or NFD form, and in every form only if they're excluded in all three.
+	// The excluded entry is reported in the form given: the first one found
+	// for any form, and the shallowest one that's excluded in every form.
+	composed, decomposed := "caf\u00e9", "cafe\u0301"
+	literal := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{composed + ".txt", "/" + decomposed + "/inner", "*.log"}}
+	docker := &Ignores{Syntax: ignore.Syntax_SyntaxDocker, Patterns: []string{composed, "!" + composed + "/keep"}}
+	for _, test := range []struct {
+		ignores    *Ignores
+		path       string
+		directory  bool
+		any, every string
+	}{
+		// Literal patterns written in one form match that form only, so they
+		// exclude names in any form, but in every form only once each form
+		// is matched.
+		{literal, composed + ".txt", false, composed + ".txt", ""},
+		{literal, decomposed + ".txt", false, decomposed + ".txt", ""},
+		{literal, "src/" + composed + ".txt", false, "src/" + composed + ".txt", ""},
+		{literal, composed + "/inner/x", false, composed + "/inner", ""},
+		{&Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{composed + ".txt", decomposed + ".txt"}}, decomposed + ".txt", false, decomposed + ".txt", decomposed + ".txt"},
+		// Patterns that match every form, and names that normalization
+		// doesn't change, are excluded in every form.
+		{literal, composed + ".log", false, composed + ".log", composed + ".log"},
+		{&Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"caf*"}}, decomposed + "/x", false, decomposed, decomposed},
+		{literal, "train.log", false, "train.log", "train.log"},
+		{literal, "train.py", false, "", ""},
+		// The shallowest entry that's excluded in every form is reported even
+		// if the forms are excluded at different depths.
+		{&Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"/" + composed, "/caf*/inner"}}, decomposed + "/inner/x", true, decomposed + "/inner", decomposed + "/inner"},
+		{&Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"/" + composed, "/caf*/inner"}}, composed + "/inner/x", true, composed, composed + "/inner"},
+		// Directories that may contain unignored content aren't excluded,
+		// while other content beneath them is excluded in the forms in which
+		// they're ignored.
+		{docker, composed, true, "", ""},
+		{docker, composed + "/keep", false, "", ""},
+		{docker, composed + "/other", false, composed + "/other", ""},
+		{docker, decomposed + "/other", false, decomposed + "/other", ""},
+		// Unknown ignores exclude nothing in either sense.
+		{nil, composed + ".txt", false, "", ""},
+		{&Ignores{Patterns: []string{"*"}}, "train.log", false, "", ""},
+	} {
+		if excluded := test.ignores.ExcludedInAnyForm(test.path, test.directory); excluded != test.any {
+			t.Errorf("incorrect exclusion in any form of %q (directory: %t) by %+v: %q", test.path, test.directory, test.ignores, excluded)
+		}
+		if excluded := test.ignores.ExcludedInEveryForm(test.path, test.directory); excluded != test.every {
+			t.Errorf("incorrect exclusion in every form of %q (directory: %t) by %+v: %q", test.path, test.directory, test.ignores, excluded)
 		}
 	}
 }

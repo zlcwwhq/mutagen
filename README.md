@@ -326,7 +326,11 @@ path, and `remote --pull <path>...` copies ignored files, directories, and
 symbolic links from the opposite endpoint, replacing local files that differ
 but never deleting local content. It refuses paths that the session (or
 another session) synchronizes, and directories with synchronized content
-beneath them.
+beneath them. Both options count a path as ignored only if the session ignores
+it in every Unicode normalization form, and, if symbolic links among its local
+parents lead elsewhere in the root, only if the session also ignores where they
+lead. `--pull` only follows links that the session ignores, and never one at
+the path itself, which a pulled file or link replaces.
 
 After each flush, `remote` also warns about content that the session couldn't
 synchronize: conflicts (paths modified on both endpoints, which aren't

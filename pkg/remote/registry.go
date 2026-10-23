@@ -277,8 +277,10 @@ type Session struct {
 	// Contained indicates whether Root contains the directory.
 	Contained bool
 	// Excluded indicates whether the session's ignores exclude the directory,
-	// or a parent of it inside Root, so that the session doesn't synchronize
-	// it (see Selection.Corresponding).
+	// or a parent of it inside Root, in any form in which scans could see it
+	// (see Ignores.ExcludedInAnyForm), so that the session may not synchronize
+	// it, and operations corresponding to it are refused (see
+	// Selection.Corresponding).
 	Excluded bool
 	// Selected indicates whether the selection locates the endpoint for the
 	// directory.
@@ -595,7 +597,7 @@ func describe(session, name string) string {
 // excludedError reports that an operation corresponding to a directory can't
 // be submitted through the session of a candidate whose ignores exclude it,
 // given the excluded slash-separated path relative to the session's root (see
-// Ignores.Excluded).
+// Ignores.ExcludedInAnyForm).
 func excludedError(directory string, c *candidate, excluded string) error {
 	session := describe(c.Session, c.Name)
 	excludedDirectory := filepath.Join(resolveSymbolicLinks(c.Root), filepath.FromSlash(excluded))
@@ -623,15 +625,23 @@ func Dial(ctx context.Context, directory, session string, operation Operation) (
 // that the directory is synchronized, and they're mentioned if no route is
 // found.
 func relate(directory string) (string, []*candidate, []*candidate, error) {
+	directory = resolveSymbolicLinks(directory)
+	compatible, incompatible, err := relateResolved(directory)
+	return directory, compatible, incompatible, err
+}
+
+// relateResolved relates the registrations to the specified path, whose
+// symbolic links have been resolved as needed, as relate does, without
+// resolving it further.
+func relateResolved(directory string) ([]*candidate, []*candidate, error) {
 	registry, err := filesystem.Mutagen(false, registryDirectoryName)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("unable to compute command registry directory: %w", err)
+		return nil, nil, fmt.Errorf("unable to compute command registry directory: %w", err)
 	}
 	registrations, err := loadRegistrations(registry)
 	if err != nil {
-		return "", nil, nil, err
+		return nil, nil, err
 	}
-	directory = resolveSymbolicLinks(directory)
 	var compatible, incompatible []*candidate
 	for _, r := range registrations {
 		root := resolveSymbolicLinks(r.Root)
@@ -647,7 +657,7 @@ func relate(directory string) (string, []*candidate, []*candidate, error) {
 			incompatible = append(incompatible, c)
 		}
 	}
-	return directory, compatible, incompatible, nil
+	return compatible, incompatible, nil
 }
 
 // Dial submits the specified operation through the registered endpoint whose
@@ -669,21 +679,24 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 	connection, c := endpoint.connection, endpoint.candidate
 
 	// Refuse operations corresponding to a directory that the session doesn't
-	// synchronize (see Selection.Corresponding).
+	// synchronize (see Selection.Corresponding), or that it might not, since
+	// running them anyway could run them in an outdated or missing directory.
 	if s.Target == nil && s.Corresponding && c.contained {
-		if excluded := c.Ignores.Excluded(c.path, true); excluded != "" {
+		if excluded := c.Ignores.ExcludedInAnyForm(c.path, true); excluded != "" {
 			connection.Close()
 			return nil, nil, excludedError(directory, c, excluded)
 		}
 	}
 
 	// Label the sessions that synchronize the directory if there are several
-	// and the session wasn't selected (see Target.Overlapping).
+	// and the session wasn't selected (see Target.Overlapping). Sessions whose
+	// ignores exclude the directory in some form aren't labeled, since
+	// selecting them would be refused, as for the located session.
 	var overlapping []string
 	if s.Target == nil && s.Session == "" && c.contained && (s.Default == "" || !matching(s.Default)(c)) {
 		all := slices.Concat(compatible, incompatible)
 		others, err := synchronizingSessions(ctx, filter(all, func(other *candidate) bool {
-			return other.Session != c.Session && other.Ignores.Excluded(other.path, true) == ""
+			return other.Session != c.Session && other.Ignores.ExcludedInAnyForm(other.path, true) == ""
 		}))
 		if err != nil {
 			connection.Close()
@@ -748,29 +761,39 @@ func (s *Selection) Locate(ctx context.Context, directory string) (*Target, erro
 	return endpoint.candidate.target(nil), nil
 }
 
-// Synchronizing describes the sessions, other than that of the specified
-// target, that synchronize content at the specified path, which is a directory
-// if directory is true: those whose roots on this system contain the path and
-// whose ignores don't exclude it, and, for a directory, those whose roots lie
-// beneath it. Writing content that such a session synchronizes, such as that of
-// a session whose root is nested inside the target's root, would race with its
-// synchronization. Only sessions registered for remote commands on this system
-// (by any version of Mutagen) are known, and dead registrations are pruned.
-func Synchronizing(ctx context.Context, path string, directory bool, except *Target) ([]string, error) {
-	path, compatible, incompatible, err := relate(path)
+// Synchronizing describes the sessions that may synchronize content written to
+// the specified path, which is a directory if directory is true: those whose
+// roots on this system contain the path and whose ignores don't exclude it in
+// every form in which scans could see it (see Ignores.ExcludedInEveryForm),
+// and, for a directory, those whose roots lie beneath it. Writing content that
+// such a session synchronizes, such as that of a session whose root is nested
+// inside the writer's root, would race with its synchronization. Sessions are
+// related to the path as writes to it land: symbolic links among its parents,
+// which must exist, are resolved, since writes follow them, but its final
+// component isn't, since writes replace it rather than following it. Both
+// endpoints of every session are considered, including those of the session
+// through which the content is written, whose ignores apply to the path that
+// writes land at, rather than the one given. Only sessions registered for
+// remote commands on this system (by any version of Mutagen) are known, and
+// dead registrations are pruned.
+func Synchronizing(ctx context.Context, path string, directory bool) ([]string, error) {
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("unable to resolve symbolic links: %w", err)
+	}
+	path = filepath.Join(parent, filepath.Base(path))
+	compatible, incompatible, err := relateResolved(path)
 	if err != nil {
 		return nil, err
 	}
-	others := filter(slices.Concat(compatible, incompatible), func(c *candidate) bool {
-		return c.Session != except.Session
-	})
-	sessions, err := synchronizingSessions(ctx, filter(others, func(c *candidate) bool {
-		return c.Ignores.Excluded(c.path, directory) == ""
+	all := slices.Concat(compatible, incompatible)
+	sessions, err := synchronizingSessions(ctx, filter(all, func(c *candidate) bool {
+		return c.Ignores.ExcludedInEveryForm(c.path, directory) == ""
 	}))
 	if err != nil {
 		return nil, err
 	} else if directory {
-		nested, err := liveSessions(ctx, filter(others, func(c *candidate) bool {
+		nested, err := liveSessions(ctx, filter(all, func(c *candidate) bool {
 			_, inside := relativePath(path, resolveSymbolicLinks(c.Root))
 			return !c.contained && inside && !slices.ContainsFunc(sessions, func(s *candidate) bool {
 				return s.Session == c.Session
@@ -859,7 +882,7 @@ func (s *Selection) Sessions(ctx context.Context, directory string) ([]Session, 
 			Root:      c.Root,
 			Version:   c.Version,
 			Contained: c.contained,
-			Excluded:  c.contained && c.Ignores.Excluded(c.path, true) != "",
+			Excluded:  c.contained && c.Ignores.ExcludedInAnyForm(c.path, true) != "",
 			Selected:  selected != nil && c.Session == selected.Session && c.Alpha == selected.Alpha,
 		}
 	}

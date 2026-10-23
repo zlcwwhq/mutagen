@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -107,40 +108,141 @@ func TestPullMerge(t *testing.T) {
 }
 
 func TestPullParents(t *testing.T) {
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	root := t.TempDir()
 	writeFiles(t, root, map[string]string{"src/a.py": "", "file": ""})
 	target := &remote.Target{
 		Root: root, Contained: true,
-		Ignores: &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"results/", "*.log", "linked"}},
+		Ignores: &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"results/", "*.log", "linked", "into-*", "caf\u00e9/"}},
 	}
 	locator := newLocator(target)
+	prepare := func(relative string) (string, error) {
+		t.Helper()
+		resolvedRoot, landing, err := prepareParents(context.Background(), target, locator, relative)
+		if err == nil {
+			if expected, resolveErr := filepath.EvalSymlinks(root); resolveErr != nil || resolvedRoot != expected {
+				t.Fatalf("incorrect resolved root for %s: %s", relative, resolvedRoot)
+			}
+		}
+		return landing, err
+	}
 
-	// Ignored parents are created, while synchronized ones aren't.
-	if err := prepareParents(target, locator, "results/run1/metrics.json"); err != nil {
+	// Ignored parents are created, while synchronized ones aren't, and paths
+	// without symbolic links land as given.
+	if landing, err := prepare("results/run1/metrics.json"); err != nil {
 		t.Fatal("ignored parents not created:", err)
 	} else if info, err := os.Stat(filepath.Join(root, "results", "run1")); err != nil || !info.IsDir() {
 		t.Fatal("ignored parents missing:", err)
-	} else if err := prepareParents(target, locator, "src/train.log"); err != nil {
+	} else if expected, _ := filepath.EvalSymlinks(filepath.Join(root, "results", "run1")); landing != filepath.Join(expected, "metrics.json") {
+		t.Fatal("incorrect landing:", landing)
+	} else if _, err := prepare("src/train.log"); err != nil {
 		t.Fatal("existing parent rejected:", err)
-	} else if err := prepareParents(target, locator, "missing/train.log"); err == nil || !strings.Contains(err.Error(), "synchronizes it") {
+	} else if _, err := prepare("missing/train.log"); err == nil || !strings.Contains(err.Error(), "synchronizes it") {
 		t.Fatal("synchronized parent created:", err)
-	} else if err := prepareParents(target, locator, "file/train.log"); err == nil || !strings.Contains(err.Error(), "isn't a directory") {
+	} else if _, err := prepare("file/train.log"); err == nil || !strings.Contains(err.Error(), "isn't a directory") {
 		t.Fatal("file accepted as a parent:", err)
 	}
 
-	// Symbolic links are only followed if they're ignored.
+	// Parents are only created if the session ignores them in every form in
+	// which scans could see them.
+	if _, err := prepare("cafe\u0301/x.json"); err == nil || !strings.Contains(err.Error(), "only some Unicode normalization forms") {
+		t.Fatal("partially ignored parent created:", err)
+	} else if _, err := os.Lstat(filepath.Join(root, "cafe\u0301")); err == nil {
+		t.Fatal("partially ignored parent exists")
+	}
+
+	// Symbolic links are only followed if they're ignored, and parents are
+	// checked where they land through them, so that ignored links don't lead
+	// to synchronized content.
 	if runtime.GOOS == "windows" {
 		return
 	}
 	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
-		t.Fatal(err)
-	} else if err := os.Symlink(outside, filepath.Join(root, "synchronized")); err != nil {
-		t.Fatal(err)
+	for link, target := range map[string]string{"linked": outside, "synchronized": outside, "into-src": "src", "into-results": "results"} {
+		if err := os.Symlink(target, filepath.Join(root, link)); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := prepareParents(target, locator, "linked/train.log"); err != nil {
+	resolvedRoot, _ := filepath.EvalSymlinks(root)
+	resolvedOutside, _ := filepath.EvalSymlinks(outside)
+	if landing, err := prepare("linked/train.log"); err != nil {
 		t.Fatal("ignored symbolic link not followed:", err)
-	} else if err := prepareParents(target, locator, "synchronized/train.log"); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+	} else if landing != filepath.Join(resolvedOutside, "train.log") {
+		t.Fatal("incorrect landing through a symbolic link:", landing)
+	} else if _, err := prepare("synchronized/train.log"); err == nil || !strings.Contains(err.Error(), "symbolic link") {
 		t.Fatal("synchronized symbolic link followed:", err)
+	} else if landing, err := prepare("linked/run1/train.log"); err != nil || landing != filepath.Join(resolvedOutside, "run1", "train.log") {
+		t.Fatal("parent outside the root not created:", landing, err)
+	} else if landing, err := prepare("into-results/run2/metrics.json"); err != nil || landing != filepath.Join(resolvedRoot, "results", "run2", "metrics.json") {
+		t.Fatal("parent landing in ignored content not created:", landing, err)
+	} else if _, err := prepare("into-src/run1/metrics.json"); err == nil ||
+		!strings.Contains(err.Error(), "into-src/run1 resolves to src/run1 through a symbolic link, and the session synchronizes that, so remote doesn't create it") {
+		t.Fatal("parent landing in synchronized content created:", err)
+	} else if _, err := os.Lstat(filepath.Join(root, "src", "run1")); err == nil {
+		t.Fatal("parent created in synchronized content")
+	} else if landing, err := prepare("into-src/a.py"); err != nil || landing != filepath.Join(resolvedRoot, "src", "a.py") {
+		t.Fatal("incorrect landing in synchronized content:", landing, err)
+	}
+}
+
+func TestPullChecks(t *testing.T) {
+	// Paths must be ignored in every form in which scans could see them, so
+	// literal patterns that match only one form of a name don't allow pulling
+	// it in any form, while patterns that match every form do.
+	composed, decomposed := "caf\u00e9.txt", "cafe\u0301.txt"
+	literal := &remote.Ignores{Syntax: ignore.Syntax_SyntaxDocker, Patterns: []string{composed, "data", "!data/keep"}}
+	wildcard := &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"caf*.txt"}}
+	for _, test := range []struct {
+		ignores   *remote.Ignores
+		path      string
+		directory bool
+		refusal   string
+	}{
+		{literal, decomposed, false, "the session ignores it in only some Unicode normalization forms of its path and may synchronize it"},
+		{literal, composed, false, "the session ignores it in only some Unicode normalization forms of its path and may synchronize it"},
+		{wildcard, decomposed, false, ""},
+		{wildcard, composed, true, ""},
+		{literal, "train.py", false, "the session synchronizes it, so remote doesn't write it"},
+		{literal, "data", true, "the session synchronizes some content beneath it"},
+		{literal, "data", false, ""},
+		{literal, "data/other", false, ""},
+	} {
+		if err := checkIgnored(test.ignores, test.path, test.directory); test.refusal == "" && err != nil {
+			t.Errorf("%q (directory: %t) refused: %v", test.path, test.directory, err)
+		} else if test.refusal != "" && (err == nil || !strings.Contains(err.Error(), test.refusal)) {
+			t.Errorf("%q (directory: %t) not refused correctly: %v", test.path, test.directory, err)
+		}
+	}
+
+	// Paths are checked where writes to them land, given the root, both with
+	// symbolic links resolved: inside the root, the session must ignore that
+	// path, and outside it, directories mustn't contain the root.
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	target := &remote.Target{
+		Root: root, Path: "sub", Contained: true,
+		Ignores: &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"results/", "into-*", composed}},
+	}
+	locator := newLocator(target)
+	for _, test := range []struct {
+		landing   string
+		directory bool
+		refusal   string
+	}{
+		{filepath.Join(root, "results", "x"), false, ""},
+		{filepath.Join(root, "results"), true, ""},
+		{filepath.Join(base, "outside", "x"), true, ""},
+		{filepath.Join(root, "src", "data"), false, "it resolves to ../src/data through a symbolic link, and the session synchronizes that, so remote doesn't write it"},
+		{filepath.Join(root, "results"), false, "it resolves to ../results through a symbolic link, and the session synchronizes that"},
+		{filepath.Join(root, decomposed), false, "it resolves to ../" + decomposed + " through a symbolic link, and the session ignores that in only some Unicode normalization forms"},
+		{root, true, "it resolves to the session's root (..) through a symbolic link"},
+		{base, true, "it resolves to " + base + " through a symbolic link, which contains the session's root"},
+		{base, false, ""},
+	} {
+		if err := checkLanding(target, locator, root, test.landing, test.directory, "it", "write it"); test.refusal == "" && err != nil {
+			t.Errorf("landing at %s (directory: %t) refused: %v", test.landing, test.directory, err)
+		} else if test.refusal != "" && (err == nil || !strings.Contains(err.Error(), test.refusal)) {
+			t.Errorf("landing at %s (directory: %t) not refused correctly: %v", test.landing, test.directory, err)
+		}
 	}
 }
