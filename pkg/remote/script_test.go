@@ -153,7 +153,12 @@ func TestExecuteScriptFailures(t *testing.T) {
 		t.Fatalf("incorrect invalid #! line result: %d, %v", code, err)
 	}
 
-	// Cancellation terminates the script and removes its file.
+	// Cancellation terminates the script and removes its file. SIGTERM can
+	// arrive after bash forks sleep but before sleep executes, when the child
+	// doesn't act on it, in which case only SIGKILL ends sleep once the grace
+	// period expires, so the grace period is shortened to keep that within the
+	// time that executeTest waits for the server.
+	useTerminationGracePeriod(t, 500*time.Millisecond)
 	request = &Request{Script: &Script{Name: "-", Contents: []byte("printf ready\nsleep 60\n")}, Directory: t.TempDir()}
 	cancelled, cancelScript := context.WithCancel(ctx)
 	defer cancelScript()

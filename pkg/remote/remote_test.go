@@ -79,7 +79,17 @@ func helperRequest(t *testing.T, mode string, arguments ...string) *Request {
 	}
 }
 
-// executeTest uses a real duplex connection and waits for server cleanup.
+// useTerminationGracePeriod sets the termination grace period for a test.
+func useTerminationGracePeriod(t *testing.T, period time.Duration) {
+	t.Helper()
+	previous := terminationGracePeriod
+	terminationGracePeriod = period
+	t.Cleanup(func() { terminationGracePeriod = previous })
+}
+
+// executeTest uses a real duplex connection and waits for server cleanup,
+// which takes up to the termination grace period for cancelled commands, so
+// tests that cancel commands should shorten it (see useTerminationGracePeriod).
 // Requests specify absolute working directories, so no root is needed.
 func executeTest(t *testing.T, ctx context.Context, request *Request, input io.Reader, output, errorOutput io.Writer) (int, error) {
 	t.Helper()
