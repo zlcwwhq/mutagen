@@ -123,6 +123,37 @@ type Job struct {
 	// Elapsed is the time for which the job has run, or ran, if known, as
 	// measured on the executing system.
 	Elapsed time.Duration `json:",omitempty"`
+	// Group is the identifier of the job's process group, which its
+	// supervisor led. It's zero if the executing endpoint predates its
+	// reporting.
+	Group int `json:",omitempty"`
+	// Leftovers are processes that remain in the job's process group after
+	// the job has ended, which its command left running, ordered by process
+	// identifier, as found on systems where processes can be listed (see
+	// findLeftovers). At most maximumLeftovers of them are listed.
+	Leftovers []JobProcess `json:",omitempty"`
+	// OmittedLeftovers is the number of leftover processes that weren't
+	// listed in Leftovers because of its limit.
+	OmittedLeftovers int `json:",omitempty"`
+	// GroupMayRemain indicates that, on a system where processes can't be
+	// listed, the job has ended but a process group with its group's
+	// identifier still exists, which may be the job's group, with processes
+	// that its command left running, or a new group to which the system
+	// assigned the identifier once the job's group had ended.
+	GroupMayRemain bool `json:",omitempty"`
+}
+
+// maximumLeftovers is the maximum number of leftover processes listed for a
+// job (see Job.Leftovers), which bounds the size of job results.
+const maximumLeftovers = 100
+
+// JobProcess describes a process that a job's command left running.
+type JobProcess struct {
+	// PID is the process identifier.
+	PID int
+	// Command is the process's command line, with its arguments separated by
+	// spaces, truncated if it's long.
+	Command string
 }
 
 // jobRecord is the on-disk description of a detached job.
@@ -189,6 +220,7 @@ func loadJob(directory string) (*jobRecord, *Job, error) {
 		Script:    record.Script,
 		Log:       record.Log,
 		Started:   record.Started,
+		Group:     record.PID,
 	}
 	if path, contained := relativePath(record.Root, record.Log); contained {
 		job.LogPath = path
@@ -307,7 +339,10 @@ func findJob(directory, root, id string) (*jobRecord, *Job, error) {
 // serveJob performs a job operation other than starting a job for an executor
 // with the specified normalized root, writing job listings to the specified
 // output as one JSON object per line, so that they aren't bounded by the size
-// of protocol messages.
+// of protocol messages. Jobs that have ended are reported along with the
+// processes that their commands left running, if any (see findLeftovers).
+// Those processes aren't part of the jobs any more, so killing the jobs
+// doesn't terminate them.
 func serveJob(ctx context.Context, root string, request *JobRequest, output io.Writer) result {
 	if !jobsSupported {
 		return result{Error: errJobsUnsupported.Error()}
@@ -320,6 +355,7 @@ func serveJob(ctx context.Context, root string, request *JobRequest, output io.W
 	case JobList:
 		pruneJobs(directory)
 		jobs, hidden := listJobs(directory, root)
+		findLeftovers(jobs)
 		encoder := json.NewEncoder(output)
 		for _, job := range jobs {
 			if err := encoder.Encode(job); err != nil {
@@ -333,6 +369,7 @@ func serveJob(ctx context.Context, root string, request *JobRequest, output io.W
 			if err != nil {
 				return result{Error: err.Error()}
 			} else if job.State != JobRunning {
+				findLeftovers([]*Job{job})
 				return result{Job: job}
 			}
 			select {
@@ -346,6 +383,7 @@ func serveJob(ctx context.Context, root string, request *JobRequest, output io.W
 		if err != nil {
 			return result{Error: err.Error()}
 		} else if job.State != JobRunning {
+			findLeftovers([]*Job{job})
 			return result{Job: job}
 		} else if host, err := os.Hostname(); err != nil || host != record.Host {
 			return result{Error: fmt.Sprintf("job %s was started on %s, not on this system", request.ID, record.Host)}
@@ -354,6 +392,7 @@ func serveJob(ctx context.Context, root string, request *JobRequest, output io.W
 		if err != nil {
 			return result{Error: fmt.Sprintf("unable to terminate job %s: %v", request.ID, err)}
 		}
+		findLeftovers([]*Job{job})
 		return result{Job: job}
 	default:
 		return result{Error: fmt.Sprintf("unknown job operation %q", request.Operation)}

@@ -225,8 +225,11 @@ exits:
     group, with no standard input.
   - A job ends when its command exits. Processes that the command leaves
     running in the background aren't part of the job afterwards: remote --wait
-    doesn't wait for them, and remote --kill doesn't terminate them. Scripts
-    that start background processes should wait for them.
+    doesn't wait for them, and remote --kill doesn't terminate them. On Linux
+    endpoints, remote --jobs, --wait, and --kill list those that remain in an
+    ended job's process group, which remote -- kill PID... terminates; on
+    other endpoints, they only report that the group may still have
+    processes. Scripts that start background processes should wait for them.
   - Output goes to --log FILE (relative to the command's directory; absolute
     and ~ paths are on the opposite endpoint), which must be a regular file
     (truncated first) or a character device such as /dev/null, not a FIFO, or

@@ -23,6 +23,10 @@ func startJob(_, _ string, _ bool, _ *Request) result {
 	return result{ExitCode: 126, Error: errJobsUnsupported.Error()}
 }
 
+// findLeftovers looks for processes that ended jobs left running. Detached jobs
+// aren't supported on this system, so it does nothing.
+func findLeftovers(_ []*Job) {}
+
 // terminateJob terminates a running job. Detached jobs aren't supported on
 // this system.
 func terminateJob(_ string, _ int) (*Job, error) {

@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -21,6 +23,13 @@ const (
 	waitRetryPeriod = time.Minute
 	// waitRetryInterval is the interval between those retries.
 	waitRetryInterval = time.Second
+	// maximumShownLeftovers is the maximum number of the processes that a job
+	// left running that are shown for the job.
+	maximumShownLeftovers = 5
+	// groupListingCommand is the command suggested for listing processes with
+	// their process groups where the processes that a job left running can't
+	// be listed.
+	groupListingCommand = "remote -- ps -A -o pid,pgid,args"
 )
 
 // executing names the endpoint that executes operations submitted through a
@@ -142,12 +151,65 @@ func listJobs(router *router, output io.Writer) error {
 	return printJobs(output, newLocator(target), executing(target), jobs, hidden)
 }
 
-// printJobs prints a job listing.
+// describeLeftovers describes the processes that an ended job left running, if
+// any, on one line with control characters neutralized, showing at most
+// maximumShownLeftovers of them.
+func describeLeftovers(job *remote.Job) string {
+	var processes []string
+	for _, process := range job.Leftovers[:min(len(job.Leftovers), maximumShownLeftovers)] {
+		processes = append(processes, fmt.Sprintf("%d %s", process.PID, neutralizeLine(process.Command)))
+	}
+	if more := len(job.Leftovers) - len(processes) + job.OmittedLeftovers; more > 0 {
+		processes = append(processes, fmt.Sprintf("and %d more", more))
+	}
+	return strings.Join(processes, "; ")
+}
+
+// leftoverKillCommand returns the command that terminates the processes that an
+// ended job left running, as listed by the executing endpoint.
+func leftoverKillCommand(job *remote.Job) string {
+	words := []string{"remote", "--", "kill"}
+	for _, process := range job.Leftovers {
+		words = append(words, strconv.Itoa(process.PID))
+	}
+	return strings.Join(words, " ")
+}
+
+// describeLeftoverReport reports the processes that an ended job left running,
+// if any, or, where they can't be listed, that its process group may still
+// have processes. The report is a warning for remote --wait, while for remote
+// --kill it notes that remote --kill doesn't terminate them. It's empty if
+// there's nothing to report.
+func describeLeftoverReport(id string, job *remote.Job, kill bool) string {
+	if len(job.Leftovers) > 0 {
+		if kill {
+			return fmt.Sprintf("remote: job %s left processes running, which remote --kill doesn't terminate: %s; %s terminates them\n",
+				id, describeLeftovers(job), leftoverKillCommand(job))
+		}
+		return fmt.Sprintf("remote: warning: job %s left processes running: %s; %s terminates them\n",
+			id, describeLeftovers(job), leftoverKillCommand(job))
+	} else if job.GroupMayRemain {
+		if kill {
+			return fmt.Sprintf("remote: process group %d of job %s may still have processes that the job left running, which remote --kill doesn't terminate; %s lists processes with their groups\n",
+				job.Group, id, groupListingCommand)
+		}
+		return fmt.Sprintf("remote: warning: process group %d of job %s may still have processes that the job left running; %s lists processes with their groups\n",
+			job.Group, id, groupListingCommand)
+	}
+	return ""
+}
+
+// printJobs prints a job listing. Jobs that left processes running are followed
+// by a line that lists them.
 func printJobs(output io.Writer, locator *locator, endpoint string, jobs []*remote.Job, hidden int) error {
 	if len(jobs) == 0 {
 		fmt.Fprintf(output, "No jobs were started at this session's root on %s.\n", endpoint)
 	} else {
-		table := tabwriter.NewWriter(output, 0, 0, 2, ' ', 0)
+		// Format the table separately, since lines without cells, such as
+		// those listing leftover processes, would break its alignment. Each
+		// job's row is one line, since its cells have line breaks neutralized.
+		var buffer bytes.Buffer
+		table := tabwriter.NewWriter(&buffer, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(table, "ID\tSTATE\tELAPSED\tSTARTED\tLOG\tCOMMAND")
 		for _, job := range jobs {
 			elapsed := "-"
@@ -158,6 +220,32 @@ func printJobs(output io.Writer, locator *locator, endpoint string, jobs []*remo
 				job.Started.Local().Format("2006-01-02 15:04:05"), describeLog(locator, job), describeCommand(job))
 		}
 		if err := table.Flush(); err != nil {
+			return err
+		}
+
+		// Print the table, with each job's row followed by the processes that
+		// the job left running, if any.
+		var leftovers, groups bool
+		rows := strings.SplitAfter(buffer.String(), "\n")
+		var listing strings.Builder
+		listing.WriteString(rows[0])
+		for i, job := range jobs {
+			listing.WriteString(rows[i+1])
+			if len(job.Leftovers) > 0 {
+				leftovers = true
+				fmt.Fprintf(&listing, "  left running: %s\n", describeLeftovers(job))
+			} else if job.GroupMayRemain {
+				groups = true
+				fmt.Fprintf(&listing, "  process group %d may still have processes\n", job.Group)
+			}
+		}
+		if leftovers {
+			listing.WriteString("(Processes that jobs left running aren't part of them, so remote --kill doesn't terminate them; remote -- kill PID... does.)\n")
+		}
+		if groups {
+			fmt.Fprintf(&listing, "(%s lists processes with their groups.)\n", groupListingCommand)
+		}
+		if _, err := io.WriteString(output, listing.String()); err != nil {
 			return err
 		}
 	}
@@ -213,9 +301,10 @@ func waitJob(router *router, id string, synchronize bool) (int, error) {
 		}
 	}
 
-	// Report how the job ended.
+	// Report how the job ended, and any processes that it left running.
 	target := router.selection.Target
 	log := describeLog(newLocator(target), job)
+	code := job.ExitCode
 	switch job.State {
 	case remote.JobExited:
 		fmt.Fprintf(router.stderr, "remote: job %s exited with status %d after %s; output in %s\n", id, job.ExitCode, formatElapsed(job.Elapsed), log)
@@ -223,9 +312,10 @@ func waitJob(router *router, id string, synchronize bool) (int, error) {
 		fmt.Fprintf(router.stderr, "remote: job %s was terminated by remote --kill (status %d); output in %s\n", id, job.ExitCode, log)
 	default:
 		fmt.Fprintf(router.stderr, "remote: job %s ended without recording its exit status, such as because it was killed with SIGKILL or %s restarted; output in %s\n", id, executing(target), log)
-		return failureExitCode, nil
+		code = failureExitCode
 	}
-	return job.ExitCode, nil
+	fmt.Fprint(router.stderr, describeLeftoverReport(id, job, false))
+	return code, nil
 }
 
 // killJob terminates a detached job and reports its state.
@@ -238,15 +328,34 @@ func killJob(router *router, id string) error {
 	if err != nil {
 		return err
 	}
+	report, err := describeKill(id, job)
+	if err != nil {
+		return err
+	}
+	fmt.Fprint(router.stderr, report)
+	return nil
+}
+
+// describeKill reports the state of a job returned by remote --kill, followed
+// by any processes that the job left running, which remote --kill doesn't
+// terminate.
+func describeKill(id string, job *remote.Job) (string, error) {
+	var report string
 	switch job.State {
 	case remote.JobKilled:
-		fmt.Fprintf(router.stderr, "remote: terminated job %s (status %d)\n", id, job.ExitCode)
+		report = fmt.Sprintf("remote: terminated job %s (status %d)\n", id, job.ExitCode)
 	case remote.JobExited:
-		fmt.Fprintf(router.stderr, "remote: job %s had already exited with status %d; processes that it left running aren't terminated\n", id, job.ExitCode)
+		if job.Group == 0 {
+			// The executing endpoint predates the reporting of processes that
+			// jobs left running, so whether there are any is unknown.
+			report = fmt.Sprintf("remote: job %s had already exited with status %d; processes that it left running aren't terminated\n", id, job.ExitCode)
+		} else {
+			report = fmt.Sprintf("remote: job %s had already exited with status %d\n", id, job.ExitCode)
+		}
 	case remote.JobLost:
-		fmt.Fprintf(router.stderr, "remote: job %s had already ended without recording its exit status\n", id)
+		report = fmt.Sprintf("remote: job %s had already ended without recording its exit status\n", id)
 	default:
-		return fmt.Errorf("job %s is still running", id)
+		return "", fmt.Errorf("job %s is still running", id)
 	}
-	return nil
+	return report + describeLeftoverReport(id, job, true), nil
 }

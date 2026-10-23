@@ -360,6 +360,30 @@ func jobGroupRemains(pid int) bool {
 	return syscall.Kill(-pid, 0) != syscall.ESRCH
 }
 
+// endedJobs returns the specified jobs that have ended and whose process groups
+// are known, which are those for which leftover processes are looked for (see
+// findLeftovers).
+func endedJobs(jobs []*Job) []*Job {
+	var ended []*Job
+	for _, job := range jobs {
+		if job.State != JobRunning && job.Group > 0 {
+			ended = append(ended, job)
+		}
+	}
+	return ended
+}
+
+// probeJobGroups marks the specified jobs, which must have ended, as possibly
+// having leftover processes if a process group with their group's identifier
+// exists (see Job.GroupMayRemain), for systems on which processes can't be
+// listed. A group that this process isn't allowed to signal counts as
+// existing.
+func probeJobGroups(jobs []*Job) {
+	for _, job := range jobs {
+		job.GroupMayRemain = jobGroupRemains(job.Group)
+	}
+}
+
 // waitForJobExit waits until a job's lock is free and no process remains in its
 // process group, which its supervisor, with the specified process identifier,
 // leads, or until the specified deadline passes, and returns whether the job
@@ -386,12 +410,12 @@ func waitForJobExit(lock string, pid int, deadline time.Time) bool {
 // ignore SIGTERM, such as a command's workers, don't outlive a job reported as
 // killed. Processes that leave the group, such as with setsid, aren't
 // terminated, and neither are processes that the command left running once
-// the job has ended, since a job that has ended isn't terminated (see
-// serveJob). Zombies remain in the group until they're reaped, so where
-// orphans aren't reaped, such as in a container whose PID 1 doesn't reap them,
-// terminating a job can take the full grace period (and the wait after
-// SIGKILL) even if its processes exit at once. The wait is bounded, so that
-// only delays the result.
+// the job has ended, since a job that has ended isn't terminated (serveJob
+// reports them instead). Zombies remain in the group until they're reaped,
+// so where orphans aren't reaped, such as in a container whose PID 1 doesn't
+// reap them, terminating a job can take the full grace period (and the wait
+// after SIGKILL) even if its processes exit at once. The wait is bounded, so
+// that only delays the result.
 //
 // Termination runs to completion once it has started, even if the request for
 // it is cancelled, such as because remote was interrupted or timed out, or the
