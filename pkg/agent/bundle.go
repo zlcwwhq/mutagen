@@ -19,6 +19,12 @@ import (
 const (
 	// BundleName is the base name of the agent bundle.
 	BundleName = "mutagen-agents.tar.gz"
+	// BundleVersionEntryName is the name of the agent bundle's first entry,
+	// which contains the Mutagen version of the bundle's agents.
+	BundleVersionEntryName = "version"
+	// maximumBundleVersionEntrySize is the maximum size of the agent bundle's
+	// version entry.
+	maximumBundleVersionEntrySize = 256
 )
 
 // BundleLocation encodes an expected location for the agent bundle.
@@ -44,13 +50,43 @@ const (
 // package.
 var ExpectedBundleLocation BundleLocation
 
-// ExecutableForPlatform attempts to locate the agent bundle and extract an
-// agent executable for the specified target platform. If no output path is
-// specified, then the extracted file will be in a temporary location accessible
-// to only the user, will have an appropriate extension for the target platform,
-// and will have the executability bit set if it makes sense. The path to the
-// extracted file will be returned, and the caller is responsible for cleaning
-// up the file if this function returns a nil error.
+// verifyBundleVersion reads the first entry of an agent bundle archive, which
+// must be the bundle's version entry, and verifies that the version that it
+// contains is the current Mutagen version. Bundles of earlier releases don't
+// have a version entry.
+func verifyBundleVersion(bundleArchive *tar.Reader) error {
+	// Read the first header and ensure that it's for the version entry.
+	header, err := bundleArchive.Next()
+	if err == io.EOF {
+		return errors.New("bundle is empty")
+	} else if err != nil {
+		return fmt.Errorf("unable to read archive header: %w", err)
+	} else if header.Name != BundleVersionEntryName {
+		return fmt.Errorf("bundle doesn't record its version and thus isn't from Mutagen %s", mutagen.Version)
+	} else if header.Size > maximumBundleVersionEntrySize {
+		return errors.New("version entry too large")
+	}
+
+	// Read the version and compare it with ours.
+	version, err := io.ReadAll(bundleArchive)
+	if err != nil {
+		return fmt.Errorf("unable to read version entry: %w", err)
+	} else if string(version) != mutagen.Version {
+		return fmt.Errorf("bundle is from Mutagen %s, not %s", version, mutagen.Version)
+	}
+
+	// Success.
+	return nil
+}
+
+// ExecutableForPlatform attempts to locate the agent bundle, verify that it's
+// from the current Mutagen version, and extract an agent executable for the
+// specified target platform. If no output path is specified, then the extracted
+// file will be in a temporary location accessible to only the user, will have
+// an appropriate extension for the target platform, and will have the
+// executability bit set if it makes sense. The path to the extracted file will
+// be returned, and the caller is responsible for cleaning up the file if this
+// function returns a nil error.
 func ExecutableForPlatform(goos, goarch, outputPath string) (string, error) {
 	// Compute the path to the location in which we expect to find the agent
 	// bundle.
@@ -81,21 +117,23 @@ func ExecutableForPlatform(goos, goarch, outputPath string) (string, error) {
 	// Loop until we find a bundle file. If we fail to locate a bundle, then
 	// abort. If we succeed, then defer its closure.
 	var bundle *os.File
+	var bundlePath string
 	for _, path := range bundleSearchPaths {
-		bundlePath := filepath.Join(path, BundleName)
-		if file, err := os.Open(bundlePath); err != nil {
+		candidatePath := filepath.Join(path, BundleName)
+		if file, err := os.Open(candidatePath); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			return "", fmt.Errorf("unable to open agent bundle (%s): %w", bundlePath, err)
+			return "", fmt.Errorf("unable to open agent bundle (%s): %w", candidatePath, err)
 		} else if metadata, err := file.Stat(); err != nil {
 			file.Close()
-			return "", fmt.Errorf("unable to access agent bundle (%s) file metadata: %w", bundlePath, err)
+			return "", fmt.Errorf("unable to access agent bundle (%s) file metadata: %w", candidatePath, err)
 		} else if metadata.Mode()&os.ModeType != 0 {
 			file.Close()
-			return "", fmt.Errorf("agent bundle (%s) is not a file", bundlePath)
+			return "", fmt.Errorf("agent bundle (%s) is not a file", candidatePath)
 		} else {
 			bundle = file
+			bundlePath = candidatePath
 			defer bundle.Close()
 		}
 	}
@@ -112,6 +150,17 @@ func ExecutableForPlatform(goos, goarch, outputPath string) (string, error) {
 
 	// Create an archive reader.
 	bundleArchive := tar.NewReader(bundleDecompressor)
+
+	// Verify that the bundle's agents are of this version. The version
+	// handshake only covers the major, minor, and patch components, which
+	// releases of this fork share, and endpoints keep an installed agent under
+	// this version's path, so an agent from another release's bundle would be
+	// used without any error. Since the agent bundle is released separately
+	// from the CLI, a bundle from an earlier installation is easily left in
+	// place when upgrading.
+	if err := verifyBundleVersion(bundleArchive); err != nil {
+		return "", fmt.Errorf("unusable agent bundle (%s): %w", bundlePath, err)
+	}
 
 	// Scan until we find a matching header.
 	var header *tar.Header
