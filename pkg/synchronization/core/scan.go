@@ -332,23 +332,66 @@ func (s *scanner) symbolicLink(
 // a single endpoint. A derivative name may still match a real name on the
 // opposite endpoint, in which case reconciliation sees the untracked or
 // problematic entry at that path just as it would for any other content.
-func recordNonUTF8Contents(contents map[string]*Entry, names []string, ignoreMask bool) {
+//
+// If the scan is cancelled while recording, then ErrScanCancelled is returned
+// and the content map may contain entries for only some of the names.
+func (s *scanner) recordNonUTF8Contents(contents map[string]*Entry, names []string, ignoreMask bool) error {
+	// If there are no names to record, which is the common case, then we're
+	// done.
+	if len(names) == 0 {
+		return nil
+	}
+
 	// Sort names by their raw bytes.
 	sort.Strings(names)
 
+	// Track, for each escaped name, the number of the first suffix that the
+	// next name with that escaped form should try, where 1 denotes the
+	// unnumbered " (non-UTF-8)" suffix. Names that only differ in their invalid
+	// byte sequences share an escaped form (each run of invalid bytes becomes a
+	// single replacement character), so a directory can contain arbitrarily
+	// many of them, and restarting the search from the unnumbered suffix for
+	// each one would make recording quadratic in their number.
+	nextSuffixes := make(map[string]int)
+
 	// Record entries.
 	for _, name := range names {
-		// Find the first derivative name that isn't in use. This loop must
-		// terminate because each iteration checks a distinct name and the
-		// content map is finite.
+		// Check for cancellation.
+		select {
+		case <-s.cancelled:
+			return ErrScanCancelled
+		default:
+		}
+
+		// Find the first derivative name that isn't in use, starting from the
+		// suffix after the one taken by the previous name with the same escaped
+		// form (if any). This finds the same derivative name as a search
+		// starting from the unnumbered suffix would: that previous name took
+		// the first derivative name not in use at the time, so every
+		// derivative name up to and including the one it took was in use then,
+		// and since entries are never removed from the content map, they all
+		// still are. Each derivative name is thus checked at most once for
+		// each escaped form, either when it's taken or when it's skipped, which
+		// keeps recording linear in the number of names and content map
+		// entries. This loop must terminate because each iteration checks a
+		// distinct name and the content map is finite.
 		escapedName := strings.ToValidUTF8(name, "�")
-		key := escapedName + " (non-UTF-8)"
-		for n := 2; ; n++ {
+		n, ok := nextSuffixes[escapedName]
+		if !ok {
+			n = 1
+		}
+		var key string
+		for ; ; n++ {
+			if n == 1 {
+				key = escapedName + " (non-UTF-8)"
+			} else {
+				key = fmt.Sprintf("%s (non-UTF-8 %d)", escapedName, n)
+			}
 			if _, ok := contents[key]; !ok {
 				break
 			}
-			key = fmt.Sprintf("%s (non-UTF-8 %d)", escapedName, n)
 		}
+		nextSuffixes[escapedName] = n + 1
 
 		// Record the entry.
 		if ignoreMask {
@@ -360,6 +403,9 @@ func recordNonUTF8Contents(contents map[string]*Entry, names []string, ignoreMas
 			}
 		}
 	}
+
+	// Success.
+	return nil
 }
 
 // directory performs processing of a directory entry. Exactly one of parent or
@@ -672,7 +718,9 @@ func (s *scanner) directory(
 	// entries under the real names of all other content (excluding temporary
 	// files and content that disappeared during the scan, neither of which we
 	// need to avoid colliding with).
-	recordNonUTF8Contents(contents, nonUTF8ContentNames, ignoreMask)
+	if err := s.recordNonUTF8Contents(contents, nonUTF8ContentNames, ignoreMask); err != nil {
+		return nil, err
+	}
 
 	// Determine the kind of directory that we'll yield. We could do more
 	// aggressive reification of phantom directories here (converting them to

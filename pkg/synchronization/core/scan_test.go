@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1153,6 +1157,35 @@ func TestRecordNonUTF8Contents(t *testing.T) {
 				"hell� (non-UTF-8 5)": tU,
 			},
 		},
+		{
+			"interleaved displayed names with gaps between valid names",
+			map[string]*Entry{
+				"hell� (non-UTF-8)":    tF1,
+				"hell� (non-UTF-8 3)":  tF2,
+				"hell� (non-UTF-8 4)":  tD0,
+				"hell� (non-UTF-8 7)":  tF3,
+				"hell�x (non-UTF-8 2)": tU,
+			},
+			// In byte order, names displayed as "hell�" and "hell�x"
+			// alternate, so each displayed name's suffix numbering has to
+			// continue where the previous name with the same displayed name
+			// stopped, regardless of names in between.
+			[]string{"hell\x80", "hell\x80x", "hell\x80\x80", "hell\xfex", "hell\xff", "hell\xff\xfe"},
+			false,
+			map[string]*Entry{
+				"hell� (non-UTF-8)":    tF1,
+				"hell� (non-UTF-8 2)":  tPInvalidUTF8(`"hell\x80"`),
+				"hell� (non-UTF-8 3)":  tF2,
+				"hell� (non-UTF-8 4)":  tD0,
+				"hell� (non-UTF-8 5)":  tPInvalidUTF8(`"hell\x80\x80"`),
+				"hell� (non-UTF-8 6)":  tPInvalidUTF8(`"hell\xff"`),
+				"hell� (non-UTF-8 7)":  tF3,
+				"hell� (non-UTF-8 8)":  tPInvalidUTF8(`"hell\xff\xfe"`),
+				"hell�x (non-UTF-8)":   tPInvalidUTF8(`"hell\x80x"`),
+				"hell�x (non-UTF-8 2)": tU,
+				"hell�x (non-UTF-8 3)": tPInvalidUTF8(`"hell\xfex"`),
+			},
+		},
 	}
 
 	// Process test cases.
@@ -1164,7 +1197,9 @@ func TestRecordNonUTF8Contents(t *testing.T) {
 				contents[name] = entry
 			}
 			order := fmt.Sprintf("%q", names)
-			recordNonUTF8Contents(contents, names, test.ignoreMask)
+			if err := (&scanner{}).recordNonUTF8Contents(contents, names, test.ignoreMask); err != nil {
+				t.Fatalf("%s: unable to record names in order %s: %v", test.description, order, err)
+			}
 
 			// Check the result.
 			if !(&Entry{Contents: contents}).Equal(&Entry{Contents: test.expected}, true) {
@@ -1173,5 +1208,200 @@ func TestRecordNonUTF8Contents(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+// testingRecordNonUTF8ContentsWithRestartedSearch is a reference
+// implementation of recordNonUTF8Contents that searches for each name's
+// derivative name starting from the unnumbered suffix, which is quadratic in
+// the number of names that share a displayed name but obviously assigns each
+// name the first derivative name that isn't in use. It doesn't check for
+// cancellation.
+func testingRecordNonUTF8ContentsWithRestartedSearch(contents map[string]*Entry, names []string, ignoreMask bool) {
+	sort.Strings(names)
+	for _, name := range names {
+		escapedName := strings.ToValidUTF8(name, "�")
+		key := escapedName + " (non-UTF-8)"
+		for n := 2; ; n++ {
+			if _, ok := contents[key]; !ok {
+				break
+			}
+			key = fmt.Sprintf("%s (non-UTF-8 %d)", escapedName, n)
+		}
+		if ignoreMask {
+			contents[key] = &Entry{Kind: EntryKind_Untracked}
+		} else {
+			contents[key] = &Entry{
+				Kind:    EntryKind_Problematic,
+				Problem: "non-UTF-8 filename " + strconv.Quote(name),
+			}
+		}
+	}
+}
+
+// TestRecordNonUTF8ContentsMatchesRestartedSearch tests that
+// recordNonUTF8Contents assigns the same derivative names as
+// testingRecordNonUTF8ContentsWithRestartedSearch for randomly generated (but
+// reproducible) names and valid content occupying derivative names.
+func TestRecordNonUTF8ContentsMatchesRestartedSearch(t *testing.T) {
+	// Create a deterministic random number generator.
+	random := rand.New(rand.NewSource(0))
+
+	// Define the parts that surround the invalid byte sequences in names. Names
+	// with the same parts are displayed identically, and parts are chosen such
+	// that names with different parts can sort between them.
+	prefixes := []string{"", "a", "hell"}
+	suffixes := []string{"", "x"}
+
+	// Process test cases.
+	for i := 0; i < 1000; i++ {
+		// Create valid content occupying random derivative names.
+		valid := make(map[string]*Entry)
+		for j := random.Intn(20); j > 0; j-- {
+			escapedName := prefixes[random.Intn(len(prefixes))] + "�" + suffixes[random.Intn(len(suffixes))]
+			if n := 1 + random.Intn(15); n == 1 {
+				valid[escapedName+" (non-UTF-8)"] = tF1
+			} else {
+				valid[fmt.Sprintf("%s (non-UTF-8 %d)", escapedName, n)] = tF1
+			}
+		}
+
+		// Generate distinct names in random order. The invalid byte sequences
+		// consist of continuation bytes without a leading byte, so each is
+		// displayed as a single replacement character.
+		var names []string
+		generated := make(map[string]bool)
+		for j := random.Intn(40); j > 0; j-- {
+			invalid := make([]byte, 1+random.Intn(3))
+			for k := range invalid {
+				invalid[k] = 0x80 + byte(random.Intn(64))
+			}
+			name := prefixes[random.Intn(len(prefixes))] + string(invalid) + suffixes[random.Intn(len(suffixes))]
+			if !generated[name] {
+				generated[name] = true
+				names = append(names, name)
+			}
+		}
+		ignoreMask := random.Intn(2) == 0
+
+		// Record the names using both implementations.
+		expected := make(map[string]*Entry, len(valid)+len(names))
+		contents := make(map[string]*Entry, len(valid)+len(names))
+		for name, entry := range valid {
+			expected[name] = entry
+			contents[name] = entry
+		}
+		order := fmt.Sprintf("%q", names)
+		testingRecordNonUTF8ContentsWithRestartedSearch(expected, append([]string(nil), names...), ignoreMask)
+		if err := (&scanner{}).recordNonUTF8Contents(contents, names, ignoreMask); err != nil {
+			t.Fatalf("test case %d: unable to record names: %v", i, err)
+		}
+
+		// Check the result.
+		if !(&Entry{Contents: contents}).Equal(&Entry{Contents: expected}, true) {
+			t.Errorf("test case %d: result for names %s not equal to expected: %v != %v",
+				i, order, contents, expected,
+			)
+		}
+	}
+}
+
+// TestRecordNonUTF8ContentsCancelled tests that recordNonUTF8Contents stops
+// recording and reports cancellation if the scan has been cancelled.
+func TestRecordNonUTF8ContentsCancelled(t *testing.T) {
+	// Create a scanner with a closed cancellation channel.
+	cancelled := make(chan struct{})
+	close(cancelled)
+	s := &scanner{cancelled: cancelled}
+
+	// Attempt to record names and ensure that the recording was cancelled.
+	contents := map[string]*Entry{"hell": tF1}
+	err := s.recordNonUTF8Contents(contents, []string{"hell\xff", "hell\xfe", "a\xff"}, false)
+	if err != ErrScanCancelled {
+		t.Fatalf("unexpected error: %v != %v", err, ErrScanCancelled)
+	}
+
+	// Since cancellation is checked before recording each name, no names
+	// should have been recorded.
+	expected := map[string]*Entry{"hell": tF1}
+	if !(&Entry{Contents: contents}).Equal(&Entry{Contents: expected}, true) {
+		t.Errorf("result not equal to expected: %v != %v", contents, expected)
+	}
+}
+
+// TestRecordNonUTF8ContentsLargeGroup tests recordNonUTF8Contents with a large
+// number of names that share a displayed name, with valid content occupying
+// some of their derivative names. This used to take time quadratic in the
+// number of names (minutes for this many names), while it now takes a fraction
+// of a second, so the test fails if recording exceeds a time limit that's
+// generous enough for slow test environments (including the race detector).
+// The limit is enforced by cancelling the recording, which also keeps a
+// regression from stalling the test.
+func TestRecordNonUTF8ContentsLargeGroup(t *testing.T) {
+	// Define the number of names and a function to generate them. Each name
+	// consists of "x" followed by three continuation bytes without a leading
+	// byte, so all names are displayed as "x�", and their byte order matches
+	// their index order.
+	const count = 50000
+	name := func(index int) string {
+		return string([]byte{
+			'x',
+			0x80 + byte(index>>12&0x3f),
+			0x80 + byte(index>>6&0x3f),
+			0x80 + byte(index&0x3f),
+		})
+	}
+
+	// Define a function to compute derivative names.
+	key := func(n int) string {
+		if n == 1 {
+			return "x� (non-UTF-8)"
+		}
+		return fmt.Sprintf("x� (non-UTF-8 %d)", n)
+	}
+
+	// Create valid content occupying every tenth derivative name, beyond the
+	// range of derivative names that the names will need.
+	const validCount = count / 4
+	contents := make(map[string]*Entry, validCount+count)
+	for n := 1; n <= validCount; n++ {
+		contents[key(10*n)] = tF1
+	}
+
+	// Generate names in reverse byte order.
+	names := make([]string, count)
+	for i := range names {
+		names[i] = name(count - 1 - i)
+	}
+
+	// Record the names, cancelling the recording if it exceeds the time limit.
+	// If the timer has already fired when we stop it, then the recording
+	// exceeded the time limit, whether or not it was cancelled as a result.
+	cancelled := make(chan struct{})
+	timer := time.AfterFunc(30*time.Second, func() { close(cancelled) })
+	err := (&scanner{cancelled: cancelled}).recordNonUTF8Contents(contents, names, false)
+	if !timer.Stop() {
+		t.Fatal("recording did not complete within time limit")
+	} else if err != nil {
+		t.Fatal("unable to record names:", err)
+	}
+
+	// Verify that the names were assigned the derivative names not occupied
+	// by valid content, in byte order. Since each name is found at a distinct
+	// derivative name, the content count also verifies that no valid content
+	// was displaced.
+	if len(contents) != validCount+count {
+		t.Errorf("content count not equal to expected: %d != %d", len(contents), validCount+count)
+	}
+	n := 1
+	for i := 0; i < count; i++ {
+		if n%10 == 0 {
+			n++
+		}
+		expected := tPInvalidUTF8(strconv.Quote(name(i)))
+		if entry := contents[key(n)]; !entry.Equal(expected, true) {
+			t.Fatalf("entry at %q not equal to expected: %v != %v", key(n), entry, expected)
+		}
+		n++
 	}
 }
