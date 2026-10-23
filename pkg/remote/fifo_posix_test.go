@@ -3,10 +3,11 @@
 package remote
 
 import (
-	"syscall"
+	"golang.org/x/sys/unix"
 )
 
-// mkfifo creates a named pipe.
+// mkfifo creates a named pipe. It uses the unix package, since the syscall
+// package lacks Mkfifo on some systems, such as AIX.
 func mkfifo(path string) error {
-	return syscall.Mkfifo(path, 0600)
+	return unix.Mkfifo(path, 0600)
 }

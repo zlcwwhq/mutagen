@@ -1,10 +1,11 @@
-//go:build !windows
+//go:build !windows && !aix
 
 package remote
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,8 +20,15 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/mutagen"
 )
 
-// jobsSupported indicates whether detached jobs are supported on this system.
+// jobsSupported indicates whether detached jobs are supported on this system
+// (see jobs_unsupported.go for the systems on which they aren't).
 const jobsSupported = true
+
+// jobStartTimeout is the time within which a job's supervisor must report that
+// the job's command is starting (see supervisorScript), after which the job is
+// killed and fails to start. Supervisors only run a few shell builtins before
+// reporting, so it only bounds the wait for one that hangs.
+const jobStartTimeout = 30 * time.Second
 
 // supervisorScript runs a detached job's command, specified by its arguments
 // after the job directory, and records its exit status in the job directory
@@ -36,10 +44,25 @@ const jobsSupported = true
 // defaults, and exec makes it an external command, as for commands run in the
 // foreground, rather than a builtin or function. Only builtins are used, so
 // that the supervisor doesn't depend on the PATH set for the command.
+//
+// Before executing the command, the subshell writes a byte to the pipe
+// inherited as descriptor 4, which it also keeps from the command. startJob
+// waits for the byte before recording the job and reporting its identifier,
+// without which the job can't be killed, so that by the time it can be,
+// signals sent to the group reach the subshell, or the command that replaces
+// it, with their default actions. Otherwise, a signal that arrived before the
+// supervisor caught signals would kill the supervisor, and one that arrived
+// before the subshell existed would be caught without reaching the command,
+// which would then run until killed with SIGKILL, so that either way the job
+// would end without the chance to exit cleanly, and with the status of
+// SIGKILL. The supervisor keeps its copy of the pipe until it exits, so the
+// pipe only closes without the byte once the supervisor has exited, and the
+// subshell doesn't execute the command if it can't write the byte, which only
+// happens once startJob has stopped waiting for it.
 const supervisorScript = `mutagen_job=$1
 shift
 trap : HUP INT TERM
-(exec "$@") 3>&-
+(printf . >&4 && exec "$@" 4>&-) 3>&-
 mutagen_status=$?
 printf '%s\n' "$mutagen_status" > "$mutagen_job/status"`
 
@@ -141,20 +164,46 @@ func startJob(root, prologue string, alpha bool, request *Request) result {
 		return result{Error: fmt.Sprintf("unable to lock job: %v", err)}
 	}
 
+	// Create the pipe through which the supervisor reports that the command is
+	// starting (see supervisorScript).
+	ready, readyWriter, err := os.Pipe()
+	if err != nil {
+		return result{Error: fmt.Sprintf("unable to create job pipe: %v", err)}
+	}
+	defer ready.Close()
+
 	// Start the supervisor in a new session, so that it neither receives
 	// signals meant for the executor's process group or terminal nor is
-	// terminated along with the executor's commands.
+	// terminated along with the executor's commands. This executor closes its
+	// copy of the pipe's write end once the supervisor has started, so that
+	// only the supervisor and its subshell hold it. Other processes that this
+	// process starts don't inherit it, since descriptors are opened
+	// close-on-exec.
 	supervisor := exec.Command(prologueShell, slices.Concat([]string{"-c", supervisorScript, "remote-job", jobDirectory}, command.arguments)...)
 	supervisor.Dir = command.directory
 	supervisor.Env = append(supervisor.Environ(), slices.Concat(command.environment, []string{JobVariable + "=" + id})...)
 	supervisor.Stdout, supervisor.Stderr = log, log
-	supervisor.ExtraFiles = []*os.File{lock}
+	supervisor.ExtraFiles = []*os.File{lock, readyWriter}
 	supervisor.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	start := time.Now()
-	if err := supervisor.Start(); err != nil {
+	err = supervisor.Start()
+	readyWriter.Close()
+	if err != nil {
 		return result{ExitCode: 126, Error: fmt.Sprintf("unable to start job: %v", err)}
 	}
 	go supervisor.Wait()
+
+	// Wait until the command is starting, so that the job can't be killed
+	// before signals reach the command (see supervisorScript). The pipe also
+	// closes if the supervisor exits first, in which case the job is recorded
+	// with whatever state the supervisor left. A supervisor that doesn't
+	// report in time is killed rather than recorded, since its subshell can't
+	// write to the pipe once this executor has closed it, and then doesn't
+	// execute the command.
+	if !waitForCommandStart(ready) {
+		syscall.Kill(-supervisor.Process.Pid, syscall.SIGKILL)
+		return result{ExitCode: 126, Error: fmt.Sprintf("unable to start job: the job's command didn't start within %v", jobStartTimeout)}
+	}
 
 	// Record the job. If that fails, then the job can't be found, so it's
 	// killed.
@@ -200,12 +249,33 @@ func startJob(root, prologue string, alpha bool, request *Request) result {
 	return result{Job: job}
 }
 
-// waitForJobLock waits until a job's lock is free or the specified duration
-// elapses, returning whether the lock was freed.
-func waitForJobLock(ctx context.Context, lock string, duration time.Duration) bool {
+// waitForCommandStart waits until a job's supervisor reports, through the
+// specified pipe, that the job's command is starting, or until the pipe closes
+// because the supervisor exited without doing so, and returns false if neither
+// happens within jobStartTimeout. The timeout relies on the pipe supporting
+// deadlines, as pipes do on the systems that support jobs.
+func waitForCommandStart(ready *os.File) bool {
+	ready.SetReadDeadline(time.Now().Add(jobStartTimeout))
+	_, err := ready.Read(make([]byte, 1))
+	return !errors.Is(err, os.ErrDeadlineExceeded)
+}
+
+// jobGroupRemains determines whether any process remains in the process group
+// led by the job supervisor with the specified process identifier. Zombies
+// remain until they're reaped, and processes that this process isn't allowed
+// to signal remain as well.
+func jobGroupRemains(pid int) bool {
+	return syscall.Kill(-pid, 0) != syscall.ESRCH
+}
+
+// waitForJobExit waits until a job's lock is free and no process remains in its
+// process group, which its supervisor, with the specified process identifier,
+// leads, or until the specified duration elapses or the context is cancelled,
+// and returns whether the job exited.
+func waitForJobExit(ctx context.Context, lock string, pid int, duration time.Duration) bool {
 	deadline := time.Now().Add(duration)
 	for {
-		if running, err := jobLockHeld(lock); err == nil && !running {
+		if running, err := jobLockHeld(lock); err == nil && !running && !jobGroupRemains(pid) {
 			return true
 		} else if !time.Now().Before(deadline) {
 			return false
@@ -219,10 +289,29 @@ func waitForJobLock(ctx context.Context, lock string, duration time.Duration) bo
 }
 
 // terminateJob terminates a running job, whose supervisor has the specified
-// process identifier, by sending SIGTERM to its process group, and then
-// SIGKILL if the job is still running once the termination grace period
-// expires, and returns the job's state afterward. Since the job is running,
-// its supervisor holds the lock, so its process group can't have been reused.
+// process identifier and leads the job's process group, and returns the job's
+// state afterward. It sends SIGTERM to the group, waits for the supervisor to
+// release the lock and for every process in the group to exit, and sends
+// SIGKILL to the group if any process remains once the termination grace
+// period expires. The supervisor releases the lock once the command exits, so
+// waiting for the group as well ensures that processes that ignore SIGTERM,
+// such as a command's workers, don't outlive a job reported as killed.
+// Processes that leave the group, such as with setsid, aren't terminated.
+// Zombies remain in the group until they're reaped, so where orphans aren't
+// reaped, such as in a container whose PID 1 doesn't reap them, terminating a
+// job can take the full grace period (and the wait after SIGKILL) even if its
+// processes exit at once. The wait is bounded, so that only delays the result.
+//
+// The group is signaled by its identifier, which the system can reuse for a
+// new process group once the job's group has ended. The system doesn't reuse a
+// process group's identifier while the group has members, zombies included,
+// and the supervisor is one while it holds the lock, so a check that finds the
+// job running (before SIGTERM) or its group remaining (before SIGKILL) ensures
+// that the identifier is still the job's. It could only belong to another
+// group by the time of the signal if, between the check and the signal, the
+// group's last member exited and was reaped and the system assigned the
+// identifier to a new group, which would require it to reuse process
+// identifiers within that interval.
 func terminateJob(ctx context.Context, directory string, pid int) (*Job, error) {
 	if err := os.WriteFile(filepath.Join(directory, jobKilledName), nil, 0600); err != nil {
 		return nil, fmt.Errorf("unable to mark job as killed: %w", err)
@@ -230,11 +319,11 @@ func terminateJob(ctx context.Context, directory string, pid int) (*Job, error) 
 	lock := filepath.Join(directory, jobLockName)
 	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 		return nil, err
-	} else if !waitForJobLock(ctx, lock, terminationGracePeriod) {
+	} else if !waitForJobExit(ctx, lock, pid, terminationGracePeriod) {
 		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 			return nil, err
 		}
-		waitForJobLock(ctx, lock, time.Second)
+		waitForJobExit(ctx, lock, pid, time.Second)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !aix
 
 package remote
 
@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -99,8 +100,11 @@ func TestJobExitStatusAndLog(t *testing.T) {
 	root := t.TempDir()
 
 	// Jobs record their exit status, write their output to their log, have no
-	// input, and are identified to their commands.
-	job := startTestJob(t, root, "", "sh", "-c", `echo out; echo err >&2; cat; printf '%s\n' "$MUTAGEN_REMOTE_JOB" "$MUTAGEN_REMOTE_ENDPOINT"; exit 37`)
+	// input, and are identified to their commands. The job runs for longer
+	// than the granularity of file timestamps, which can be coarser than that
+	// of the clock and from which its running time is computed, so that its
+	// running time is positive.
+	job := startTestJob(t, root, "", "sh", "-c", `echo out; echo err >&2; cat; printf '%s\n' "$MUTAGEN_REMOTE_JOB" "$MUTAGEN_REMOTE_ENDPOINT"; sleep 0.1; exit 37`)
 	if job.Log != filepath.Join(directory, job.ID, jobLogName) || job.LogPath != "" {
 		t.Fatalf("incorrect default log: %q, %q", job.Log, job.LogPath)
 	}
@@ -216,6 +220,77 @@ func TestJobKill(t *testing.T) {
 		t.Fatalf("incorrect killed job: %+v, %v", killed, err)
 	} else if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
 		t.Fatal("job killed before the grace period expired:", elapsed)
+	}
+}
+
+func TestJobKillAtStart(t *testing.T) {
+	directory := useTestJobs(t)
+	useTerminationGracePeriod(t, 2*time.Second)
+	root := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	// A job killed as soon as it has started is terminated by SIGTERM, which
+	// reaches its command, rather than killing its supervisor before it
+	// catches signals or being caught before the command exists, in which
+	// cases the job would be killed with SIGKILL. The job is killed directly,
+	// rather than through a route, so that the kill follows the start closely
+	// enough to hit those windows.
+	for attempt := 1; attempt <= 20; attempt++ {
+		started := startJob(root, "", false, &Request{Arguments: []string{"sleep", "60"}, Job: &JobRequest{Operation: JobStart}})
+		if started.Job == nil {
+			t.Fatal("unable to start job:", started.Error)
+		}
+		jobDirectory := filepath.Join(directory, started.Job.ID)
+		record, _, err := loadJob(jobDirectory)
+		if err != nil {
+			t.Fatal("unable to load job:", err)
+		}
+		if killed, err := terminateJob(ctx, jobDirectory, record.PID); err != nil {
+			t.Fatal("unable to kill job:", err)
+		} else if killed.State != JobKilled || killed.ExitCode != 143 {
+			t.Fatalf("incorrect job killed at start (attempt %d): %+v", attempt, killed)
+		}
+	}
+}
+
+func TestJobKillTerminatesGroup(t *testing.T) {
+	useTestJobs(t)
+	useTerminationGracePeriod(t, 500*time.Millisecond)
+	root := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Start a job whose command exits on SIGTERM, leaving a child that ignores
+	// it. The child reports its process identifier once it ignores SIGTERM.
+	path := filepath.Join(t.TempDir(), "child")
+	script := `sh -c 'trap "" TERM; echo $$ > "$1"; exec sleep 60' sh "$1" & wait`
+	job := startTestJob(t, root, "", "sh", "-c", script, "sh", path)
+	var child int
+	for {
+		if data, err := os.ReadFile(path); err == nil && strings.HasSuffix(string(data), "\n") {
+			if child, err = strconv.Atoi(strings.TrimSpace(string(data))); err != nil {
+				t.Fatal("invalid child process identifier:", err)
+			}
+			break
+		} else if ctx.Err() != nil {
+			t.Fatal("child didn't start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The job is only reported as killed, with its command's status, once the
+	// child has been killed with SIGKILL after the grace period, even though
+	// the supervisor releases the lock as soon as the command exits.
+	start := time.Now()
+	if killed, err := KillJob(ctx, jobRoute(ctx, root), job.ID); err != nil {
+		t.Fatal("unable to kill job:", err)
+	} else if killed.State != JobKilled || killed.ExitCode != 143 {
+		t.Fatalf("incorrect killed job: %+v", killed)
+	} else if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
+		t.Fatal("job reported as killed before the grace period expired:", elapsed)
+	} else if err := syscall.Kill(child, 0); err != syscall.ESRCH {
+		t.Fatal("child survived the job:", err)
 	}
 }
 

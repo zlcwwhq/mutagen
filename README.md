@@ -318,7 +318,7 @@ with SIGKILL or its system restarted, is reported as lost. Job state is kept for
 and can end with the processes that run the endpoint, such as when a daemon
 running as a systemd service is stopped, or, on systems where logind's
 `KillUserProcesses` is enabled, with the SSH connection. Detached jobs aren't
-supported on Windows endpoints.
+supported on Windows or AIX endpoints.
 
 Content that commands write to ignored paths exists only on the executing
 endpoint. `remote --ignores <path>...` shows whether the session ignores each

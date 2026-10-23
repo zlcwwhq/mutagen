@@ -716,8 +716,8 @@ func waitForFile(t *testing.T, path string) {
 }
 
 func TestRemoteDetachedJobs(t *testing.T) {
-	// Jobs rely on a POSIX shell.
-	if runtime.GOOS == "windows" {
+	// Jobs rely on a POSIX shell, and on flock locks, which AIX lacks.
+	if runtime.GOOS == "windows" || runtime.GOOS == "aix" {
 		t.Skip()
 	}
 

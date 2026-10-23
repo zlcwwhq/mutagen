@@ -61,8 +61,8 @@ const (
 )
 
 // errJobsUnsupported indicates that detached jobs aren't supported on the
-// executing system.
-var errJobsUnsupported = errors.New("detached jobs aren't supported on Windows endpoints")
+// executing system (see jobsSupported).
+var errJobsUnsupported = errors.New("detached jobs aren't supported on Windows or AIX endpoints")
 
 // JobError is an error that the executing endpoint reports for a job
 // operation, such as for a job that doesn't exist, as opposed to a failure to
@@ -438,7 +438,8 @@ func WaitJob(ctx context.Context, connection io.ReadWriteCloser, id string) (*Jo
 // KillJob terminates the job with the specified identifier, started at the
 // opposite endpoint's root, over an established route (see Dial), and returns
 // the job. It owns and closes the connection. The job's process group receives
-// SIGTERM, and then SIGKILL if it remains once TerminationGracePeriod expires.
+// SIGTERM, and then SIGKILL if any of its processes remain once
+// TerminationGracePeriod expires.
 func KillJob(ctx context.Context, connection io.ReadWriteCloser, id string) (*Job, error) {
 	return operateJob(ctx, connection, JobKill, id)
 }

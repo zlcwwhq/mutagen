@@ -244,7 +244,7 @@ exits:
     KillUserProcesses is enabled, jobs on SSH endpoints end with the SSH
     connection.
   - --timeout can't be combined with --detach; run the command with timeout
-    instead. Detached jobs aren't supported on Windows endpoints.
+    instead. Detached jobs aren't supported on Windows or AIX endpoints.
 `},
 	{"conflicts", "resolving files modified on both endpoints", `Usage: remote --conflicts [--json]
        remote --conflict-checkout [--base <file>] [--json] <path>...
