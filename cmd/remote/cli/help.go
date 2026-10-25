@@ -361,10 +361,12 @@ files, is refused before checking out. Failed automatic apply keeps its
 workspace for retry or manual merging; --delete never auto-checks out.
 
 Listing summaries describe actual local/remote changes from the submitter's
-perspective. Oversized summaries report omitted changes. JSON retains Path and
-adds LocalChanges, RemoteChanges, and ExcludedChanges; internal checkout emits
-no separate result when --take applies a path. Failed path results also carry
-ErrorKind (operation, connection, or timeout), alongside Error.
+perspective. Text lines describe at most 5 changes per side and count the
+rest; oversized summaries also omit changes from JSON and count them. JSON
+retains Path and adds LocalChanges, RemoteChanges, and ExcludedChanges;
+internal checkout emits no separate result when --take applies a path. Failed
+path results also carry ErrorKind (operation, connection, or timeout),
+alongside Error.
 
   - remote --conflicts synchronizes, lists every conflict, how it can be
     resolved, and through which endpoint it's checked out, flags checked-out

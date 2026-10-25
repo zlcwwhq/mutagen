@@ -953,6 +953,24 @@ func localSides(conflict *remote.ConflictRoot, target *remote.Target) []string {
 	return sides
 }
 
+// listedChanges is the maximum number of each endpoint's changes that a text
+// listing describes for a conflict, so that a conflict such as a deleted
+// directory whose contents changed on the other endpoint stays a short line.
+// JSON listings include every change received.
+const listedChanges = 5
+
+// limitChanges limits each endpoint's changes in a conflict's summary to a
+// maximum, counting those omitted with the changes that were already omitted.
+func limitChanges(conflict remote.Conflict, maximum int) remote.Conflict {
+	for _, changes := range []*[]remote.Change{&conflict.Alpha, &conflict.Beta} {
+		if len(*changes) > maximum {
+			conflict.ExcludedChanges += uint64(len(*changes) - maximum)
+			*changes = (*changes)[:maximum]
+		}
+	}
+	return conflict
+}
+
 // printConflicts lists conflicts, the endpoint through which each one is
 // checked out, if any, whether a local checkout's copies changed since checkout
 // or results were applied through its workspace, and the workspaces whose
@@ -1053,7 +1071,7 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 		return err
 	}
 	for c, conflict := range conflicts {
-		line := reports.describeConflict(listing.Conflicts[c].Changes())
+		line := reports.describeConflict(limitChanges(listing.Conflicts[c].Changes(), listedChanges))
 		if !conflict.Resolvable {
 			line += " (remote can't resolve it, since it involves a directory, the synchronization root, or content that can't be synchronized or read)"
 		} else if !conflict.Files {
