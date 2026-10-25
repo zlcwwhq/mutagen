@@ -38,7 +38,7 @@ func Execute(ctx context.Context, connection io.ReadWriteCloser, request *Reques
 	if err != nil {
 		return 0, err
 	} else if response.Error != "" {
-		return response.ExitCode, errors.New(response.Error)
+		return response.ExitCode, response.executionError()
 	}
 	return response.ExitCode, nil
 }

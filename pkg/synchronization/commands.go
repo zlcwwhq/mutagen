@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -153,11 +154,15 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 	ignores := EffectiveIgnores(c.mergedAlphaConfiguration, c.session.Version)
 	ctx, cancel := context.WithCancel(ctx)
 	var maintainers sync.WaitGroup
-	for index, url := range []*urlpkg.URL{c.session.Alpha, c.session.Beta} {
+	urls := [2]*urlpkg.URL{c.session.Alpha, c.session.Beta}
+	for index, url := range urls {
+		executionHost, executionRoot := commandExecutionLocation(urls[1-index])
 		endpoint := &remote.Endpoint{
 			Session:        c.session.Identifier,
 			Name:           c.session.Name,
 			Root:           url.Path,
+			ExecutionHost:  executionHost,
+			ExecutionRoot:  executionRoot,
 			Alpha:          index == 0,
 			SessionCreated: c.session.CreationTime.AsTime(),
 			Submit:         (index == 0 && betaExecutes) || (index == 1 && alphaExecutes),
@@ -176,6 +181,17 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		maintainers.Wait()
 		relay.routes.Wait()
 	}
+}
+
+// commandExecutionLocation describes a configured execution endpoint without
+// revealing credentials or transport configuration. Local endpoints run on the
+// daemon's system, whose hostname also identifies it to remote submitters.
+func commandExecutionLocation(url *urlpkg.URL) (string, string) {
+	host := url.Host
+	if url.Protocol == urlpkg.Protocol_Local {
+		host, _ = os.Hostname()
+	}
+	return host, url.Path
 }
 
 // maintain keeps an endpoint's channel connected until cancelled. Channel

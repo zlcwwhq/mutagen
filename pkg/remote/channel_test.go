@@ -497,13 +497,13 @@ func TestDialExcluded(t *testing.T) {
 		{Default: "inner", Corresponding: true},
 	} {
 		if _, err := dialTest(selection, directory); err == nil ||
-			!strings.Contains(err.Error(), directory+" is inside "+inner+", which session outer (sync_outer) ignores") ||
-			!strings.Contains(err.Error(), "use --cwd .") {
+			!strings.Contains(err.Error(), "inner/x is inside inner, which session outer ignores") ||
+			!strings.Contains(err.Error(), "--cwd . runs in the other side's own copy") {
 			t.Errorf("excluded directory not refused (%+v): %v", selection, err)
 		}
 	}
 	if _, err := dialTest(&Selection{Corresponding: true}, inner); err == nil ||
-		!strings.Contains(err.Error(), inner+" is ignored by session outer (sync_outer)") {
+		!strings.Contains(err.Error(), "inner is ignored by session outer") {
 		t.Error("excluded root of the nested session not refused:", err)
 	}
 
@@ -607,9 +607,9 @@ func TestSessions(t *testing.T) {
 	stale.listener.(*registeredListener).Listener.Close()
 	registerIncompatible(t, registry, "sync_legacy", filepath.Join(base, "legacy"))
 	expected := []Session{
-		{Session: "sync_inner", Name: "inner", Label: "inner", Root: inner, Version: mutagen.Version, Contained: true, Selected: true},
-		{Session: "sync_late", Name: "late", Label: "late", Root: inner, Version: mutagen.Version, Contained: true},
-		{Session: "sync_outer", Name: "outer", Label: "outer", Alpha: true, Root: outer, Version: mutagen.Version, Contained: true, Excluded: true},
+		{Session: "sync_inner", Name: "inner", Label: "inner", Root: inner, Path: "x", Version: mutagen.Version, Contained: true, Selected: true},
+		{Session: "sync_late", Name: "late", Label: "late", Root: inner, Path: "x", Version: mutagen.Version, Contained: true},
+		{Session: "sync_outer", Name: "outer", Label: "outer", Alpha: true, Root: outer, Path: "inner/x", Version: mutagen.Version, Contained: true, Excluded: true},
 		{Session: "sync_first", Name: "first", Label: "first", Root: first, Version: mutagen.Version},
 		{Session: "sync_legacy", Label: "sync_legacy", Root: filepath.Join(base, "legacy"), Version: "0.0.1"},
 	}
@@ -768,9 +768,13 @@ func TestAgentChannel(t *testing.T) {
 		return filepath.Join(base, "agents", "remote"), nil
 	}
 	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"ignored"}}
-	channel := testChannel(t, &Endpoint{Session: "sync_test", Root: root, Submit: true, Execute: true, Ignores: ignores}, install)
+	channel := testChannel(t, &Endpoint{Session: "sync_test", Root: root, Submit: true, Execute: true, Ignores: ignores, ExecutionHost: "opposite-host", ExecutionRoot: opposite}, install)
 	if !installed {
 		t.Fatal("remote executable not installed")
+	}
+	if sessions, err := (&Selection{}).Sessions(context.Background(), filepath.Join(root, "sub")); err != nil ||
+		len(sessions) != 1 || sessions[0].ExecutionHost != "opposite-host" || sessions[0].ExecutionRoot != opposite || sessions[0].Path != "sub" {
+		t.Fatalf("agent initialization lost execution metadata: %+v, %v", sessions, err)
 	}
 
 	// Commands opened by the daemon run in the endpoint's root.
@@ -1216,4 +1220,67 @@ func TestFlush(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("abandoned flush not received")
 	}
+}
+
+func TestSessionsExecutionMetadata(t *testing.T) {
+	useTestRegistry(t)
+	base := resolveSymbolicLinks(t.TempDir())
+	alpha, beta := filepath.Join(base, "alpha"), filepath.Join(base, "beta")
+	mkdirs(t, filepath.Join(alpha, "sub", "dir"), filepath.Join(beta, "sub", "dir"))
+	var lock sync.Mutex
+	var accepted []string
+	registerTest(t, &Endpoint{Session: "sync_both", Root: alpha, Alpha: true, ExecutionHost: "beta-host", ExecutionRoot: beta}, "alpha", &accepted, &lock)
+	registerTest(t, &Endpoint{Session: "sync_both", Root: beta, ExecutionHost: "alpha-host", ExecutionRoot: alpha}, "beta", &accepted, &lock)
+	for _, test := range []struct {
+		root, opposite, host string
+	}{
+		{alpha, beta, "beta-host"},
+		{beta, alpha, "alpha-host"},
+	} {
+		directory := filepath.Join(test.root, "sub", "dir")
+		sessions, err := (&Selection{}).Sessions(context.Background(), directory)
+		if err != nil || len(sessions) != 2 {
+			t.Fatalf("unable to list endpoints: %+v, %v", sessions, err)
+		}
+		session := sessions[0]
+		target, err := dialTest(&Selection{}, directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mapped, err := workingDirectory(test.opposite, &Request{Path: target.Path})
+		if err != nil || session.ExecutionHost != test.host || session.ExecutionRoot != test.opposite ||
+			session.Path != target.Path || filepath.Join(session.ExecutionRoot, filepath.FromSlash(session.Path)) != mapped {
+			t.Fatalf("listing and execution disagree: %+v, %+v, %q, %v", session, target, mapped, err)
+		}
+		if sessions[1].Path != "" || sessions[1].Contained {
+			t.Fatalf("outside-root mapping was not cleared: %+v", sessions[1])
+		}
+	}
+}
+
+func TestExcludedSessionLabels(t *testing.T) {
+	useTestRegistry(t)
+	base := resolveSymbolicLinks(t.TempDir())
+	root, other := filepath.Join(base, "root"), filepath.Join(base, "other")
+	directory := filepath.Join(root, "build", "sub")
+	mkdirs(t, directory, other)
+	var lock sync.Mutex
+	var accepted []string
+	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"build"}}
+	registerTest(t, &Endpoint{Session: "sync_root", Name: "project", Root: root, Ignores: ignores}, "root", &accepted, &lock)
+	check := func(label string) {
+		t.Helper()
+		_, err := dialTest(&Selection{Corresponding: true}, directory)
+		if err == nil || !strings.Contains(err.Error(), "build/sub is inside build, which session "+label+" ignores") ||
+			!strings.Contains(err.Error(), "don't use --cwd") || !strings.Contains(err.Error(), "--cwd . runs in the other side's own copy") {
+			t.Fatal("incorrect exclusion diagnostic:", err)
+		}
+		sessions, listErr := (&Selection{}).Sessions(context.Background(), directory)
+		if listErr != nil || len(sessions) == 0 || sessions[0].Label != label {
+			t.Fatalf("error/listing labels disagree: %+v, %v", sessions, listErr)
+		}
+	}
+	check("project")
+	registerTest(t, &Endpoint{Session: "sync_other", Name: "project", Root: other}, "other", &accepted, &lock)
+	check("sync_root")
 }

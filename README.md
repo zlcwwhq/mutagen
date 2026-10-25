@@ -161,8 +161,13 @@ If several sessions' roots contain the current directory equally
 specifically, such as when one directory is synchronized to several machines,
 the session created first is used. `remote --sessions` lists the sessions
 connected for remote commands on the current system, separating those whose
-roots contain the current directory and marking the one used by default. When
-several sessions synchronize the current directory (their roots contain it,
+roots contain the current directory and marking the one used by default. Each
+entry shows `local root`, the execution host and configured root (`runs on`),
+and the mapped execution `cwd`. Home-relative paths use `~/` for the executing
+user's home and are not resolved during listing; old registrations with no
+execution metadata show `unknown`. Ignored directories and selections outside
+a root are annotated. When several sessions synchronize the current directory
+(their roots contain it,
 and they don't ignore it), `remote` names them in a warning, unless the session
 was selected with `--session` or a matching `MUTAGEN_REMOTE_SESSION`. Sessions
 are named by their names, or by their identifiers if they're unnamed or share
@@ -185,8 +190,11 @@ enclosing session.
 the corresponding directory, or against the opposite endpoint's root when
 submitting from outside the session's root). `-e NAME=VALUE` sets a variable,
 `-e NAME` forwards a local one, and `--env-file` loads literal `NAME=VALUE`
-lines. Otherwise, commands inherit the environment of the agent (or, on the
-daemon's system, of the daemon).
+lines. Quote home paths, such as `remote -C '~/project' pwd`, so your shell
+doesn't expand `~` into the local home. If an explicit absolute path under your
+local home is missing on the executing side, the error suggests this spelling
+conditionally; it never rewrites the path. Otherwise, commands inherit the
+environment of the agent (or, on the daemon's system, of the daemon).
 
 Every command receives `MUTAGEN_REMOTE_ENDPOINT=alpha` or `beta`, identifying
 the endpoint where it executes. This value overrides inherited values and
@@ -271,6 +279,14 @@ is connected, and the daemon connects command channels in the background, so
 SSH authentication must work non-interactively. `remote --help` summarizes
 usage, and `remote --help <topic>` covers sessions, synchronization, scripts,
 detached jobs, environment setup, termination, and conflicts in detail.
+
+Programs may buffer output without a terminal. For immediate Python output,
+use `remote -e PYTHONUNBUFFERED=1 python train.py` or
+`remote python -u train.py`. For programs using glibc stdio,
+`remote stdbuf -oL <command>` requests line buffering; it doesn't affect
+programs that manage their own buffers. Buffering and colors are independent:
+use the target program's own force-color option when colors are wanted.
+See `remote --help environment` for these examples and environment setup.
 
 `remote --script <file>` runs a local script, or one read from standard input
 with `-`, such as a here-document whose quoted delimiter (`<<'EOF'`) keeps the
@@ -378,7 +394,9 @@ printing the final N lines with `--tail N` once the job ends.
 
 Content that commands write to ignored paths exists only on the executing
 endpoint. `remote --ignores <path>...` shows whether the session ignores each
-path, and `remote --pull <path>...` copies ignored files, directories, and
+path. Missing local paths are marked `not present locally`, with conditional
+results for a file or directory; access errors are reported separately.
+`remote --pull <path>...` copies ignored files, directories, and
 symbolic links from the opposite endpoint, replacing local files that differ
 but never deleting local content. It refuses paths that the session (or
 another session) synchronizes, and directories with synchronized content
@@ -414,162 +432,19 @@ remote --conflict-checkout src/app.go # download both copies into a workspace
 remote --conflict-apply src/app.go    # write it to both copies and verify
 ```
 
-Checkout downloads both complete copies, however large, into a workspace in
-the Mutagen data directory (which must be outside the synchronization root)
-and prints their paths. For two files, it also looks for their common ancestor,
-the file that both endpoints had when they last agreed: Mutagen records only
-its digest, so checkout verifies candidates against it, trying the versions in
-Git's `HEAD` commit and index (read with `git cat-file`), or a file given with
-`--base`.
+Stop writers on both endpoints until apply finishes. A checkout belongs to one
+endpoint, and an existing workspace may be another person's work; only apply
+or discard checkouts that you made. Apply refuses copies changed since checkout,
+but concurrent edits while it writes can be overwritten. Review the entire
+merged file, even when it has no conflict markers. Directories require manual
+resolution; other supported types can be resolved with `--take local|remote`.
 
-With the ancestor, checkout uses a text-based three-way merge model similar to
-Git's: it compares the ancestor with both current copies, merges regions changed
-on only one side or changed identically on both, and marks regions changed
-differently on both sides with the local, base, and remote versions in Git's
-`diff3` style. The implementation includes additional conservative checks and
-may mark more conflicts than Git; its results and conflict boundaries aren't
-guaranteed to match Git's. Without the ancestor, every region where the copies
-differ is marked.
-
-Like Git's three-way merge, this compares file snapshots and doesn't track
-editing operations or the identity of moved lines, so a merge with no conflict
-markers can still misrepresent intended changes. Lines removed and then
-restored in place look unchanged: if both sides deleted a function and one side
-then restored it, the merge deletes it. A change that both sides made in the
-same place is kept once, even if each side meant to add its own copy, and one
-that they made in different places (such as the same import added at different
-lines) can be kept twice. Moved lines, especially lines that repeat (such as
-blank lines or closing braces), can be misplaced, or kept too often or too
-rarely. Review the complete `merged` file against both copies and the ancestor
-before applying it, even if nothing is marked, checking these cases in
-particular, and resolve ambiguous intent manually.
-
-Changes among repeated lines can be aligned with the ancestor in several ways,
-which can drop or duplicate them, so checkout merges both sides' changes
-separately only where a line that occurs once in each version separates them,
-and otherwise marks them together, with all three versions, even if they look
-independent. For example, if each side modified a different copy of a repeated
-block, both sides may instead have deleted a copy and then each added a
-modified one, and merging the changes separately would drop a whole copy. Both
-ends of a detected move may be marked together too. If its line-count checks
-find an inconsistent result, it marks every region where the copies differ
-instead, without the base version. These checks don't establish that the result
-preserves the intended changes.
-
-Copies too large to compare line by line (or with too many lines) and copies
-that aren't valid UTF-8 are enclosed whole in a single region, with the
-ancestor, and binary copies get no merged file; checkout says which applies.
-Since synchronization continues meanwhile, checkout verifies that it downloaded
-the copies that it listed, whose ancestor it knows, and otherwise fails; check
-out again. A conflict can't be checked out again while its workspace exists,
-so checking out with `--base` after checking out without it requires discarding
-the workspace first (which changes neither copy).
-
-Resolution assumes that the conflicting paths don't change from checkout until
-apply finishes, so before checking out, stop editors, builds, and anything else
-that might write them on either endpoint. Changing a checked-out path isn't
-supported: apply refuses copies that changed before it runs, without writing
-them, but it doesn't lock them, so changes made while it runs can be
-overwritten. `remote --conflicts` flags checked-out copies that changed since
-checkout, so that their workspaces can be discarded before any merge work, as
-long as their conflicts are still listed: a change can also end a conflict.
-
-If a checked-out path changes anyway, first stop whatever changed it, so that
-it doesn't change again. The synchronized copies remain authoritative.
-Discarding the workspace changes neither copy and keeps the workspace, but the
-workspace may hold the only copy of one side's changes, and it's deleted after
-7 days. A conflict that's still listed, such as one flagged as changed, or one
-that apply reports as changed or conflicting again, is resolved by discarding
-its workspace and checking it out again; if apply already updated the remote
-copy, the new conflict is between that result and the changed local copy, and
-the discarded workspace's merged file still has the earlier merge. A change can
-also end the conflict by itself, such as by making the copies identical, or by
-reverting or deleting one copy so that synchronization copies the other over
-it, including after part of a resolution was applied, which applying again then
-reports as a changed copy. The overwritten side's changes then remain only in
-the workspace, and checking out again fails. `remote --conflicts` can't tell
-such a change from a deliberate resolution, so it lists the workspace, with its
-location, as one whose conflict was resolved some other way or ended by a
-change: before discarding it, compare its `local`, `remote`, and `merged` files
-with the current file, restore what's needed by editing the file, which is no
-longer a conflict, and check the copies with `remote --diff <path>`. In
-one-way-safe sessions, synchronization copies alpha's copy over a reverted or
-deleted beta copy, but leaves beta's copy unsynchronized if alpha's was
-deleted, and never copies beta's changes to alpha, so content is restored on
-alpha. Changes made while apply writes a copy can't be recovered. A workspace
-that can't be read, such as one whose metadata was modified, can only be
-discarded, which sets it aside as well; if anything was applied through it,
-check the copies against its files.
-
-Each conflict is checked out once, through one endpoint. Workspaces are kept on
-the system that checked them out, so the daemon records which endpoint checked
-out each conflict, in its data directory, until the session is terminated.
-Checking a conflict out again, through either endpoint, fails until that
-endpoint applies or discards it, which releases the checkout, and
-`remote --conflicts` says through which endpoint each conflict is checked out.
-Checkouts aren't tied to whoever made them, so a conflict checked out on a
-system may be another agent's or person's resolution in progress there, and
-discarding its workspace would let a new checkout reuse its files: only
-whoever checked a conflict out should apply or discard it.
-Apply confirms the checkout before writing either copy, so a workspace whose
-conflict the opposite endpoint has checked out can only be discarded.
-`remote --conflicts` also releases checkouts whose workspaces are missing, such
-as those of interrupted checkouts, as does discarding them.
-
-For two files, apply writes the merged file to both copies, or an original copy
-(`--take local` or `--take remote`), or deletes both copies (`--delete`);
-copies that differ in executability require `--executable` or `--take`. It
-refuses a merged file that still contains conflict markers, or one that's empty
-while neither copy is: such a file was probably truncated, such as by a command
-that reads it with its output redirected to it (`sed ... merged > merged`), and
-would replace both copies with nothing. If the result should be empty, discard
-the workspace and empty both copies, which then agree.
-Conflicts involving directories require manual resolution: checkout and apply
-reject them, including apply through an existing workspace. Other conflicts,
-such as a symbolic link on one endpoint and a file on the other, can only be
-resolved with `--take`, which writes the copy taken, as checked out, to the
-other endpoint; to combine content from both copies, take one and edit it
-afterward. Conflicts at the root of a single-file session can be resolved like
-other files, with `--session` from outside the root, but conflicts involving
-directories or content that can't be synchronized or read must be resolved
-manually.
-
-Apply replaces or deletes each copy only if it's one of the checked-out copies,
-which the workspace keeps, or a result applied before. Results are written next
-to each copy under a temporary name and renamed over it, so an interrupted
-apply leaves either the copy or the complete result. Apply writes the remote
-copy, then the local one, then flushes and checks that no conflict or problem
-involves the path and that both copies have the result before setting the
-workspace aside. Either checked-out copy is accepted on both endpoints, since
-synchronization doesn't pause between the writes and may copy one over a
-partially applied result (a deletion, or a result matching what both copies
-last agreed on), which also removes the conflict. If either copy changed since
-checkout, apply fails without changing it; discard the workspace and check out
-again. Any other failed apply can be retried, even if the conflict is no longer
-listed or the merged file was edited since, and copies that already have the
-result are left as they are. `remote --conflicts` marks such partially applied
-resolutions, whether or not their conflicts are still listed, to be applied
-again rather than discarded: discarding may leave a copy with the result, or
-one side's original only in the workspace if synchronization copied the other
-over it, as discard then points out. A workspace through which nothing was
-applied, however, belongs to a conflict that was resolved some other way (such
-as by editing a copy), or ended by a change after checkout, once it's no longer
-listed: `remote --conflicts` lists it separately, and apply refuses it without
-changing either copy, rather than replace that resolution, so compare it with
-the current file, as above, before discarding it. Workspaces of resolved and
-discarded conflicts are kept for 7 days, so that the original copies can be
-recovered. The retention follows the system clock: backups are named by the
-time they were set aside and deleted by it, so a clock jump can delete them
-early.
-
-Writes of a copy wait for each other, since an apply that timed out may still
-be writing the remote copy, and apply fails without changing a copy that a
-later apply, through either endpoint, reached first, in which case
-`remote --conflicts` shows what that apply left.
-
-Conflict operations accept several paths, after their options, and `--json`
-prints machine-readable results, one line per path. A conflict operation fails
-while another one on the same path is running on the same system.
+Failed apply retains its workspace for retry, including partially applied
+results. Successful apply and discard keep the original copies as backups.
+See `remote --help conflicts` for the short workflow and
+`remote --help conflict-details` for merge limitations, retention, and recovery
+when copies change or an operation is interrupted. Conflict operations accept
+several paths and `--json` for machine-readable results.
 
 Any process running as your user on a submitting endpoint's system can run
 commands on the executing endpoint, so only enable remote commands toward

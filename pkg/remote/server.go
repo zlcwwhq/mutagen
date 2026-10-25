@@ -242,15 +242,22 @@ type preparedCommand struct {
 func prepare(root, prologue string, alpha bool, request *Request, scriptPath string) (*preparedCommand, *result) {
 	directory, err := workingDirectory(root, request)
 	if err != nil {
-		return nil, &result{Error: fmt.Sprintf("invalid working directory: %v", err)}
+		return nil, &result{ExitCode: 126, DirectoryError: DirectoryErrorInvalid, Directory: request.Directory,
+			Error: fmt.Sprintf("invalid working directory %q: %v", request.Directory, err)}
 	}
 	// Check the working directory explicitly, since a missing one (such as an
 	// ignored or not yet synchronized directory) would otherwise be reported as
 	// a missing executable by the operating system.
 	if info, err := os.Stat(directory); err != nil {
-		return nil, &result{ExitCode: 126, Error: fmt.Sprintf("unable to access working directory: %v", err)}
+		kind := DirectoryErrorInaccessible
+		if os.IsNotExist(err) {
+			kind = DirectoryErrorMissing
+		}
+		return nil, &result{ExitCode: 126, DirectoryError: kind, Directory: directory,
+			Error: fmt.Sprintf("unable to access working directory: %v", err)}
 	} else if !info.IsDir() {
-		return nil, &result{ExitCode: 126, Error: fmt.Sprintf("working directory is not a directory: %s", directory)}
+		return nil, &result{ExitCode: 126, DirectoryError: DirectoryErrorNotDirectory, Directory: directory,
+			Error: fmt.Sprintf("working directory is not a directory: %s", directory)}
 	}
 
 	// The executing endpoint supplies its identity after all user-provided

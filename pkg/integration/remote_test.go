@@ -460,7 +460,8 @@ func TestRemoteNestedSessionSelection(t *testing.T) {
 
 	// Both sessions are listed, with the one that's used marked.
 	if code, output, errorOutput := runRemote(t, submission, "--sessions"); code != 0 ||
-		output != "Sessions whose roots contain the current directory:\n  inner: alpha root "+inner+" (used by default)\n  outer: alpha root "+outer+"\n" {
+		!strings.Contains(output, "inner: local root "+inner+" (alpha); runs on unknown:"+innerBeta+"; cwd "+filepath.Join(innerBeta, "sub")+" (used by default)") ||
+		!strings.Contains(output, "outer: local root "+outer+" (alpha); runs on unknown:"+outerBeta+"; cwd "+filepath.Join(outerBeta, "inner", "sub")) {
 		t.Fatalf("incorrect session listing: %d, %q, %q", code, output, errorOutput)
 	}
 
@@ -506,7 +507,8 @@ func TestRemoteSharedRootSelection(t *testing.T) {
 	if code, output, errorOutput := runRemote(t, submission, pwd...); code != 0 || output != filepath.Join(secondBeta, "sub")+"\n" || errorOutput != "" {
 		t.Fatalf("default session not used: %d, %q, %q", code, output, errorOutput)
 	} else if code, output, errorOutput := runRemote(t, submission, "--sessions"); code != 0 ||
-		output != "Sessions whose roots contain the current directory:\n  gpu1: alpha root "+root+"\n  gpu2: alpha root "+root+" (used by default)\n" {
+		!strings.Contains(output, "gpu1: local root "+root+" (alpha); runs on unknown:"+firstBeta+"; cwd "+filepath.Join(firstBeta, "sub")+"\n") ||
+		!strings.Contains(output, "gpu2: local root "+root+" (alpha); runs on unknown:"+secondBeta+"; cwd "+filepath.Join(secondBeta, "sub")+" (used by default)") {
 		t.Fatalf("incorrect session listing: %d, %q, %q", code, output, errorOutput)
 	}
 }
@@ -539,7 +541,7 @@ func TestRemoteNestedSessionExcluded(t *testing.T) {
 	if err := synchronizationManager.Pause(context.Background(), &selection.Selection{Specifications: []string{innerID}}, ""); err != nil {
 		t.Fatal("unable to pause session:", err)
 	} else if code, output, errorOutput := runRemote(t, submission, pwd...); code != 255 || output != "" ||
-		!strings.Contains(errorOutput, "is inside "+inner+", which session outer") || !strings.Contains(errorOutput, "--cwd .") {
+		!strings.Contains(errorOutput, "inner/sub is inside inner, which session outer ignores") || !strings.Contains(errorOutput, "--cwd .") {
 		t.Fatalf("command in an excluded directory not refused: %d, %q, %q", code, output, errorOutput)
 	}
 	if err := os.MkdirAll(filepath.Join(outerBeta, "inner", "sub"), 0700); err != nil {
@@ -997,7 +999,7 @@ func TestRemotePullIgnored(t *testing.T) {
 
 	// The ignores show which paths aren't synchronized.
 	code, output, _ := runRemote(t, alphaRoot, "--ignores", "results/run1", "train.log", "train.py")
-	expected := "results/run1: ignored (inside results, which the session ignores)\ntrain.log: ignored\ntrain.py: synchronized\n"
+	expected := "results/run1: not present locally; if a file or directory: ignored (inside results, which the session ignores)\ntrain.log: not present locally; if a file or directory: ignored\ntrain.py: synchronized\n"
 	if code != 1 || output != expected {
 		t.Fatalf("incorrect ignores: %d, %q", code, output)
 	} else if code, output, _ := runRemote(t, alphaRoot, "--ignores"); code != 0 || !strings.Contains(output, "results/") {

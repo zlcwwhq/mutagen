@@ -37,6 +37,12 @@ type Endpoint struct {
 	Name string
 	// Root is the synchronization root, interpreted on the endpoint's system.
 	Root string
+	// ExecutionHost is the host or container name of the opposite endpoint. It
+	// is display metadata only, without credentials or connection parameters.
+	ExecutionHost string `json:",omitempty"`
+	// ExecutionRoot is the configured root on the opposite endpoint. It may be
+	// home-relative and has not been resolved on that endpoint.
+	ExecutionRoot string `json:",omitempty"`
 	// Alpha indicates whether the endpoint is alpha.
 	Alpha bool
 	// SessionCreated is the session's creation time, which determines the

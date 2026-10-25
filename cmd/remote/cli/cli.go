@@ -150,33 +150,33 @@ func parse(arguments []string) (*options, error) {
 	flags.SetInterspersed(false)
 	flags.SortFlags = false
 	// Names in backquotes are used as value placeholders in usage information.
-	flags.StringVarP(&result.session, "session", "s", "", "Use the session with this `NAME` or identifier, even from outside its root")
-	flags.StringVarP(&result.directory, "cwd", "C", "", "Run in `DIR`: absolute and ~ paths are on the opposite endpoint, others are relative to the corresponding directory")
-	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set `NAME[=VALUE]`, where a bare NAME forwards the local value (repeatable)")
-	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read literal NAME=VALUE lines from `FILE` (repeatable)")
-	flags.StringVar(&result.script, "script", "", "Run the local script `FILE` (- for standard input) with its #! interpreter, or bash; arguments are passed to it")
-	flags.Var((*timeoutValue)(&result.timeout), "timeout", "Exit after `DURATION` (seconds, or with a unit such as 10m), terminating the command")
-	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the workspace or configured remote prologue")
-	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize before and after the command (only for commands that use no synchronized files)")
-	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
+	flags.StringVarP(&result.session, "session", "s", "", "Select session `NAME` or identifier")
+	flags.StringVarP(&result.directory, "cwd", "C", "", "Override execution directory with `DIR`")
+	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set or forward `NAME[=VALUE]` (repeatable)")
+	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read NAME=VALUE from `FILE` (repeatable)")
+	flags.StringVar(&result.script, "script", "", "Run local script `FILE` (- reads stdin)")
+	flags.Var((*timeoutValue)(&result.timeout), "timeout", "Limit runtime to `DURATION` (seconds or 10m)")
+	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Skip the execution prologue")
+	flags.BoolVar(&result.noFlush, "no-flush", false, "Skip synchronization (see --help sync)")
+	flags.BoolVar(&result.flush, "flush", false, "Synchronize, optionally before a command")
 	var progress bool
-	flags.BoolVar(&progress, "progress", false, "Show the progress of synchronizations that take over 3 seconds (automatic on terminals; --progress=false disables it)")
-	flags.BoolVar(&result.detach, "detach", false, "Run the command as a detached job, which keeps running after remote exits, and print its identifier")
-	flags.StringVar(&result.log, "log", "", "With --detach, write the job's output to `FILE` (relative to the command's directory), a regular file or character device")
-	flags.BoolVar(&result.jobs, "jobs", false, "List the detached jobs started at the session's root on the opposite endpoint, and processes that ended jobs left running")
-	flags.StringVar(&result.wait, "wait", "", "Wait for the detached job `ID` to end, synchronize, and exit with its status")
-	flags.Int64Var(&result.tail, "tail", 0, "With --wait, print the final `N` log lines when the job ends or --timeout expires (at most 1 MiB; 0 disables output)")
-	flags.BoolVar(&result.follow, "follow", false, "With --wait, print the job's log as it's written, from its beginning or the final --tail lines")
-	flags.StringVar(&result.kill, "kill", "", "Terminate the detached job `ID` without synchronizing (--no-flush is accepted but has no effect)")
-	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
-	flags.BoolVar(&result.ignores, "ignores", false, "Show the session's ignores, or whether the given paths are ignored")
-	flags.BoolVar(&result.pull, "pull", false, "Copy the given paths, which the session must ignore, from the opposite endpoint")
-	flags.BoolVar(&result.sessions, "sessions", false, "List the connected sessions, showing which ones contain the current directory and which one is used")
+	flags.BoolVar(&progress, "progress", false, "Show sync progress; =false hides it")
+	flags.BoolVar(&result.detach, "detach", false, "Start a detached job and print its ID")
+	flags.StringVar(&result.log, "log", "", "Write detached output to `FILE`")
+	flags.BoolVar(&result.jobs, "jobs", false, "List detached jobs on the other endpoint")
+	flags.StringVar(&result.wait, "wait", "", "Wait for job `ID`, sync, return its status")
+	flags.Int64Var(&result.tail, "tail", 0, "With --wait, print final `N` log lines")
+	flags.BoolVar(&result.follow, "follow", false, "With --wait, stream the job's log")
+	flags.StringVar(&result.kill, "kill", "", "Terminate job `ID` without synchronizing")
+	flags.BoolVar(&result.diff, "diff", false, "Sync, then compare paths or conflicts")
+	flags.BoolVar(&result.ignores, "ignores", false, "Show ignore rules or check given paths")
+	flags.BoolVar(&result.pull, "pull", false, "Copy ignored paths from the other side")
+	flags.BoolVar(&result.sessions, "sessions", false, "List sessions, execution hosts, and cwd")
 	result.conflictFlags = pflag.NewFlagSet("conflicts", pflag.ContinueOnError)
 	result.conflictFlags.SortFlags = false
 	result.conflictOptions.register(result.conflictFlags)
 	flags.AddFlagSet(result.conflictFlags)
-	flags.BoolVarP(&result.help, "help", "h", false, "Show this help, or the help topic given as an argument")
+	flags.BoolVarP(&result.help, "help", "h", false, "Show help, optionally for a topic")
 	flags.BoolVar(&result.version, "version", false, "Show version information")
 	options, operands := arguments, []string(nil)
 	if boundary := scriptBoundary(flags, arguments); boundary >= 0 {
@@ -606,7 +606,7 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 		if interruptedCode, ok := interrupted("starting the job"); ok {
 			return interruptedCode
 		} else if err != nil {
-			fmt.Fprintln(stderr, "remote:", err)
+			printCommandError(stderr, err, request.Directory)
 			if code != 0 {
 				return code
 			}
@@ -628,7 +628,7 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 	} else if err != nil {
 		// Startup failures such as missing commands report conventional exit
 		// codes (126 or 127) alongside the error.
-		fmt.Fprintln(stderr, "remote:", err)
+		printCommandError(stderr, err, request.Directory)
 		if code != 0 {
 			return code
 		}

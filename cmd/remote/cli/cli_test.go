@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/pflag"
+
 	"github.com/mutagen-io/mutagen/pkg/remote"
 )
 
@@ -168,6 +170,26 @@ func TestHelp(t *testing.T) {
 			}
 		}
 	}
+	// Every registered option remains discoverable in the default help or its
+	// conflict topic. Skills use this to detect older installed versions.
+	options, err := parse([]string{"--help"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if code := Run([]string{"--help", "conflicts"}, strings.NewReader(""), &output, io.Discard); code != 0 {
+		t.Fatal("conflict help failed:", code)
+	}
+	conflicts := output.String()
+	options.flags.VisitAll(func(flag *pflag.Flag) {
+		text := help
+		if options.conflictFlags.Lookup(flag.Name) != nil {
+			text = conflicts
+		}
+		if !strings.Contains(text, "--"+flag.Name) {
+			t.Errorf("option --%s is missing from its help", flag.Name)
+		}
+	})
 	if code := Run([]string{"--help", "unknown"}, strings.NewReader(""), io.Discard, io.Discard); code != failureExitCode {
 		t.Error("unknown help topic accepted:", code)
 	}

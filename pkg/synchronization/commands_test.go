@@ -3,6 +3,7 @@ package synchronization
 import (
 	"context"
 	"fmt"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/state"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	urlpkg "github.com/mutagen-io/mutagen/pkg/url"
 )
 
 func TestCommandRelayFlush(t *testing.T) {
@@ -199,6 +201,30 @@ func TestRemoteDirectoryConflicts(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+func TestCommandExecutionLocation(t *testing.T) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		protocol                 urlpkg.Protocol
+		host, path, expectedHost string
+	}{
+		{urlpkg.Protocol_Local, "", "/local/project", hostname},
+		{urlpkg.Protocol_SSH, "ssh-alias", "project", "ssh-alias"},
+		{urlpkg.Protocol_SSH, "ssh-alias", "~other/project", "ssh-alias"},
+		{urlpkg.Protocol_Docker, "container", "/root/project", "container"},
+	} {
+		url := &urlpkg.URL{Protocol: test.protocol, Host: test.host, Path: test.path,
+			User: "private-user", Environment: map[string]string{"SECRET": "private"},
+			Parameters: map[string]string{"secret": "private"}}
+		host, root := commandExecutionLocation(url)
+		if host != test.expectedHost || root != test.path {
+			t.Fatalf("incorrect execution metadata: %q, %q", host, root)
 		}
 	}
 }

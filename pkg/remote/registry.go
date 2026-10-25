@@ -70,6 +70,10 @@ type record struct {
 	Name string
 	// Root is the normalized synchronization root on this system.
 	Root string
+	// ExecutionHost and ExecutionRoot describe the opposite endpoint for
+	// display (see Endpoint). Scopes and older registrations omit them.
+	ExecutionHost string `json:",omitempty"`
+	ExecutionRoot string `json:",omitempty"`
 	// Alpha indicates whether the registered endpoint is alpha.
 	Alpha bool
 	// Created is the registration time, used to prefer the newest registration
@@ -198,6 +202,8 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 		Session:        endpoint.Session,
 		Name:           endpoint.Name,
 		Root:           root,
+		ExecutionHost:  endpoint.ExecutionHost,
+		ExecutionRoot:  endpoint.ExecutionRoot,
 		Alpha:          endpoint.Alpha,
 		SessionCreated: endpoint.SessionCreated,
 		Ignores:        endpoint.Ignores,
@@ -376,6 +382,13 @@ type Session struct {
 	Alpha bool
 	// Root is the endpoint's synchronization root.
 	Root string
+	// ExecutionHost and ExecutionRoot describe the opposite endpoint for
+	// display (see Endpoint). They are empty for older registrations.
+	ExecutionHost string
+	ExecutionRoot string
+	// Path is the slash-separated submission directory relative to Root, as
+	// mapped for command execution. It is empty outside Root.
+	Path string
 	// Version is the Mutagen version that registered the endpoint, which must
 	// match this version for submissions through it.
 	Version string
@@ -703,15 +716,12 @@ func describe(session, name string) string {
 // be submitted through the session of a candidate whose ignores exclude it,
 // given the excluded slash-separated path relative to the session's root (see
 // Ignores.ExcludedInAnyForm).
-func excludedError(directory string, c *candidate, excluded string) error {
-	session := describe(c.Session, c.Name)
-	excludedDirectory := filepath.Join(resolveSymbolicLinks(c.Root), filepath.FromSlash(excluded))
-	location := fmt.Sprintf("%s is ignored by session %s", directory, session)
+func excludedError(c *candidate, session, excluded string) error {
+	location := fmt.Sprintf("%s is ignored by session %s", c.path, session)
 	if excluded != c.path {
-		location = fmt.Sprintf("%s is inside %s, which session %s ignores", directory, excludedDirectory, session)
+		location = fmt.Sprintf("%s is inside %s, which session %s ignores", c.path, excluded, session)
 	}
-	return fmt.Errorf("%s, so that session doesn't synchronize the corresponding directory on its opposite endpoint; if %s is the root of another session, then that session is paused, disconnected, or doesn't run commands submitted from this side, so commands can't run through it until it does; otherwise, to run the command in the corresponding directory anyway, use --cwd .",
-		location, excludedDirectory)
+	return fmt.Errorf("%s. If it's another session's root, that session isn't running commands now: don't use --cwd. If it exists separately on each side, --cwd . runs in the other side's own copy.", location)
 }
 
 // Dial submits the specified operation through the endpoint that a selection of
@@ -801,7 +811,7 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 	if s.Target == nil && s.Corresponding && c.contained {
 		if excluded := c.Ignores.ExcludedInAnyForm(c.path, true); excluded != "" {
 			connection.Close()
-			return nil, nil, excludedError(directory, c, excluded)
+			return nil, nil, excludedError(c, labeler(slices.Concat(compatible, incompatible))(c), excluded)
 		}
 	}
 
@@ -1016,15 +1026,18 @@ func (s *Selection) Sessions(ctx context.Context, directory string) ([]Session, 
 	result := make([]Session, len(live))
 	for l, c := range live {
 		result[l] = Session{
-			Session:   c.Session,
-			Name:      c.Name,
-			Label:     label(c),
-			Alpha:     c.Alpha,
-			Root:      c.Root,
-			Version:   c.Version,
-			Contained: c.contained,
-			Excluded:  c.contained && c.Ignores.ExcludedInAnyForm(c.path, true) != "",
-			Selected:  selected != nil && c.Session == selected.Session && c.Alpha == selected.Alpha,
+			Session:       c.Session,
+			Name:          c.Name,
+			Label:         label(c),
+			Alpha:         c.Alpha,
+			Root:          c.Root,
+			ExecutionHost: c.ExecutionHost,
+			ExecutionRoot: c.ExecutionRoot,
+			Path:          c.path,
+			Version:       c.Version,
+			Contained:     c.contained,
+			Excluded:      c.contained && c.Ignores.ExcludedInAnyForm(c.path, true) != "",
+			Selected:      selected != nil && c.Session == selected.Session && c.Alpha == selected.Alpha,
 		}
 	}
 	return result, nil

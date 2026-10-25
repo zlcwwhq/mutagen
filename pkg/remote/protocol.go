@@ -370,6 +370,11 @@ type result struct {
 	ExitCode int
 	// Error is the execution infrastructure error, if any.
 	Error string
+	// DirectoryError classifies a working directory failure without requiring
+	// clients to inspect Error. Directory identifies the failed execution path,
+	// or the explicit path that could not be expanded.
+	DirectoryError DirectoryErrorKind `json:",omitempty"`
+	Directory      string             `json:",omitempty"`
 	// Entry is the requested entry for file requests, excluding its data,
 	// which is sent as output.
 	Entry *Entry `json:",omitempty"`

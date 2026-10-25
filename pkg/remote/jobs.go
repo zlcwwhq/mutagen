@@ -479,7 +479,7 @@ func StartJob(ctx context.Context, connection io.ReadWriteCloser, request *Reque
 	if err != nil {
 		return nil, 0, err
 	} else if response.Error != "" {
-		return nil, response.ExitCode, errors.New(response.Error)
+		return nil, response.ExitCode, response.executionError()
 	} else if response.Job == nil {
 		return nil, 0, errors.New("no job received")
 	}
