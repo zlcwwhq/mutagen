@@ -167,11 +167,11 @@ and the mapped execution `cwd`. Home-relative paths use `~/` for the executing
 user's home and are not resolved during listing; old registrations with no
 execution metadata show `unknown`. Ignored directories and selections outside
 a root are annotated. When several sessions synchronize the current directory
-(their roots contain it,
-and they don't ignore it), `remote` names them in a warning, unless the session
-was selected with `--session` or a matching `MUTAGEN_REMOTE_SESSION`. Sessions
-are named by their names, or by their identifiers if they're unnamed or share
-their names, as `--session` accepts them.
+(their roots contain it, and they don't ignore it), `remote` names them in a
+warning, unless the session was selected with `--session` or a matching
+`MUTAGEN_REMOTE_SESSION`. Sessions are named by their names, or by their
+identifiers if they're unnamed or share their names, as `--session` accepts
+them.
 
 Commands don't run in a directory that the session ignores, or inside one, since
 the session doesn't synchronize it, unless `--cwd` is given: `--cwd .` runs them
@@ -283,10 +283,11 @@ signals use 128+N. `--diff` and `--ignores` use 1 for their results and 125/255
 for failures. In batches, interruption or timeout takes precedence, followed by
 connection failures, then operation failures. This changes scripts that used
 255 for all failures of remote itself. No pseudo-terminal is allocated.
-Commands can only be routed while the session is connected, and the daemon connects command channels in the background, so
-SSH authentication must work non-interactively. `remote --help` summarizes
-usage, and `remote --help <topic>` covers sessions, synchronization, scripts,
-detached jobs, environment setup, termination, and conflicts in detail.
+Commands can only be routed while the session is connected, and the daemon
+connects command channels in the background, so SSH authentication must work
+non-interactively. `remote --help` summarizes usage, and `remote --help
+<topic>` covers sessions, synchronization, scripts, detached jobs, environment
+setup, termination, and conflicts in detail.
 
 Programs may buffer output without a terminal. For immediate Python output,
 use `remote -e PYTHONUNBUFFERED=1 python train.py` or
@@ -367,12 +368,11 @@ list those that remain in an ended job's process group, which `remote -- kill
 <pid>...` terminates; on other endpoints, they only report that the group may
 still have processes. A job whose status couldn't be recorded, such as because
 it was killed with SIGKILL or its system restarted, is reported as lost
-(`--wait` returns 125). Job
-state is kept for 7 days after jobs end. Jobs end with the system or container
-that runs them, and can end with the processes that run the endpoint, such as
-when a daemon running as a systemd service is stopped, or, on systems where
-logind's `KillUserProcesses` is enabled, with the SSH connection. Detached jobs
-aren't supported on Windows or AIX endpoints.
+(`--wait` returns 125). Job state is kept for 7 days after jobs end. Jobs end
+with the system or container that runs them, and can end with the processes
+that run the endpoint, such as when a daemon running as a systemd service is
+stopped, or, on systems where logind's `KillUserProcesses` is enabled, with the
+SSH connection. Detached jobs aren't supported on Windows or AIX endpoints.
 
 `remote --wait <id> --tail N` also prints the final N log lines to standard
 output, including logs outside the root or in ignored paths, once the job ends,
