@@ -95,15 +95,15 @@ func (o *conflictOptions) active() bool {
 
 // register registers conflict options.
 func (o *conflictOptions) register(flags *pflag.FlagSet) {
-	flags.BoolVar(&o.conflicts, "conflicts", false, "Synchronize, then list all conflicts, how remote can resolve them, and unfinished resolutions")
-	flags.BoolVar(&o.checkout, "conflict-checkout", false, "Download both copies of each conflicting path given as an argument into a workspace for resolution")
-	flags.BoolVar(&o.apply, "conflict-apply", false, "Apply the resolution of each path given as an argument to both copies and verify it")
-	flags.BoolVar(&o.discard, "conflict-discard", false, "Set aside the workspace of each path given as an argument without changing either copy")
-	flags.StringVar(&o.take, "take", "", "With --conflict-apply, take the original `SIDE` (local or remote) instead of the merged file")
-	flags.BoolVar(&o.delete, "delete", false, "With --conflict-apply, delete both copies instead")
-	flags.StringVar(&o.executable, "executable", "", "With --conflict-apply, set whether the result is executable (`BOOL`: true or false)")
-	flags.StringVar(&o.base, "base", "", "With --conflict-checkout of one path, merge using `FILE` as the copies' common ancestor, if it's verified to be")
-	flags.BoolVar(&o.json, "json", false, "Print the results of conflict operations as JSON")
+	flags.BoolVar(&o.conflicts, "conflicts", false, "Sync and list conflicts and checkout state")
+	flags.BoolVar(&o.checkout, "conflict-checkout", false, "Download copies into a merge workspace")
+	flags.BoolVar(&o.apply, "conflict-apply", false, "Apply chosen or merged copies and verify")
+	flags.BoolVar(&o.discard, "conflict-discard", false, "Set aside workspace; leave copies alone")
+	flags.StringVar(&o.take, "take", "", "Take `SIDE` (local/remote); auto-checkout")
+	flags.BoolVar(&o.delete, "delete", false, "Delete both checked-out copies")
+	flags.StringVar(&o.executable, "executable", "", "Set result executability (`BOOL`)")
+	flags.StringVar(&o.base, "base", "", "Use `FILE` as a verified merge ancestor")
+	flags.BoolVar(&o.json, "json", false, "Print conflict results as JSON")
 }
 
 // validateConflicts checks the combination of conflict options.
@@ -506,9 +506,9 @@ func dialOpposite(ctx context.Context, directory, session string, expected *remo
 	return dialSession(ctx, directory, session, remote.OperationExecute, expected)
 }
 
-// claim records with the daemon that a conflict root is checked out through
-// the endpoint that the specified target identifies, under a token identifying
-// the claim, failing if the opposite endpoint holds its checkout (see
+// claimSequence records with the daemon that a conflict root is checked out
+// through the endpoint that the specified target identifies, under a token
+// identifying the claim, failing if the opposite endpoint holds its checkout (see
 // remote.ClaimCheckout). Each conflict is checked out through a single
 // endpoint, which alone can apply or discard its resolution, since workspaces
 // are kept on the system that checked them out, where the opposite endpoint
@@ -523,13 +523,8 @@ func dialOpposite(ctx context.Context, directory, session string, expected *remo
 // fails if the opposite endpoint claims it meanwhile. A checkout recorded
 // without a token, by a build that didn't issue tokens, takes the claim's
 // token instead, since it may belong to the workspace.
-func claim(ctx context.Context, directory, session string, target *remote.Target, path, token string) error {
-	_, err := claimSequence(ctx, directory, session, target, path, token)
-	return err
-}
-
-// claimSequence claims the checkout of a conflict root (see claim) and returns
-// the claim's sequence number, which orders the replacements that an apply
+//
+// It returns the claim's sequence number, which orders the replacements an apply
 // makes after claiming its checkout (see remote.Replacement.Sequence) after
 // those of all earlier applies of the conflict, including those whose clients
 // stopped waiting for them while the replacements kept running.
@@ -586,7 +581,7 @@ func release(ctx context.Context, directory, session string, target *remote.Targ
 // thus abandoned too, since the local endpoint has no workspace for the
 // conflict root, so it's released by that token, and one recorded after the
 // release is released by listing conflicts, discarding, or checking the
-// conflict out again (see claim). That includes a checkout without a token,
+// conflict out again (see claimSequence). That includes a checkout without a token,
 // recorded by a build that didn't issue tokens, which a release without one
 // removes.
 func releaseOver(ctx context.Context, connection io.ReadWriteCloser, directory, session string, target *remote.Target, path, token string) (bool, error) {
@@ -881,6 +876,12 @@ func runConflicts(ctx context.Context, directory string, o *options, output, err
 type listedConflict struct {
 	// Path is the local path of the conflict root.
 	Path string
+	// LocalChanges and RemoteChanges describe changes from the submitting
+	// endpoint's perspective, with paths mapped in the same way as Path.
+	LocalChanges  []remote.Change
+	RemoteChanges []remote.Change
+	// ExcludedChanges counts changes omitted from this conflict's summary.
+	ExcludedChanges uint64 `json:",omitempty"`
 	// Resolvable indicates whether remote can resolve the conflict.
 	Resolvable bool
 	// Files indicates whether both copies are files, which can be merged.
@@ -980,11 +981,22 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 		return ""
 	}
 	conflicts := make([]listedConflict, len(listing.Conflicts))
+	reports := newReporter(errorOutput, target)
 	for c := range listing.Conflicts {
 		conflict := &listing.Conflicts[c]
+		localChanges, remoteChanges := reports.sides(conflict.Changes())
+		localize := func(changes []remote.Change) []remote.Change {
+			result := slices.Clone(changes)
+			for c := range result {
+				result[c].Path = l.local(result[c].Path)
+			}
+			return result
+		}
 		listed := listedConflict{
 			Path: l.local(conflict.Path), Resolvable: conflict.Resolvable(), Files: conflict.Files,
 			Take: localSides(conflict, target), CheckedOut: checkedOut(conflict.Path),
+			LocalChanges: localize(localChanges), RemoteChanges: localize(remoteChanges),
+			ExcludedChanges: conflict.ExcludedChanges,
 		}
 		// Copies changed since checkout are only identified while nothing was
 		// applied (see workspace.changedSince), so a workspace through which
@@ -1030,7 +1042,7 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 		return err
 	}
 	for c, conflict := range conflicts {
-		line := l.display(listing.Conflicts[c].Path)
+		line := reports.describeConflict(listing.Conflicts[c].Changes())
 		if !conflict.Resolvable {
 			line += " (remote can't resolve it, since it involves a directory, the synchronization root, or content that can't be synchronized or read)"
 		} else if !conflict.Files {
@@ -1150,21 +1162,33 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 		return nil, err
 	}
 	defer unlock()
-	path, err := newLocator(target).resolve(local)
+	w, _, err := checkoutLocked(ctx, directory, o, listing, target, local)
 	if err != nil {
 		return nil, err
 	}
+	return describe(w, argument)
+}
+
+// checkoutLocked prepares a checkout while the caller holds the local path's
+// workspace lock. It returns the claim's sequence number so that an automatic
+// checkout can apply its result under that same claim, without another round
+// trip. A non-nil workspace on failure has been published and is kept for retry.
+func checkoutLocked(ctx context.Context, directory string, o *options, listing *remote.Listing, target *remote.Target, local string) (*workspace, uint64, error) {
+	path, err := newLocator(target).resolve(local)
+	if err != nil {
+		return nil, 0, err
+	}
 	conflict := findConflict(listing, path)
 	if w, err := loadWorkspace(local); err == nil {
-		return nil, checkedOut(w, conflict, target, path)
+		return nil, 0, checkedOut(w, conflict, target, path)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		return nil, 0, err
 	} else if conflict == nil {
-		return nil, errors.New("isn't a conflict root (see remote --conflicts)")
+		return nil, 0, errors.New("isn't a conflict root (see remote --conflicts)")
 	} else if !conflict.Resolvable() {
-		return nil, errors.New("isn't a conflict that remote can resolve (see remote --conflicts)")
+		return nil, 0, errors.New("isn't a conflict that remote can resolve (see remote --conflicts)")
 	} else if o.base != "" && !conflict.Files {
-		return nil, errors.New("--base requires a conflict between two files")
+		return nil, 0, errors.New("--base requires a conflict between two files")
 	}
 
 	// Claim the checkout before downloading the copies, so that the opposite
@@ -1173,10 +1197,11 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 	// that late claims and releases of earlier checkouts can't take over or
 	// remove its checkout. A checkout that the local endpoint already holds
 	// without a workspace, such as one left by an interrupted checkout, is
-	// released first (see claim).
+	// released first (see claimSequence).
 	token := rand.Text()[:8]
-	if err := claim(ctx, directory, o.session, target, path, token); err != nil {
-		return nil, err
+	sequence, err := claimSequence(ctx, directory, o.session, target, path, token)
+	if err != nil {
+		return nil, 0, err
 	}
 	created := false
 	defer func() {
@@ -1186,16 +1211,16 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 	}()
 	base, final, err := workspaceDirectory(local)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	} else if err := outside(base, target.Root); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// Prepare the workspace in a temporary directory and move it into place
 	// once complete, so that interrupted checkouts leave no workspace.
 	staging, err := os.MkdirTemp(base, stagingPrefix)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create workspace: %w", err)
+		return nil, 0, fmt.Errorf("unable to create workspace: %w", err)
 	}
 	defer os.RemoveAll(staging)
 	w := &workspace{Session: target.Session, Alpha: target.Alpha, Path: path, Token: token, directory: staging}
@@ -1214,23 +1239,23 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 		err = checkoutEntries(ctx, directory, o, target, w)
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	} else if err := w.save(); err != nil {
-		return nil, fmt.Errorf("unable to save workspace: %w", err)
+		return nil, 0, fmt.Errorf("unable to save workspace: %w", err)
 	} else if err := os.Rename(staging, final); err != nil {
-		return nil, fmt.Errorf("unable to save workspace: %w", err)
+		return nil, 0, fmt.Errorf("unable to save workspace: %w", err)
 	}
 	created = true
+	w.directory = final
 	// The workspace's files and directory were flushed (see workspace.save),
 	// so flush the workspaces directory that it was moved into, and that
 	// directory's parent, in case the workspaces directory was just created,
 	// so that the copies survive a power loss or an operating system crash
 	// once checkout reports them.
 	if err := errors.Join(remote.SyncDirectory(base), remote.SyncDirectory(filepath.Dir(base))); err != nil {
-		return nil, fmt.Errorf("unable to save workspace: %w", err)
+		return w, sequence, fmt.Errorf("unable to save workspace: %w", err)
 	}
-	w.directory = final
-	return describe(w, argument)
+	return w, sequence, nil
 }
 
 // errCopiesChanged indicates that the copies downloaded for a checkout aren't
@@ -1488,19 +1513,54 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 	// conflicts are no longer listed (see workspace.applied), which requires a
 	// listing before writing them. It's made at most once, when first needed,
 	// and isn't needed to finish resolutions applied before.
+	// Pin the session once selected, including before automatically checking
+	// out multiple paths. Each workspace also checks the submitting endpoint.
+	options := *o
+	o = &options
 	var preliminary *remote.Listing
+	var preliminaryTarget, selected *remote.Target
 	var preliminaryErr error
-	listed := func() (*remote.Listing, error) {
+	listed := func() (*remote.Listing, *remote.Target, error) {
 		if preliminary == nil && preliminaryErr == nil {
-			preliminary, _, preliminaryErr = listConflicts(ctx, directory, o, p.errors)
+			preliminary, preliminaryTarget, preliminaryErr = listConflicts(ctx, directory, o, p.errors)
+			if preliminaryErr == nil {
+				if selected != nil && (selected.Session != preliminaryTarget.Session || selected.Alpha != preliminaryTarget.Alpha) {
+					preliminaryErr = errors.New("the session was located differently while resolving the conflict")
+					return nil, nil, preliminaryErr
+				}
+				selected = preliminaryTarget
+				o.session = preliminaryTarget.Session
+				warnOverlapping(p.errors, preliminaryTarget)
+			}
 		}
-		return preliminary, preliminaryErr
+		return preliminary, preliminaryTarget, preliminaryErr
 	}
 	var applications []*application
+	seen := make(map[string]bool)
 	for _, argument := range o.arguments {
-		a, unlock, err := apply(ctx, directory, o, argument, listed)
+		// POSIX record locks don't exclude locks in the same process, and
+		// closing another descriptor would release the first lock. Aliases of
+		// an earlier argument must therefore be rejected before locking them.
+		local, err := filepath.Abs(argument)
+		var key string
+		if err == nil {
+			_, key, err = workspaceDirectory(local)
+		}
+		if err != nil {
+			p.print(argument, nil, err)
+			continue
+		} else if seen[key] {
+			p.print(argument, nil, errors.New("this path was already specified"))
+			continue
+		}
+		seen[key] = true
+		a, unlock, err := apply(ctx, directory, o, argument, selected, listed)
 		if unlock != nil {
 			unlocks = append(unlocks, unlock)
+		}
+		if a != nil {
+			selected = a.target
+			o.session = selected.Session
 		}
 		if err != nil {
 			p.print(argument, nil, err)
@@ -1511,10 +1571,14 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 	if len(applications) == 0 {
 		return nil
 	}
-	listing, _, listErr := listConflicts(ctx, directory, o, p.errors)
+	listing, target, listErr := listConflicts(ctx, directory, o, p.errors)
 	for _, a := range applications {
-		if listErr != nil {
-			p.print(a.argument, nil, fmt.Errorf("updated the copies, but unable to verify synchronization (retry to verify): %w", listErr))
+		err := listErr
+		if err == nil && (target.Session != a.target.Session || target.Alpha != a.target.Alpha) {
+			err = errors.New("the session was located differently while resolving the conflict")
+		}
+		if err != nil {
+			p.print(a.argument, nil, fmt.Errorf("updated the copies, but unable to verify synchronization (retry to verify): %w", err))
 			continue
 		}
 		result, err := a.verify(ctx, directory, o, listing)
@@ -1543,7 +1607,7 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 // that the other endpoint checked out, possibly with a result that's one of
 // the checked-out copies, which this workspace would otherwise accept and
 // replace.
-func apply(ctx context.Context, directory string, o *options, argument string, listed func() (*remote.Listing, error)) (*application, func(), error) {
+func apply(ctx context.Context, directory string, o *options, argument string, expected *remote.Target, listed func() (*remote.Listing, *remote.Target, error)) (_ *application, _ func(), resultErr error) {
 	local, err := filepath.Abs(argument)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to locate it: %w", err)
@@ -1553,9 +1617,27 @@ func apply(ctx context.Context, directory string, o *options, argument string, l
 		return nil, nil, err
 	}
 	w, err := loadWorkspace(local)
-	if errors.Is(err, os.ErrNotExist) {
+	var sequence uint64
+	if errors.Is(err, os.ErrNotExist) && (o.take == sideLocal || o.take == sideRemote) {
+		// Hold this lock from checking for a workspace through claim,
+		// checkout, both replacements, and final verification. In particular,
+		// don't call checkout, which would try to take this lock again.
+		listing, target, listErr := listed()
+		if listErr != nil {
+			return nil, unlock, fmt.Errorf("unable to synchronize before applying: %w", listErr)
+		}
+		w, sequence, err = checkoutLocked(ctx, directory, o, listing, target, local)
+		if w != nil {
+			defer func() {
+				if resultErr != nil {
+					resultErr = fmt.Errorf("%w; the automatic checkout is kept in %s: address this error, then retry apply (see remote --help conflicts)", resultErr, w.directory)
+				}
+			}()
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
 		return nil, unlock, errors.New("isn't checked out (see remote --conflict-checkout)")
-	} else if err != nil {
+	}
+	if err != nil {
 		return nil, unlock, err
 	} else if w.hasDirectory() {
 		return nil, unlock, errDirectoryConflict
@@ -1569,13 +1651,19 @@ func apply(ctx context.Context, directory string, o *options, argument string, l
 		return nil, unlock, err
 	}
 	a := &application{argument: argument, w: w, result: result, target: target, locator: newLocator(target)}
-	if path, err := a.locator.resolve(local); err != nil || !w.matches(target, path) {
+	if expected != nil && (target.Session != expected.Session || target.Alpha != expected.Alpha) {
+		connection.Close()
+		return nil, unlock, errors.New("the session was located differently while resolving the conflict")
+	} else if path, err := a.locator.resolve(local); err != nil || !w.matches(target, path) {
 		connection.Close()
 		return nil, unlock, errors.New("the workspace was checked out through a different session or endpoint")
 	} else if !w.applied() {
-		if listing, err := listed(); err != nil {
+		if listing, listedTarget, err := listed(); err != nil {
 			connection.Close()
 			return nil, unlock, fmt.Errorf("unable to synchronize before applying: %w", err)
+		} else if listedTarget.Session != target.Session || listedTarget.Alpha != target.Alpha {
+			connection.Close()
+			return nil, unlock, errors.New("the session was located differently while resolving the conflict")
 		} else if findConflict(listing, w.Path) == nil {
 			connection.Close()
 			return nil, unlock, errResolvedOtherwise
@@ -1586,7 +1674,11 @@ func apply(ctx context.Context, directory string, o *options, argument string, l
 	// still listed and the opposite endpoint hasn't checked it out. Each apply
 	// claims the checkout again, since the claim's sequence number orders its
 	// replacements after those of earlier applies (see write).
-	sequence, err := claimSequence(ctx, directory, o.session, target, w.Path, w.Token)
+	// Automatic checkout already claimed this token and obtained the sequence
+	// while holding the same lock. Existing workspaces always claim anew.
+	if sequence == 0 {
+		sequence, err = claimSequence(ctx, directory, o.session, target, w.Path, w.Token)
+	}
 	if err != nil {
 		connection.Close()
 		return nil, unlock, err

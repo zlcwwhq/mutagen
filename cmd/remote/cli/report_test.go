@@ -131,3 +131,28 @@ func TestTruncatedConflict(t *testing.T) {
 		t.Fatal("truncated conflict root wasn't compared:", paths)
 	}
 }
+
+func TestConflictRootSummary(t *testing.T) {
+	// Listings retain actual change history, including omitted changes, and
+	// use the warning formatter from either endpoint's perspective. Control
+	// characters in roots and descendant paths are neutralized only for text.
+	conflict := &remote.ConflictRoot{
+		Path:            "sub/d\x1b",
+		AlphaChanges:    []remote.Change{{Path: "sub/d\x1b", Old: "directory", New: "file"}},
+		BetaChanges:     []remote.Change{{Path: "sub/d\x1b/child\x1b", New: "symbolic link"}},
+		ExcludedChanges: 42,
+	}
+	for _, alpha := range []bool{true, false} {
+		reports := newReporter(nil, &remote.Target{Root: t.TempDir(), Alpha: alpha, Contained: true, Path: "sub"})
+		summary := reports.describeConflict(conflict.Changes())
+		side := "locally"
+		if !alpha {
+			side = "remotely"
+		}
+		if !strings.HasPrefix(summary, "d^[: ") || !strings.Contains(summary, "changed directory to file "+side) ||
+			!strings.Contains(summary, "created symbolic link "+filepath.Join("d^[", "child^[")) ||
+			!strings.Contains(summary, "42 more changes") || strings.Contains(summary, "\x1b") {
+			t.Fatalf("incorrect summary: %q", summary)
+		}
+	}
+}

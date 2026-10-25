@@ -333,3 +333,38 @@ func TestCorruptCheckouts(t *testing.T) {
 		t.Fatal("checkouts not saved or temporary files left behind:", entries, err)
 	}
 }
+
+func TestCheckoutConcurrentClaims(t *testing.T) {
+	// Simultaneous claims from opposite endpoints admit exactly one holder.
+	// Automatic checkout must rely on this atomic decision, even when both
+	// callers obtained the same unoccupied listing beforehand.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	c := newCheckoutController("file")
+	type result struct {
+		alpha  bool
+		status remote.CheckoutStatus
+		err    error
+	}
+	for attempt := 0; attempt < 20; attempt++ {
+		start := make(chan struct{})
+		results := make(chan result, 2)
+		for _, alpha := range []bool{true, false} {
+			go func() {
+				<-start
+				status, err := c.claimCheckout(alpha, "file", "token")
+				results <- result{alpha, status, err}
+			}()
+		}
+		close(start)
+		first, second := <-results, <-results
+		if first.err != nil {
+			first, second = second, first
+		}
+		if first.err != nil || first.status.Sequence == 0 || second.status.Sequence != 0 || !errors.Is(second.err, errCheckedOutOpposite) {
+			t.Fatalf("claims weren't exclusive: %+v, %+v", first, second)
+		}
+		if _, err := c.releaseCheckout(first.alpha, "file", "token"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

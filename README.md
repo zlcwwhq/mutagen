@@ -431,11 +431,21 @@ In two-way-safe and one-way-safe sessions, `remote` can also resolve
 conflicts:
 
 ```sh
-remote --conflicts                    # synchronize and list every conflict
+remote --conflict-apply --take local src/app.go   # keep the submitting copy
+remote --conflict-apply --take remote src/app.go  # keep the opposite copy
+
+# Or merge both copies manually:
+remote --conflicts                    # list actual changes and checkout state
 remote --conflict-checkout src/app.go # download both copies into a workspace
 # Edit the printed merged file, resolving its conflict markers.
 remote --conflict-apply src/app.go    # write it to both copies and verify
 ```
+
+`--take local|remote` automatically checks out an unclaimed conflict when no
+workspace exists, then applies and verifies it in one invocation. Local and
+remote are relative to the submitting endpoint. Existing workspaces retain
+their original copies and validation; another endpoint's checkout is refused.
+Plain merged-file apply and `--delete` require an explicit checkout.
 
 Stop writers on both endpoints until apply finishes. A checkout belongs to one
 endpoint, and an existing workspace may be another person's work; only apply

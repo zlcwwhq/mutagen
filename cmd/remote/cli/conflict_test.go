@@ -49,9 +49,9 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 			}
 			for _, side := range []string{sideLocal, sideRemote} {
 				o := &options{conflictOptions: conflictOptions{take: side}}
-				_, unlock, err := apply(ctx, root, o, local, func() (*remote.Listing, error) {
+				_, unlock, err := apply(ctx, root, o, local, nil, func() (*remote.Listing, *remote.Target, error) {
 					t.Fatal("conflicts listed for a directory workspace")
-					return nil, nil
+					return nil, nil, nil
 				})
 				if unlock != nil {
 					unlock()
@@ -104,9 +104,9 @@ func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 			if _, err := checkout(ctx, root, &options{}, &remote.Listing{}, target, local); !reported(err) {
 				t.Fatal("unreadable workspace not reported by checkout:", err)
 			}
-			_, unlock, err := apply(ctx, root, &options{}, local, func() (*remote.Listing, error) {
+			_, unlock, err := apply(ctx, root, &options{}, local, nil, func() (*remote.Listing, *remote.Target, error) {
 				t.Fatal("conflicts listed for an unreadable workspace")
-				return nil, nil
+				return nil, nil, nil
 			})
 			if unlock != nil {
 				unlock()
@@ -718,4 +718,35 @@ func TestUnterminatedCopies(t *testing.T) {
 			t.Fatalf("%q and %q not noted: %s", test.local, test.remote, output)
 		}
 	}
+}
+
+func TestAutomaticCheckoutKeepsWorkspaceLock(t *testing.T) {
+	// Automatic checkout retains the local lock from its initial check until
+	// the batch completes. POSIX record locks require another process to
+	// check exclusion (see TestWorkspaceLock).
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	local := filepath.Join(t.TempDir(), "file")
+	check := func(held bool) {
+		t.Helper()
+		helper := exec.Command(os.Args[0], "-test.run=^TestWorkspaceLock$")
+		helper.Env = append(os.Environ(), "MUTAGEN_TEST_WORKSPACE_LOCK="+local)
+		output, err := helper.CombinedOutput()
+		if held && (err == nil || !strings.Contains(string(output), "in progress")) {
+			t.Fatalf("workspace lock not retained: %s, %v", output, err)
+		} else if !held && (err != nil || string(output) != "locked\n") {
+			t.Fatalf("workspace lock not released: %s, %v", output, err)
+		}
+	}
+	expected := errors.New("listing failed")
+	_, unlock, err := apply(context.Background(), filepath.Dir(local), &options{conflictOptions: conflictOptions{take: sideLocal}}, local, nil,
+		func() (*remote.Listing, *remote.Target, error) {
+			check(true)
+			return nil, nil, expected
+		})
+	if unlock == nil || !errors.Is(err, expected) {
+		t.Fatalf("listing error or lock lost: %v", err)
+	}
+	check(true)
+	unlock()
+	check(false)
 }

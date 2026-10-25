@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,12 @@ type ConflictRoot struct {
 	// Path is the slash-separated conflict root relative to the
 	// synchronization root, which is empty for the root itself.
 	Path string
+	// AlphaChanges and BetaChanges describe the actual changes on each
+	// endpoint, bounded to fit the conflict's listing message.
+	AlphaChanges []Change
+	BetaChanges  []Change
+	// ExcludedChanges counts changes omitted from this conflict's summary.
+	ExcludedChanges uint64 `json:",omitempty"`
 	// Files indicates whether both endpoints have a regular file at the
 	// conflict root, in which case remote can write a result, such as a merge
 	// of both copies, to both endpoints.
@@ -53,6 +60,38 @@ type ConflictRoot struct {
 // Resolvable indicates whether remote can resolve a conflict in some way.
 func (c *ConflictRoot) Resolvable() bool {
 	return c.Files || c.AlphaTakable || c.BetaTakable
+}
+
+// Changes returns the conflict's change summary in the same form as a
+// synchronization warning, retaining endpoint roles and omitted changes.
+func (c *ConflictRoot) Changes() Conflict {
+	return Conflict{Root: c.Path, Alpha: c.AlphaChanges, Beta: c.BetaChanges, ExcludedChanges: c.ExcludedChanges}
+}
+
+// boundConflict fits a conflict into its listing message without modifying
+// the source. A directory conflict may contain thousands of changes. Halve
+// the longest list first, preserving resolution metadata and counting every
+// omitted change, including when a single change exceeds the message limit.
+func boundConflict(conflict *ConflictRoot) (*ConflictRoot, error) {
+	bounded := *conflict
+	for {
+		data, err := json.Marshal(&conflictsMessage{Conflict: &bounded})
+		if err != nil {
+			return nil, err
+		} else if len(data) <= maximumMessageSize {
+			return &bounded, nil
+		}
+		longest := &bounded.AlphaChanges
+		if len(bounded.BetaChanges) > len(*longest) {
+			longest = &bounded.BetaChanges
+		}
+		if len(*longest) == 0 {
+			return nil, errors.New("conflict metadata exceeds size limit")
+		}
+		removed := (len(*longest) + 1) / 2
+		bounded.ExcludedChanges += uint64(removed)
+		*longest = (*longest)[:len(*longest)-removed]
+	}
 }
 
 // Listing is a complete listing of a session's conflicts and problems as of a
@@ -99,7 +138,14 @@ func RespondWithConflicts(connection io.ReadWriteCloser, listing *Listing, err e
 	}
 	writer := bufio.NewWriter(connection)
 	for c := range listing.Conflicts {
-		if err := writeMessage(writer, &conflictsMessage{Conflict: &listing.Conflicts[c]}); err != nil {
+		conflict, err := boundConflict(&listing.Conflicts[c])
+		if err != nil {
+			if err := writeMessage(writer, &conflictsMessage{Error: err.Error()}); err != nil {
+				return err
+			}
+			return writer.Flush()
+		}
+		if err := writeMessage(writer, &conflictsMessage{Conflict: conflict}); err != nil {
 			return err
 		}
 	}

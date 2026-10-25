@@ -310,15 +310,18 @@ exits:
 Resolve conflicting files in two-way-safe and one-way-safe sessions.
 Local and remote always mean the submitting and opposite endpoints.
 
+To keep one side (no checkout needed):
+  remote --conflict-apply --take local app.go
+  remote --conflict-apply --take remote app.go
+This creates a checkout if none exists, then applies and verifies. Existing
+workspaces retain their original copies; another endpoint's checkout refuses
+this operation. --delete still requires an explicit checkout.
+
 To merge both copies:
-  remote --conflicts                    (list conflicts and checkout status)
+  remote --conflicts                    (list actual changes and checkout state)
   remote --conflict-checkout app.go     (download copies into a workspace)
   (edit and review the complete merged file printed by checkout)
   remote --conflict-apply app.go        (write both copies, then verify)
-
-To keep one checked-out copy:
-  remote --conflict-apply --take local app.go
-  remote --conflict-apply --take remote app.go
 
 Stop writers on both endpoints until apply finishes. Apply refuses copies
 changed since checkout; concurrent edits during apply can be overwritten.
@@ -336,7 +339,18 @@ and recovery after changed copies, interruptions, or damaged workspaces.
 
 Options:
 `},
-	{"conflict-details", "merge rules, backups, and recovery", `  - remote --conflicts synchronizes, lists every conflict, how it can be
+	{"conflict-details", "merge rules, backups, and recovery", `--take local|remote creates a checkout when none exists, under one local lock
+held through apply and verification. It reuses its claim's write sequence;
+existing workspaces use the usual validation and retries. Multi-path applies
+share one synchronization before writing and one after. Failed automatic apply
+keeps its workspace for retry or manual merging; --delete never auto-checks out.
+
+Listing summaries describe actual local/remote changes from the submitter's
+perspective. Oversized summaries report omitted changes. JSON retains Path and
+adds LocalChanges, RemoteChanges, and ExcludedChanges; internal checkout emits
+no separate result when --take applies a path.
+
+  - remote --conflicts synchronizes, lists every conflict, how it can be
     resolved, and through which endpoint it's checked out, flags checked-out
     copies that changed since checkout and partially applied resolutions, and
     lists workspaces whose conflicts are no longer listed, with their

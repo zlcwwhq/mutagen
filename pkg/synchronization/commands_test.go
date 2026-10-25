@@ -84,6 +84,14 @@ func TestRemoteReport(t *testing.T) {
 		t.Fatal("state modified")
 	}
 
+	// Resolution listings use the same actual changes as warnings, including
+	// directory descendants and type changes, without deriving history from
+	// the current copies' types.
+	listed := resolution(conflicts[len(conflicts)-1], "sha1")
+	if !reflect.DeepEqual(listed.Changes(), report.Conflicts[0]) {
+		t.Fatalf("listing and warning disagree: %+v, %+v", listed.Changes(), report.Conflicts[0])
+	}
+
 	// Sessions without conflicts or problems produce empty reports.
 	c.state = &State{AlphaState: &EndpointState{}, BetaState: &EndpointState{}}
 	if report := c.remoteReport(); !report.Empty() {

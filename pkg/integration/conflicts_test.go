@@ -55,13 +55,15 @@ func createConflictSessionWithCommands(t *testing.T, commands synchronization.Re
 // conflictListing is the JSON output of remote --conflicts.
 type conflictListing struct {
 	Conflicts []struct {
-		Path       string
-		Resolvable bool
-		Files      bool
-		Take       []string
-		CheckedOut string
-		Changed    bool
-		Applied    bool
+		Path                        string
+		Resolvable                  bool
+		Files                       bool
+		Take                        []string
+		CheckedOut                  string
+		Changed                     bool
+		Applied                     bool
+		LocalChanges, RemoteChanges []remote.Change
+		ExcludedChanges             uint64
 	}
 	Pending []struct {
 		Path      string
@@ -291,7 +293,7 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 					t.Fatalf("unexpected change reported: %+v", conflict)
 				}
 			}
-			if !strings.Contains(c.invoke("--conflicts"), "text (checked out, but the remote copy changed since") {
+			if !strings.Contains(c.invoke("--conflicts"), "text: modified file locally, modified file remotely (checked out, but the remote copy changed since") {
 				t.Fatal("changed copy not listed as text")
 			}
 			c.fail("the remote copy changed since checkout", "--conflict-checkout", "text")
@@ -319,7 +321,7 @@ func TestRemoteConflictWorkflow(t *testing.T) {
 			// Directory conflicts remain listed and can't be checked out or
 			// applied. Neither copy is changed.
 			c.fail("isn't a conflict that remote can resolve", "--conflict-checkout", "type")
-			c.fail("isn't checked out", "--conflict-apply", "--take", "local", "type")
+			c.fail("isn't a conflict that remote can resolve", "--conflict-apply", "--take", "local", "type")
 			if read(roots[0], filepath.Join("type", "child")) != "child\n" || read(roots[1], "type") != "file\n" {
 				t.Fatal("directory conflict modified despite rejection")
 			}
@@ -370,7 +372,7 @@ func TestRemoteConflictSingleCheckout(t *testing.T) {
 		t.Fatalf("local checkout not listed: %+v", listing)
 	} else if listing := beta.list(); len(listing.Conflicts) != 1 || listing.Conflicts[0].CheckedOut != "remote" {
 		t.Fatalf("opposite checkout not listed: %+v", listing)
-	} else if !strings.Contains(beta.invoke("--conflicts"), "file (checked out through the opposite endpoint") {
+	} else if !strings.Contains(beta.invoke("--conflicts"), "file: modified file locally, modified file remotely (checked out through the opposite endpoint") {
 		t.Fatal("opposite checkout not listed as text")
 	}
 
@@ -765,7 +767,7 @@ func TestRemoteConflictRetryWithChangedResult(t *testing.T) {
 	if listing := c.list(); len(listing.Conflicts) != 1 || !listing.Conflicts[0].Applied ||
 		listing.Conflicts[0].CheckedOut != "local" || listing.Conflicts[0].Changed || len(listing.Pending) != 0 {
 		t.Fatalf("partially applied resolution not listed: %+v", listing)
-	} else if text := c.invoke("--conflicts"); !strings.Contains(text, path+" (checked out and partially applied: apply again to finish)") {
+	} else if text := c.invoke("--conflicts"); !strings.Contains(text, path+": modified file locally, modified file remotely (checked out and partially applied: apply again to finish)") {
 		t.Fatal("partially applied resolution not listed as text:", text)
 	}
 	c.fail("partially applied through it: apply again to finish resolving it", "--conflict-checkout", path)
@@ -1124,7 +1126,7 @@ func TestRemoteConflictDirectoryRejected(t *testing.T) {
 	}
 	c.fail("isn't a conflict that remote can resolve", "--conflict-checkout", "d")
 	for _, side := range []string{"local", "remote"} {
-		c.fail("isn't checked out", "--conflict-apply", "--take", side, "d")
+		c.fail("isn't a conflict that remote can resolve", "--conflict-apply", "--take", side, "d")
 	}
 	if readFile(filepath.Join(alphaRoot, "d", "f")) != "edited\n" || readFile(filepath.Join(betaRoot, "d")) != "replacement\n" {
 		t.Fatal("directory conflict modified despite rejection")
@@ -1291,6 +1293,195 @@ func TestRemoteConflictTakeChangedCopy(t *testing.T) {
 					t.Fatalf("remote copy changed: %q", current)
 				}
 			})
+		}
+	}
+}
+
+func TestRemoteConflictAutomaticTake(t *testing.T) {
+	// Taking either copy works directly from either endpoint, including a
+	// batch, with one final JSON result and one retained backup per path.
+	for _, submitAlpha := range []bool{true, false} {
+		for _, take := range []string{"local", "remote"} {
+			t.Run(fmt.Sprintf("alpha=%t/take=%s", submitAlpha, take), func(t *testing.T) {
+				alpha, beta, roots := createBothSidedConflicts(t, "first", "second", "manual-first", "manual-second")
+				c, expected, other := alpha, "alpha\n", "beta\n"
+				if !submitAlpha {
+					c, expected, other = beta, other, expected
+				}
+				if take == "remote" {
+					expected = other
+				}
+				cycles := func() uint64 {
+					t.Helper()
+					_, states, err := synchronizationManager.List(context.Background(), &selection.Selection{All: true}, 0)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, state := range states {
+						if state.Session.Alpha.Path == roots[0] {
+							return state.SuccessfulCycles
+						}
+					}
+					t.Fatal("session not listed")
+					return 0
+				}
+				before, started := cycles(), time.Now()
+				outcomes := c.outcomes("--conflict-apply", "--take", take, "first", "second")
+				elapsed, count := time.Since(started), cycles()-before
+				if len(outcomes) != 2 {
+					t.Fatalf("internal checkout produced extra JSON outcomes: %+v", outcomes)
+				} else if count != 2 {
+					t.Fatalf("automatic batch used %d synchronization cycles instead of 2", count)
+				}
+				for _, outcome := range outcomes {
+					if !outcome.Resolved || outcome.Local != "" || outcome.Merged != "" {
+						t.Fatalf("unexpected final outcome: %+v", outcome)
+					}
+					for _, root := range roots {
+						if data := readFile(filepath.Join(root, outcome.Path)); data != expected {
+							t.Fatalf("wrong copy taken: %q, expected %q", data, expected)
+						}
+					}
+					localOriginal, remoteOriginal := "alpha\n", "beta\n"
+					if !submitAlpha {
+						localOriginal, remoteOriginal = remoteOriginal, localOriginal
+					}
+					if readFile(filepath.Join(outcome.Backup, "local")) != localOriginal || readFile(filepath.Join(outcome.Backup, "remote")) != remoteOriginal {
+						t.Fatal("original copies not retained")
+					}
+				}
+				before, started = cycles(), time.Now()
+				c.outcomes("--conflict-checkout", "manual-first", "manual-second")
+				c.invoke("--conflict-apply", "--take", take, "manual-first", "manual-second")
+				manualElapsed, manualCycles := time.Since(started), cycles()-before
+				if manualCycles != 3 {
+					t.Fatalf("manual workflow used %d cycles instead of 3", manualCycles)
+				}
+				t.Logf("automatic batch (2 paths): %s, %d syncs; manual batch (2 paths): %s, %d syncs", elapsed, count, manualElapsed, manualCycles)
+				c.fail("isn't a conflict root", "--conflict-apply", "--take", take, "first")
+			})
+		}
+	}
+}
+
+func TestRemoteConflictAutomaticTakeRefusals(t *testing.T) {
+	alpha, beta, roots := createBothSidedConflicts(t, "file", "explicit")
+	// Plain merged-file apply and --delete continue to require checkout.
+	alpha.fail("isn't checked out", "--conflict-apply", "explicit")
+	alpha.fail("isn't checked out", "--conflict-apply", "--delete", "explicit")
+	w := alpha.checkout("file")
+	writeFile(t, w.Merged, "manual edits\n")
+	beta.fail("checked out through the opposite endpoint", "--conflict-apply", "--take", "local", "file")
+	if readFile(w.Merged) != "manual edits\n" || readFile(filepath.Join(roots[1], "file")) != "beta\n" {
+		t.Fatal("opposite endpoint's checkout or copy changed")
+	}
+	alpha.invoke("--conflict-apply", "--take", "remote", "file")
+}
+
+func TestRemoteConflictAutomaticTakeTimeout(t *testing.T) {
+	alpha, _, roots := createBothSidedConflicts(t, "file")
+	// Interruption after automatic checkout retains the workspace and claim,
+	// including merged content for manual recovery. The retry reuses its
+	// originals and supersedes the earlier replacement.
+	var first atomic.Bool
+	paused, resumed, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	resume := func() { once.Do(func() { close(resumed) }) }
+	remote.ReplaceHook = func(stage, directory, _ string) {
+		if stage == "writing" && directory == roots[1] && first.CompareAndSwap(false, true) {
+			close(paused)
+			<-resumed
+			close(finished)
+		}
+	}
+	t.Cleanup(func() {
+		resume()
+		if first.Load() {
+			<-finished
+		}
+		remote.ReplaceHook = nil
+	})
+	code, output, errors := runRemote(t, roots[0], "--timeout", "2s", "--json", "--conflict-apply", "--take", "local", "file")
+	if code != 124 || !strings.Contains(errors, "automatic checkout is kept") {
+		t.Fatalf("automatic apply interruption not explained: %d, %s", code, errors)
+	}
+	var failed conflictOutcome
+	if err := json.Unmarshal([]byte(output), &failed); err != nil || failed.Error == "" || failed.Resolved {
+		t.Fatalf("expected one final failure outcome: %s, %v", output, err)
+	}
+	select {
+	case <-paused:
+	default:
+		t.Fatal("replacement wasn't paused")
+	}
+	resume()
+	outcomes := alpha.outcomes("--conflict-apply", "--take", "remote", "file")
+	if len(outcomes) != 1 || !outcomes[0].Resolved {
+		t.Fatalf("retry failed: %+v", outcomes)
+	}
+	backup := outcomes[0].Backup
+	if readFile(filepath.Join(backup, "local")) != "alpha\n" || readFile(filepath.Join(backup, "remote")) != "beta\n" || readFile(filepath.Join(backup, "merged")) == "" {
+		t.Fatal("automatic workspace wasn't retained unchanged")
+	}
+	for _, root := range roots {
+		if readFile(filepath.Join(root, "file")) != "beta\n" {
+			t.Fatal("retry didn't apply the original remote copy")
+		}
+	}
+}
+
+func TestRemoteConflictChangeSummaries(t *testing.T) {
+	alpha, beta, roots := createBothSidedConflicts(t, "file")
+	if err := os.Mkdir(filepath.Join(roots[0], "kind"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(roots[1], "kind"), "new file\n")
+	for _, c := range []*conflictCommands{alpha, beta} {
+		listing := c.list()
+		if len(listing.Conflicts) != 2 {
+			t.Fatalf("unexpected listing: %+v", listing)
+		}
+		kind := listing.Conflicts[1]
+		c.fail("isn't a conflict that remote can resolve", "--conflict-apply", "--take", "local", "kind")
+		local, opposite := "directory", "file"
+		if c == beta {
+			local, opposite = opposite, local
+		}
+		if len(kind.LocalChanges) != 1 || kind.LocalChanges[0].Path != "kind" || kind.LocalChanges[0].New != local ||
+			len(kind.RemoteChanges) != 1 || kind.RemoteChanges[0].New != opposite || kind.ExcludedChanges != 0 {
+			t.Fatalf("incorrect structured changes: %+v", kind)
+		}
+		summary := fmt.Sprintf("kind: created %s locally, created %s remotely", local, opposite)
+		if text := c.invoke("--conflicts"); !strings.Contains(text, summary) || !strings.Contains(text, "file: modified file locally, modified file remotely") {
+			t.Fatalf("incorrect summary: %s", text)
+		}
+	}
+}
+
+func TestRemoteConflictAutomaticTakeDuplicate(t *testing.T) {
+	_, _, roots := createBothSidedConflicts(t, "file")
+	// Aliases in one batch must not acquire the same process-level lock
+	// twice, or retire the same workspace twice. Each argument gets one JSON
+	// result: the first succeeds and the duplicate reports its error.
+	code, output, errors := runRemote(t, roots[0], "--json", "--conflict-apply", "--take", "local", "file", "./file")
+	if code == 0 || !strings.Contains(errors, "already specified") {
+		t.Fatalf("duplicate argument not rejected: %d, %s", code, errors)
+	}
+	decoder := json.NewDecoder(strings.NewReader(output))
+	var results []conflictOutcome
+	for decoder.More() {
+		var result conflictOutcome
+		if err := decoder.Decode(&result); err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, result)
+	}
+	if len(results) != 2 || results[0].Path != "./file" || results[0].Error == "" || results[1].Path != "file" || !results[1].Resolved {
+		t.Fatalf("incorrect per-argument outcomes: %+v", results)
+	}
+	for _, root := range roots {
+		if readFile(filepath.Join(root, "file")) != "alpha\n" {
+			t.Fatal("first argument wasn't resolved")
 		}
 	}
 }

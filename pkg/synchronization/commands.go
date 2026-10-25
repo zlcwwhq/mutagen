@@ -498,7 +498,10 @@ func (c *controller) remoteConflicts(algorithm string) (*remote.Listing, error) 
 // can't be content that can't be synchronized (such as a named pipe), and
 // replacing the other copy requires reading it.
 func resolution(conflict *core.Conflict, algorithm string) remote.ConflictRoot {
-	root := remote.ConflictRoot{Path: conflict.Root}
+	root := remote.ConflictRoot{
+		Path: conflict.Root, AlphaChanges: remoteChanges(conflict.AlphaChanges),
+		BetaChanges: remoteChanges(conflict.BetaChanges),
+	}
 	files, directory := true, false
 	for _, changes := range [][]*core.Change{conflict.AlphaChanges, conflict.BetaChanges} {
 		if len(changes) != 1 || changes[0].Path != conflict.Root ||
