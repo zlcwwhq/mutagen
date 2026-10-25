@@ -1,12 +1,70 @@
 package cli
 
 import (
+	"context"
+	"io"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/remote"
 )
+
+func TestKillNoFlush(t *testing.T) {
+	if runtime.GOOS == "windows" || runtime.GOOS == "aix" {
+		t.Skip("detached jobs aren't supported")
+	}
+
+	// Keep the data directory short enough for Unix domain sockets on macOS.
+	data, err := os.MkdirTemp("", "mr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(data) })
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
+	root := t.TempDir()
+	relaySession(t, "sync_kill", t.TempDir(), root, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dial := func() io.ReadWriteCloser {
+		t.Helper()
+		connection, _, err := remote.Dial(ctx, root, "sync_kill", remote.OperationExecute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return connection
+	}
+
+	// Use an ended job so that repeated kill requests return the same result.
+	job, code, err := remote.StartJob(ctx, dial(), &remote.Request{
+		Arguments: []string{"sh", "-c", "exit 0"},
+		Job:       &remote.JobRequest{Operation: remote.JobStart},
+	})
+	if err != nil || code != 0 {
+		t.Fatalf("unable to start job: %d, %v", code, err)
+	} else if job, err = remote.WaitJob(ctx, dial(), job.ID); err != nil || job.State != remote.JobExited {
+		t.Fatalf("unable to wait for job: %+v, %v", job, err)
+	}
+
+	// The relay refuses flush requests, so synchronizing before or after the
+	// kill would cause an error or warning instead of this successful report.
+	// Explicitly disabling --no-flush must also leave the behavior unchanged.
+	expected := "remote: job " + job.ID + " had already exited with status 0\n"
+	for _, option := range []string{"", "--no-flush", "--no-flush=false"} {
+		arguments := []string{"-s", "sync_kill", "--timeout", "10", "--kill", job.ID}
+		if option != "" {
+			arguments = append(arguments, option)
+		}
+		var stdout, stderr strings.Builder
+		if code := Run(arguments, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("kill with %q failed: %d, %s", option, code, stderr.String())
+		} else if stdout.Len() != 0 || stderr.String() != expected {
+			t.Fatalf("unexpected kill output with %q: stdout %q, stderr %q", option, stdout.String(), stderr.String())
+		}
+	}
+}
 
 func TestShellQuote(t *testing.T) {
 	for argument, expected := range map[string]string{

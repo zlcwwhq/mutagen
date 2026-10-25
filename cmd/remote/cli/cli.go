@@ -153,7 +153,7 @@ func parse(arguments []string) (*options, error) {
 	flags.StringVar(&result.log, "log", "", "With --detach, write the job's output to `FILE` (relative to the command's directory), a regular file or character device")
 	flags.BoolVar(&result.jobs, "jobs", false, "List the detached jobs started at the session's root on the opposite endpoint, and processes that ended jobs left running")
 	flags.StringVar(&result.wait, "wait", "", "Wait for the detached job `ID` to end, synchronize, and exit with its status")
-	flags.StringVar(&result.kill, "kill", "", "Terminate the detached job `ID`")
+	flags.StringVar(&result.kill, "kill", "", "Terminate the detached job `ID` without synchronizing (--no-flush is accepted but has no effect)")
 	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
 	flags.BoolVar(&result.ignores, "ignores", false, "Show the session's ignores, or whether the given paths are ignored")
 	flags.BoolVar(&result.pull, "pull", false, "Copy the given paths, which the session must ignore, from the opposite endpoint")
@@ -234,7 +234,7 @@ var modes = []struct {
 	{"sessions", nil},
 	{"jobs", []string{"session"}},
 	{"wait", []string{"session", "timeout", "no-flush"}},
-	{"kill", []string{"session", "timeout"}},
+	{"kill", []string{"session", "timeout", "no-flush"}},
 	{"ignores", []string{"session"}},
 	{"pull", []string{"session", "timeout"}},
 }

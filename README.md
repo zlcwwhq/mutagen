@@ -292,7 +292,8 @@ before a command can silently run outdated code, while an unneeded flush only
 costs a rescan of both roots, so use `--no-flush` only for commands that
 neither read nor write synchronized files. `--detach` flushes only before
 starting a job and `--wait` only after it ends, while `--jobs`, `--kill`,
-`--ignores`, and `--pull` don't flush.
+`--ignores`, and `--pull` don't flush. `--kill` accepts `--no-flush`, which
+has no effect.
 
 Commands are terminated when `--timeout` expires, when `remote` is interrupted,
 and when the session stops synchronizing, such as when it's paused, reconnects

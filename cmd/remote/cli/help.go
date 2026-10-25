@@ -215,7 +215,7 @@ shell passes unchanged if its delimiter is quoted:
        remote [options] --detach [--log <file>] --script <file>|- [<args>...]
        remote --jobs
        remote --wait <id> [--timeout <duration>] [--no-flush]
-       remote --kill <id>
+       remote --kill <id> [--timeout <duration>] [--no-flush]
 
 --detach synchronizes the session, starts the command (or script) as a detached
 job on the opposite endpoint, prints the job's ID on standard output, and
@@ -254,7 +254,8 @@ exits:
     then SIGKILL 5 seconds later if any of it remains, even if remote --kill
     is interrupted meanwhile. Repeating it while the job is being terminated
     doesn't send SIGTERM again. Processes that leave the group, such as
-    daemons, aren't terminated.
+    daemons, aren't terminated. It doesn't synchronize; --no-flush is
+    accepted but has no effect.
   - Job state is kept for 7 days after jobs end. Logs given with --log are
     never removed.
   - Jobs end with the system or container that runs them, and can end with the
