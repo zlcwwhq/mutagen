@@ -52,8 +52,9 @@ const (
 	// record, such as one whose executor failed while starting the job, is
 	// removed, unless the job is running.
 	incompleteJobRetention = 24 * time.Hour
-	// jobPollInterval is the interval at which a job's lock is checked while
-	// waiting for the job to end.
+	// jobPollInterval is the interval at which a job's lock, and its log if
+	// it's followed (see waitForJob), are checked while waiting for the job to
+	// end.
 	jobPollInterval = 100 * time.Millisecond
 	// JobVariable is the environment variable that identifies a detached job to
 	// its command.
@@ -338,10 +339,10 @@ func findJob(directory, root, id string) (*jobRecord, *Job, error) {
 
 // serveJob performs a job operation other than starting a job for an executor
 // with the specified normalized root, writing job listings to the specified
-// output as one JSON object per line and requested log tails as raw bytes,
-// so that neither is bounded by the size of protocol messages. Jobs that have
-// ended are reported along with the
-// processes that their commands left running, if any (see findLeftovers).
+// output as one JSON object per line, requested log tails as raw bytes, and
+// followed logs as frames (see logFrame), so that none of them is bounded by
+// the size of protocol messages. Jobs that have ended are reported along with
+// the processes that their commands left running, if any (see findLeftovers).
 // Those processes aren't part of the jobs any more, so killing the jobs
 // doesn't terminate them.
 func serveJob(ctx context.Context, root string, request *JobRequest, output io.Writer) result {
@@ -365,27 +366,7 @@ func serveJob(ctx context.Context, root string, request *JobRequest, output io.W
 		}
 		return result{HiddenJobs: hidden}
 	case JobWait:
-		for {
-			_, job, err := findJob(directory, root, request.ID)
-			if err != nil {
-				return result{Error: err.Error()}
-			} else if job.State != JobRunning {
-				findLeftovers([]*Job{job})
-				response := result{Job: job}
-				if request.Tail > 0 {
-					response.JobLog = readJobLog(ctx, job.Log, request.Tail)
-					if _, err := output.Write(response.JobLog.Data); err != nil {
-						return result{Error: fmt.Sprintf("unable to send job log: %v", err)}
-					}
-				}
-				return response
-			}
-			select {
-			case <-time.After(jobPollInterval):
-			case <-ctx.Done():
-				return result{Error: ctx.Err().Error()}
-			}
-		}
+		return waitForJob(ctx, directory, root, request, output)
 	case JobKill:
 		record, job, err := findJob(directory, root, request.ID)
 		if err != nil {
@@ -404,6 +385,77 @@ func serveJob(ctx context.Context, root string, request *JobRequest, output io.W
 		return result{Job: job}
 	default:
 		return result{Error: fmt.Sprintf("unknown job operation %q", request.Operation)}
+	}
+}
+
+// waitForJob waits for a job to end, or for the request's timeout to expire,
+// streaming the job's log meanwhile if requested (see JobRequest.Follow), and
+// returns the job, along with the requested log tail, if any.
+//
+// Streamed logs are polled for growth whenever the job's state is checked, at
+// jobPollInterval, and data that's already there is sent without waiting.
+// That keeps the delay of streamed output well below what people or agents
+// watching it notice, while the fstat that each poll adds costs nothing
+// measurable. Notification mechanisms, such as inotify and kqueue, would
+// require code for each platform without covering every log, since they don't
+// report writes made by other systems, such as to logs on network
+// filesystems.
+func waitForJob(ctx context.Context, directory, root string, request *JobRequest, output io.Writer) result {
+	var deadline time.Time
+	if request.Timeout > 0 {
+		deadline = time.Now().Add(request.Timeout)
+	}
+	var streamer *logStreamer
+	defer func() {
+		if streamer != nil {
+			streamer.close()
+		}
+	}()
+	for {
+		_, job, err := findJob(directory, root, request.ID)
+		if err != nil {
+			return result{Error: err.Error()}
+		}
+
+		// Stream what was appended to the log since it was last polled. The
+		// job's state is determined first, so once the job has ended, this
+		// sends everything that its command wrote, but not what processes
+		// that it left running write afterward.
+		if request.Follow != nil {
+			if streamer == nil {
+				streamer, err = streamJobLog(ctx, job.Log, request.Follow, output)
+			}
+			if err == nil {
+				err = streamer.poll()
+			}
+			if err != nil {
+				return result{Error: err.Error()}
+			}
+		}
+
+		// Return the job once it has ended, or once the timeout expires.
+		if timedOut := !deadline.IsZero() && !time.Now().Before(deadline); job.State != JobRunning || timedOut {
+			if job.State != JobRunning {
+				findLeftovers([]*Job{job})
+			}
+			response := result{Job: job}
+			if request.Tail > 0 {
+				response.JobLog = readJobLog(ctx, job.Log, request.Tail)
+				if _, err := output.Write(response.JobLog.Data); err != nil {
+					return result{Error: fmt.Sprintf("unable to send job log: %v", err)}
+				}
+			}
+			return response
+		}
+		interval := jobPollInterval
+		if !deadline.IsZero() {
+			interval = min(interval, time.Until(deadline))
+		}
+		select {
+		case <-time.After(interval):
+		case <-ctx.Done():
+			return result{Error: ctx.Err().Error()}
+		}
 	}
 }
 

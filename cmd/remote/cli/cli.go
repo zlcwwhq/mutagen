@@ -73,8 +73,12 @@ type options struct {
 	jobs bool
 	// wait is the identifier of a detached job to wait for, if any.
 	wait string
-	// tail is the number of final log lines to print after waiting for a job.
+	// tail is the number of final log lines to print after waiting for a job,
+	// or with which following its log starts.
 	tail int64
+	// follow indicates that a job's log should be printed while waiting for
+	// the job.
+	follow bool
 	// kill is the identifier of a detached job to terminate, if any.
 	kill string
 	// diff indicates that local and remote copies of the paths specified by
@@ -155,7 +159,8 @@ func parse(arguments []string) (*options, error) {
 	flags.StringVar(&result.log, "log", "", "With --detach, write the job's output to `FILE` (relative to the command's directory), a regular file or character device")
 	flags.BoolVar(&result.jobs, "jobs", false, "List the detached jobs started at the session's root on the opposite endpoint, and processes that ended jobs left running")
 	flags.StringVar(&result.wait, "wait", "", "Wait for the detached job `ID` to end, synchronize, and exit with its status")
-	flags.Int64Var(&result.tail, "tail", 0, "With --wait, print the final `N` log lines (at most 1 MiB; 0 disables output)")
+	flags.Int64Var(&result.tail, "tail", 0, "With --wait, print the final `N` log lines when the job ends or --timeout expires (at most 1 MiB; 0 disables output)")
+	flags.BoolVar(&result.follow, "follow", false, "With --wait, print the job's log as it's written, from its beginning or the final --tail lines")
 	flags.StringVar(&result.kill, "kill", "", "Terminate the detached job `ID` without synchronizing (--no-flush is accepted but has no effect)")
 	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
 	flags.BoolVar(&result.ignores, "ignores", false, "Show the session's ignores, or whether the given paths are ignored")
@@ -236,7 +241,7 @@ var modes = []struct {
 }{
 	{"sessions", nil},
 	{"jobs", []string{"session"}},
-	{"wait", []string{"session", "timeout", "no-flush", "tail"}},
+	{"wait", []string{"session", "timeout", "no-flush", "tail", "follow"}},
 	{"kill", []string{"session", "timeout", "no-flush"}},
 	{"ignores", []string{"session"}},
 	{"pull", []string{"session", "timeout"}},
@@ -246,6 +251,8 @@ var modes = []struct {
 func (o *options) validate(flags *pflag.FlagSet) error {
 	if flags.Changed("tail") && !flags.Changed("wait") {
 		return errors.New("--tail requires --wait")
+	} else if flags.Changed("follow") && !flags.Changed("wait") {
+		return errors.New("--follow requires --wait")
 	} else if o.tail < 0 {
 		return errors.New("tail count must not be negative")
 	} else if o.timeout < 0 {
@@ -426,8 +433,15 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		activity, err = "listing jobs", listJobs(router, stdout)
 	case options.wait != "":
 		activity = "waiting for the job"
-		code, err = waitJob(router, options.wait, !options.noFlush, options.tail, stdout)
-		if interruptedCode, ok := interrupted(activity); ok {
+		code, err = waitJob(router, options, stdout)
+		interruptedCode, ok := interrupted(activity)
+		if !ok && errors.Is(err, errJobRunning) {
+			// The executing endpoint returned the running job shortly before
+			// the timeout (see remote.WaitOptions.Deadline).
+			fmt.Fprintf(stderr, "remote: timed out after %v while %s\n", options.timeout, activity)
+			interruptedCode, ok = timeoutExitCode, true
+		}
+		if ok {
 			fmt.Fprintf(stderr, "remote: job %s is still running; remote --wait %[1]s resumes waiting, and remote --kill %[1]s terminates it\n", options.wait)
 			return interruptedCode
 		}

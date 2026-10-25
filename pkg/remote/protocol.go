@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -55,8 +57,63 @@ type JobRequest struct {
 	// directory.
 	Log string `json:",omitempty"`
 	// Tail is the number of final log lines requested with JobWait. Zero
-	// disables log reading, and negative counts are invalid.
+	// disables log reading, and negative counts are invalid. It must be zero
+	// if Follow is non-nil.
 	Tail int64 `json:",omitempty"`
+	// Follow, if non-nil, requests that JobWait stream the job's log as output
+	// while waiting, as frames (see logFrame), instead of sending its tail.
+	// Once the job ends, the log's contents up to then are sent before the
+	// result. Executors that predate following, which don't report
+	// featureFollow, ignore it.
+	Follow *JobFollow `json:",omitempty"`
+	// Timeout, if positive, is the time after which JobWait returns the job
+	// even if it's still running, along with the tail requested by Tail, so
+	// that the result can arrive before the client stops waiting. Executors
+	// that predate it, which don't report featureWaitTimeout, ignore it.
+	Timeout time.Duration `json:",omitempty"`
+}
+
+// JobFollow describes where JobWait starts streaming a job's log (see
+// JobRequest.Follow).
+type JobFollow struct {
+	// Tail indicates that streaming starts with the log's final Lines lines,
+	// limited to its final MaximumJobLogSize bytes as tails are, or at its end
+	// if Lines is zero. Otherwise, streaming starts at Offset.
+	Tail bool `json:",omitempty"`
+	// Lines is the number of final lines with which streaming starts if Tail
+	// is set. Negative counts are invalid.
+	Lines int64 `json:",omitempty"`
+	// Offset is the log offset at which streaming starts unless Tail is set:
+	// zero for the log's beginning, or the offset up to which a previous wait
+	// received the log, to resume streaming where it stopped.
+	Offset int64 `json:",omitempty"`
+	// Identity identifies the log file that a previous wait streamed, as its
+	// frames reported it, so that streaming doesn't resume in another file that
+	// has replaced it at the log's path. It's empty if unknown.
+	Identity string `json:",omitempty"`
+}
+
+// ensureValid checks the options of a job request, if any, that only apply to
+// waiting for a job.
+func (r *JobRequest) ensureValid() error {
+	if r == nil {
+		return nil
+	} else if r.Tail < 0 || r.Tail != 0 && r.Operation != JobWait {
+		return errors.New("a non-negative log tail count can only be specified when waiting for a job")
+	} else if r.Timeout < 0 || r.Timeout != 0 && r.Operation != JobWait {
+		return errors.New("a non-negative timeout can only be specified when waiting for a job")
+	} else if r.Follow == nil {
+		return nil
+	} else if r.Operation != JobWait || r.Tail != 0 {
+		return errors.New("logs can only be followed when waiting for a job, without a log tail")
+	} else if r.Follow.Lines < 0 || r.Follow.Offset < 0 {
+		return errors.New("log positions must not be negative")
+	} else if r.Follow.Tail && (r.Follow.Offset != 0 || r.Follow.Identity != "") || !r.Follow.Tail && r.Follow.Lines != 0 {
+		return errors.New("logs are followed either from their tails or from offsets")
+	} else if !utf8.ValidString(r.Follow.Identity) || strings.IndexByte(r.Follow.Identity, 0) >= 0 {
+		return errors.New("log identity contains invalid UTF-8 or a null byte")
+	}
+	return nil
 }
 
 // Request describes a single command (or script), which may be run as a
@@ -137,8 +194,8 @@ func validRelativePath(value string) bool {
 func (r *Request) EnsureValid() error {
 	if r == nil {
 		return errors.New("no command specified")
-	} else if r.Job != nil && (r.Job.Tail < 0 || r.Job.Tail != 0 && r.Job.Operation != JobWait) {
-		return errors.New("a non-negative log tail count can only be specified when waiting for a job")
+	} else if err := r.Job.ensureValid(); err != nil {
+		return err
 	} else if (r.File != "" || r.Copy != "" || r.Archive != "" || r.Replace != nil) && (r.Script != nil || r.Job != nil) {
 		return errors.New("file operations must not specify a script or a job operation")
 	} else if r.Copy != "" || r.Archive != "" || r.Replace != nil {
@@ -243,12 +300,37 @@ type submission struct {
 	Operation Operation
 }
 
+// Features of the protocol that executing endpoints report supporting (see
+// status.Features), so that submitters can adapt their requests to executors
+// of other versions, which ignore request fields that they don't know.
+const (
+	// featureFollow indicates that the executor streams job logs while waiting
+	// for jobs (see JobRequest.Follow).
+	featureFollow = "follow"
+	// featureWaitTimeout indicates that the executor returns running jobs once
+	// a wait's timeout expires (see JobRequest.Timeout).
+	featureWaitTimeout = "wait-timeout"
+)
+
+// executorFeatures are the features that this executor reports supporting.
+var executorFeatures = []string{featureFollow, featureWaitTimeout}
+
 // status reports whether a command route reached an executing endpoint. It is
 // written by the executing endpoint on success or by any intermediate hop that
 // is unable to establish the route.
 type status struct {
 	// Error is the routing error, if any.
 	Error string
+	// Features are the optional protocol features that the executing endpoint
+	// supports. Executors that predate feature reporting report none, and hops
+	// that report routing errors don't report any.
+	Features []string `json:",omitempty"`
+}
+
+// supports indicates whether the executing endpoint reported supporting a
+// feature.
+func (s *status) supports(feature string) bool {
+	return slices.Contains(s.Features, feature)
 }
 
 // flushResponse reports the outcome of a flush. Hops that are unable to reach

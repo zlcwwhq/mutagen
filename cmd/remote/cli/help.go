@@ -214,14 +214,17 @@ shell passes unchanged if its delimiter is quoted:
 	{"jobs", "detached jobs: --detach, --jobs, --wait, and --kill", `Usage: remote [options] --detach [--log <file>] <command> [<args>...]
        remote [options] --detach [--log <file>] --script <file>|- [<args>...]
        remote --jobs
-       remote --wait <id> [--tail <lines>] [--timeout <duration>] [--no-flush]
+       remote --wait <id> [--tail <lines>] [--follow] [--timeout <duration>]
+              [--no-flush]
        remote --kill <id> [--timeout <duration>] [--no-flush]
 
 --detach synchronizes the session, starts the command (or script) as a detached
 job on the opposite endpoint, prints the job's ID on standard output, and
 exits:
   id=$(remote --detach --log train.log python train.py)
-  remote --wait "$id" --tail 20
+  remote --wait "$id" --follow          (print the log while waiting for it)
+  remote --wait "$id" --tail 20 --timeout 5m
+                                        (status 124 if it's still running)
 
   - Jobs keep running when remote exits and when the session stops
     synchronizing (such as when it's paused or reconnects, or the daemon
@@ -251,12 +254,24 @@ exits:
     job whose status couldn't be recorded, such as because it was killed with
     SIGKILL or its system restarted, is lost (status 255).
   - With --wait, --tail N prints the final N log lines to standard output
-    after the job ends, including logs outside the root or in ignored paths.
-    Zero prints nothing; negative counts are invalid. The tail is limited to
-    the final 1 MiB; remote warns if this cuts the requested lines, possibly
+    after the job ends, or before exiting with status 124 if --timeout expires
+    while it runs, including logs outside the root or in ignored paths. Zero
+    prints nothing; negative counts are invalid. The tail is limited to the
+    final 1 MiB; remote warns if this cuts the requested lines, possibly
     within a line. Missing, unreadable, or non-regular logs (such as /dev/null)
     cause a warning without changing the job's exit status. Log reads run no
     commands or prologues, and --no-flush still skips synchronization.
+  - With --wait, --follow prints the log to standard output as it's written,
+    unchanged (carriage returns included), from its beginning, or from its
+    final N lines with --tail N (only new output with --tail 0). Once the job
+    ends, the rest of its output is printed, and remote synchronizes and
+    reports as it does without --follow, on a new line of standard error if
+    the log ends within a line; what processes that the job left running
+    write afterward isn't printed. If the connection is lost, remote resumes
+    where it stopped. It warns if the log becomes shorter, such as when it's
+    truncated, and then follows it from its beginning, or if another file
+    replaced the log while the connection was lost, which it doesn't follow.
+    Logs that can't be followed cause a warning as with --tail.
   - remote --kill ID terminates the job: its process group receives SIGTERM,
     then SIGKILL 5 seconds later if any of it remains, even if remote --kill
     is interrupted meanwhile. Repeating it while the job is being terminated

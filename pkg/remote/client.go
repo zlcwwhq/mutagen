@@ -45,8 +45,18 @@ func Execute(ctx context.Context, connection io.ReadWriteCloser, request *Reques
 
 // execute implements Execute, returning the result sent by the executor.
 func execute(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer) (*result, error) {
-	// Wait for the route to reach an executing endpoint. Any hop that cannot
-	// establish the route reports why instead of simply disconnecting.
+	if _, err := connect(ctx, connection); err != nil {
+		return nil, err
+	}
+	return exchange(ctx, connection, request, stdin, stdout, stderr)
+}
+
+// connect waits for a route to reach an executing endpoint and returns the
+// route's status, which reports the executor's features, so that the request
+// can be adapted to them before exchange sends it. Any hop that cannot
+// establish the route reports why instead of simply disconnecting. The
+// connection is closed if this fails.
+func connect(ctx context.Context, connection io.ReadWriteCloser) (*status, error) {
 	stopRoute := context.AfterFunc(ctx, func() { connection.Close() })
 	var route status
 	err := readMessage(connection, &route)
@@ -59,7 +69,13 @@ func execute(ctx context.Context, connection io.ReadWriteCloser, request *Reques
 		connection.Close()
 		return nil, errors.New(route.Error)
 	}
+	return &route, nil
+}
 
+// exchange sends a request over a route that has reached an executing endpoint
+// (see connect), forwards the command's streams, and returns the result sent
+// by the executor. It owns and closes the connection.
+func exchange(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer) (*result, error) {
 	// Keep control and all three standard streams independent so that blocked
 	// command input cannot prevent output, exit status, or cancellation.
 	mux := multiplexing.Multiplex(multiplexing.NewCarrierFromStream(connection), true, commandMultiplexerConfiguration())

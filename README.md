@@ -336,12 +336,31 @@ logind's `KillUserProcesses` is enabled, with the SSH connection. Detached jobs
 aren't supported on Windows or AIX endpoints.
 
 `remote --wait <id> --tail N` also prints the final N log lines to standard
-output, including logs outside the root or in ignored paths. Zero disables
-output, and negative counts are invalid. Output is limited to the final
-1 MiB, with a warning if the requested lines are cut (possibly within a line).
-Missing, unreadable, or non-regular logs, such as `/dev/null`, cause a warning
-without changing the job's exit status. Reading the log runs no commands or
-prologues; `--no-flush` still skips synchronization.
+output, including logs outside the root or in ignored paths, once the job ends,
+or, if `--timeout` expires while the job runs, before reporting that it's still
+running and exiting with status 124, so that `remote --wait <id> --tail N
+--timeout T` checks on a job for at most T. To receive the tail in time, such a
+wait ends up to a second before the timeout (half of the time left for timeouts
+under two seconds). Zero disables output, and negative counts are invalid.
+Output is limited to the final 1 MiB, with a warning if the requested lines are
+cut (possibly within a line). Missing, unreadable, or non-regular logs, such as
+`/dev/null`, cause a warning without changing the job's exit status. Reading
+the log runs no commands or prologues; `--no-flush` still skips
+synchronization.
+
+`remote --wait <id> --follow` prints the job's log to standard output as it's
+written, unchanged, from its beginning, or from its final N lines with
+`--tail N` (`--tail 0` prints only new output), and exits as `--wait` does once
+the job ends and the rest of its output has been printed; what processes that
+the job left running write afterward isn't printed. The executing endpoint
+checks the log for new output every 100 ms. If the connection is lost,
+`remote` resumes following where it stopped. It warns if the log becomes
+shorter, such as when it's truncated, and then follows it from its beginning,
+and if another file has replaced the log when it resumes, which it doesn't
+follow. Logs that can't be followed cause a warning without changing the job's
+exit status. Executing endpoints of earlier versions support neither following
+nor tails when `--timeout` expires: `remote` then warns and waits as before,
+printing the final N lines with `--tail N` once the job ends.
 
 Content that commands write to ignored paths exists only on the executing
 endpoint. `remote --ignores <path>...` shows whether the session ignores each

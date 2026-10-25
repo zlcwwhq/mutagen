@@ -5,9 +5,20 @@ package remote
 import (
 	"fmt"
 	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
+
+// logIdentity identifies the file that the specified information describes by
+// its device and inode numbers, so that a log that was replaced at its path
+// can be recognized. It's empty if they're unknown.
+func logIdentity(info os.FileInfo) string {
+	if metadata, ok := info.Sys().(*syscall.Stat_t); ok {
+		return fmt.Sprintf("%d:%d", metadata.Dev, metadata.Ino)
+	}
+	return ""
+}
 
 // openJobLog opens a log for reading without blocking if its path has been
 // replaced by a FIFO. The opened descriptor must refer to a regular file;

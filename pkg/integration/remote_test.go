@@ -746,7 +746,7 @@ func TestRemoteDetachedJobs(t *testing.T) {
 			// Start a job that waits for a release marker, keeping its markers
 			// outside the roots. Only its identifier is printed.
 			started, release := filepath.Join(directory, "started"), filepath.Join(directory, "release")
-			script := `echo > "$1"; while [ ! -e "$2" ]; do sleep 0.1; done; echo done; exit 3`
+			script := `echo started; echo > "$1"; while [ ! -e "$2" ]; do sleep 0.1; done; echo done; exit 3`
 			code, output, errorOutput := runRemote(t, submitting, "--detach", "--log", "out.log", "sh", "-c", script, "sh", started, release)
 			id := strings.TrimSpace(output)
 			if code != 0 || len(id) != 8 || !strings.Contains(errorOutput, "remote --wait "+id) {
@@ -757,8 +757,26 @@ func TestRemoteDetachedJobs(t *testing.T) {
 				t.Fatalf("incorrect job listing: %d, %q", code, output)
 			}
 
+			// A wait whose timeout expires while the job runs prints the
+			// log's current tail.
+			if code, output, errorOutput := runRemote(t, submitting, "--wait", id, "--tail", "1", "--timeout", "2", "--no-flush"); code != 124 || output != "started\n" || !strings.Contains(errorOutput, "job "+id+" is still running") {
+				t.Fatalf("incorrect timed out wait: %d, %q, %q", code, output, errorOutput)
+			}
+
+			// Following the log prints it while the job runs.
+			var followOutput, followErrors lockedBuffer
+			followed := make(chan int, 1)
+			go func() {
+				followed <- cli.Run([]string{"--wait", id, "--follow"}, strings.NewReader(""), &followOutput, &followErrors)
+			}()
+			for deadline := time.Now().Add(30 * time.Second); followOutput.String() != "started\n"; time.Sleep(10 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("log wasn't followed: %q, %q", followOutput.String(), followErrors.String())
+				}
+			}
+
 			// The job keeps running while the session is paused, unlike
-			// commands.
+			// commands, and following resumes once it reconnects.
 			specification := &selection.Selection{Specifications: []string{sessionID}}
 			if err := synchronizationManager.Pause(context.Background(), specification, ""); err != nil {
 				t.Fatal("unable to pause session:", err)
@@ -771,11 +789,23 @@ func TestRemoteDetachedJobs(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			// The followed wait prints the rest of the log exactly once,
+			// despite the lost connection, and returns the job's status after
+			// synchronization.
+			select {
+			case code := <-followed:
+				if code != 3 || followOutput.String() != "started\ndone\n" || !strings.Contains(followErrors.String(), "so remote retries") || !strings.Contains(followErrors.String(), "exited with status 3") {
+					t.Fatalf("incorrect followed wait result: %d, %q, %q", code, followOutput.String(), followErrors.String())
+				}
+			case <-time.After(time.Minute):
+				t.Fatal("followed wait didn't return")
+			}
+
 			// Waiting prints the requested tail and returns the job's status
 			// after synchronization, so the log is also present locally.
 			if code, output, errorOutput := runRemote(t, submitting, "--wait", id, "--tail", "1"); code != 3 || output != "done\n" || !strings.Contains(errorOutput, "exited with status 3") {
 				t.Fatalf("incorrect wait result: %d, %q, %q", code, output, errorOutput)
-			} else if data, err := os.ReadFile(filepath.Join(submitting, "out.log")); err != nil || string(data) != "done\n" {
+			} else if data, err := os.ReadFile(filepath.Join(submitting, "out.log")); err != nil || string(data) != "started\ndone\n" {
 				t.Fatalf("log not synchronized: %q, %v", data, err)
 			}
 

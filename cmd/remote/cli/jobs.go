@@ -258,28 +258,69 @@ func printJobs(output io.Writer, locator *locator, endpoint string, jobs []*remo
 	return nil
 }
 
+// errJobRunning indicates that a job was still running when the timeout of
+// remote --wait expired, as reported by the executing endpoint shortly before
+// it (see remote.WaitOptions.Deadline).
+var errJobRunning = errors.New("the job is still running")
+
 // waitJob waits for a detached job to end, retrying for a while if the
 // connection to the executing endpoint is lost, synchronizes the session if
-// requested, reports how the job ended, and returns the job's exit status.
-func waitJob(router *router, id string, synchronize bool, lines int64, output io.Writer) (int, error) {
+// requested, reports how the job ended, and returns the job's exit status. A
+// requested log tail is printed once the job ends, or, if the timeout expires
+// while it's running, before returning errJobRunning, while a followed log is
+// printed as it's written.
+func waitJob(router *router, options *options, output io.Writer) (int, error) {
+	id := options.wait
+	wait := &remote.WaitOptions{Warn: func(message string) { router.warn("%s", message) }}
+	if deadline, ok := router.ctx.Deadline(); ok {
+		wait.Deadline = deadline
+	}
+	if options.follow {
+		wait.Follow = &remote.LogFollower{Output: output, Lines: options.tail}
+		if !options.flags.Changed("tail") {
+			wait.Follow.Lines = -1
+		}
+	} else {
+		wait.Tail = options.tail
+	}
+
+	// If the followed log ends within a line, such as with a progress bar that
+	// carriage returns redraw, then start what's printed afterward on a new
+	// line of standard error, so that remote's reports start lines when both
+	// streams are shown together, as on terminals, or merged for line-based
+	// filters. The log itself is printed unchanged.
+	ended := false
+	endLine := func() {
+		if !ended && wait.Follow != nil && wait.Follow.PartialLine() {
+			fmt.Fprintln(router.stderr)
+		}
+		ended = true
+	}
+	defer endLine()
+
+	// Wait for the job, retrying with the same follower, which resumes where
+	// the previous attempt stopped.
 	var job *remote.Job
 	var tail *remote.JobLog
 	var deadline time.Time
 	for {
+		started := time.Now()
 		connection, _, err := router.dial(remote.OperationExecute)
 		if err == nil {
-			if job, tail, err = remote.WaitJobWithTail(router.ctx, connection, id, lines); err == nil {
+			if job, tail, err = remote.WaitJobWithOptions(router.ctx, connection, id, wait); err == nil {
 				break
 			}
 		}
 
 		// Retry failures to reach the executing endpoint once it has been
 		// reached, but not errors about the job or failures to locate the
-		// session.
+		// session. An attempt that waited for longer than the retry period
+		// before failing, such as one that followed a log for hours, starts
+		// a new retry period.
 		var jobError *remote.JobError
 		if router.ctx.Err() != nil || errors.As(err, &jobError) || router.selection.Target == nil {
 			return 0, err
-		} else if deadline.IsZero() {
+		} else if deadline.IsZero() || time.Since(started) > waitRetryPeriod {
 			deadline = time.Now().Add(waitRetryPeriod)
 			router.warn("unable to wait for job %s, which keeps running, so remote retries for up to %v: %v", id, waitRetryPeriod, err)
 		} else if time.Now().After(deadline) {
@@ -291,8 +332,9 @@ func waitJob(router *router, id string, synchronize bool, lines int64, output io
 			return 0, router.ctx.Err()
 		}
 	}
+	endLine()
 
-	// Print only the successful attempt's log, so reconnecting can't repeat
+	// Print only the successful attempt's tail, so reconnecting can't repeat
 	// partial output. A log failure doesn't replace the job's exit status.
 	if tail != nil {
 		if tail.Error != "" {
@@ -307,9 +349,16 @@ func waitJob(router *router, id string, synchronize bool, lines int64, output io
 		}
 	}
 
+	// A job that's still running was returned because the timeout was about
+	// to expire. It isn't synchronized, as with timeouts that expire while
+	// waiting.
+	if job.State == remote.JobRunning {
+		return 0, errJobRunning
+	}
+
 	// Synchronize the job's changes. The job's status takes precedence over
 	// failure to do so.
-	if synchronize {
+	if !options.noFlush {
 		if _, _, err := router.synchronize(); err != nil {
 			if router.ctx.Err() != nil {
 				return 0, err
