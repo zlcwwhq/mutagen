@@ -132,7 +132,7 @@ func TestHelp(t *testing.T) {
 		t.Fatal("help failed:", code)
 	}
 	help := output.String()
-	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--diff", "--script FILE", "--detach", "--log FILE", "--wait ID", "--kill ID", "--jobs", "--ignores", "--pull"} {
+	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--diff", "--script FILE", "--detach", "--log FILE", "--wait ID", "--tail N", "--kill ID", "--jobs", "--ignores", "--pull"} {
 		if !strings.Contains(help, expected) {
 			t.Errorf("help is missing %q", expected)
 		}
@@ -232,6 +232,8 @@ func TestParseModes(t *testing.T) {
 		{"--jobs"},
 		{"-s", "name", "--jobs"},
 		{"--wait", "0123abcd"},
+		{"--wait", "0123abcd", "--tail", "20", "--no-flush"},
+		{"--wait", "0123abcd", "--tail", "0"},
 		{"--wait", "0123abcd", "--timeout", "10", "--no-flush", "-s", "name"},
 		{"--kill", "0123abcd", "--timeout", "10"},
 		{"--kill", "0123abcd", "--no-flush"},
@@ -282,6 +284,13 @@ func TestParseModes(t *testing.T) {
 		{"--jobs", "--conflicts"},
 		{"--wait"},
 		{"--wait", ""},
+		{"--wait", "0123abcd", "--tail", "-1"},
+		{"--wait", "0123abcd", "--tail", "abc"},
+		{"--wait", "0123abcd", "--tail", "9999999999999999999999999"},
+		{"--tail", "1", "true"},
+		{"--tail", "0", "true"},
+		{"--jobs", "--tail", "1"},
+		{"--kill", "0123abcd", "--tail", "1"},
 		{"--wait", "0123abcd", "x"},
 		{"--wait", "0123abcd", "-C", "sub"},
 		{"--kill", "0123abcd", "--flush"},

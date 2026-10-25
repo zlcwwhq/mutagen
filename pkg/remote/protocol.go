@@ -54,6 +54,9 @@ type JobRequest struct {
 	// system, while other paths are resolved against the command's working
 	// directory.
 	Log string `json:",omitempty"`
+	// Tail is the number of final log lines requested with JobWait. Zero
+	// disables log reading, and negative counts are invalid.
+	Tail int64 `json:",omitempty"`
 }
 
 // Request describes a single command (or script), which may be run as a
@@ -134,6 +137,8 @@ func validRelativePath(value string) bool {
 func (r *Request) EnsureValid() error {
 	if r == nil {
 		return errors.New("no command specified")
+	} else if r.Job != nil && (r.Job.Tail < 0 || r.Job.Tail != 0 && r.Job.Operation != JobWait) {
+		return errors.New("a non-negative log tail count can only be specified when waiting for a job")
 	} else if (r.File != "" || r.Copy != "" || r.Archive != "" || r.Replace != nil) && (r.Script != nil || r.Job != nil) {
 		return errors.New("file operations must not specify a script or a job operation")
 	} else if r.Copy != "" || r.Archive != "" || r.Replace != nil {
@@ -274,6 +279,10 @@ type result struct {
 	// Job describes the job started, waited for, or terminated by a job
 	// request.
 	Job *Job `json:",omitempty"`
+	// JobLog describes the requested tail of a waited-for job's log. Its
+	// contents are sent as output. A nil value means no tail was requested,
+	// or the executing endpoint predates log tails.
+	JobLog *JobLog `json:",omitempty"`
 	// HiddenJobs is the number of jobs omitted from a job listing because they
 	// were started at other roots.
 	HiddenJobs int `json:",omitempty"`

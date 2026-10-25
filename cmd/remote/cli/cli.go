@@ -73,6 +73,8 @@ type options struct {
 	jobs bool
 	// wait is the identifier of a detached job to wait for, if any.
 	wait string
+	// tail is the number of final log lines to print after waiting for a job.
+	tail int64
 	// kill is the identifier of a detached job to terminate, if any.
 	kill string
 	// diff indicates that local and remote copies of the paths specified by
@@ -153,6 +155,7 @@ func parse(arguments []string) (*options, error) {
 	flags.StringVar(&result.log, "log", "", "With --detach, write the job's output to `FILE` (relative to the command's directory), a regular file or character device")
 	flags.BoolVar(&result.jobs, "jobs", false, "List the detached jobs started at the session's root on the opposite endpoint, and processes that ended jobs left running")
 	flags.StringVar(&result.wait, "wait", "", "Wait for the detached job `ID` to end, synchronize, and exit with its status")
+	flags.Int64Var(&result.tail, "tail", 0, "With --wait, print the final `N` log lines (at most 1 MiB; 0 disables output)")
 	flags.StringVar(&result.kill, "kill", "", "Terminate the detached job `ID` without synchronizing (--no-flush is accepted but has no effect)")
 	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
 	flags.BoolVar(&result.ignores, "ignores", false, "Show the session's ignores, or whether the given paths are ignored")
@@ -233,7 +236,7 @@ var modes = []struct {
 }{
 	{"sessions", nil},
 	{"jobs", []string{"session"}},
-	{"wait", []string{"session", "timeout", "no-flush"}},
+	{"wait", []string{"session", "timeout", "no-flush", "tail"}},
 	{"kill", []string{"session", "timeout", "no-flush"}},
 	{"ignores", []string{"session"}},
 	{"pull", []string{"session", "timeout"}},
@@ -241,7 +244,11 @@ var modes = []struct {
 
 // validate checks the combination of options other than conflict options.
 func (o *options) validate(flags *pflag.FlagSet) error {
-	if o.timeout < 0 {
+	if flags.Changed("tail") && !flags.Changed("wait") {
+		return errors.New("--tail requires --wait")
+	} else if o.tail < 0 {
+		return errors.New("tail count must not be negative")
+	} else if o.timeout < 0 {
 		return errors.New("timeout must not be negative")
 	}
 	for _, mode := range modes {
@@ -419,7 +426,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		activity, err = "listing jobs", listJobs(router, stdout)
 	case options.wait != "":
 		activity = "waiting for the job"
-		code, err = waitJob(router, options.wait, !options.noFlush)
+		code, err = waitJob(router, options.wait, !options.noFlush, options.tail, stdout)
 		if interruptedCode, ok := interrupted(activity); ok {
 			fmt.Fprintf(stderr, "remote: job %s is still running; remote --wait %[1]s resumes waiting, and remote --kill %[1]s terminates it\n", options.wait)
 			return interruptedCode

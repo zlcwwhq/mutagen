@@ -2,6 +2,14 @@
 
 package remote
 
+import "os"
+
+// openJobLog opens a job log for reading. Detached jobs aren't supported on
+// this system.
+func openJobLog(_ string) (*os.File, error) {
+	return nil, errJobsUnsupported
+}
+
 // jobsSupported indicates whether detached jobs are supported on this system.
 // They aren't supported on Windows, which lacks the POSIX shell, sessions, and
 // process groups that their supervisors rely on (see jobs_posix.go), or on AIX,

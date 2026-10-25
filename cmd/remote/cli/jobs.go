@@ -260,13 +260,14 @@ func printJobs(output io.Writer, locator *locator, endpoint string, jobs []*remo
 // waitJob waits for a detached job to end, retrying for a while if the
 // connection to the executing endpoint is lost, synchronizes the session if
 // requested, reports how the job ended, and returns the job's exit status.
-func waitJob(router *router, id string, synchronize bool) (int, error) {
+func waitJob(router *router, id string, synchronize bool, lines int64, output io.Writer) (int, error) {
 	var job *remote.Job
+	var tail *remote.JobLog
 	var deadline time.Time
 	for {
 		connection, _, err := router.dial(remote.OperationExecute)
 		if err == nil {
-			if job, err = remote.WaitJob(router.ctx, connection, id); err == nil {
+			if job, tail, err = remote.WaitJobWithTail(router.ctx, connection, id, lines); err == nil {
 				break
 			}
 		}
@@ -287,6 +288,21 @@ func waitJob(router *router, id string, synchronize bool) (int, error) {
 		case <-time.After(waitRetryInterval):
 		case <-router.ctx.Done():
 			return 0, router.ctx.Err()
+		}
+	}
+
+	// Print only the successful attempt's log, so reconnecting can't repeat
+	// partial output. A log failure doesn't replace the job's exit status.
+	if tail != nil {
+		if tail.Error != "" {
+			router.warn("unable to read the log of job %s: %s", id, tail.Error)
+		} else {
+			if tail.Truncated {
+				router.warn("the requested log tail exceeds 1 MiB; showing only the final 1 MiB, which may start within a line")
+			}
+			if _, err := output.Write(tail.Data); err != nil {
+				router.warn("unable to print the log of job %s: %v", id, err)
+			}
 		}
 	}
 

@@ -214,14 +214,14 @@ shell passes unchanged if its delimiter is quoted:
 	{"jobs", "detached jobs: --detach, --jobs, --wait, and --kill", `Usage: remote [options] --detach [--log <file>] <command> [<args>...]
        remote [options] --detach [--log <file>] --script <file>|- [<args>...]
        remote --jobs
-       remote --wait <id> [--timeout <duration>] [--no-flush]
+       remote --wait <id> [--tail <lines>] [--timeout <duration>] [--no-flush]
        remote --kill <id> [--timeout <duration>] [--no-flush]
 
 --detach synchronizes the session, starts the command (or script) as a detached
 job on the opposite endpoint, prints the job's ID on standard output, and
 exits:
   id=$(remote --detach --log train.log python train.py)
-  remote --wait "$id"
+  remote --wait "$id" --tail 20
 
   - Jobs keep running when remote exits and when the session stops
     synchronizing (such as when it's paused or reconnects, or the daemon
@@ -250,6 +250,13 @@ exits:
     executing endpoint is lost while waiting, remote retries for a minute. A
     job whose status couldn't be recorded, such as because it was killed with
     SIGKILL or its system restarted, is lost (status 255).
+  - With --wait, --tail N prints the final N log lines to standard output
+    after the job ends, including logs outside the root or in ignored paths.
+    Zero prints nothing; negative counts are invalid. The tail is limited to
+    the final 1 MiB; remote warns if this cuts the requested lines, possibly
+    within a line. Missing, unreadable, or non-regular logs (such as /dev/null)
+    cause a warning without changing the job's exit status. Log reads run no
+    commands or prologues, and --no-flush still skips synchronization.
   - remote --kill ID terminates the job: its process group receives SIGTERM,
     then SIGKILL 5 seconds later if any of it remains, even if remote --kill
     is interrupted meanwhile. Repeating it while the job is being terminated

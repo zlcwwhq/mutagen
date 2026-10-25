@@ -771,12 +771,16 @@ func TestRemoteDetachedJobs(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// Waiting returns the job's status, once the session has been
-			// synchronized, so the log is present locally.
-			if code, _, errorOutput := runRemote(t, submitting, "--wait", id); code != 3 || !strings.Contains(errorOutput, "exited with status 3") {
-				t.Fatalf("incorrect wait result: %d, %q", code, errorOutput)
+			// Waiting prints the requested tail and returns the job's status
+			// after synchronization, so the log is also present locally.
+			if code, output, errorOutput := runRemote(t, submitting, "--wait", id, "--tail", "1"); code != 3 || output != "done\n" || !strings.Contains(errorOutput, "exited with status 3") {
+				t.Fatalf("incorrect wait result: %d, %q, %q", code, output, errorOutput)
 			} else if data, err := os.ReadFile(filepath.Join(submitting, "out.log")); err != nil || string(data) != "done\n" {
 				t.Fatalf("log not synchronized: %q, %v", data, err)
+			}
+
+			if code, output, errorOutput := runRemote(t, submitting, "--wait", id, "--no-flush"); code != 3 || output != "" {
+				t.Fatalf("plain wait unexpectedly printed a log: %d, %q, %q", code, output, errorOutput)
 			}
 
 			// Killing a job terminates it, and waiting for it reports the

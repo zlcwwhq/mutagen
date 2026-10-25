@@ -335,6 +335,14 @@ when a daemon running as a systemd service is stopped, or, on systems where
 logind's `KillUserProcesses` is enabled, with the SSH connection. Detached jobs
 aren't supported on Windows or AIX endpoints.
 
+`remote --wait <id> --tail N` also prints the final N log lines to standard
+output, including logs outside the root or in ignored paths. Zero disables
+output, and negative counts are invalid. Output is limited to the final
+1 MiB, with a warning if the requested lines are cut (possibly within a line).
+Missing, unreadable, or non-regular logs, such as `/dev/null`, cause a warning
+without changing the job's exit status. Reading the log runs no commands or
+prologues; `--no-flush` still skips synchronization.
+
 Content that commands write to ignored paths exists only on the executing
 endpoint. `remote --ignores <path>...` shows whether the session ignores each
 path, and `remote --pull <path>...` copies ignored files, directories, and

@@ -338,8 +338,9 @@ func findJob(directory, root, id string) (*jobRecord, *Job, error) {
 
 // serveJob performs a job operation other than starting a job for an executor
 // with the specified normalized root, writing job listings to the specified
-// output as one JSON object per line, so that they aren't bounded by the size
-// of protocol messages. Jobs that have ended are reported along with the
+// output as one JSON object per line and requested log tails as raw bytes,
+// so that neither is bounded by the size of protocol messages. Jobs that have
+// ended are reported along with the
 // processes that their commands left running, if any (see findLeftovers).
 // Those processes aren't part of the jobs any more, so killing the jobs
 // doesn't terminate them.
@@ -370,7 +371,14 @@ func serveJob(ctx context.Context, root string, request *JobRequest, output io.W
 				return result{Error: err.Error()}
 			} else if job.State != JobRunning {
 				findLeftovers([]*Job{job})
-				return result{Job: job}
+				response := result{Job: job}
+				if request.Tail > 0 {
+					response.JobLog = readJobLog(ctx, job.Log, request.Tail)
+					if _, err := output.Write(response.JobLog.Data); err != nil {
+						return result{Error: fmt.Sprintf("unable to send job log: %v", err)}
+					}
+				}
+				return response
 			}
 			select {
 			case <-time.After(jobPollInterval):
@@ -471,7 +479,8 @@ func operateJob(ctx context.Context, connection io.ReadWriteCloser, operation Jo
 // returns the job. It owns and closes the connection. Cancellation abandons
 // the wait without affecting the job.
 func WaitJob(ctx context.Context, connection io.ReadWriteCloser, id string) (*Job, error) {
-	return operateJob(ctx, connection, JobWait, id)
+	job, _, err := WaitJobWithTail(ctx, connection, id, 0)
+	return job, err
 }
 
 // KillJob terminates the job with the specified identifier, started at the
