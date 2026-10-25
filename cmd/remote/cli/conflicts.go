@@ -210,9 +210,16 @@ func (w *workspace) hasDirectory() bool {
 	return w.Local.Kind == remote.EntryDirectory || w.Remote.Kind == remote.EntryDirectory
 }
 
-// takable determines whether a copy can be taken.
-func (w *workspace) takable(side string) bool {
-	return w.files() || slices.Contains(w.Take, side)
+// checkTake checks that the --take and --executable options of an apply can
+// resolve a conflict, given whether its copies are both files and, if they
+// aren't, which of them can be taken.
+func checkTake(o *options, files bool, takable []string) error {
+	if !files && (o.take == "" || o.executable != "") {
+		return errors.New("the copies aren't both files, so they can only be resolved with --take local or --take remote")
+	} else if o.take != "" && !files && !slices.Contains(takable, o.take) {
+		return fmt.Errorf("the %s copy can't be taken for this conflict (see remote --conflicts)", o.take)
+	}
+	return nil
 }
 
 // changedSince describes the copies of a checked-out conflict between two files
@@ -1194,6 +1201,15 @@ func checkoutLocked(ctx context.Context, directory string, o *options, listing *
 	} else if o.base != "" && !conflict.Files {
 		return nil, 0, errors.New("--base requires a conflict between two files")
 	}
+	// An automatic checkout for --take (see apply) checks the apply's options
+	// against the listing first, so that a mistake in them leaves neither a
+	// claim nor a workspace behind. Apply checks them again against the
+	// copies that were checked out (see resolution).
+	if o.apply {
+		if err := checkTake(o, conflict.Files, localSides(conflict, target)); err != nil {
+			return nil, 0, err
+		}
+	}
 
 	// Claim the checkout before downloading the copies, so that the opposite
 	// endpoint can't check the conflict out meanwhile, and release it if
@@ -1409,10 +1425,8 @@ func describe(w *workspace, argument string) (*outcome, error) {
 // file is refused if it still contains conflict markers, or if it's empty
 // while neither copy is (see errEmptyMerged).
 func resolution(ctx context.Context, w *workspace, o *options) (*remote.Entry, string, error) {
-	if !w.files() && (o.take == "" || o.executable != "") {
-		return nil, "", errors.New("the copies aren't both files, so they can only be resolved with --take local or --take remote")
-	} else if o.take != "" && !w.takable(o.take) {
-		return nil, "", fmt.Errorf("the %s copy can't be taken for this conflict (see remote --conflicts)", o.take)
+	if err := checkTake(o, w.files(), w.Take); err != nil {
+		return nil, "", err
 	} else if o.delete {
 		if w.Path == "" {
 			return nil, "", errors.New("the synchronization root can't be deleted")

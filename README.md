@@ -457,7 +457,9 @@ remote --conflict-apply src/app.go    # write it to both copies and verify
 workspace exists, then applies and verifies it in one invocation. Local and
 remote are relative to the submitting endpoint. Existing workspaces retain
 their original copies and validation; another endpoint's checkout is refused.
-Plain merged-file apply and `--delete` require an explicit checkout.
+A side that can't be taken, or `--executable` for copies that aren't both
+files, is refused before anything is checked out. Plain merged-file apply and
+`--delete` require an explicit checkout.
 
 Stop writers on both endpoints until apply finishes. A checkout belongs to one
 endpoint, and an existing workspace may be another person's work; only apply

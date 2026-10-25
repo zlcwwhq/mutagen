@@ -355,8 +355,10 @@ Options:
 	{"conflict-details", "merge rules, backups, and recovery", `--take local|remote creates a checkout when none exists, under one local lock
 held through apply and verification. It reuses its claim's write sequence;
 existing workspaces use the usual validation and retries. Multi-path applies
-share one synchronization before writing and one after. Failed automatic apply
-keeps its workspace for retry or manual merging; --delete never auto-checks out.
+share one synchronization before writing and one after. A side that the
+listing says can't be taken, or --executable for copies that aren't both
+files, is refused before checking out. Failed automatic apply keeps its
+workspace for retry or manual merging; --delete never auto-checks out.
 
 Listing summaries describe actual local/remote changes from the submitter's
 perspective. Oversized summaries report omitted changes. JSON retains Path and

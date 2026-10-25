@@ -750,3 +750,39 @@ func TestAutomaticCheckoutKeepsWorkspaceLock(t *testing.T) {
 	unlock()
 	check(false)
 }
+
+func TestAutomaticCheckoutChecksTake(t *testing.T) {
+	// Automatic checkout refuses --take and --executable options that the
+	// listed conflict can't use before claiming it, which would fail here
+	// without a daemon, so that no claim or workspace is left behind.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	root := t.TempDir()
+	local := filepath.Join(root, "conflict")
+	target := &remote.Target{Session: "session", Alpha: true, Root: root}
+	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{{Path: "conflict", AlphaTakable: true}}}
+	for _, test := range []struct {
+		options  conflictOptions
+		expected string
+	}{
+		{conflictOptions{apply: true, take: sideRemote}, "the remote copy can't be taken"},
+		{conflictOptions{apply: true, take: sideLocal, executable: "true"}, "can only be resolved with --take"},
+		{conflictOptions{apply: true, take: sideLocal}, ""},
+	} {
+		_, unlock, err := apply(ctx, root, &options{conflictOptions: test.options}, local, nil,
+			func() (*remote.Listing, *remote.Target, error) {
+				return listing, target, nil
+			})
+		if unlock != nil {
+			unlock()
+		}
+		if test.expected != "" && (err == nil || !strings.Contains(err.Error(), test.expected)) {
+			t.Errorf("%+v not refused before claiming: %v", test.options, err)
+		} else if test.expected == "" && (err == nil || strings.Contains(err.Error(), "can't be taken") || strings.Contains(err.Error(), "can only be resolved")) {
+			t.Errorf("%+v refused, rather than claimed: %v", test.options, err)
+		}
+		if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%+v left a workspace: %v", test.options, err)
+		}
+	}
+}
