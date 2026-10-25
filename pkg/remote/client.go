@@ -166,20 +166,34 @@ func exchange(ctx context.Context, connection io.ReadWriteCloser, request *Reque
 // synchronize. It owns and closes the connection. Cancellation abandons the
 // wait, but not the synchronization cycle.
 func Flush(ctx context.Context, connection io.ReadWriteCloser) (*Report, error) {
+	return FlushWithProgress(ctx, connection, nil)
+}
+
+// FlushWithProgress is Flush for a submission that may have requested progress
+// messages (see Submission.Progress), which are passed to progress, if
+// non-nil, as they arrive. Daemons and hops that predate progress messages
+// send none.
+func FlushWithProgress(ctx context.Context, connection io.ReadWriteCloser, progress func(*Progress)) (*Report, error) {
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
-	var response flushResponse
-	err := readMessage(connection, &response)
-	if !stop() {
-		return nil, ctx.Err()
-	} else if err != nil {
-		return nil, fmt.Errorf("unable to receive synchronization status: %w", err)
-	} else if response.Error != "" {
-		return nil, errors.New(response.Error)
-	} else if response.Report == nil {
-		return nil, errors.New("no synchronization report received")
+	defer stop()
+	for {
+		var response flushResponse
+		if err := readMessage(connection, &response); err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("unable to receive synchronization status: %w", err)
+		} else if response.Error != "" {
+			return nil, errors.New(response.Error)
+		} else if response.Report != nil {
+			return response.Report, nil
+		} else if response.Progress == nil {
+			return nil, errors.New("no synchronization report received")
+		} else if progress != nil {
+			progress(response.Progress)
+		}
 	}
-	return response.Report, nil
 }
 
 // Fetch reads the entry at a slash-separated path, relative to the opposite

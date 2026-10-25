@@ -71,7 +71,8 @@ type Listing struct {
 // conflictsMessage is a message of a conflict listing, which consists of one
 // message per conflict or problem followed by a message with Done set. Hops
 // that are unable to reach the daemon send a status instead, which decodes
-// compatibly.
+// compatibly. Progress messages precede the listing if the submission
+// requested them (see progressMessage).
 type conflictsMessage struct {
 	// Error is the flush or routing error, if any, which ends the listing.
 	Error string `json:",omitempty"`
@@ -83,6 +84,8 @@ type conflictsMessage struct {
 	Checkout *Checkout `json:",omitempty"`
 	// Done indicates the end of a complete listing.
 	Done bool `json:",omitempty"`
+	// Progress is set, and nothing else, by progress messages.
+	Progress *Progress `json:",omitempty"`
 }
 
 // RespondWithConflicts sends the outcome of a conflicts submission and closes
@@ -120,6 +123,14 @@ func RespondWithConflicts(connection io.ReadWriteCloser, listing *Listing, err e
 // submission (see Dial) to complete and returns the session's conflicts,
 // problems, and checkouts. It owns and closes the connection.
 func ListConflicts(ctx context.Context, connection io.ReadWriteCloser) (*Listing, error) {
+	return ListConflictsWithProgress(ctx, connection, nil)
+}
+
+// ListConflictsWithProgress is ListConflicts for a submission that may have
+// requested progress messages (see Submission.Progress), which are passed to
+// progress, if non-nil, as they arrive. Daemons and hops that predate progress
+// messages send none.
+func ListConflictsWithProgress(ctx context.Context, connection io.ReadWriteCloser, progress func(*Progress)) (*Listing, error) {
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
 	defer stop()
@@ -142,6 +153,10 @@ func ListConflicts(ctx context.Context, connection io.ReadWriteCloser) (*Listing
 			listing.Problems = append(listing.Problems, *message.Problem)
 		} else if message.Checkout != nil {
 			listing.Checkouts = append(listing.Checkouts, *message.Checkout)
+		} else if message.Progress != nil {
+			if progress != nil {
+				progress(message.Progress)
+			}
 		} else {
 			return nil, errors.New("invalid conflict listing")
 		}

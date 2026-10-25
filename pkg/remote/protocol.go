@@ -293,11 +293,18 @@ const (
 	OperationRelease
 )
 
-// submission is the header of each submission, written by the submitting
-// client and consumed by the daemon before it handles the submission.
-type submission struct {
+// Submission is the header of each submission, written by the submitting
+// client and consumed by the daemon before it handles the submission (see
+// ReceiveSubmission). Hops between them forward it unchanged, along with the
+// rest of the route's data.
+type Submission struct {
 	// Operation is the requested operation.
 	Operation Operation
+	// Progress requests progress messages (see ReportProgress) while the
+	// daemon waits for the synchronization cycle of an OperationFlush or
+	// OperationConflicts submission. Daemons that predate it ignore it and
+	// send only their final response, which submissions must accept.
+	Progress bool `json:",omitempty"`
 }
 
 // Features of the protocol that executing endpoints report supporting (see
@@ -333,14 +340,28 @@ func (s *status) supports(feature string) bool {
 	return slices.Contains(s.Features, feature)
 }
 
-// flushResponse reports the outcome of a flush. Hops that are unable to reach
-// the daemon send a status instead, which decodes compatibly.
+// flushResponse reports the outcome of a flush, or its progress. Hops that are
+// unable to reach the daemon send a status instead, which decodes compatibly
+// as an outcome.
 type flushResponse struct {
 	// Error is the flush or routing error, if any.
 	Error string
 	// Report describes content that the session couldn't synchronize. It's
 	// non-nil if and only if the flush succeeded.
 	Report *Report `json:",omitempty"`
+	// Progress is set, without Error and Report, by the progress messages that
+	// precede the outcome if the submission requested them (see
+	// progressMessage).
+	Progress *Progress `json:",omitempty"`
+}
+
+// progressMessage is a progress message sent to a flush or conflicts
+// submission that requested progress (see Submission.Progress), before the
+// final response. It decodes as a flushResponse or conflictsMessage with only
+// Progress set, which no final response or status is.
+type progressMessage struct {
+	// Progress is the session's progress.
+	Progress *Progress
 }
 
 // result distinguishes command exit status from execution infrastructure errors.
