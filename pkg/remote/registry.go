@@ -70,6 +70,10 @@ type record struct {
 	Name string
 	// Root is the normalized synchronization root on this system.
 	Root string
+	// ExecutionHost and ExecutionRoot describe the opposite endpoint for
+	// display (see Endpoint). Scopes and older registrations omit them.
+	ExecutionHost string `json:",omitempty"`
+	ExecutionRoot string `json:",omitempty"`
 	// Alpha indicates whether the registered endpoint is alpha.
 	Alpha bool
 	// Created is the registration time, used to prefer the newest registration
@@ -198,6 +202,8 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 		Session:        endpoint.Session,
 		Name:           endpoint.Name,
 		Root:           root,
+		ExecutionHost:  endpoint.ExecutionHost,
+		ExecutionRoot:  endpoint.ExecutionRoot,
 		Alpha:          endpoint.Alpha,
 		SessionCreated: endpoint.SessionCreated,
 		Ignores:        endpoint.Ignores,
@@ -376,6 +382,13 @@ type Session struct {
 	Alpha bool
 	// Root is the endpoint's synchronization root.
 	Root string
+	// ExecutionHost and ExecutionRoot describe the opposite endpoint for
+	// display (see Endpoint). They are empty for older registrations.
+	ExecutionHost string
+	ExecutionRoot string
+	// Path is the slash-separated submission directory relative to Root, as
+	// mapped for command execution. It is empty outside Root.
+	Path string
 	// Version is the Mutagen version that registered the endpoint, which must
 	// match this version for submissions through it.
 	Version string
@@ -545,7 +558,7 @@ func probeTier(ctx context.Context, tier []*candidate) ([]liveEndpoint, error) {
 				continue
 			}
 			closeEndpoints(live)
-			return nil, fmt.Errorf("unable to connect to session %s: %w", describe(c.Session, c.Name), err)
+			return nil, ConnectionError(fmt.Errorf("unable to connect to session %s: %w", describe(c.Session, c.Name), err))
 		}
 		resolved[key] = true
 		live = append(live, liveEndpoint{connection, c})
@@ -703,15 +716,12 @@ func describe(session, name string) string {
 // be submitted through the session of a candidate whose ignores exclude it,
 // given the excluded slash-separated path relative to the session's root (see
 // Ignores.ExcludedInAnyForm).
-func excludedError(directory string, c *candidate, excluded string) error {
-	session := describe(c.Session, c.Name)
-	excludedDirectory := filepath.Join(resolveSymbolicLinks(c.Root), filepath.FromSlash(excluded))
-	location := fmt.Sprintf("%s is ignored by session %s", directory, session)
+func excludedError(c *candidate, session, excluded string) error {
+	location := fmt.Sprintf("%s is ignored by session %s", c.path, session)
 	if excluded != c.path {
-		location = fmt.Sprintf("%s is inside %s, which session %s ignores", directory, excludedDirectory, session)
+		location = fmt.Sprintf("%s is inside %s, which session %s ignores", c.path, excluded, session)
 	}
-	return fmt.Errorf("%s, so that session doesn't synchronize the corresponding directory on its opposite endpoint; if %s is the root of another session, then that session is paused, disconnected, or doesn't run commands submitted from this side, so commands can't run through it until it does; otherwise, to run the command in the corresponding directory anyway, use --cwd .",
-		location, excludedDirectory)
+	return fmt.Errorf("%s. If it's another session's root, that session isn't running commands now: don't use --cwd. If it exists separately on each side, --cwd . runs in the other side's own copy.", location)
 }
 
 // Dial submits the specified operation through the endpoint that a selection of
@@ -801,7 +811,7 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 	if s.Target == nil && s.Corresponding && c.contained {
 		if excluded := c.Ignores.ExcludedInAnyForm(c.path, true); excluded != "" {
 			connection.Close()
-			return nil, nil, excludedError(directory, c, excluded)
+			return nil, nil, excludedError(c, labeler(slices.Concat(compatible, incompatible))(c), excluded)
 		}
 	}
 
@@ -840,7 +850,7 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 		return nil, nil, ctx.Err()
 	} else if err != nil {
 		connection.Close()
-		return nil, nil, fmt.Errorf("unable to handshake with session %s: %w", describe(c.Session, c.Name), err)
+		return nil, nil, ConnectionError(fmt.Errorf("unable to handshake with session %s: %w", describe(c.Session, c.Name), err))
 	}
 	return connection, c.target(overlapping), nil
 }
@@ -1016,15 +1026,18 @@ func (s *Selection) Sessions(ctx context.Context, directory string) ([]Session, 
 	result := make([]Session, len(live))
 	for l, c := range live {
 		result[l] = Session{
-			Session:   c.Session,
-			Name:      c.Name,
-			Label:     label(c),
-			Alpha:     c.Alpha,
-			Root:      c.Root,
-			Version:   c.Version,
-			Contained: c.contained,
-			Excluded:  c.contained && c.Ignores.ExcludedInAnyForm(c.path, true) != "",
-			Selected:  selected != nil && c.Session == selected.Session && c.Alpha == selected.Alpha,
+			Session:       c.Session,
+			Name:          c.Name,
+			Label:         label(c),
+			Alpha:         c.Alpha,
+			Root:          c.Root,
+			ExecutionHost: c.ExecutionHost,
+			ExecutionRoot: c.ExecutionRoot,
+			Path:          c.path,
+			Version:       c.Version,
+			Contained:     c.contained,
+			Excluded:      c.contained && c.Ignores.ExcludedInAnyForm(c.path, true) != "",
+			Selected:      selected != nil && c.Session == selected.Session && c.Alpha == selected.Alpha,
 		}
 	}
 	return result, nil
@@ -1079,8 +1092,8 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 	// returns the specified error otherwise.
 	mismatched := func(considered []*candidate, err error) error {
 		if versions := versions(considered); len(versions) > 0 {
-			return fmt.Errorf("matching sessions are registered by Mutagen %s, but this is Mutagen %s; use the remote executable installed with that version",
-				strings.Join(versions, ", "), mutagen.Version)
+			return ConnectionError(fmt.Errorf("matching sessions are registered by Mutagen %s, but this is Mutagen %s; use the remote executable installed with that version",
+				strings.Join(versions, ", "), mutagen.Version))
 		}
 		return err
 	}
@@ -1096,8 +1109,8 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 		if err != nil {
 			return nil, err
 		} else if len(live) == 0 {
-			return nil, fmt.Errorf("session %s is no longer connected for remote commands on this system (it may have been paused or terminated, or be reconnecting)",
-				describe(s.Target.Session, s.Target.Name))
+			return nil, ConnectionError(fmt.Errorf("session %s is no longer connected for remote commands on this system (it may have been paused or terminated, or be reconnecting)",
+				describe(s.Target.Session, s.Target.Name)))
 		}
 		return single(live, selectedAmbiguity(fmt.Sprintf("%q", s.Target.Session)))
 	}
@@ -1136,8 +1149,11 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 		if err != nil {
 			return nil, err
 		} else if len(live) == 0 {
-			return nil, mismatched(filter(incompatible, selected),
-				fmt.Errorf("no connected session matching %q has remote commands enabled on this system (remote --sessions lists them)", s.Session))
+			err := fmt.Errorf("no connected session matching %q has remote commands enabled on this system (remote --sessions lists them)", s.Session)
+			if len(filter(compatible, selected)) > 0 {
+				return nil, ConnectionError(err)
+			}
+			return nil, mismatched(filter(incompatible, selected), err)
 		}
 		return single(live, selectedAmbiguity(fmt.Sprintf("%q", s.Session)))
 	}
@@ -1176,7 +1192,7 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 			return c.contained || preferred(c)
 		})
 		return nil, mismatched(considered,
-			fmt.Errorf("no connected session with remote commands enabled contains %s or matches %s (remote --sessions lists them)", directory, label))
+			ConnectionError(fmt.Errorf("no connected session with remote commands enabled contains %s or matches %s (remote --sessions lists them)", directory, label)))
 	}
 
 	// Otherwise, the most specific containing root is used.
@@ -1185,7 +1201,7 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 		return nil, err
 	} else if len(live) == 0 {
 		return nil, mismatched(filter(incompatible, containing),
-			fmt.Errorf("no connected session with remote commands enabled contains %s (remote --sessions lists them)", directory))
+			ConnectionError(fmt.Errorf("no connected session with remote commands enabled contains %s (remote --sessions lists them)", directory)))
 	}
 	return first(live), nil
 }

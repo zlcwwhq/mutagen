@@ -232,7 +232,7 @@ func TestJobLogs(t *testing.T) {
 
 	// Logs that can't be opened prevent jobs from starting.
 	request.Job.Log = "missing/out.log"
-	if _, code, err := StartJob(ctx, jobRoute(ctx, root), request); code != 126 || err == nil || !strings.Contains(err.Error(), "log") {
+	if _, code, err := StartJob(ctx, jobRoute(ctx, root), request); code != 0 || err == nil || ClassifyError(err) != ErrorKindOperation || !strings.Contains(err.Error(), "log") {
 		t.Fatalf("incorrect result for an inaccessible log: %d, %v", code, err)
 	}
 
@@ -311,7 +311,7 @@ func TestJobLogTypes(t *testing.T) {
 		if reader != nil {
 			reader.Close()
 		}
-		if code != 126 || err == nil || !strings.Contains(err.Error(), "regular file or character device") {
+		if code != 0 || err == nil || ClassifyError(err) != ErrorKindOperation || !strings.Contains(err.Error(), "regular file or character device") {
 			t.Errorf("incorrect result for a log that's a %s: %d, %v (after %v)", test.description, code, err, elapsed)
 		}
 		if entries, err := os.ReadDir(directory); err != nil || len(entries) != 0 {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -50,7 +51,7 @@ type CommandProtocolHandler interface {
 
 // errFlushTerminated indicates that synchronization stopped before a flush
 // requested by a submission completed.
-var errFlushTerminated = errors.New("synchronization stopped before the flush completed")
+var errFlushTerminated = remote.ConnectionError(errors.New("synchronization stopped before the flush completed"))
 
 // errResolutionUnsupported indicates that the session's synchronization mode
 // doesn't support conflict resolution.
@@ -153,11 +154,15 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 	ignores := EffectiveIgnores(c.mergedAlphaConfiguration, c.session.Version)
 	ctx, cancel := context.WithCancel(ctx)
 	var maintainers sync.WaitGroup
-	for index, url := range []*urlpkg.URL{c.session.Alpha, c.session.Beta} {
+	urls := [2]*urlpkg.URL{c.session.Alpha, c.session.Beta}
+	for index, url := range urls {
+		executionHost, executionRoot := commandExecutionLocation(urls[1-index])
 		endpoint := &remote.Endpoint{
 			Session:        c.session.Identifier,
 			Name:           c.session.Name,
 			Root:           url.Path,
+			ExecutionHost:  executionHost,
+			ExecutionRoot:  executionRoot,
 			Alpha:          index == 0,
 			SessionCreated: c.session.CreationTime.AsTime(),
 			Submit:         (index == 0 && betaExecutes) || (index == 1 && alphaExecutes),
@@ -176,6 +181,17 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		maintainers.Wait()
 		relay.routes.Wait()
 	}
+}
+
+// commandExecutionLocation describes a configured execution endpoint without
+// revealing credentials or transport configuration. Local endpoints run on the
+// daemon's system, whose hostname also identifies it to remote submitters.
+func commandExecutionLocation(url *urlpkg.URL) (string, string) {
+	host := url.Host
+	if url.Protocol == urlpkg.Protocol_Local {
+		host, _ = os.Hostname()
+	}
+	return host, url.Path
 }
 
 // maintain keeps an endpoint's channel connected until cancelled. Channel
@@ -298,14 +314,14 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 	channel := r.channels[target]
 	r.channelsLock.Unlock()
 	if channel == nil {
-		remote.Reject(submission, fmt.Errorf("%s is not connected for remote commands", endpointName(target)))
+		remote.Reject(submission, remote.ConnectionError(fmt.Errorf("%s is not connected for remote commands", endpointName(target))))
 		return
 	}
 	openCtx, cancel := context.WithTimeout(ctx, commandRouteOpenTimeout)
 	execution, err := channel.Open(openCtx)
 	cancel()
 	if err != nil {
-		remote.Reject(submission, fmt.Errorf("unable to reach %s: %w", endpointName(target), err))
+		remote.Reject(submission, remote.ConnectionError(fmt.Errorf("unable to reach %s: %w", endpointName(target), err)))
 		return
 	}
 	remote.Splice(submission, execution)
@@ -482,7 +498,10 @@ func (c *controller) remoteConflicts(algorithm string) (*remote.Listing, error) 
 // can't be content that can't be synchronized (such as a named pipe), and
 // replacing the other copy requires reading it.
 func resolution(conflict *core.Conflict, algorithm string) remote.ConflictRoot {
-	root := remote.ConflictRoot{Path: conflict.Root}
+	root := remote.ConflictRoot{
+		Path: conflict.Root, AlphaChanges: remoteChanges(conflict.AlphaChanges),
+		BetaChanges: remoteChanges(conflict.BetaChanges),
+	}
 	files, directory := true, false
 	for _, changes := range [][]*core.Change{conflict.AlphaChanges, conflict.BetaChanges} {
 		if len(changes) != 1 || changes[0].Path != conflict.Root ||

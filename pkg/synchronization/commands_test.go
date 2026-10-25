@@ -3,6 +3,7 @@ package synchronization
 import (
 	"context"
 	"fmt"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/state"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	urlpkg "github.com/mutagen-io/mutagen/pkg/url"
 )
 
 func TestCommandRelayFlush(t *testing.T) {
@@ -80,6 +82,14 @@ func TestRemoteReport(t *testing.T) {
 		t.Fatalf("problems converted incorrectly: %+v, %+v", first, last)
 	} else if c.state.Conflicts[0].Root != fmt.Sprintf("conflict%02d", maximumListConflicts) || c.state.AlphaState.ScanProblems[0].Path != fmt.Sprintf("scan%02d", maximumListScanProblems) {
 		t.Fatal("state modified")
+	}
+
+	// Resolution listings use the same actual changes as warnings, including
+	// directory descendants and type changes, without deriving history from
+	// the current copies' types.
+	listed := resolution(conflicts[len(conflicts)-1], "sha1")
+	if !reflect.DeepEqual(listed.Changes(), report.Conflicts[0]) {
+		t.Fatalf("listing and warning disagree: %+v, %+v", listed.Changes(), report.Conflicts[0])
 	}
 
 	// Sessions without conflicts or problems produce empty reports.
@@ -199,6 +209,30 @@ func TestRemoteDirectoryConflicts(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+func TestCommandExecutionLocation(t *testing.T) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		protocol                 urlpkg.Protocol
+		host, path, expectedHost string
+	}{
+		{urlpkg.Protocol_Local, "", "/local/project", hostname},
+		{urlpkg.Protocol_SSH, "ssh-alias", "project", "ssh-alias"},
+		{urlpkg.Protocol_SSH, "ssh-alias", "~other/project", "ssh-alias"},
+		{urlpkg.Protocol_Docker, "container", "/root/project", "container"},
+	} {
+		url := &urlpkg.URL{Protocol: test.protocol, Host: test.host, Path: test.path,
+			User: "private-user", Environment: map[string]string{"SECRET": "private"},
+			Parameters: map[string]string{"secret": "private"}}
+		host, root := commandExecutionLocation(url)
+		if host != test.expectedHost || root != test.path {
+			t.Fatalf("incorrect execution metadata: %q, %q", host, root)
 		}
 	}
 }

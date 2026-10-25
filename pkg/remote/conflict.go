@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,12 @@ type ConflictRoot struct {
 	// Path is the slash-separated conflict root relative to the
 	// synchronization root, which is empty for the root itself.
 	Path string
+	// AlphaChanges and BetaChanges describe the actual changes on each
+	// endpoint, bounded to fit the conflict's listing message.
+	AlphaChanges []Change
+	BetaChanges  []Change
+	// ExcludedChanges counts changes omitted from this conflict's summary.
+	ExcludedChanges uint64 `json:",omitempty"`
 	// Files indicates whether both endpoints have a regular file at the
 	// conflict root, in which case remote can write a result, such as a merge
 	// of both copies, to both endpoints.
@@ -55,6 +62,38 @@ func (c *ConflictRoot) Resolvable() bool {
 	return c.Files || c.AlphaTakable || c.BetaTakable
 }
 
+// Changes returns the conflict's change summary in the same form as a
+// synchronization warning, retaining endpoint roles and omitted changes.
+func (c *ConflictRoot) Changes() Conflict {
+	return Conflict{Root: c.Path, Alpha: c.AlphaChanges, Beta: c.BetaChanges, ExcludedChanges: c.ExcludedChanges}
+}
+
+// boundConflict fits a conflict into its listing message without modifying
+// the source. A directory conflict may contain thousands of changes. Halve
+// the longest list first, preserving resolution metadata and counting every
+// omitted change, including when a single change exceeds the message limit.
+func boundConflict(conflict *ConflictRoot) (*ConflictRoot, error) {
+	bounded := *conflict
+	for {
+		data, err := json.Marshal(&conflictsMessage{Conflict: &bounded})
+		if err != nil {
+			return nil, err
+		} else if len(data) <= maximumMessageSize {
+			return &bounded, nil
+		}
+		longest := &bounded.AlphaChanges
+		if len(bounded.BetaChanges) > len(*longest) {
+			longest = &bounded.BetaChanges
+		}
+		if len(*longest) == 0 {
+			return nil, errors.New("conflict metadata exceeds size limit")
+		}
+		removed := (len(*longest) + 1) / 2
+		bounded.ExcludedChanges += uint64(removed)
+		*longest = (*longest)[:len(*longest)-removed]
+	}
+}
+
 // Listing is a complete listing of a session's conflicts and problems as of a
 // synchronization cycle, along with its checkouts.
 type Listing struct {
@@ -76,6 +115,8 @@ type Listing struct {
 type conflictsMessage struct {
 	// Error is the flush or routing error, if any, which ends the listing.
 	Error string `json:",omitempty"`
+	// ErrorKind classifies Error independently of its diagnostic text.
+	ErrorKind ErrorKind `json:",omitempty"`
 	// Conflict is the listed conflict, if any.
 	Conflict *ConflictRoot `json:",omitempty"`
 	// Problem is the listed problem, if any.
@@ -95,11 +136,18 @@ type conflictsMessage struct {
 func RespondWithConflicts(connection io.ReadWriteCloser, listing *Listing, err error) error {
 	defer connection.Close()
 	if err != nil {
-		return writeMessage(connection, &conflictsMessage{Error: err.Error()})
+		return writeMessage(connection, &conflictsMessage{Error: err.Error(), ErrorKind: ClassifyError(err)})
 	}
 	writer := bufio.NewWriter(connection)
 	for c := range listing.Conflicts {
-		if err := writeMessage(writer, &conflictsMessage{Conflict: &listing.Conflicts[c]}); err != nil {
+		conflict, err := boundConflict(&listing.Conflicts[c])
+		if err != nil {
+			if err := writeMessage(writer, &conflictsMessage{Error: err.Error(), ErrorKind: ClassifyError(err)}); err != nil {
+				return err
+			}
+			return writer.Flush()
+		}
+		if err := writeMessage(writer, &conflictsMessage{Conflict: conflict}); err != nil {
 			return err
 		}
 	}
@@ -142,9 +190,9 @@ func ListConflictsWithProgress(ctx context.Context, connection io.ReadWriteClose
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			return nil, fmt.Errorf("unable to receive conflicts: %w", err)
+			return nil, ConnectionError(fmt.Errorf("unable to receive conflicts: %w", err))
 		} else if message.Error != "" {
-			return nil, errors.New(message.Error)
+			return nil, receivedError(message.ErrorKind, errors.New(message.Error))
 		} else if message.Done {
 			return listing, nil
 		} else if message.Conflict != nil {
@@ -158,7 +206,7 @@ func ListConflictsWithProgress(ctx context.Context, connection io.ReadWriteClose
 				progress(message.Progress)
 			}
 		} else {
-			return nil, errors.New("invalid conflict listing")
+			return nil, ConnectionError(errors.New("invalid conflict listing"))
 		}
 	}
 }
@@ -623,11 +671,11 @@ func requestPath(path string) string {
 // a replacement was stale or superseded.
 func responseError(response *result) error {
 	if response.Stale {
-		return &staleError{response.Error}
+		return receivedError(response.ErrorKind, &staleError{response.Error})
 	} else if response.Superseded {
-		return &supersededError{response.Error}
+		return receivedError(response.ErrorKind, &supersededError{response.Error})
 	}
-	return errors.New(response.Error)
+	return receivedError(response.ErrorKind, errors.New(response.Error))
 }
 
 // Copy requests the complete contents of a regular file at a slash-separated
@@ -642,7 +690,7 @@ func Copy(ctx context.Context, connection io.ReadWriteCloser, path string, outpu
 	} else if response.Error != "" {
 		return nil, responseError(response)
 	} else if response.Entry == nil {
-		return nil, errors.New("no entry received")
+		return nil, ConnectionError(errors.New("no entry received"))
 	}
 	return response.Entry, nil
 }
@@ -658,7 +706,7 @@ func Archive(ctx context.Context, connection io.ReadWriteCloser, path string, ou
 	} else if response.Error != "" {
 		return nil, responseError(response)
 	} else if response.Entry == nil {
-		return nil, errors.New("no entry received")
+		return nil, ConnectionError(errors.New("no entry received"))
 	}
 	return response.Entry, nil
 }

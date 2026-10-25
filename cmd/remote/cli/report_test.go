@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -129,5 +130,53 @@ func TestTruncatedConflict(t *testing.T) {
 		t.Fatal("omissions weren't explained:", output.String())
 	} else if paths := conflictPaths(report); strings.Join(paths, ",") != "d,d/file" {
 		t.Fatal("truncated conflict root wasn't compared:", paths)
+	}
+}
+
+func TestConflictRootSummary(t *testing.T) {
+	// Listings retain actual change history, including omitted changes, and
+	// use the warning formatter from either endpoint's perspective. Control
+	// characters in roots and descendant paths are neutralized only for text.
+	conflict := &remote.ConflictRoot{
+		Path:            "sub/d\x1b",
+		AlphaChanges:    []remote.Change{{Path: "sub/d\x1b", Old: "directory", New: "file"}},
+		BetaChanges:     []remote.Change{{Path: "sub/d\x1b/child\x1b", New: "symbolic link"}},
+		ExcludedChanges: 42,
+	}
+	for _, alpha := range []bool{true, false} {
+		reports := newReporter(nil, &remote.Target{Root: t.TempDir(), Alpha: alpha, Contained: true, Path: "sub"})
+		summary := reports.describeConflict(conflict.Changes())
+		side := "locally"
+		if !alpha {
+			side = "remotely"
+		}
+		if !strings.HasPrefix(summary, "d^[: ") || !strings.Contains(summary, "changed directory to file "+side) ||
+			!strings.Contains(summary, "created symbolic link "+filepath.Join("d^[", "child^[")) ||
+			!strings.Contains(summary, "42 more changes") || strings.Contains(summary, "\x1b") {
+			t.Fatalf("incorrect summary: %q", summary)
+		}
+	}
+}
+
+func TestListedConflictChangesLimited(t *testing.T) {
+	// Text listings describe a bounded number of each endpoint's changes,
+	// keeping the first ones, such as the root's, and counting the rest with
+	// those that the daemon already omitted, without modifying the listing.
+	root := &remote.ConflictRoot{Path: "out", AlphaChanges: []remote.Change{{Path: "out", Old: "directory"}}, ExcludedChanges: 3}
+	for i := range 11 {
+		root.AlphaChanges = append(root.AlphaChanges, remote.Change{Path: fmt.Sprintf("out/%d", i), Old: "file"})
+	}
+	root.BetaChanges = []remote.Change{{Path: "out/0", Old: "file", New: "file"}, {Path: "out/1", Old: "file", New: "file"}}
+	limited := limitChanges(root.Changes(), listedChanges)
+	if len(limited.Alpha) != listedChanges || limited.Alpha[0].Path != "out" || len(limited.Beta) != 2 ||
+		limited.ExcludedChanges != 3+12-listedChanges {
+		t.Fatalf("incorrect limit: %+v", limited)
+	} else if len(root.AlphaChanges) != 12 || root.ExcludedChanges != 3 {
+		t.Fatal("listing modified:", root)
+	}
+	reports := newReporter(nil, &remote.Target{Root: t.TempDir(), Alpha: true, Contained: true})
+	if summary := reports.describeConflict(limited); !strings.HasPrefix(summary, "out: deleted directory locally") ||
+		!strings.Contains(summary, "...and 10 more changes") || strings.Contains(summary, "out/5") {
+		t.Fatalf("incorrect summary: %q", summary)
 	}
 }

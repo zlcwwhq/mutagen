@@ -63,6 +63,10 @@ func TestPullMerge(t *testing.T) {
 		"same": "same\n", "changed": "old\n", "local-only": "kept\n", "sub/local": "kept\n",
 		"file-to-directory": "file\n", "directory-to-file/e": "e\n",
 	})
+	// The identical file also has identical metadata.
+	mtime := time.Unix(1700000000, 0)
+	setPullModificationTime(t, filepath.Join(staged, "same"), mtime)
+	setPullModificationTime(t, filepath.Join(destination, "same"), mtime)
 	links := runtime.GOOS != "windows"
 	if links {
 		os.Symlink("same", filepath.Join(staged, "link"))

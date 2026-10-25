@@ -49,9 +49,9 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 			}
 			for _, side := range []string{sideLocal, sideRemote} {
 				o := &options{conflictOptions: conflictOptions{take: side}}
-				_, unlock, err := apply(ctx, root, o, local, func() (*remote.Listing, error) {
+				_, unlock, err := apply(ctx, root, o, local, nil, func() (*remote.Listing, *remote.Target, error) {
 					t.Fatal("conflicts listed for a directory workspace")
-					return nil, nil
+					return nil, nil, nil
 				})
 				if unlock != nil {
 					unlock()
@@ -104,9 +104,9 @@ func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 			if _, err := checkout(ctx, root, &options{}, &remote.Listing{}, target, local); !reported(err) {
 				t.Fatal("unreadable workspace not reported by checkout:", err)
 			}
-			_, unlock, err := apply(ctx, root, &options{}, local, func() (*remote.Listing, error) {
+			_, unlock, err := apply(ctx, root, &options{}, local, nil, func() (*remote.Listing, *remote.Target, error) {
 				t.Fatal("conflicts listed for an unreadable workspace")
-				return nil, nil
+				return nil, nil, nil
 			})
 			if unlock != nil {
 				unlock()
@@ -716,6 +716,73 @@ func TestUnterminatedCopies(t *testing.T) {
 			t.Fatalf("%q and %q noted: %s", test.local, test.remote, output)
 		} else if !strings.Contains(output, test.note) {
 			t.Fatalf("%q and %q not noted: %s", test.local, test.remote, output)
+		}
+	}
+}
+
+func TestAutomaticCheckoutKeepsWorkspaceLock(t *testing.T) {
+	// Automatic checkout retains the local lock from its initial check until
+	// the batch completes. POSIX record locks require another process to
+	// check exclusion (see TestWorkspaceLock).
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	local := filepath.Join(t.TempDir(), "file")
+	check := func(held bool) {
+		t.Helper()
+		helper := exec.Command(os.Args[0], "-test.run=^TestWorkspaceLock$")
+		helper.Env = append(os.Environ(), "MUTAGEN_TEST_WORKSPACE_LOCK="+local)
+		output, err := helper.CombinedOutput()
+		if held && (err == nil || !strings.Contains(string(output), "in progress")) {
+			t.Fatalf("workspace lock not retained: %s, %v", output, err)
+		} else if !held && (err != nil || string(output) != "locked\n") {
+			t.Fatalf("workspace lock not released: %s, %v", output, err)
+		}
+	}
+	expected := errors.New("listing failed")
+	_, unlock, err := apply(context.Background(), filepath.Dir(local), &options{conflictOptions: conflictOptions{take: sideLocal}}, local, nil,
+		func() (*remote.Listing, *remote.Target, error) {
+			check(true)
+			return nil, nil, expected
+		})
+	if unlock == nil || !errors.Is(err, expected) {
+		t.Fatalf("listing error or lock lost: %v", err)
+	}
+	check(true)
+	unlock()
+	check(false)
+}
+
+func TestAutomaticCheckoutChecksTake(t *testing.T) {
+	// Automatic checkout refuses --take and --executable options that the
+	// listed conflict can't use before claiming it, which would fail here
+	// without a daemon, so that no claim or workspace is left behind.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	root := t.TempDir()
+	local := filepath.Join(root, "conflict")
+	target := &remote.Target{Session: "session", Alpha: true, Root: root}
+	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{{Path: "conflict", AlphaTakable: true}}}
+	for _, test := range []struct {
+		options  conflictOptions
+		expected string
+	}{
+		{conflictOptions{apply: true, take: sideRemote}, "the remote copy can't be taken"},
+		{conflictOptions{apply: true, take: sideLocal, executable: "true"}, "can only be resolved with --take"},
+		{conflictOptions{apply: true, take: sideLocal}, ""},
+	} {
+		_, unlock, err := apply(ctx, root, &options{conflictOptions: test.options}, local, nil,
+			func() (*remote.Listing, *remote.Target, error) {
+				return listing, target, nil
+			})
+		if unlock != nil {
+			unlock()
+		}
+		if test.expected != "" && (err == nil || !strings.Contains(err.Error(), test.expected)) {
+			t.Errorf("%+v not refused before claiming: %v", test.options, err)
+		} else if test.expected == "" && (err == nil || strings.Contains(err.Error(), "can't be taken") || strings.Contains(err.Error(), "can only be resolved")) {
+			t.Errorf("%+v refused, rather than claimed: %v", test.options, err)
+		}
+		if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%+v left a workspace: %v", test.options, err)
 		}
 	}
 }

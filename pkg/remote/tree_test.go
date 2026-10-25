@@ -125,9 +125,18 @@ func TestExtractionConfinement(t *testing.T) {
 			&tar.Header{Typeflag: tar.TypeReg, Name: "link/escaped"}),
 		"misnamed top": archive(&tar.Header{Typeflag: tar.TypeReg, Name: "file"}),
 		"extra entry":  archive(&tar.Header{Typeflag: tar.TypeReg, Name: "."}, &tar.Header{Typeflag: tar.TypeReg, Name: "file"}),
+		"duplicate file": archive(top, &tar.Header{Typeflag: tar.TypeReg, Name: "file"},
+			&tar.Header{Typeflag: tar.TypeReg, Name: "file"}),
+		"duplicate directory": archive(top, &tar.Header{Typeflag: tar.TypeDir, Name: "dir"},
+			&tar.Header{Typeflag: tar.TypeDir, Name: "dir"}),
+		"missing parent": archive(top, &tar.Header{Typeflag: tar.TypeReg, Name: "missing/file"}),
+		"file parent": archive(top, &tar.Header{Typeflag: tar.TypeReg, Name: "file"},
+			&tar.Header{Typeflag: tar.TypeReg, Name: "file/child"}),
 	} {
 		if _, err := ExtractArchive(ctx, input, filepath.Join(t.TempDir(), "copy")); err == nil {
 			t.Fatalf("%s accepted", description)
+		} else if ClassifyError(err) != ErrorKindConnection {
+			t.Fatalf("%s not classified as protocol failure: %v", description, err)
 		} else if _, err := os.Lstat(filepath.Join(outside, "escaped")); err == nil {
 			t.Fatalf("%s escaped", description)
 		}

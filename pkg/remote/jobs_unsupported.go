@@ -34,7 +34,7 @@ func jobLockHeld(_ string) (bool, error) {
 // startJob starts a requested command as a detached job. Detached jobs aren't
 // supported on this system.
 func startJob(_, _ string, _ bool, _ *Request) result {
-	return result{ExitCode: 126, Error: errJobsUnsupported.Error()}
+	return result{ExitCode: 126, ErrorKind: ErrorKindOperation, Error: errJobsUnsupported.Error()}
 }
 
 // findLeftovers looks for processes that ended jobs left running. Detached jobs

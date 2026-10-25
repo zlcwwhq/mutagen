@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 )
@@ -82,6 +83,12 @@ func snapshotLeaf(ctx context.Context, root *os.Root, path, name string, info os
 		var output io.Writer = io.Discard
 		if archive != nil {
 			header.Typeflag, header.Size = tar.TypeReg, info.Size()
+			// Keep the default format, which stores whole seconds: PAX
+			// subsecond times add 1 KiB per file, doubling the archive size
+			// for small files. Truncate rather than let the writer round, so
+			// that a copy is never newer than its source, which tools such as
+			// make would take for an up-to-date output.
+			header.ModTime = info.ModTime().Truncate(time.Second)
 			if err := archive.WriteHeader(header); err != nil {
 				return nil, err
 			}
@@ -173,7 +180,9 @@ func Snapshot(ctx context.Context, directory, path string) (*Entry, error) {
 }
 
 // ArchiveEntry writes an archive of the entry at a slash-separated path
-// relative to a root (see openFile) to output and returns its snapshot.
+// relative to a root (see openFile) to output and returns its snapshot. Regular
+// file modification times are preserved, truncated to whole seconds, and don't
+// participate in snapshots or content comparisons.
 func ArchiveEntry(ctx context.Context, directory, path string, output io.Writer) (*Entry, error) {
 	root, path, _, err := openFile(directory, path)
 	if err != nil {
@@ -189,12 +198,13 @@ func ArchiveEntry(ctx context.Context, directory, path string, output io.Writer)
 }
 
 // errInvalidArchive indicates that an archive doesn't have the expected form.
-var errInvalidArchive = errors.New("invalid archive")
+var errInvalidArchive = ConnectionError(errors.New("invalid archive"))
 
 // ExtractArchive extracts an archive (see ArchiveEntry) to a destination path,
 // at which nothing may exist, and returns the snapshot that it describes, which
 // is computed as received rather than read back. Extraction is confined to the
-// destination. Extracted files are private.
+// destination. Extracted files are private, with their archived modification
+// times, to the precision supported by the destination filesystem.
 func ExtractArchive(ctx context.Context, input io.Reader, destination string) (*Entry, error) {
 	return extractArchive(ctx, input, destination, true)
 }
@@ -213,7 +223,7 @@ func extractArchive(ctx context.Context, input io.Reader, destination string, pr
 	if err == io.EOF {
 		return &Entry{Kind: EntryMissing}, nil
 	} else if err != nil {
-		return nil, err
+		return nil, ConnectionError(err)
 	} else if header.Name != archiveTop {
 		return nil, errInvalidArchive
 	}
@@ -225,6 +235,8 @@ func extractArchive(ctx context.Context, input io.Reader, destination string, pr
 			err = nil
 		} else if err == nil {
 			err = errInvalidArchive
+		} else {
+			err = ConnectionError(err)
 		}
 	}
 	if err != nil {
@@ -232,7 +244,7 @@ func extractArchive(ctx context.Context, input io.Reader, destination string, pr
 	}
 	// Consume the archive's padding, so that the sender isn't blocked.
 	_, err = io.Copy(io.Discard, input)
-	return entry, err
+	return entry, ConnectionError(err)
 }
 
 // extractLeaf extracts an archive entry other than a directory to a native
@@ -259,7 +271,21 @@ func extractLeaf(reader *tar.Reader, header *tar.Header, root *os.Root, path str
 			return nil, err
 		}
 		hasher := sha256.New()
-		size, err := io.Copy(io.MultiWriter(file, hasher), reader)
+		size, err := io.Copy(io.MultiWriter(file, hasher), connectionReader{reader})
+		// Restore the archived modification time before flushing and
+		// publishing the newly created file. This path is confined to the
+		// extraction directory and was created exclusively above, so no
+		// existing symbolic link or hard link is modified.
+		if err == nil {
+			if root != nil {
+				err = root.Chtimes(path, header.ModTime, header.ModTime)
+			} else {
+				err = os.Chtimes(path, header.ModTime, header.ModTime)
+			}
+			if err != nil {
+				err = fmt.Errorf("unable to preserve modification time: %w", err)
+			}
+		}
 		// Flush the file, so that an extracted copy, such as a checked-out
 		// one, survives a power loss or an operating system crash once the
 		// directory containing it is flushed too (see SyncDirectory).
@@ -307,15 +333,24 @@ func extractDirectory(reader *tar.Reader, destination string, private bool) (*En
 	defer root.Close()
 	tree := treeHasher{sha256.New()}
 	tree.add(archiveTop, &Entry{Kind: EntryDirectory})
+	// Validate archive structure before performing filesystem operations, so
+	// malformed entries are protocol failures while actual filesystem errors
+	// remain operation failures. Parents must have been explicit directories;
+	// symbolic links and duplicate entries can never redirect extraction.
+	directories := map[string]bool{archiveTop: true}
 	for {
 		header, err := reader.Next()
 		if err == io.EOF {
 			return &Entry{Kind: EntryDirectory, Digest: tree.digest()}, nil
 		} else if err != nil {
-			return nil, err
+			return nil, ConnectionError(err)
 		} else if header.Name == archiveTop || !validRelativePath(header.Name) {
 			return nil, errInvalidArchive
 		}
+		if _, duplicate := directories[header.Name]; duplicate || !directories[path.Dir(header.Name)] {
+			return nil, errInvalidArchive
+		}
+		directories[header.Name] = header.Typeflag == tar.TypeDir
 		native := filepath.FromSlash(header.Name)
 		entry := &Entry{Kind: EntryDirectory}
 		if header.Typeflag == tar.TypeDir {

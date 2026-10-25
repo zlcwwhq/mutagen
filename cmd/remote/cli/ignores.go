@@ -130,20 +130,27 @@ func printIgnores(router *router, paths []string, output io.Writer) (int, error)
 		root, landing := resolveLanding(target.Root, relative)
 		file, fileIgnored := describeExclusion(target, locator, relative, root, landing, false)
 		directory, directoryIgnored := describeExclusion(target, locator, relative, root, landing, true)
+		absent := false
 		if info, err := os.Lstat(filepath.Join(target.Root, filepath.FromSlash(relative))); err == nil {
 			if info.IsDir() {
 				file, fileIgnored = directory, directoryIgnored
 			} else {
 				directory, directoryIgnored = file, fileIgnored
 			}
+		} else if os.IsNotExist(err) {
+			absent = true
+		} else {
+			return 0, fmt.Errorf("unable to inspect local path %s: %w", display, err)
 		}
 		if fileIgnored || directoryIgnored {
 			code = 1
 		}
-		if file == directory {
-			fmt.Fprintf(output, "%s: %s\n", display, file)
+		if absent && file == directory {
+			fmt.Fprintf(output, "%s: not present locally; if a file or directory: %s\n", display, file)
+		} else if absent {
+			fmt.Fprintf(output, "%s: not present locally; if a directory: %s; if a file: %s\n", display, directory, file)
 		} else {
-			fmt.Fprintf(output, "%s: %s as a file, %s as a directory\n", display, file, directory)
+			fmt.Fprintf(output, "%s: %s\n", display, file)
 		}
 	}
 	return code, nil

@@ -37,6 +37,12 @@ type Endpoint struct {
 	Name string
 	// Root is the synchronization root, interpreted on the endpoint's system.
 	Root string
+	// ExecutionHost is the host or container name of the opposite endpoint. It
+	// is display metadata only, without credentials or connection parameters.
+	ExecutionHost string `json:",omitempty"`
+	// ExecutionRoot is the configured root on the opposite endpoint. It may be
+	// home-relative and has not been resolved on that endpoint.
+	ExecutionRoot string `json:",omitempty"`
 	// Alpha indicates whether the endpoint is alpha.
 	Alpha bool
 	// SessionCreated is the session's creation time, which determines the
@@ -187,6 +193,8 @@ type ExecutableInstaller func() (string, error)
 type initializeResponse struct {
 	// Error is the initialization error, if any.
 	Error string
+	// ErrorKind classifies Error independently of its diagnostic text.
+	ErrorKind ErrorKind `json:",omitempty"`
 	// Warning is a non-fatal initialization problem, if any.
 	Warning string
 	// Executable is the remote executable path on the endpoint's system, if
@@ -257,9 +265,9 @@ func initializeExecutor(logger *logging.Logger, carrier multiplexing.Carrier, en
 	}
 	var response initializeResponse
 	if err := readMessage(carrier, &response); err != nil {
-		return fmt.Errorf("unable to receive initialization response: %w", err)
+		return ConnectionError(fmt.Errorf("unable to receive initialization response: %w", err))
 	} else if response.Error != "" {
-		return fmt.Errorf("executor initialization failed: %s", response.Error)
+		return fmt.Errorf("executor initialization failed: %w", receivedError(response.ErrorKind, errors.New(response.Error)))
 	}
 	if response.Warning != "" {
 		logger.Warn("Remote executable unavailable:", response.Warning)
@@ -341,7 +349,7 @@ type serverInitialization struct {
 func initializeServer(carrier multiplexing.Carrier, install ExecutableInstaller) (result serverInitialization) {
 	// Receive the endpoint description.
 	if err := readMessage(carrier, &result.endpoint); err != nil {
-		result.err = fmt.Errorf("unable to receive initialization request: %w", err)
+		result.err = ConnectionError(fmt.Errorf("unable to receive initialization request: %w", err))
 		return
 	}
 	endpoint := &result.endpoint
@@ -351,7 +359,7 @@ func initializeServer(carrier multiplexing.Carrier, install ExecutableInstaller)
 	// install it is reported as a warning, since it may be installed
 	// separately.
 	fail := func(err error) serverInitialization {
-		writeMessage(carrier, &initializeResponse{Error: err.Error()})
+		writeMessage(carrier, &initializeResponse{Error: err.Error(), ErrorKind: ClassifyError(err)})
 		return serverInitialization{err: err}
 	}
 	root, err := filesystem.Normalize(endpoint.Root)
@@ -450,7 +458,7 @@ func ServeChannel(ctx context.Context, logger *logging.Logger, stream io.ReadWri
 			serveSubmissions(logger, listener, func(connection net.Conn) {
 				stream, err := multiplexer.OpenStream(ctx)
 				if err != nil {
-					Reject(connection, fmt.Errorf("unable to reach the Mutagen daemon: %w", err))
+					Reject(connection, ConnectionError(fmt.Errorf("unable to reach the Mutagen daemon: %w", err)))
 					return
 				}
 				Splice(connection, stream)

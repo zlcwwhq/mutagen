@@ -658,6 +658,8 @@ func TestStandardStreamFailures(t *testing.T) {
 			t.Fatal("standard stream failure was not reported")
 		} else if errors.Is(err, ErrConnectionLost) {
 			t.Fatal("standard stream failure reported as connection loss:", err)
+		} else if ClassifyError(err) != ErrorKindOperation {
+			t.Fatal("local standard stream failure misclassified:", err)
 		}
 	}
 }

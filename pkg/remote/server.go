@@ -75,7 +75,7 @@ func Serve(ctx context.Context, connection io.ReadWriteCloser, root, prologue st
 	if err := readMessage(control, &request); err != nil {
 		return fmt.Errorf("unable to receive command: %w", err)
 	}
-	response := run(ctx, root, prologue, alpha, &request, input, output, errorOutput)
+	response := run(ctx, root, prologue, alpha, &request, connectionReader{input}, connectionWriter{output}, connectionWriter{errorOutput})
 	input.Close()
 	output.CloseWrite()
 	errorOutput.CloseWrite()
@@ -105,9 +105,9 @@ func workingDirectory(root string, request *Request) (string, error) {
 func sendEntry(ctx context.Context, root, path string, output io.Writer) result {
 	entry, err := ReadEntry(ctx, filepath.Join(root, filepath.FromSlash(path)))
 	if err != nil {
-		return result{Error: fmt.Sprintf("unable to read %s: %v", path, err)}
+		return failedResult(fmt.Errorf("unable to read %s: %w", path, err))
 	} else if _, err := output.Write(entry.Data); err != nil {
-		return result{Error: fmt.Sprintf("unable to send file contents: %v", err)}
+		return failedResult(fmt.Errorf("unable to send file contents: %w", err))
 	}
 	return result{Entry: entry}
 }
@@ -170,19 +170,19 @@ func terminate(command *exec.Cmd, finished <-chan struct{}, abandon func()) {
 // performs a requested file or job operation.
 func run(ctx context.Context, root, prologue string, alpha bool, request *Request, stdin io.Reader, stdout, stderr io.Writer) result {
 	if err := request.EnsureValid(); err != nil {
-		return result{Error: err.Error()}
+		return failedResult(err)
 	} else if request.File != "" {
 		return sendEntry(ctx, root, request.File, stdout)
 	} else if request.Copy != "" {
 		entry, err := CopyFile(ctx, root, request.Copy, stdout)
 		if err != nil {
-			return result{Error: fmt.Sprintf("unable to copy %s: %v", request.Copy, err)}
+			return failedResult(fmt.Errorf("unable to copy %s: %w", request.Copy, err))
 		}
 		return result{Entry: entry}
 	} else if request.Archive != "" {
 		entry, err := ArchiveEntry(ctx, root, request.Archive, stdout)
 		if err != nil {
-			return result{Error: fmt.Sprintf("unable to archive %s: %v", request.Archive, err)}
+			return failedResult(fmt.Errorf("unable to archive %s: %w", request.Archive, err))
 		}
 		return result{Entry: entry}
 	} else if request.Replace != nil {
@@ -195,6 +195,7 @@ func run(ctx context.Context, root, prologue string, alpha bool, request *Reques
 		if err := ReplaceFile(ctx, root, request.Replace, stdin); err != nil {
 			return result{
 				Error:      fmt.Sprintf("unable to replace %s: %v", request.Replace.Path, err),
+				ErrorKind:  ClassifyError(err),
 				Stale:      errors.Is(err, ErrStale),
 				Superseded: errors.Is(err, ErrSuperseded),
 			}
@@ -242,15 +243,22 @@ type preparedCommand struct {
 func prepare(root, prologue string, alpha bool, request *Request, scriptPath string) (*preparedCommand, *result) {
 	directory, err := workingDirectory(root, request)
 	if err != nil {
-		return nil, &result{Error: fmt.Sprintf("invalid working directory: %v", err)}
+		return nil, &result{ExitCode: 126, ErrorKind: ErrorKindOperation, DirectoryError: DirectoryErrorInvalid, Directory: request.Directory,
+			Error: fmt.Sprintf("invalid working directory %q: %v", request.Directory, err)}
 	}
 	// Check the working directory explicitly, since a missing one (such as an
 	// ignored or not yet synchronized directory) would otherwise be reported as
 	// a missing executable by the operating system.
 	if info, err := os.Stat(directory); err != nil {
-		return nil, &result{ExitCode: 126, Error: fmt.Sprintf("unable to access working directory: %v", err)}
+		kind := DirectoryErrorInaccessible
+		if os.IsNotExist(err) {
+			kind = DirectoryErrorMissing
+		}
+		return nil, &result{ExitCode: 126, ErrorKind: ErrorKindOperation, DirectoryError: kind, Directory: directory,
+			Error: fmt.Sprintf("unable to access working directory: %v", err)}
 	} else if !info.IsDir() {
-		return nil, &result{ExitCode: 126, Error: fmt.Sprintf("working directory is not a directory: %s", directory)}
+		return nil, &result{ExitCode: 126, ErrorKind: ErrorKindOperation, DirectoryError: DirectoryErrorNotDirectory, Directory: directory,
+			Error: fmt.Sprintf("working directory is not a directory: %s", directory)}
 	}
 
 	// The executing endpoint supplies its identity after all user-provided
@@ -266,7 +274,7 @@ func prepare(root, prologue string, alpha bool, request *Request, scriptPath str
 	// without reconnecting the channel. Disabled prologues aren't inspected.
 	if request.Prologue {
 		if prologue, err = selectPrologue(root, prologue); err != nil {
-			return nil, &result{ExitCode: 126, Error: err.Error()}
+			return nil, &result{ExitCode: 126, ErrorKind: ErrorKindOperation, Error: err.Error()}
 		}
 	}
 
@@ -274,7 +282,7 @@ func prepare(root, prologue string, alpha bool, request *Request, scriptPath str
 	command := &preparedCommand{arguments: request.Arguments, directory: directory, environment: environment}
 	if request.Script != nil {
 		if command.script, command.scriptLock, command.arguments, err = writeScript(request.Script, request.Arguments, scriptPath); err != nil {
-			return nil, &result{ExitCode: 126, Error: err.Error()}
+			return nil, &result{ExitCode: 126, ErrorKind: ErrorKindOperation, Error: err.Error()}
 		}
 	}
 	fail := func(failure result) (*preparedCommand, *result) {
@@ -286,14 +294,14 @@ func prepare(root, prologue string, alpha bool, request *Request, scriptPath str
 	// once the prologue has been sourced.
 	if request.Prologue && prologue != "" {
 		if command.arguments, err = prologueArguments(prologue, command.arguments); err != nil {
-			return fail(result{ExitCode: 126, Error: err.Error()})
+			return fail(result{ExitCode: 126, ErrorKind: ErrorKindOperation, Error: err.Error()})
 		}
 		command.path = command.arguments[0]
 	} else if command.path, err = lookPath(command.arguments[0], directory, append(os.Environ(), environment...)); err != nil {
 		if request.Script != nil {
-			return fail(result{ExitCode: 127, Error: fmt.Sprintf("unable to find the script's interpreter: %v", err)})
+			return fail(result{ExitCode: 127, ErrorKind: ErrorKindOperation, Error: fmt.Sprintf("unable to find the script's interpreter: %v", err)})
 		}
-		return fail(result{ExitCode: 127, Error: fmt.Sprintf("unable to find command: %v", err)})
+		return fail(result{ExitCode: 127, ErrorKind: ErrorKindOperation, Error: fmt.Sprintf("unable to find command: %v", err)})
 	}
 	return command, nil
 }
@@ -333,13 +341,13 @@ func (c *preparedCommand) runForeground(ctx context.Context, stdin io.Reader, st
 	// Normal draining has no deadline, preserving output over slow links.
 	outputReader, outputWriter, err := os.Pipe()
 	if err != nil {
-		return result{Error: fmt.Sprintf("unable to create command output: %v", err)}
+		return failedResult(fmt.Errorf("unable to create command output: %w", err))
 	}
 	defer outputReader.Close()
 	defer outputWriter.Close()
 	errorReader, errorWriter, err := os.Pipe()
 	if err != nil {
-		return result{Error: fmt.Sprintf("unable to create command error output: %v", err)}
+		return failedResult(fmt.Errorf("unable to create command error output: %w", err))
 	}
 	defer errorReader.Close()
 	defer errorWriter.Close()
@@ -349,12 +357,12 @@ func (c *preparedCommand) runForeground(ctx context.Context, stdin io.Reader, st
 	// input when a command that does not consume stdin exits.
 	input, err := command.StdinPipe()
 	if err != nil {
-		return result{Error: fmt.Sprintf("unable to create command input: %v", err)}
+		return failedResult(fmt.Errorf("unable to create command input: %w", err))
 	}
 	if err := ctx.Err(); err != nil {
-		return result{ExitCode: 126, Error: fmt.Sprintf("unable to start command: %v", err)}
+		return result{ExitCode: 126, ErrorKind: ErrorKindOperation, Error: fmt.Sprintf("unable to start command: %v", err)}
 	} else if err := command.Start(); err != nil {
-		return result{ExitCode: 126, Error: fmt.Sprintf("unable to start command: %v", err)}
+		return result{ExitCode: 126, ErrorKind: ErrorKindOperation, Error: fmt.Sprintf("unable to start command: %v", err)}
 	}
 	outputWriter.Close()
 	errorWriter.Close()
@@ -391,7 +399,7 @@ func (c *preparedCommand) runForeground(ctx context.Context, stdin io.Reader, st
 		<-terminated
 	}
 	if outputError != nil {
-		return result{Error: fmt.Sprintf("unable to forward command output: %v", outputError)}
+		return failedResult(fmt.Errorf("unable to forward command output: %w", outputError))
 	}
 	if err == nil {
 		return result{}
@@ -400,5 +408,5 @@ func (c *preparedCommand) runForeground(ctx context.Context, stdin io.Reader, st
 	if errors.As(err, &exitError) {
 		return result{ExitCode: processExitCode(exitError.ProcessState)}
 	}
-	return result{Error: fmt.Sprintf("unable to run command: %v", err)}
+	return failedResult(fmt.Errorf("unable to run command: %w", err))
 }

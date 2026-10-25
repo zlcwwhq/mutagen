@@ -1,10 +1,14 @@
 package remote
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -112,5 +116,54 @@ func TestListingIncludesCheckouts(t *testing.T) {
 	go RespondWithConflicts(server, sent, nil)
 	if received, err := ListConflicts(ctx, client); err != nil || !reflect.DeepEqual(received, sent) {
 		t.Fatalf("listing received incorrectly: %+v, %v", received, err)
+	}
+}
+
+func TestListingBoundsChanges(t *testing.T) {
+	// Listing roots remain complete, while each conflict's changes fit one
+	// protocol message. Existing omission counts survive further truncation.
+	conflict := ConflictRoot{Path: "directory", ExcludedChanges: 3}
+	conflict.AlphaChanges = []Change{{Path: "directory", Old: "directory", New: "file"}}
+	for i := 0; i < 18000; i++ {
+		conflict.BetaChanges = append(conflict.BetaChanges, Change{
+			Path: fmt.Sprintf("directory/file-%040d", i), Old: "file", New: "file",
+		})
+	}
+	original, err := json.Marshal(conflict)
+	if err != nil || len(original) <= maximumMessageSize {
+		t.Fatal("test conflict doesn't exceed the protocol limit:", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, server := net.Pipe()
+	sent := &Listing{Conflicts: []ConflictRoot{conflict, {Path: "next", Files: true}}}
+	response := make(chan error, 1)
+	go func() { response <- RespondWithConflicts(server, sent, nil) }()
+	received, err := ListConflicts(ctx, client)
+	if err != nil {
+		t.Fatal(err)
+	} else if err := <-response; err != nil {
+		t.Fatal(err)
+	} else if len(received.Conflicts) != 2 || received.Conflicts[1].Path != "next" {
+		t.Fatalf("conflict roots lost: %+v", received)
+	}
+	bounded := received.Conflicts[0]
+	if bounded.Path != conflict.Path || bounded.ExcludedChanges <= conflict.ExcludedChanges ||
+		uint64(len(bounded.AlphaChanges)+len(bounded.BetaChanges))+bounded.ExcludedChanges != 18004 {
+		t.Fatalf("incorrect truncation: %d, %d, %d", len(bounded.AlphaChanges), len(bounded.BetaChanges), bounded.ExcludedChanges)
+	} else if after, err := json.Marshal(conflict); err != nil || !bytes.Equal(original, after) {
+		t.Fatal("original conflict modified:", err)
+	}
+
+	// Escaped strings can exceed the limit even in a single change. A root
+	// that cannot fit is reported explicitly instead of silently omitted.
+	boundedPointer, err := boundConflict(&ConflictRoot{Path: "root", AlphaChanges: []Change{{Path: strings.Repeat("\x00", maximumMessageSize)}}})
+	if err != nil || boundedPointer.ExcludedChanges != 1 || len(boundedPointer.AlphaChanges) != 0 {
+		t.Fatalf("oversized change not bounded: %+v, %v", boundedPointer, err)
+	}
+	client, server = net.Pipe()
+	go RespondWithConflicts(server, &Listing{Conflicts: []ConflictRoot{{Path: strings.Repeat("x", maximumMessageSize)}}}, nil)
+	if _, err := ListConflicts(ctx, client); err == nil || !strings.Contains(err.Error(), "metadata exceeds size limit") {
+		t.Fatal("oversized root not reported:", err)
 	}
 }

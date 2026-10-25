@@ -328,6 +328,8 @@ var executorFeatures = []string{featureFollow, featureWaitTimeout}
 type status struct {
 	// Error is the routing error, if any.
 	Error string
+	// ErrorKind classifies Error independently of its diagnostic text.
+	ErrorKind ErrorKind `json:",omitempty"`
 	// Features are the optional protocol features that the executing endpoint
 	// supports. Executors that predate feature reporting report none, and hops
 	// that report routing errors don't report any.
@@ -346,6 +348,8 @@ func (s *status) supports(feature string) bool {
 type flushResponse struct {
 	// Error is the flush or routing error, if any.
 	Error string
+	// ErrorKind classifies Error independently of its diagnostic text.
+	ErrorKind ErrorKind `json:",omitempty"`
 	// Report describes content that the session couldn't synchronize. It's
 	// non-nil if and only if the flush succeeded.
 	Report *Report `json:",omitempty"`
@@ -370,6 +374,13 @@ type result struct {
 	ExitCode int
 	// Error is the execution infrastructure error, if any.
 	Error string
+	// ErrorKind classifies Error independently of its diagnostic text.
+	ErrorKind ErrorKind `json:",omitempty"`
+	// DirectoryError classifies a working directory failure without requiring
+	// clients to inspect Error. Directory identifies the failed execution path,
+	// or the explicit path that could not be expanded.
+	DirectoryError DirectoryErrorKind `json:",omitempty"`
+	Directory      string             `json:",omitempty"`
 	// Entry is the requested entry for file requests, excluding its data,
 	// which is sent as output.
 	Entry *Entry `json:",omitempty"`
@@ -399,10 +410,13 @@ func writeMessage(writer io.Writer, value any) error {
 	} else if len(data) > maximumMessageSize {
 		return errors.New("command metadata exceeds size limit")
 	}
-	if err := binary.Write(writer, binary.BigEndian, uint32(len(data))); err != nil {
+	// Encoding and size errors are local input failures. Only failures in
+	// writing the encoded message belong to the connection.
+	transport := connectionWriter{writer}
+	if err := binary.Write(transport, binary.BigEndian, uint32(len(data))); err != nil {
 		return err
 	}
-	_, err = writer.Write(data)
+	_, err = transport.Write(data)
 	return err
 }
 

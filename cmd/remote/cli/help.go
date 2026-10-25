@@ -14,48 +14,26 @@ import (
 // are left to help topics.
 const usage = `Usage: remote [options] <command> [<args>...]
        remote [options] --script <file>|- [<args>...]
-       remote [options] --detach [--log <file>] <command> [<args>...]
-       remote [options] --flush
-       remote [options] --diff [<path>...]
-       remote [-s <session>] --jobs | --wait <id> | --kill <id>
-       remote [-s <session>] --ignores [<path>...] | --pull <path>...
-       remote --sessions
+       remote [options] --flush | --diff [<path>...] | --pull <path>...
+       remote [options] --jobs | --wait <id> | --kill <id>
+       remote --sessions | --ignores [<path>...] | --help <topic>
 
-Run a command on the opposite endpoint of the Mutagen synchronization session
-whose root contains the current directory, in the corresponding directory
-there. Standard input, output, error, and the exit status are forwarded. The
-session is synchronized before the command, so that it sees local changes, and
-after it, so that its changes are present locally when remote exits.
+Run on the session's opposite endpoint, in the corresponding directory.
+Synchronize before and after; forward stdin, stdout, stderr, and exit status.
+Options precede the command. No terminal is allocated.
 
 Examples:
   remote pytest -x tests/
-  remote sh -c 'make && ./bin/app'      (shell syntax needs a shell or --script)
+  remote sh -c 'make && ./bin/app'       (expand shell syntax remotely)
   remote -e CONDA_ENV=torch python train.py
-  remote --timeout 600 make bench       (terminate it after 10 minutes)
   remote --detach --log train.log python train.py
-                                        (run it in the background: prints an ID)
-  remote --wait <id>                    (wait for that job, then synchronize)
-  remote --flush                        (only synchronize)
-  remote --script - <<'EOF'             (run shell code as written, with bash)
-  for p in a b; do python run.py --preset "$p"; done
-  EOF
+  remote --wait <id> --follow           (watch a detached job)
+Your shell expands variables, globs, and ~ first; quote remote expressions.
 
-Your local shell expands variables, globs, and ~ before remote sees them, and
-no remote shell interprets the arguments, so use sh -c '...' for anything that
-should be expanded remotely, or --script - with a quoted here-document
-(<<'EOF'), which your shell passes unchanged. Options must precede the command;
-the arguments after --script's file are the script's. No terminal is
-allocated, so interactive programs don't work.
-
-Exit status is the command's own, or:
-  255  remote failed, such as when no session was found or the connection was
-       lost (it prints a remote: error saying why)
-  127  command not found
-  126  command couldn't be started, or the prologue failed
-  124  --timeout expired
-With --wait, it's the job's status. With --diff, it's 0 if the copies are
-identical and 1 if they differ, and with --ignores, it's 1 if any given path
-is ignored.
+Exit status: command/job status, or 125 for remote's input/operation failures,
+  255 connection/protocol failure or unreachable session, 124 timeout,
+  126 unable to start, 127 command not found, 128+N signal.
+  --diff: 0 identical, 1 different. --ignores: 0 synchronized, 1 ignored.
 
 Options:
 `
@@ -75,12 +53,18 @@ directory, and runs commands in the corresponding directory on its opposite
 endpoint (remote pwd prints it). Among equally specific roots, such as one
 directory synchronized to several machines, the session created first is used.
 remote --sessions lists the connected sessions, marking the one used by default
-and those whose roots contain the current directory.
+and those whose roots contain the current directory. Each entry shows its local
+root, the execution host/root (runs on), and the mapped cwd. Paths are configured
+values: ~/ means the executing user's home; older records show unknown.
 
   - --session selects a session by name or identifier instead, even if its
     roots don't contain the current directory: commands then run at the root
     of its opposite endpoint, or in --cwd (relative to that root), and require
     --cwd if another session's root contains the directory.
+  - --cwd (-C) overrides the mapped directory. Absolute paths and quoted ~
+    paths belong to the executing system; relative paths start at the mapped
+    directory. Quote home paths: remote -C '~/project' pwd. Your shell expands
+    an unquoted ~ into the local home before remote sees it.
   - An exported MUTAGEN_REMOTE_SESSION only selects among the sessions
     containing the current directory, and is ignored if none of them matches
     it; outside every root, it selects a session as --session does.
@@ -90,9 +74,10 @@ and those whose roots contain the current directory.
     MUTAGEN_REMOTE_SESSION.
   - Commands don't run in a directory that the session ignores (or inside
     one), since the session doesn't synchronize it, unless --cwd is given:
-    --cwd . runs them in the corresponding directory anyway, such as in an
-    ignored build directory that exists on both endpoints. remote --ignores
-    lists the session's ignores.
+    if it's another session's root, that session isn't running commands now,
+    so don't use --cwd to work around it. Only when the directory exists
+    separately on both sides does --cwd . run in the other side's own copy.
+    remote --ignores lists the session's ignores.
   - Sessions that are paused, disconnected, or don't run commands submitted
     from this side can't be found, so inside the root of such a session that
     is nested in another session's root, the enclosing session is used: if it
@@ -135,8 +120,10 @@ and those whose roots contain the current directory.
   - Content written to ignored paths exists only on the endpoint that wrote
     it. remote --ignores lists the session's ignores, and
     remote --ignores <path>... shows whether each path is ignored, as the kind
-    of entry that it is locally (exit status 1 if any is). remote --pull
-    <path>... copies ignored files, directories, and symbolic links from the
+    of entry that it is locally (exit status 1 if any is). Missing local paths
+    are marked not present locally, with conditional file/directory results;
+    either candidate being ignored gives status 1. Access failures are errors.
+    remote --pull <path>... copies ignored files, directories, and links from the
     opposite endpoint, replacing local files that differ but never deleting
     local content. It refuses the root, paths that the session synchronizes,
     which synchronization updates instead, and directories with synchronized
@@ -146,6 +133,15 @@ and those whose roots contain the current directory.
     session also ignores where they lead. --pull only follows links that the
     session ignores, and never one at the path itself, which a pulled file or
     link replaces.
+  - --pull preserves regular files' modification times, including files in
+    directories, truncated to whole seconds, so copies are never newer than
+    their sources. Times use the executing endpoint's clock; clock skew is
+    preserved. Directory and link times and access/change times aren't
+    preserved. Added and replaced files get default permissions (executable
+    if the remote copy is). Identical contents with a changed mtime are
+    atomically replaced, keeping local permissions but not hard links, owner,
+    or extended attributes, and counted as metadata updated; repeated pulls
+    leave identical files and times unchanged.
   - --pull also refuses paths that another session synchronizes, whether or
     not that session runs remote commands, but it only knows sessions whose
     endpoints on this system are connected and run by this version of
@@ -159,8 +155,9 @@ and those whose roots contain the current directory.
 `},
 	{"environment", "environment variables and prologues", `  - Commands inherit the environment of the executing endpoint's Mutagen agent
     (or, on the daemon's system, of the daemon), which usually lacks
-    interactive shell setup such as conda init. -e and --env-file set
-    additional variables (your shell expands -e PATH=$PATH to the local PATH).
+    interactive shell setup such as conda init. -e NAME=VALUE sets a variable;
+    -e NAME forwards its local value. --env-file reads literal NAME=VALUE
+    lines. Both can be repeated. Your shell expands -e PATH=$PATH locally.
   - /bin/sh sources .remote-prologue.sh in the executing endpoint's sync root
     if it exists, otherwise that endpoint's configured remotePrologue, before
     commands submitted from inside the root (even with --cwd). It sees -e
@@ -179,6 +176,14 @@ and those whose roots contain the current directory.
     even with --no-prologue or when submitting from outside the root.
     Detached jobs also receive MUTAGEN_REMOTE_JOB, set to their ID.
 
+No terminal is allocated. Programs may buffer output or disable colors:
+  remote -e PYTHONUNBUFFERED=1 python train.py
+  remote python -u train.py
+  remote stdbuf -oL <command>
+The last example applies to programs using glibc stdio; programs managing their
+own buffers may ignore it. Unbuffering reduces output delay. For colors, use
+the target program's own force-color option; unbuffering doesn't enable them.
+
 Example .remote-prologue.sh, activating a conda environment on beta only:
   case "$MUTAGEN_REMOTE_ENDPOINT" in
     beta) eval "$(~/miniconda3/bin/conda shell.posix hook)"
@@ -186,8 +191,17 @@ Example .remote-prologue.sh, activating a conda environment on beta only:
   esac
 `},
 	{"termination", "timeouts, interruptions, and lost connections", `--timeout takes seconds, or a duration with a unit, such as 10m or 1h30m.
-Commands are terminated when it expires, when remote is interrupted, and when
-the session stops synchronizing (such as when it's paused or reconnects, or the
+remote's own input errors and operation failures exit with 125; read the
+remote: diagnostic and correct the cause before retrying. Connection setup,
+lost connections, protocol failures, and an unreachable session exit with 255.
+An invalid explicit session selection is 125. Commands and completed jobs pass
+through their own statuses unchanged, including 125 and 255, so status alone
+cannot always identify who failed. --diff/--ignores use 1 only for a result;
+their failures follow the same 125/255 distinction. For batches, interruption
+or timeout takes precedence over connection failures, then operation failures.
+
+Commands are terminated when the timeout expires, when remote is interrupted,
+and when the session stops synchronizing (such as when it's paused or reconnects, or the
 daemon stops): their process group receives SIGTERM, then
 SIGKILL 5 seconds later if any of it remains (on Windows, the command is killed
 at once). If the session stops synchronizing, remote reports that the
@@ -263,7 +277,7 @@ exits:
     waiting (status 124) without affecting the job. If the connection to the
     executing endpoint is lost while waiting, remote retries for a minute. A
     job whose status couldn't be recorded, such as because it was killed with
-    SIGKILL or its system restarted, is lost (status 255).
+    SIGKILL or its system restarted, is lost (status 125).
   - With --wait, --tail N prints the final N log lines to standard output
     after the job ends, or before exiting with status 124 if --timeout expires
     while it runs, including logs outside the root or in ignored paths. Zero
@@ -300,20 +314,60 @@ exits:
   - --timeout can't be combined with --detach; run the command with timeout
     instead. Detached jobs aren't supported on Windows or AIX endpoints.
 `},
-	{"conflicts", "resolving files modified on both endpoints", `Usage: remote --conflicts [--json]
+	{"conflicts", "choosing or merging conflicting copies", `Usage: remote --conflicts [--json]
        remote --conflict-checkout [--base <file>] [--json] <path>...
        remote --conflict-apply [--take local|remote | --delete]
               [--executable true|false] [--json] <path>...
        remote --conflict-discard [--json] <path>...
 
-Conflicts are files modified on both endpoints, which stay unsynchronized until
-resolved. remote resolves them in two-way-safe and one-way-safe sessions:
-  remote --conflicts                    (list all conflicts)
-  remote --conflict-checkout app.go     (download both copies for merging)
-  (edit the merged file that checkout prints, then review all of it)
-  remote --conflict-apply app.go        (write the merged file to both copies)
+Resolve conflicting files in two-way-safe and one-way-safe sessions.
+Local and remote always mean the submitting and opposite endpoints.
 
-Notes:
+To keep one side (no checkout needed):
+  remote --conflict-apply --take local app.go
+  remote --conflict-apply --take remote app.go
+This creates a checkout if none exists, then applies and verifies. Existing
+workspaces retain their original copies; another endpoint's checkout refuses
+this operation. --delete still requires an explicit checkout.
+
+To merge both copies:
+  remote --conflicts                    (list actual changes and checkout state)
+  remote --conflict-checkout app.go     (download copies into a workspace)
+  (edit and review the complete merged file printed by checkout)
+  remote --conflict-apply app.go        (write both copies, then verify)
+
+Stop writers on both endpoints until apply finishes. Apply refuses copies
+changed since checkout; concurrent edits during apply can be overwritten.
+Each conflict has one checkout, through one endpoint. A workspace on your
+system may belong to someone else; only apply or discard your own checkouts.
+Directories require manual resolution. Other supported types require --take.
+
+Failed apply can leave a partial result: retry using the retained workspace.
+If a copy changed or the conflict disappeared, inspect the current files and
+workspace before discarding it. Successful apply and discard retain original
+copies as backups. --json prints machine-readable results.
+
+See remote --help conflict-details for merge limitations, backup retention,
+and recovery after changed copies, interruptions, or damaged workspaces.
+
+Options:
+`},
+	{"conflict-details", "merge rules, backups, and recovery", `--take local|remote creates a checkout when none exists, under one local lock
+held through apply and verification. It reuses its claim's write sequence;
+existing workspaces use the usual validation and retries. Multi-path applies
+share one synchronization before writing and one after. A side that the
+listing says can't be taken, or --executable for copies that aren't both
+files, is refused before checking out. Failed automatic apply keeps its
+workspace for retry or manual merging; --delete never auto-checks out.
+
+Listing summaries describe actual local/remote changes from the submitter's
+perspective. Text lines describe at most 5 changes per side and count the
+rest; oversized summaries also omit changes from JSON and count them. JSON
+retains Path and adds LocalChanges, RemoteChanges, and ExcludedChanges;
+internal checkout emits no separate result when --take applies a path. Failed
+path results also carry ErrorKind (operation, connection, or timeout),
+alongside Error.
+
   - remote --conflicts synchronizes, lists every conflict, how it can be
     resolved, and through which endpoint it's checked out, flags checked-out
     copies that changed since checkout and partially applied resolutions, and
@@ -394,8 +448,6 @@ Notes:
     of a copy wait for each other, since an apply that timed out may still be
     writing the remote copy, and apply fails without changing a copy that a
     later apply (through either endpoint) reached first; run --conflicts.
-
-Options:
 `},
 }
 
@@ -409,7 +461,7 @@ func printHelp(o *options, output io.Writer) error {
 		}))
 		fmt.Fprintln(output, "\nHelp topics (remote --help <topic>):")
 		for _, topic := range helpTopics {
-			fmt.Fprintf(output, "  %-13s%s\n", topic.name, topic.summary)
+			fmt.Fprintf(output, "  %-17s%s\n", topic.name, topic.summary)
 		}
 		return nil
 	}

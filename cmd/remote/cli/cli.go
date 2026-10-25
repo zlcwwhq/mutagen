@@ -28,13 +28,47 @@ import (
 )
 
 const (
-	// failureExitCode is the exit code for failures to run the command, which
-	// matches the convention used by ssh.
-	failureExitCode = 255
+	// failureExitCode is the exit code for remote input and operation errors,
+	// following the wrapper-failure convention used by timeout and env.
+	failureExitCode = 125
+	// connectionExitCode denotes unavailable sessions and communication errors.
+	connectionExitCode = 255
 	// timeoutExitCode is the exit code for commands cancelled by --timeout,
 	// which matches the convention used by timeout.
 	timeoutExitCode = 124
 )
+
+// errorExitCode maps remote's own failures at the CLI boundary. Commands and
+// completed jobs bypass this mapping and retain their original exit status.
+func errorExitCode(err error) int {
+	switch remote.ClassifyError(err) {
+	case remote.ErrorKindTimeout:
+		return timeoutExitCode
+	case remote.ErrorKindConnection:
+		return connectionExitCode
+	default:
+		return failureExitCode
+	}
+}
+
+// checkedWriter retains output errors from formatters that don't return them.
+// Operation output is written serially; command streams use remote.Execute's
+// separate source and destination error tracking instead.
+type checkedWriter struct {
+	io.Writer
+	err error
+}
+
+func (w *checkedWriter) Write(data []byte) (int, error) {
+	count, err := w.Writer.Write(data)
+	if err == nil && count != len(data) {
+		err = io.ErrShortWrite
+	}
+	if w.err == nil {
+		w.err = err
+	}
+	return count, err
+}
 
 // options are the parsed command line options.
 type options struct {
@@ -150,33 +184,33 @@ func parse(arguments []string) (*options, error) {
 	flags.SetInterspersed(false)
 	flags.SortFlags = false
 	// Names in backquotes are used as value placeholders in usage information.
-	flags.StringVarP(&result.session, "session", "s", "", "Use the session with this `NAME` or identifier, even from outside its root")
-	flags.StringVarP(&result.directory, "cwd", "C", "", "Run in `DIR`: absolute and ~ paths are on the opposite endpoint, others are relative to the corresponding directory")
-	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set `NAME[=VALUE]`, where a bare NAME forwards the local value (repeatable)")
-	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read literal NAME=VALUE lines from `FILE` (repeatable)")
-	flags.StringVar(&result.script, "script", "", "Run the local script `FILE` (- for standard input) with its #! interpreter, or bash; arguments are passed to it")
-	flags.Var((*timeoutValue)(&result.timeout), "timeout", "Exit after `DURATION` (seconds, or with a unit such as 10m), terminating the command")
-	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the workspace or configured remote prologue")
-	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize before and after the command (only for commands that use no synchronized files)")
-	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
+	flags.StringVarP(&result.session, "session", "s", "", "Select session `NAME` or identifier")
+	flags.StringVarP(&result.directory, "cwd", "C", "", "Override execution directory with `DIR`")
+	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set or forward `NAME[=VALUE]` (repeatable)")
+	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read NAME=VALUE from `FILE` (repeatable)")
+	flags.StringVar(&result.script, "script", "", "Run local script `FILE` (- reads stdin)")
+	flags.Var((*timeoutValue)(&result.timeout), "timeout", "Limit runtime to `DURATION` (seconds or 10m)")
+	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Skip the execution prologue")
+	flags.BoolVar(&result.noFlush, "no-flush", false, "Skip synchronization (see --help sync)")
+	flags.BoolVar(&result.flush, "flush", false, "Synchronize, optionally before a command")
 	var progress bool
-	flags.BoolVar(&progress, "progress", false, "Show the progress of synchronizations that take over 3 seconds (automatic on terminals; --progress=false disables it)")
-	flags.BoolVar(&result.detach, "detach", false, "Run the command as a detached job, which keeps running after remote exits, and print its identifier")
-	flags.StringVar(&result.log, "log", "", "With --detach, write the job's output to `FILE` (relative to the command's directory), a regular file or character device")
-	flags.BoolVar(&result.jobs, "jobs", false, "List the detached jobs started at the session's root on the opposite endpoint, and processes that ended jobs left running")
-	flags.StringVar(&result.wait, "wait", "", "Wait for the detached job `ID` to end, synchronize, and exit with its status")
-	flags.Int64Var(&result.tail, "tail", 0, "With --wait, print the final `N` log lines when the job ends or --timeout expires (at most 1 MiB; 0 disables output)")
-	flags.BoolVar(&result.follow, "follow", false, "With --wait, print the job's log as it's written, from its beginning or the final --tail lines")
-	flags.StringVar(&result.kill, "kill", "", "Terminate the detached job `ID` without synchronizing (--no-flush is accepted but has no effect)")
-	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
-	flags.BoolVar(&result.ignores, "ignores", false, "Show the session's ignores, or whether the given paths are ignored")
-	flags.BoolVar(&result.pull, "pull", false, "Copy the given paths, which the session must ignore, from the opposite endpoint")
-	flags.BoolVar(&result.sessions, "sessions", false, "List the connected sessions, showing which ones contain the current directory and which one is used")
+	flags.BoolVar(&progress, "progress", false, "Show sync progress; =false hides it")
+	flags.BoolVar(&result.detach, "detach", false, "Start a detached job and print its ID")
+	flags.StringVar(&result.log, "log", "", "Write detached output to `FILE`")
+	flags.BoolVar(&result.jobs, "jobs", false, "List detached jobs on the other endpoint")
+	flags.StringVar(&result.wait, "wait", "", "Wait for job `ID`, sync, return its status")
+	flags.Int64Var(&result.tail, "tail", 0, "With --wait, print final `N` log lines")
+	flags.BoolVar(&result.follow, "follow", false, "With --wait, stream the job's log")
+	flags.StringVar(&result.kill, "kill", "", "Terminate job `ID` without synchronizing")
+	flags.BoolVar(&result.diff, "diff", false, "Sync, then compare paths or conflicts")
+	flags.BoolVar(&result.ignores, "ignores", false, "Show ignore rules or check given paths")
+	flags.BoolVar(&result.pull, "pull", false, "Pull ignored paths, preserving file mtime")
+	flags.BoolVar(&result.sessions, "sessions", false, "List sessions, execution hosts, and cwd")
 	result.conflictFlags = pflag.NewFlagSet("conflicts", pflag.ContinueOnError)
 	result.conflictFlags.SortFlags = false
 	result.conflictOptions.register(result.conflictFlags)
 	flags.AddFlagSet(result.conflictFlags)
-	flags.BoolVarP(&result.help, "help", "h", false, "Show this help, or the help topic given as an argument")
+	flags.BoolVarP(&result.help, "help", "h", false, "Show help, optionally for a topic")
 	flags.BoolVar(&result.version, "version", false, "Show version information")
 	options, operands := arguments, []string(nil)
 	if boundary := scriptBoundary(flags, arguments); boundary >= 0 {
@@ -324,7 +358,7 @@ func (o *options) command() bool {
 func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fail := func(err error) int {
 		fmt.Fprintln(stderr, "remote:", err)
-		return failureExitCode
+		return errorExitCode(err)
 	}
 
 	// Parse options.
@@ -332,12 +366,15 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(fmt.Errorf("%w (see remote --help)", err))
 	} else if options.help {
-		if err := printHelp(options, stdout); err != nil {
+		output := &checkedWriter{Writer: stdout}
+		if err := errors.Join(printHelp(options, output), output.err); err != nil {
 			return fail(err)
 		}
 		return 0
 	} else if options.version {
-		fmt.Fprintln(stdout, mutagen.Version)
+		if _, err := fmt.Fprintln(stdout, mutagen.Version); err != nil {
+			return fail(err)
+		}
 		return 0
 	}
 
@@ -434,13 +471,14 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Perform operations other than running commands.
 	var activity string
 	var code int
+	output := &checkedWriter{Writer: stdout}
 	switch {
 	case options.sessions:
-		activity, err = "listing sessions", printSessions(ctx, directory, options.defaultSession, stdout)
+		activity, err = "listing sessions", printSessions(ctx, directory, options.defaultSession, output)
 	case options.active():
-		activity, err = "resolving conflicts", runConflicts(ctx, directory, options, stdout, stderr)
+		activity, err = "resolving conflicts", runConflicts(ctx, directory, options, output, stderr)
 	case options.jobs:
-		activity, err = "listing jobs", listJobs(router, stdout)
+		activity, err = "listing jobs", listJobs(router, output)
 	case options.wait != "":
 		activity = "waiting for the job"
 		code, err = waitJob(router, options, stdout)
@@ -459,16 +497,19 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		activity, err = "terminating the job", killJob(router, options.kill)
 	case options.ignores:
 		activity = "checking ignores"
-		code, err = printIgnores(router, options.arguments, stdout)
+		code, err = printIgnores(router, options.arguments, output)
 	case options.pull:
 		activity, err = "pulling", pull(router, options.arguments)
 	default:
 		return runCommand(router, options, request, stdin, stdout, stderr, interrupted)
 	}
+	if output.err != nil {
+		err = errors.Join(err, fmt.Errorf("unable to print output: %w", output.err))
+	}
 	if interruptedCode, ok := interrupted(activity); ok {
 		return interruptedCode
 	} else if errors.Is(err, errReported) {
-		return failureExitCode
+		return errorExitCode(err)
 	} else if err != nil {
 		return fail(err)
 	}
@@ -557,7 +598,7 @@ func (r *router) warn(format string, arguments ...any) {
 func runCommand(router *router, options *options, request *remote.Request, stdin io.Reader, stdout, stderr io.Writer, interrupted func(string) (int, bool)) int {
 	fail := func(err error) int {
 		fmt.Fprintln(stderr, "remote:", err)
-		return failureExitCode
+		return errorExitCode(err)
 	}
 
 	// Synchronize local changes before the command. Failure to locate the
@@ -606,11 +647,11 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 		if interruptedCode, ok := interrupted("starting the job"); ok {
 			return interruptedCode
 		} else if err != nil {
-			fmt.Fprintln(stderr, "remote:", err)
+			printCommandError(stderr, err, request.Directory)
 			if code != 0 {
 				return code
 			}
-			return failureExitCode
+			return errorExitCode(err)
 		}
 		return 0
 	}
@@ -622,17 +663,17 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 		// lost, which happens whenever the session stops synchronizing, so
 		// synchronizing afterwards isn't attempted.
 		if options.noFlush {
-			return fail(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated"))
+			return fail(remote.ConnectionError(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated")))
 		}
-		return fail(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated and the session wasn't synchronized afterwards"))
+		return fail(remote.ConnectionError(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated and the session wasn't synchronized afterwards")))
 	} else if err != nil {
 		// Startup failures such as missing commands report conventional exit
 		// codes (126 or 127) alongside the error.
-		fmt.Fprintln(stderr, "remote:", err)
+		printCommandError(stderr, err, request.Directory)
 		if code != 0 {
 			return code
 		}
-		return failureExitCode
+		return errorExitCode(err)
 	}
 
 	// Synchronize the command's changes back. Once the command has finished,
