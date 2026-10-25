@@ -125,13 +125,14 @@ func startJob(ctx context.Context, connection net.Conn, target *remote.Target, r
 		// in which scans could see its path, and remote --pull copies it
 		// then. If the session ignores it in only some of them, it may not be
 		// synchronized, but remote --pull doesn't write it either (see
-		// remote.Ignores.ExcludedInEveryForm).
+		// remote.Ignores.ExcludedInEveryForm). Reading it, including with
+		// remote --wait --tail, works in either case.
 		if excluded := target.Ignores.ExcludedInEveryForm(job.LogPath, false); excluded != "" {
-			fmt.Fprintf(stderr, "remote: warning: the session ignores %s, so the log isn't synchronized; read it with remote cat or copy it with remote --pull\n",
-				locator.display(excluded))
+			fmt.Fprintf(stderr, "remote: warning: the session ignores %s, so the log isn't synchronized; read it with remote cat or remote --wait %s --tail <lines>, or copy it with remote --pull\n",
+				locator.display(excluded), job.ID)
 		} else if excluded := target.Ignores.ExcludedInAnyForm(job.LogPath, false); excluded != "" {
-			fmt.Fprintf(stderr, "remote: warning: the session ignores %s in only some Unicode normalization forms of its path, so the log may not be synchronized; read it with remote cat\n",
-				locator.display(excluded))
+			fmt.Fprintf(stderr, "remote: warning: the session ignores %s in only some Unicode normalization forms of its path, so the log may not be synchronized; read it with remote cat or remote --wait %s --tail <lines>\n",
+				locator.display(excluded), job.ID)
 		}
 	}
 	return 0, nil

@@ -101,3 +101,35 @@ func TestWaitJobTailTimeout(t *testing.T) {
 		t.Fatalf("wait couldn't be resumed: %d, %q, %q", code, output.String(), errors.String())
 	}
 }
+
+func TestDetachIgnoredLogWarning(t *testing.T) {
+	alpha, _ := setupPullSessions(t, map[string]string{"kept": "local"}, map[string]string{"results/kept": "remote"})
+	t.Chdir(alpha)
+	for _, test := range []struct {
+		log    string
+		warned bool
+	}{
+		{"results/train.log", true},
+		{"results/train.log", true},
+		{"train.log", false},
+	} {
+		var output, errors bytes.Buffer
+		arguments := []string{"-s", "sync_outer", "--detach", "--log", test.log, "--no-flush", "sh", "-c", "printf 'done\\n'"}
+		if code := Run(arguments, strings.NewReader(""), &output, &errors); code != 0 {
+			t.Fatalf("unable to start job: %d, %q", code, errors.String())
+		}
+		id := strings.TrimSpace(output.String())
+
+		// Every job with an ignored log is warned about, along with the wait
+		// that prints the log's end.
+		warning := "remote: warning: the session ignores results, so the log isn't synchronized; read it with remote cat or remote --wait " + id + " --tail <lines>, or copy it with remote --pull\n"
+		if test.warned && !strings.Contains(errors.String(), warning) || !test.warned && strings.Contains(errors.String(), "warning") {
+			t.Fatalf("incorrect warning for %s: %q", test.log, errors.String())
+		}
+		output.Reset()
+		errors.Reset()
+		if code := Run([]string{"-s", "sync_outer", "--wait", id, "--tail", "1", "--no-flush"}, strings.NewReader(""), &output, &errors); code != 0 || output.String() != "done\n" {
+			t.Fatalf("suggested wait didn't print the log: %d, %q, %q", code, output.String(), errors.String())
+		}
+	}
+}
