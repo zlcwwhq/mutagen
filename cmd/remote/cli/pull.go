@@ -42,12 +42,15 @@ func pull(router *router, paths []string) error {
 }
 
 // pullSummary counts the files and symbolic links that a pull added,
-// replaced, or left unchanged, and records the entries that it couldn't merge.
+// replaced, updated only in metadata, or left unchanged, and records the entries
+// that it couldn't merge.
 type pullSummary struct {
 	// added is the number of entries added.
 	added int
 	// replaced is the number of entries replaced.
 	replaced int
+	// metadataUpdated is the number of files replaced only to update metadata.
+	metadataUpdated int
 	// unchanged is the number of entries left unchanged.
 	unchanged int
 	// problems describe the entries that couldn't be merged.
@@ -56,6 +59,9 @@ type pullSummary struct {
 
 // String implements fmt.Stringer.String.
 func (s *pullSummary) String() string {
+	if s.metadataUpdated > 0 {
+		return fmt.Sprintf("%d added, %d replaced, %d metadata updated, %d unchanged", s.added, s.replaced, s.metadataUpdated, s.unchanged)
+	}
 	return fmt.Sprintf("%d added, %d replaced, %d unchanged", s.added, s.replaced, s.unchanged)
 }
 
@@ -350,12 +356,23 @@ func (s *pullSummary) merge(source, destination, display string) {
 	} else if destinationInfo.IsDir() {
 		problem("exists locally as a directory")
 		return
-	} else if same, err := sameEntries(source, sourceInfo, destination, destinationInfo); err != nil {
+	}
+	same, err := sameEntries(source, sourceInfo, destination, destinationInfo)
+	if err != nil {
 		problem("couldn't be compared: %v", err)
-	} else if same {
+		return
+	}
+	// Compare the staged file's actual time so that the destination
+	// filesystem's precision is already accounted for. Even metadata-only
+	// changes replace the file atomically: changing the destination's time
+	// directly would follow symbolic links and modify other hard links.
+	metadataChanged := same && sourceInfo.Mode().IsRegular() && !sourceInfo.ModTime().Equal(destinationInfo.ModTime())
+	if same && !metadataChanged {
 		s.unchanged++
 	} else if err := os.Rename(source, destination); err != nil {
 		problem("couldn't be replaced: %v", err)
+	} else if metadataChanged {
+		s.metadataUpdated++
 	} else {
 		s.replaced++
 	}

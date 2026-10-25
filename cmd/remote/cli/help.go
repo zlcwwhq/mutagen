@@ -132,6 +132,12 @@ values: ~/ means the executing user's home; older records show unknown.
     session also ignores where they lead. --pull only follows links that the
     session ignores, and never one at the path itself, which a pulled file or
     link replaces.
+  - --pull preserves regular files' modification times, including files in
+    directories, rounded to the nearest second. Times use the executing
+    endpoint's clock; clock skew is preserved. Directory and link times and
+    access/change times aren't preserved. Identical contents with a changed
+    mtime are atomically replaced and counted as metadata updated; repeated
+    pulls leave identical files and times unchanged.
   - --pull also refuses paths that another session synchronizes, whether or
     not that session runs remote commands, but it only knows sessions whose
     endpoints on this system are connected and run by this version of

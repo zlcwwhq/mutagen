@@ -82,6 +82,10 @@ func snapshotLeaf(ctx context.Context, root *os.Root, path, name string, info os
 		var output io.Writer = io.Discard
 		if archive != nil {
 			header.Typeflag, header.Size = tar.TypeReg, info.Size()
+			// Keep the default format, which rounds modification times to
+			// seconds. PAX subsecond times add 1 KiB per file, doubling the
+			// archive size for small files.
+			header.ModTime = info.ModTime()
 			if err := archive.WriteHeader(header); err != nil {
 				return nil, err
 			}
@@ -173,7 +177,9 @@ func Snapshot(ctx context.Context, directory, path string) (*Entry, error) {
 }
 
 // ArchiveEntry writes an archive of the entry at a slash-separated path
-// relative to a root (see openFile) to output and returns its snapshot.
+// relative to a root (see openFile) to output and returns its snapshot. Regular
+// file modification times are preserved to the nearest second and don't
+// participate in snapshots or content comparisons.
 func ArchiveEntry(ctx context.Context, directory, path string, output io.Writer) (*Entry, error) {
 	root, path, _, err := openFile(directory, path)
 	if err != nil {
@@ -194,7 +200,8 @@ var errInvalidArchive = errors.New("invalid archive")
 // ExtractArchive extracts an archive (see ArchiveEntry) to a destination path,
 // at which nothing may exist, and returns the snapshot that it describes, which
 // is computed as received rather than read back. Extraction is confined to the
-// destination. Extracted files are private.
+// destination. Extracted files are private, with their archived modification
+// times, to the precision supported by the destination filesystem.
 func ExtractArchive(ctx context.Context, input io.Reader, destination string) (*Entry, error) {
 	return extractArchive(ctx, input, destination, true)
 }
@@ -260,6 +267,20 @@ func extractLeaf(reader *tar.Reader, header *tar.Header, root *os.Root, path str
 		}
 		hasher := sha256.New()
 		size, err := io.Copy(io.MultiWriter(file, hasher), reader)
+		// Restore the archived modification time before flushing and
+		// publishing the newly created file. This path is confined to the
+		// extraction directory and was created exclusively above, so no
+		// existing symbolic link or hard link is modified.
+		if err == nil {
+			if root != nil {
+				err = root.Chtimes(path, header.ModTime, header.ModTime)
+			} else {
+				err = os.Chtimes(path, header.ModTime, header.ModTime)
+			}
+			if err != nil {
+				err = fmt.Errorf("unable to preserve modification time: %w", err)
+			}
+		}
 		// Flush the file, so that an extracted copy, such as a checked-out
 		// one, survives a power loss or an operating system crash once the
 		// directory containing it is flushed too (see SyncDirectory).

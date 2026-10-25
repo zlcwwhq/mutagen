@@ -170,7 +170,7 @@ func parse(arguments []string) (*options, error) {
 	flags.StringVar(&result.kill, "kill", "", "Terminate job `ID` without synchronizing")
 	flags.BoolVar(&result.diff, "diff", false, "Sync, then compare paths or conflicts")
 	flags.BoolVar(&result.ignores, "ignores", false, "Show ignore rules or check given paths")
-	flags.BoolVar(&result.pull, "pull", false, "Copy ignored paths from the other side")
+	flags.BoolVar(&result.pull, "pull", false, "Pull ignored paths, preserving file mtime")
 	flags.BoolVar(&result.sessions, "sessions", false, "List sessions, execution hosts, and cwd")
 	result.conflictFlags = pflag.NewFlagSet("conflicts", pflag.ContinueOnError)
 	result.conflictFlags.SortFlags = false
