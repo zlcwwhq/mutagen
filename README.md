@@ -295,6 +295,20 @@ starting a job and `--wait` only after it ends, while `--jobs`, `--kill`,
 `--ignores`, and `--pull` don't flush. `--kill` accepts `--no-flush`, which
 has no effect.
 
+Flushes that take over 3 seconds show their progress on standard error,
+following git's convention: on a terminal, as a line updated in place, and
+elsewhere only with `--progress`, as separate `remote:` lines printed when the
+phase changes and every 10 seconds, which suits commands run in the background
+or under a line-based monitor; `--progress=false` disables it. This applies to
+every flush, including those of `--wait`, `--diff`, and the conflict
+operations. A final line summarizes where the time went, such as
+`remote: synchronized in 44s: scanning 31s; staging on alpha (local) 12s, 1 file, 5.0 MiB`:
+scanning both roots (a flush rescans them in full), staging changed files on an
+endpoint (transferring their contents to it; the size is approximate),
+applying changes, and so on. Phases can repeat if the session was already
+synchronizing when the flush was requested. If the daemon doesn't report
+progress, `remote` shows only the elapsed time.
+
 Commands are terminated when `--timeout` expires, when `remote` is interrupted,
 and when the session stops synchronizing, such as when it's paused, reconnects
 after an error, or is replaced by `mutagen project apply`, or when the daemon

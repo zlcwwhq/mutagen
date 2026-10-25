@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -826,6 +827,95 @@ func TestRemoteDetachedJobs(t *testing.T) {
 				t.Fatalf("incorrect wait result for a killed job: %d, %q", code, errorOutput)
 			} else if code, _, errorOutput := runRemote(t, submitting, "--wait", "00000000"); code != 255 || !strings.Contains(errorOutput, "no job 00000000") {
 				t.Fatalf("incorrect wait result for a nonexistent job: %d, %q", code, errorOutput)
+			}
+		})
+	}
+}
+
+// progressLine matches synchronization progress lines, with the phase if the
+// daemon has reported it.
+var progressLine = regexp.MustCompile(`^remote: synchronizing for \d+s(: .+)?$`)
+
+// progressSummary matches synchronization progress summaries.
+var progressSummary = regexp.MustCompile(`^remote: synchronized in \d+s(: .+)?$`)
+
+func TestRemoteProgress(t *testing.T) {
+	// Commands rely on a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+
+	// Show progress at once, so that fast synchronizations show it too.
+	delay := cli.ProgressDelay
+	cli.ProgressDelay = 0
+	t.Cleanup(func() { cli.ProgressDelay = delay })
+
+	// Submissions from beta pass through its agent-style executor's channel,
+	// and those from alpha through the daemon's local channel.
+	for _, alphaExecutes := range []bool{false, true} {
+		name := "from alpha"
+		if alphaExecutes {
+			name = "from beta"
+		}
+		t.Run(name, func(t *testing.T) {
+			directory, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			alphaRoot, betaRoot := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta")
+			if err := os.Mkdir(alphaRoot, 0700); err != nil {
+				t.Fatal(err)
+			}
+			createRemoteSession(t, "progress", alphaRoot, betaRoot, alphaExecutes)
+			submitting := alphaRoot
+			if alphaExecutes {
+				submitting = betaRoot
+			}
+
+			// Without --progress, progress isn't shown on standard error,
+			// which isn't a terminal, so the output is unchanged.
+			if code, output, errorOutput := runRemote(t, submitting, "--flush"); code != 0 || output != "" || errorOutput != "" {
+				t.Fatalf("incorrect flush without progress: %d, %q, %q", code, output, errorOutput)
+			} else if code, output, errorOutput := runRemote(t, submitting, "--progress=false", "sh", "-c", "echo out > out"); code != 0 || output != "" || errorOutput != "" {
+				t.Fatalf("incorrect command without progress: %d, %q, %q", code, output, errorOutput)
+			}
+
+			// Flushes that request progress receive it through every hop
+			// before their report, since the daemon reports the session's
+			// status when it starts waiting.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			connection, _, err := remote.Submit(ctx, submitting, "", &remote.Submission{Operation: remote.OperationFlush, Progress: true})
+			if err != nil {
+				t.Fatal("unable to submit flush:", err)
+			}
+			var statuses []string
+			if report, err := remote.FlushWithProgress(ctx, connection, func(progress *remote.Progress) {
+				statuses = append(statuses, progress.Status)
+			}); err != nil || report == nil || len(statuses) == 0 || statuses[0] == "" {
+				t.Fatalf("incorrect flush with progress: %+v, %v, %q", report, err, statuses)
+			}
+
+			// With --progress, each flush, such as those before and after a
+			// command, prints progress lines followed by a summary.
+			code, output, errorOutput := runRemote(t, submitting, "--progress", "sh", "-c", "echo changed > out")
+			if code != 0 || output != "" {
+				t.Fatalf("incorrect command with progress: %d, %q, %q", code, output, errorOutput)
+			}
+			t.Logf("progress output: %q", errorOutput)
+			lines := strings.Split(strings.TrimSuffix(errorOutput, "\n"), "\n")
+			summaries := 0
+			for _, line := range lines {
+				if progressSummary.MatchString(line) {
+					summaries++
+				} else if !progressLine.MatchString(line) {
+					t.Fatalf("unexpected output with progress: %q", errorOutput)
+				}
+			}
+			if summaries != 2 || !progressSummary.MatchString(lines[len(lines)-1]) {
+				t.Fatalf("incorrect progress output: %q", errorOutput)
+			} else if data, err := os.ReadFile(filepath.Join(submitting, "out")); err != nil || string(data) != "changed\n" {
+				t.Fatalf("command's changes not synchronized: %q, %v", data, err)
 			}
 		})
 	}

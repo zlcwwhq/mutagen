@@ -111,6 +111,17 @@ and those whose roots contain the current directory.
     synchronized files, such as nvidia-smi or reading an ignored log; when
     unsure, synchronize. --flush without a command only synchronizes. --timeout
     includes the time spent synchronizing.
+  - Synchronizations that take over 3 seconds show their progress on standard
+    error: on a terminal, on a line updated in place, and otherwise only with
+    --progress (such as for runs in the background or under a monitor), as
+    remote: lines printed when the phase changes and every 10 seconds;
+    --progress=false hides it. This includes the synchronizations of --wait,
+    --diff, and conflict operations. A summary line then shows where the time
+    went: scanning (both roots are rescanned in full), staging on alpha or
+    beta (transferring changed files to that endpoint, with their count and
+    approximate size), applying changes, and so on. Phases can repeat if the
+    session was already synchronizing. If the daemon doesn't report progress,
+    only the elapsed time is shown.
   - --detach synchronizes only before starting the job, and --wait only after
     the job ends. --jobs, --kill, --ignores, and --pull don't synchronize.
   - After synchronizing, remote warns about conflicts (files modified on both
@@ -215,7 +226,7 @@ shell passes unchanged if its delimiter is quoted:
        remote [options] --detach [--log <file>] --script <file>|- [<args>...]
        remote --jobs
        remote --wait <id> [--tail <lines>] [--follow] [--timeout <duration>]
-              [--no-flush]
+              [--no-flush] [--progress]
        remote --kill <id> [--timeout <duration>] [--no-flush]
 
 --detach synchronizes the session, starts the command (or script) as a detached

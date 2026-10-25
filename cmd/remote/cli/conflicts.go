@@ -461,13 +461,19 @@ func sessionWorkspaces(target *remote.Target) map[string]*workspace {
 	return workspaces
 }
 
-// listConflicts synchronizes the session and lists all of its conflicts.
-func listConflicts(ctx context.Context, directory, session string) (*remote.Listing, *remote.Target, error) {
-	connection, target, err := remote.Dial(ctx, directory, session, remote.OperationConflicts)
+// listConflicts synchronizes the session, showing the synchronization's
+// progress on errorOutput if enabled (see newProgressOutput), and lists all of
+// its conflicts.
+func listConflicts(ctx context.Context, directory string, o *options, errorOutput io.Writer) (*remote.Listing, *remote.Target, error) {
+	output := newProgressOutput(errorOutput, o.progress)
+	header := &remote.Submission{Operation: remote.OperationConflicts, Progress: output.writer != nil}
+	connection, target, err := remote.Submit(ctx, directory, o.session, header)
 	if err != nil {
 		return nil, nil, err
 	}
-	listing, err := remote.ListConflicts(ctx, connection)
+	display := newProgressDisplay(output, target)
+	listing, err := remote.ListConflictsWithProgress(ctx, connection, display.begin())
+	display.finish(ctx, err)
 	return listing, target, err
 }
 
@@ -952,7 +958,7 @@ func localSides(conflict *remote.ConflictRoot, target *remote.Target) []string {
 // to the working directory if it's inside the root, as other operations
 // expect.
 func printConflicts(ctx context.Context, directory string, o *options, output, errorOutput io.Writer) error {
-	listing, target, err := listConflicts(ctx, directory, o.session)
+	listing, target, err := listConflicts(ctx, directory, o, errorOutput)
 	if err != nil {
 		return err
 	}
@@ -1083,7 +1089,7 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 
 // checkoutAll checks out the specified conflicts after listing them.
 func checkoutAll(ctx context.Context, directory string, o *options, p *printer) error {
-	listing, target, err := listConflicts(ctx, directory, o.session)
+	listing, target, err := listConflicts(ctx, directory, o, p.errors)
 	if err != nil {
 		return err
 	}
@@ -1486,7 +1492,7 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 	var preliminaryErr error
 	listed := func() (*remote.Listing, error) {
 		if preliminary == nil && preliminaryErr == nil {
-			preliminary, _, preliminaryErr = listConflicts(ctx, directory, o.session)
+			preliminary, _, preliminaryErr = listConflicts(ctx, directory, o, p.errors)
 		}
 		return preliminary, preliminaryErr
 	}
@@ -1505,7 +1511,7 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 	if len(applications) == 0 {
 		return nil
 	}
-	listing, _, listErr := listConflicts(ctx, directory, o.session)
+	listing, _, listErr := listConflicts(ctx, directory, o, p.errors)
 	for _, a := range applications {
 		if listErr != nil {
 			p.print(a.argument, nil, fmt.Errorf("updated the copies, but unable to verify synchronization (retry to verify): %w", listErr))
