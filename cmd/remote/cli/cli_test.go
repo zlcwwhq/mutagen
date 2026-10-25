@@ -217,7 +217,7 @@ func TestRunFailures(t *testing.T) {
 	}
 	for _, arguments := range [][]string{{"true"}, {"--no-flush", "true"}, {"--flush"}, {"--diff"}} {
 		errorOutput.Reset()
-		if code := Run(arguments, strings.NewReader(""), &output, &errorOutput); code != failureExitCode ||
+		if code := Run(arguments, strings.NewReader(""), &output, &errorOutput); code != connectionExitCode ||
 			strings.Count(errorOutput.String(), "no connected session") != 1 || strings.Contains(errorOutput.String(), "remote: warning:") {
 			t.Fatalf("missing session not reported by %v: %d, %q", arguments, code, errorOutput.String())
 		}

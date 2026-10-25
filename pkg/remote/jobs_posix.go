@@ -194,7 +194,7 @@ func openLog(path string, permissions os.FileMode) (*os.File, error) {
 func startJob(root, prologue string, alpha bool, request *Request) result {
 	directory, err := filesystem.Mutagen(true, jobsDirectoryName)
 	if err != nil {
-		return result{Error: fmt.Sprintf("unable to compute job directory: %v", err)}
+		return failedResult(fmt.Errorf("unable to compute job directory: %w", err))
 	}
 	pruneJobs(directory)
 
@@ -202,13 +202,13 @@ func startJob(root, prologue string, alpha bool, request *Request) result {
 	var id, jobDirectory string
 	for attempts := 0; ; attempts++ {
 		if id, err = newJobID(); err != nil {
-			return result{Error: err.Error()}
+			return failedResult(err)
 		}
 		jobDirectory = filepath.Join(directory, id)
 		if err = os.Mkdir(jobDirectory, 0700); err == nil {
 			break
 		} else if !os.IsExist(err) || attempts == 9 {
-			return result{Error: fmt.Sprintf("unable to create job directory: %v", err)}
+			return failedResult(fmt.Errorf("unable to create job directory: %w", err))
 		}
 	}
 	started := false
@@ -235,13 +235,13 @@ func startJob(root, prologue string, alpha bool, request *Request) result {
 	logPath, permissions := filepath.Join(jobDirectory, jobLogName), os.FileMode(0600)
 	if request.Job.Log != "" {
 		if logPath, err = resolveLog(command.directory, request.Job.Log); err != nil {
-			return result{ExitCode: 126, Error: fmt.Sprintf("invalid log path: %v", err)}
+			return failedResult(fmt.Errorf("invalid log path: %w", err))
 		}
 		permissions = 0666
 	}
 	log, err := openLog(logPath, permissions)
 	if err != nil {
-		return result{ExitCode: 126, Error: fmt.Sprintf("unable to open log: %v", err)}
+		return failedResult(fmt.Errorf("unable to open log: %w", err))
 	}
 	defer log.Close()
 
@@ -249,18 +249,18 @@ func startJob(root, prologue string, alpha bool, request *Request) result {
 	// this executor has closed its descriptor.
 	lock, err := os.OpenFile(filepath.Join(jobDirectory, jobLockName), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		return result{Error: fmt.Sprintf("unable to create job lock: %v", err)}
+		return failedResult(fmt.Errorf("unable to create job lock: %w", err))
 	}
 	defer lock.Close()
 	if err := flock(lock, unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return result{Error: fmt.Sprintf("unable to lock job: %v", err)}
+		return failedResult(fmt.Errorf("unable to lock job: %w", err))
 	}
 
 	// Create the pipe through which the supervisor reports that the command is
 	// starting (see supervisorScript).
 	ready, readyWriter, err := os.Pipe()
 	if err != nil {
-		return result{Error: fmt.Sprintf("unable to create job pipe: %v", err)}
+		return failedResult(fmt.Errorf("unable to create job pipe: %w", err))
 	}
 	defer ready.Close()
 
@@ -281,7 +281,7 @@ func startJob(root, prologue string, alpha bool, request *Request) result {
 	err = supervisor.Start()
 	readyWriter.Close()
 	if err != nil {
-		return result{ExitCode: 126, Error: fmt.Sprintf("unable to start job: %v", err)}
+		return result{ExitCode: 126, ErrorKind: ErrorKindOperation, Error: fmt.Sprintf("unable to start job: %v", err)}
 	}
 	go supervisor.Wait()
 
@@ -294,7 +294,7 @@ func startJob(root, prologue string, alpha bool, request *Request) result {
 	// execute the command.
 	if !waitForCommandStart(ready) {
 		syscall.Kill(-supervisor.Process.Pid, syscall.SIGKILL)
-		return result{ExitCode: 126, Error: fmt.Sprintf("unable to start job: the job's command didn't start within %v", jobStartTimeout)}
+		return result{ExitCode: 126, ErrorKind: ErrorKindOperation, Error: fmt.Sprintf("unable to start job: the job's command didn't start within %v", jobStartTimeout)}
 	}
 
 	// Record the job. If that fails, then the job can't be found, so it's
@@ -322,7 +322,7 @@ func startJob(root, prologue string, alpha bool, request *Request) result {
 	}
 	if err != nil {
 		syscall.Kill(-supervisor.Process.Pid, syscall.SIGKILL)
-		return result{Error: fmt.Sprintf("unable to record job: %v", err)}
+		return failedResult(fmt.Errorf("unable to record job: %w", err))
 	}
 	started = true
 	job := &Job{

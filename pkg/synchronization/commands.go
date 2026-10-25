@@ -51,7 +51,7 @@ type CommandProtocolHandler interface {
 
 // errFlushTerminated indicates that synchronization stopped before a flush
 // requested by a submission completed.
-var errFlushTerminated = errors.New("synchronization stopped before the flush completed")
+var errFlushTerminated = remote.ConnectionError(errors.New("synchronization stopped before the flush completed"))
 
 // errResolutionUnsupported indicates that the session's synchronization mode
 // doesn't support conflict resolution.
@@ -314,14 +314,14 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 	channel := r.channels[target]
 	r.channelsLock.Unlock()
 	if channel == nil {
-		remote.Reject(submission, fmt.Errorf("%s is not connected for remote commands", endpointName(target)))
+		remote.Reject(submission, remote.ConnectionError(fmt.Errorf("%s is not connected for remote commands", endpointName(target))))
 		return
 	}
 	openCtx, cancel := context.WithTimeout(ctx, commandRouteOpenTimeout)
 	execution, err := channel.Open(openCtx)
 	cancel()
 	if err != nil {
-		remote.Reject(submission, fmt.Errorf("unable to reach %s: %w", endpointName(target), err))
+		remote.Reject(submission, remote.ConnectionError(fmt.Errorf("unable to reach %s: %w", endpointName(target), err)))
 		return
 	}
 	remote.Splice(submission, execution)

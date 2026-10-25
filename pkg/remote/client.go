@@ -14,7 +14,7 @@ import (
 // ErrConnectionLost indicates that the connection to the executing endpoint was
 // lost before a command's result was received, such as because the session
 // stopped synchronizing, which terminates the command.
-var ErrConnectionLost = errors.New("the connection to the executing endpoint was lost")
+var ErrConnectionLost = ConnectionError(errors.New("the connection to the executing endpoint was lost"))
 
 // commandMultiplexerConfiguration returns the configuration for multiplexing a
 // single command's streams. Heartbeats are disabled because each hop of the
@@ -64,10 +64,10 @@ func connect(ctx context.Context, connection io.ReadWriteCloser) (*status, error
 		return nil, ctx.Err()
 	} else if err != nil {
 		connection.Close()
-		return nil, fmt.Errorf("unable to receive route status: %w", err)
+		return nil, ConnectionError(fmt.Errorf("unable to receive route status: %w", err))
 	} else if route.Error != "" {
 		connection.Close()
-		return nil, errors.New(route.Error)
+		return nil, receivedError(route.ErrorKind, errors.New(route.Error))
 	}
 	return &route, nil
 }
@@ -86,7 +86,7 @@ func exchange(ctx context.Context, connection io.ReadWriteCloser, request *Reque
 	for i := range streams {
 		stream, err := mux.OpenStream(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("unable to open command stream: %w", err)
+			return nil, ConnectionError(fmt.Errorf("unable to open command stream: %w", err))
 		}
 		streams[i] = stream
 	}
@@ -106,17 +106,21 @@ func exchange(ctx context.Context, connection io.ReadWriteCloser, request *Reque
 		}
 		input.CloseWrite()
 	}()
-	outputErrors := make(chan error, 2)
+	type outputFailure struct {
+		copy, write error
+	}
+	outputErrors := make(chan outputFailure, 2)
 	for _, pair := range []struct {
 		source      io.Reader
 		destination io.Writer
 	}{{output, stdout}, {errorOutput, stderr}} {
 		go func(source io.Reader, destination io.Writer) {
-			_, err := io.Copy(destination, source)
+			writer := &outputWriter{Writer: destination}
+			_, err := io.Copy(writer, source)
 			if err != nil {
 				mux.Close()
 			}
-			outputErrors <- err
+			outputErrors <- outputFailure{err, writer.err}
 		}(pair.source, pair.destination)
 	}
 
@@ -127,7 +131,7 @@ func exchange(ctx context.Context, connection io.ReadWriteCloser, request *Reque
 	if responseErr != nil {
 		mux.Close()
 	}
-	var forwardingErrors [2]error
+	var forwardingErrors [2]outputFailure
 	for i := range forwardingErrors {
 		select {
 		case forwardingErrors[i] = <-outputErrors:
@@ -145,15 +149,24 @@ func exchange(ctx context.Context, connection io.ReadWriteCloser, request *Reque
 	// the command (see Serve).
 	if err := ctx.Err(); err != nil {
 		return nil, err
-	} else if internalError := mux.InternalError(); responseErr != nil && internalError != nil {
+	}
+	// A local writer failure closes the multiplexer, which can in turn make
+	// the other output stream and the response fail. Preserve the initiating
+	// I/O failure rather than misclassifying those effects as a lost route.
+	for _, failure := range forwardingErrors {
+		if failure.write != nil {
+			return nil, fmt.Errorf("unable to forward command output: %w", failure.write)
+		}
+	}
+	if internalError := mux.InternalError(); responseErr != nil && internalError != nil {
 		return nil, fmt.Errorf("%w (%v)", ErrConnectionLost, internalError)
-	} else if forwardingError := errors.Join(forwardingErrors[:]...); forwardingError != nil {
-		return nil, fmt.Errorf("unable to forward command output: %w", forwardingError)
+	} else if forwardingError := errors.Join(forwardingErrors[0].copy, forwardingErrors[1].copy); forwardingError != nil {
+		return nil, ConnectionError(fmt.Errorf("unable to forward command output: %w", forwardingError))
 	} else if responseErr != nil {
-		return nil, fmt.Errorf("unable to receive command result: %w", responseErr)
+		return nil, ConnectionError(fmt.Errorf("unable to receive command result: %w", responseErr))
 	}
 	if _, err := control.Write([]byte{0}); err != nil {
-		return nil, fmt.Errorf("unable to acknowledge command result: %w", err)
+		return nil, ConnectionError(fmt.Errorf("unable to acknowledge command result: %w", err))
 	}
 	// The multiplexer buffers writes. Keep it alive until the server receives
 	// the acknowledgement and closes the connection.
@@ -183,13 +196,13 @@ func FlushWithProgress(ctx context.Context, connection io.ReadWriteCloser, progr
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			return nil, fmt.Errorf("unable to receive synchronization status: %w", err)
+			return nil, ConnectionError(fmt.Errorf("unable to receive synchronization status: %w", err))
 		} else if response.Error != "" {
-			return nil, errors.New(response.Error)
+			return nil, receivedError(response.ErrorKind, errors.New(response.Error))
 		} else if response.Report != nil {
 			return response.Report, nil
 		} else if response.Progress == nil {
-			return nil, errors.New("no synchronization report received")
+			return nil, ConnectionError(errors.New("no synchronization report received"))
 		} else if progress != nil {
 			progress(response.Progress)
 		}
@@ -208,9 +221,9 @@ func Fetch(ctx context.Context, connection io.ReadWriteCloser, path string) (*En
 	if err != nil {
 		return nil, err
 	} else if response.Error != "" {
-		return nil, errors.New(response.Error)
+		return nil, receivedError(response.ErrorKind, errors.New(response.Error))
 	} else if response.Entry == nil {
-		return nil, errors.New("no entry received")
+		return nil, ConnectionError(errors.New("no entry received"))
 	}
 	entry := response.Entry
 	if data.Len() > 0 {
@@ -230,6 +243,24 @@ func (r *inputReader) Read(buffer []byte) (int, error) {
 	count, err := r.Reader.Read(buffer)
 	if err != nil && err != io.EOF {
 		r.err = err
+	}
+	return count, err
+}
+
+// outputWriter records destination failures separately from transport reads.
+// It deliberately doesn't expose ReaderFrom, so io.Copy uses Write.
+type outputWriter struct {
+	io.Writer
+	err error
+}
+
+func (w *outputWriter) Write(data []byte) (int, error) {
+	count, err := w.Writer.Write(data)
+	if err == nil && count != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.err = err
 	}
 	return count, err
 }

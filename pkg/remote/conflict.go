@@ -115,6 +115,8 @@ type Listing struct {
 type conflictsMessage struct {
 	// Error is the flush or routing error, if any, which ends the listing.
 	Error string `json:",omitempty"`
+	// ErrorKind classifies Error independently of its diagnostic text.
+	ErrorKind ErrorKind `json:",omitempty"`
 	// Conflict is the listed conflict, if any.
 	Conflict *ConflictRoot `json:",omitempty"`
 	// Problem is the listed problem, if any.
@@ -134,13 +136,13 @@ type conflictsMessage struct {
 func RespondWithConflicts(connection io.ReadWriteCloser, listing *Listing, err error) error {
 	defer connection.Close()
 	if err != nil {
-		return writeMessage(connection, &conflictsMessage{Error: err.Error()})
+		return writeMessage(connection, &conflictsMessage{Error: err.Error(), ErrorKind: ClassifyError(err)})
 	}
 	writer := bufio.NewWriter(connection)
 	for c := range listing.Conflicts {
 		conflict, err := boundConflict(&listing.Conflicts[c])
 		if err != nil {
-			if err := writeMessage(writer, &conflictsMessage{Error: err.Error()}); err != nil {
+			if err := writeMessage(writer, &conflictsMessage{Error: err.Error(), ErrorKind: ClassifyError(err)}); err != nil {
 				return err
 			}
 			return writer.Flush()
@@ -188,9 +190,9 @@ func ListConflictsWithProgress(ctx context.Context, connection io.ReadWriteClose
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			return nil, fmt.Errorf("unable to receive conflicts: %w", err)
+			return nil, ConnectionError(fmt.Errorf("unable to receive conflicts: %w", err))
 		} else if message.Error != "" {
-			return nil, errors.New(message.Error)
+			return nil, receivedError(message.ErrorKind, errors.New(message.Error))
 		} else if message.Done {
 			return listing, nil
 		} else if message.Conflict != nil {
@@ -204,7 +206,7 @@ func ListConflictsWithProgress(ctx context.Context, connection io.ReadWriteClose
 				progress(message.Progress)
 			}
 		} else {
-			return nil, errors.New("invalid conflict listing")
+			return nil, ConnectionError(errors.New("invalid conflict listing"))
 		}
 	}
 }
@@ -669,11 +671,11 @@ func requestPath(path string) string {
 // a replacement was stale or superseded.
 func responseError(response *result) error {
 	if response.Stale {
-		return &staleError{response.Error}
+		return receivedError(response.ErrorKind, &staleError{response.Error})
 	} else if response.Superseded {
-		return &supersededError{response.Error}
+		return receivedError(response.ErrorKind, &supersededError{response.Error})
 	}
-	return errors.New(response.Error)
+	return receivedError(response.ErrorKind, errors.New(response.Error))
 }
 
 // Copy requests the complete contents of a regular file at a slash-separated
@@ -688,7 +690,7 @@ func Copy(ctx context.Context, connection io.ReadWriteCloser, path string, outpu
 	} else if response.Error != "" {
 		return nil, responseError(response)
 	} else if response.Entry == nil {
-		return nil, errors.New("no entry received")
+		return nil, ConnectionError(errors.New("no entry received"))
 	}
 	return response.Entry, nil
 }
@@ -704,7 +706,7 @@ func Archive(ctx context.Context, connection io.ReadWriteCloser, path string, ou
 	} else if response.Error != "" {
 		return nil, responseError(response)
 	} else if response.Entry == nil {
-		return nil, errors.New("no entry received")
+		return nil, ConnectionError(errors.New("no entry received"))
 	}
 	return response.Entry, nil
 }

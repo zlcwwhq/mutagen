@@ -32,7 +32,7 @@ func ReceiveSubmission(ctx context.Context, connection io.ReadWriteCloser) (*Sub
 	if !stop() {
 		return nil, fmt.Errorf("submission not received: %w", ctx.Err())
 	} else if err != nil {
-		return nil, fmt.Errorf("unable to receive submission: %w", err)
+		return nil, ConnectionError(fmt.Errorf("unable to receive submission: %w", err))
 	} else if header.Operation > OperationRelease {
 		return nil, fmt.Errorf("unsupported submission operation: %d", header.Operation)
 	}
@@ -42,7 +42,7 @@ func ReceiveSubmission(ctx context.Context, connection io.ReadWriteCloser) (*Sub
 // Reject reports a routing failure to the submitting side of a route and
 // closes the connection.
 func Reject(connection io.ReadWriteCloser, err error) {
-	writeMessage(connection, &status{Error: err.Error()})
+	writeMessage(connection, &status{Error: err.Error(), ErrorKind: ClassifyError(err)})
 	connection.Close()
 }
 
@@ -52,12 +52,12 @@ func Reject(connection io.ReadWriteCloser, err error) {
 func RespondToFlush(connection io.ReadWriteCloser, report *Report, err error) error {
 	defer connection.Close()
 	if err != nil {
-		return writeMessage(connection, &status{Error: err.Error()})
+		return writeMessage(connection, &status{Error: err.Error(), ErrorKind: ClassifyError(err)})
 	} else if report == nil {
 		report = &Report{}
 	}
 	if report, err = boundReport(report); err != nil {
-		return writeMessage(connection, &status{Error: err.Error()})
+		return writeMessage(connection, &status{Error: err.Error(), ErrorKind: ClassifyError(err)})
 	}
 	return writeMessage(connection, &flushResponse{Report: report})
 }

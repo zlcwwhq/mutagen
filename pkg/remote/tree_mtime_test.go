@@ -130,7 +130,7 @@ func TestExtractModificationTimeFailure(t *testing.T) {
 		}
 	}
 	if entry, err := extractLeaf(reader, header, root, "file", true); entry != nil ||
-		!errors.Is(err, os.ErrClosed) || !strings.Contains(err.Error(), "unable to preserve modification time") {
+		!errors.Is(err, os.ErrClosed) || ClassifyError(err) != ErrorKindOperation || !strings.Contains(err.Error(), "unable to preserve modification time") {
 		t.Fatalf("modification time failure not reported: %+v, %v", entry, err)
 	}
 }

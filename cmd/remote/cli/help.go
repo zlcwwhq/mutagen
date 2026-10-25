@@ -30,8 +30,9 @@ Examples:
   remote --wait <id> --follow           (watch a detached job)
 Your shell expands variables, globs, and ~ first; quote remote expressions.
 
-Exit status: command/job status, or 255 for remote/connection failures,
-  124 timeout, 126 unable to start, 127 command not found, 128+N signal.
+Exit status: command/job status, or 125 for remote's input/operation failures,
+  255 connection/protocol failure or unreachable session, 124 timeout,
+  126 unable to start, 127 command not found, 128+N signal.
   --diff: 0 identical, 1 different. --ignores: 0 synchronized, 1 ignored.
 
 Options:
@@ -187,8 +188,17 @@ Example .remote-prologue.sh, activating a conda environment on beta only:
   esac
 `},
 	{"termination", "timeouts, interruptions, and lost connections", `--timeout takes seconds, or a duration with a unit, such as 10m or 1h30m.
-Commands are terminated when it expires, when remote is interrupted, and when
-the session stops synchronizing (such as when it's paused or reconnects, or the
+remote's own input errors and operation failures exit with 125; read the
+remote: diagnostic and correct the cause before retrying. Connection setup,
+lost connections, protocol failures, and an unreachable session exit with 255.
+An invalid explicit session selection is 125. Commands and completed jobs pass
+through their own statuses unchanged, including 125 and 255, so status alone
+cannot always identify who failed. --diff/--ignores use 1 only for a result;
+their failures follow the same 125/255 distinction. For batches, interruption
+or timeout takes precedence over connection failures, then operation failures.
+
+Commands are terminated when the timeout expires, when remote is interrupted,
+and when the session stops synchronizing (such as when it's paused or reconnects, or the
 daemon stops): their process group receives SIGTERM, then
 SIGKILL 5 seconds later if any of it remains (on Windows, the command is killed
 at once). If the session stops synchronizing, remote reports that the
@@ -264,7 +274,7 @@ exits:
     waiting (status 124) without affecting the job. If the connection to the
     executing endpoint is lost while waiting, remote retries for a minute. A
     job whose status couldn't be recorded, such as because it was killed with
-    SIGKILL or its system restarted, is lost (status 255).
+    SIGKILL or its system restarted, is lost (status 125).
   - With --wait, --tail N prints the final N log lines to standard output
     after the job ends, or before exiting with status 124 if --timeout expires
     while it runs, including logs outside the root or in ignored paths. Zero
@@ -348,7 +358,8 @@ keeps its workspace for retry or manual merging; --delete never auto-checks out.
 Listing summaries describe actual local/remote changes from the submitter's
 perspective. Oversized summaries report omitted changes. JSON retains Path and
 adds LocalChanges, RemoteChanges, and ExcludedChanges; internal checkout emits
-no separate result when --take applies a path.
+no separate result when --take applies a path. Failed path results also carry
+ErrorKind (operation, connection, or timeout), alongside Error.
 
   - remote --conflicts synchronizes, lists every conflict, how it can be
     resolved, and through which endpoint it's checked out, flags checked-out

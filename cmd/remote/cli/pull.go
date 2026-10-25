@@ -25,18 +25,18 @@ func pull(router *router, paths []string) error {
 		return err
 	}
 	locator := newLocator(target)
-	failed := false
+	var failures []error
 	for _, argument := range paths {
 		display := terminal.NeutralizeControlCharacters(argument)
 		if summary, err := pullPath(router, target, locator, argument); err != nil {
 			fmt.Fprintf(router.stderr, "remote: unable to pull %s: %v\n", display, err)
-			failed = true
+			failures = append(failures, err)
 		} else {
 			fmt.Fprintf(router.stderr, "remote: pulled %s (%s)\n", display, summary)
 		}
 	}
-	if failed {
-		return errReported
+	if len(failures) > 0 {
+		return errors.Join(append([]error{errReported}, failures...)...)
 	}
 	return nil
 }

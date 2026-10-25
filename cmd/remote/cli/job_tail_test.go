@@ -57,7 +57,7 @@ func TestWaitJobTail(t *testing.T) {
 				t.Fatalf("ignored log appeared locally: %v", err)
 			}
 			if logPath == "results/train.log" {
-				// A lost job still reports status 255 when its log is available.
+				// A lost job reports remote failure status 125 when its log is available.
 				status := filepath.Join(os.Getenv("MUTAGEN_DATA_DIRECTORY"), "remote-jobs", job.ID, "status")
 				if err := os.Remove(status); err != nil {
 					t.Fatal(err)

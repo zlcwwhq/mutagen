@@ -37,7 +37,7 @@ func (e *DirectoryError) Error() string {
 // executionError reconstructs an execution infrastructure error from a result.
 func (r *result) executionError() error {
 	if r.DirectoryError != "" {
-		return &DirectoryError{Kind: r.DirectoryError, Path: r.Directory, Message: r.Error}
+		return receivedError(r.ErrorKind, &DirectoryError{Kind: r.DirectoryError, Path: r.Directory, Message: r.Error})
 	}
-	return errors.New(r.Error)
+	return receivedError(r.ErrorKind, errors.New(r.Error))
 }

@@ -347,11 +347,11 @@ func findJob(directory, root, id string) (*jobRecord, *Job, error) {
 // doesn't terminate them.
 func serveJob(ctx context.Context, root string, request *JobRequest, output io.Writer) result {
 	if !jobsSupported {
-		return result{Error: errJobsUnsupported.Error()}
+		return failedResult(errJobsUnsupported)
 	}
 	directory, err := filesystem.Mutagen(false, jobsDirectoryName)
 	if err != nil {
-		return result{Error: fmt.Sprintf("unable to compute job directory: %v", err)}
+		return failedResult(fmt.Errorf("unable to compute job directory: %w", err))
 	}
 	switch request.Operation {
 	case JobList:
@@ -361,7 +361,7 @@ func serveJob(ctx context.Context, root string, request *JobRequest, output io.W
 		encoder := json.NewEncoder(output)
 		for _, job := range jobs {
 			if err := encoder.Encode(job); err != nil {
-				return result{Error: fmt.Sprintf("unable to send job listing: %v", err)}
+				return failedResult(fmt.Errorf("unable to send job listing: %w", err))
 			}
 		}
 		return result{HiddenJobs: hidden}
@@ -370,21 +370,21 @@ func serveJob(ctx context.Context, root string, request *JobRequest, output io.W
 	case JobKill:
 		record, job, err := findJob(directory, root, request.ID)
 		if err != nil {
-			return result{Error: err.Error()}
+			return failedResult(err)
 		} else if job.State != JobRunning {
 			findLeftovers([]*Job{job})
 			return result{Job: job}
 		} else if host, err := os.Hostname(); err != nil || host != record.Host {
-			return result{Error: fmt.Sprintf("job %s was started on %s, not on this system", request.ID, record.Host)}
+			return failedResult(fmt.Errorf("job %s was started on %s, not on this system", request.ID, record.Host))
 		}
 		job, err = terminateJob(filepath.Join(directory, request.ID), record.PID)
 		if err != nil {
-			return result{Error: fmt.Sprintf("unable to terminate job %s: %v", request.ID, err)}
+			return failedResult(fmt.Errorf("unable to terminate job %s: %w", request.ID, err))
 		}
 		findLeftovers([]*Job{job})
 		return result{Job: job}
 	default:
-		return result{Error: fmt.Sprintf("unknown job operation %q", request.Operation)}
+		return failedResult(fmt.Errorf("unknown job operation %q", request.Operation))
 	}
 }
 
@@ -414,7 +414,7 @@ func waitForJob(ctx context.Context, directory, root string, request *JobRequest
 	for {
 		_, job, err := findJob(directory, root, request.ID)
 		if err != nil {
-			return result{Error: err.Error()}
+			return failedResult(err)
 		}
 
 		// Stream what was appended to the log since it was last polled. The
@@ -429,7 +429,7 @@ func waitForJob(ctx context.Context, directory, root string, request *JobRequest
 				err = streamer.poll()
 			}
 			if err != nil {
-				return result{Error: err.Error()}
+				return failedResult(err)
 			}
 		}
 
@@ -442,7 +442,7 @@ func waitForJob(ctx context.Context, directory, root string, request *JobRequest
 			if request.Tail > 0 {
 				response.JobLog = readJobLog(ctx, job.Log, request.Tail)
 				if _, err := output.Write(response.JobLog.Data); err != nil {
-					return result{Error: fmt.Sprintf("unable to send job log: %v", err)}
+					return failedResult(fmt.Errorf("unable to send job log: %w", err))
 				}
 			}
 			return response
@@ -454,7 +454,7 @@ func waitForJob(ctx context.Context, directory, root string, request *JobRequest
 		select {
 		case <-time.After(interval):
 		case <-ctx.Done():
-			return result{Error: ctx.Err().Error()}
+			return failedResult(ctx.Err())
 		}
 	}
 }
@@ -481,7 +481,7 @@ func StartJob(ctx context.Context, connection io.ReadWriteCloser, request *Reque
 	} else if response.Error != "" {
 		return nil, response.ExitCode, response.executionError()
 	} else if response.Job == nil {
-		return nil, 0, errors.New("no job received")
+		return nil, 0, ConnectionError(errors.New("no job received"))
 	}
 	return response.Job, 0, nil
 }
@@ -495,7 +495,7 @@ func ListJobs(ctx context.Context, connection io.ReadWriteCloser) ([]*Job, int, 
 	if err != nil {
 		return nil, 0, err
 	} else if response.Error != "" {
-		return nil, 0, &JobError{response.Error}
+		return nil, 0, receivedError(response.ErrorKind, &JobError{response.Error})
 	}
 	var jobs []*Job
 	decoder := json.NewDecoder(&output)
@@ -504,7 +504,7 @@ func ListJobs(ctx context.Context, connection io.ReadWriteCloser) ([]*Job, int, 
 		if err := decoder.Decode(&job); err == io.EOF {
 			break
 		} else if err != nil {
-			return nil, 0, fmt.Errorf("invalid job listing: %w", err)
+			return nil, 0, ConnectionError(fmt.Errorf("invalid job listing: %w", err))
 		}
 		jobs = append(jobs, &job)
 	}
@@ -519,9 +519,9 @@ func operateJob(ctx context.Context, connection io.ReadWriteCloser, operation Jo
 	if err != nil {
 		return nil, err
 	} else if response.Error != "" {
-		return nil, &JobError{response.Error}
+		return nil, receivedError(response.ErrorKind, &JobError{response.Error})
 	} else if response.Job == nil {
-		return nil, errors.New("no job received")
+		return nil, ConnectionError(errors.New("no job received"))
 	}
 	return response.Job, nil
 }

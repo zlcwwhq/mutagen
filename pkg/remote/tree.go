@@ -195,7 +195,7 @@ func ArchiveEntry(ctx context.Context, directory, path string, output io.Writer)
 }
 
 // errInvalidArchive indicates that an archive doesn't have the expected form.
-var errInvalidArchive = errors.New("invalid archive")
+var errInvalidArchive = ConnectionError(errors.New("invalid archive"))
 
 // ExtractArchive extracts an archive (see ArchiveEntry) to a destination path,
 // at which nothing may exist, and returns the snapshot that it describes, which
@@ -220,7 +220,7 @@ func extractArchive(ctx context.Context, input io.Reader, destination string, pr
 	if err == io.EOF {
 		return &Entry{Kind: EntryMissing}, nil
 	} else if err != nil {
-		return nil, err
+		return nil, ConnectionError(err)
 	} else if header.Name != archiveTop {
 		return nil, errInvalidArchive
 	}
@@ -232,6 +232,8 @@ func extractArchive(ctx context.Context, input io.Reader, destination string, pr
 			err = nil
 		} else if err == nil {
 			err = errInvalidArchive
+		} else {
+			err = ConnectionError(err)
 		}
 	}
 	if err != nil {
@@ -239,7 +241,7 @@ func extractArchive(ctx context.Context, input io.Reader, destination string, pr
 	}
 	// Consume the archive's padding, so that the sender isn't blocked.
 	_, err = io.Copy(io.Discard, input)
-	return entry, err
+	return entry, ConnectionError(err)
 }
 
 // extractLeaf extracts an archive entry other than a directory to a native
@@ -266,7 +268,7 @@ func extractLeaf(reader *tar.Reader, header *tar.Header, root *os.Root, path str
 			return nil, err
 		}
 		hasher := sha256.New()
-		size, err := io.Copy(io.MultiWriter(file, hasher), reader)
+		size, err := io.Copy(io.MultiWriter(file, hasher), connectionReader{reader})
 		// Restore the archived modification time before flushing and
 		// publishing the newly created file. This path is confined to the
 		// extraction directory and was created exclusively above, so no
@@ -328,15 +330,24 @@ func extractDirectory(reader *tar.Reader, destination string, private bool) (*En
 	defer root.Close()
 	tree := treeHasher{sha256.New()}
 	tree.add(archiveTop, &Entry{Kind: EntryDirectory})
+	// Validate archive structure before performing filesystem operations, so
+	// malformed entries are protocol failures while actual filesystem errors
+	// remain operation failures. Parents must have been explicit directories;
+	// symbolic links and duplicate entries can never redirect extraction.
+	directories := map[string]bool{archiveTop: true}
 	for {
 		header, err := reader.Next()
 		if err == io.EOF {
 			return &Entry{Kind: EntryDirectory, Digest: tree.digest()}, nil
 		} else if err != nil {
-			return nil, err
+			return nil, ConnectionError(err)
 		} else if header.Name == archiveTop || !validRelativePath(header.Name) {
 			return nil, errInvalidArchive
 		}
+		if _, duplicate := directories[header.Name]; duplicate || !directories[path.Dir(header.Name)] {
+			return nil, errInvalidArchive
+		}
+		directories[header.Name] = header.Typeflag == tar.TypeDir
 		native := filepath.FromSlash(header.Name)
 		entry := &Entry{Kind: EntryDirectory}
 		if header.Typeflag == tar.TypeDir {

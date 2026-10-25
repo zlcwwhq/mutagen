@@ -272,10 +272,18 @@ Prologues aren't supported on Windows endpoints.
 
 Options must precede the command, and arguments are passed without shell
 interpretation, so shell syntax requires an explicit shell or `--script`.
-Standard streams and the exit status are preserved (255 indicates that the
-command couldn't be routed, or that the connection was lost while it ran), but
-no pseudo-terminal is allocated. Commands can only be routed while the session
-is connected, and the daemon connects command channels in the background, so
+Standard streams and the command or job's own exit status are preserved.
+Remote's own argument, input, or operation failures return 125; connection
+setup, lost connections, protocol failures, and an unreachable session return
+255. An invalid explicit session selection returns 125. Read the `remote:`
+diagnostic before retrying a 125 failure. Commands may themselves return 125
+or 255, so exit status alone cannot always identify the source. Timeouts remain
+124, startup/working-directory/prologue failures 126, and missing commands 127;
+signals use 128+N. `--diff` and `--ignores` use 1 for their results and 125/255
+for failures. In batches, interruption or timeout takes precedence, followed by
+connection failures, then operation failures. This changes scripts that used
+255 for all failures of remote itself. No pseudo-terminal is allocated.
+Commands can only be routed while the session is connected, and the daemon connects command channels in the background, so
 SSH authentication must work non-interactively. `remote --help` summarizes
 usage, and `remote --help <topic>` covers sessions, synchronization, scripts,
 detached jobs, environment setup, termination, and conflicts in detail.
@@ -358,7 +366,8 @@ should `wait` for them. On Linux endpoints, `--jobs`, `--wait`, and `--kill`
 list those that remain in an ended job's process group, which `remote -- kill
 <pid>...` terminates; on other endpoints, they only report that the group may
 still have processes. A job whose status couldn't be recorded, such as because
-it was killed with SIGKILL or its system restarted, is reported as lost. Job
+it was killed with SIGKILL or its system restarted, is reported as lost
+(`--wait` returns 125). Job
 state is kept for 7 days after jobs end. Jobs end with the system or container
 that runs them, and can end with the processes that run the endpoint, such as
 when a daemon running as a systemd service is stopped, or, on systems where

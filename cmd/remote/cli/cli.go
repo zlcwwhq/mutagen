@@ -28,13 +28,47 @@ import (
 )
 
 const (
-	// failureExitCode is the exit code for failures to run the command, which
-	// matches the convention used by ssh.
-	failureExitCode = 255
+	// failureExitCode is the exit code for remote input and operation errors,
+	// following the wrapper-failure convention used by timeout and env.
+	failureExitCode = 125
+	// connectionExitCode denotes unavailable sessions and communication errors.
+	connectionExitCode = 255
 	// timeoutExitCode is the exit code for commands cancelled by --timeout,
 	// which matches the convention used by timeout.
 	timeoutExitCode = 124
 )
+
+// errorExitCode maps remote's own failures at the CLI boundary. Commands and
+// completed jobs bypass this mapping and retain their original exit status.
+func errorExitCode(err error) int {
+	switch remote.ClassifyError(err) {
+	case remote.ErrorKindTimeout:
+		return timeoutExitCode
+	case remote.ErrorKindConnection:
+		return connectionExitCode
+	default:
+		return failureExitCode
+	}
+}
+
+// checkedWriter retains output errors from formatters that don't return them.
+// Operation output is written serially; command streams use remote.Execute's
+// separate source and destination error tracking instead.
+type checkedWriter struct {
+	io.Writer
+	err error
+}
+
+func (w *checkedWriter) Write(data []byte) (int, error) {
+	count, err := w.Writer.Write(data)
+	if err == nil && count != len(data) {
+		err = io.ErrShortWrite
+	}
+	if w.err == nil {
+		w.err = err
+	}
+	return count, err
+}
 
 // options are the parsed command line options.
 type options struct {
@@ -324,7 +358,7 @@ func (o *options) command() bool {
 func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fail := func(err error) int {
 		fmt.Fprintln(stderr, "remote:", err)
-		return failureExitCode
+		return errorExitCode(err)
 	}
 
 	// Parse options.
@@ -332,12 +366,15 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(fmt.Errorf("%w (see remote --help)", err))
 	} else if options.help {
-		if err := printHelp(options, stdout); err != nil {
+		output := &checkedWriter{Writer: stdout}
+		if err := errors.Join(printHelp(options, output), output.err); err != nil {
 			return fail(err)
 		}
 		return 0
 	} else if options.version {
-		fmt.Fprintln(stdout, mutagen.Version)
+		if _, err := fmt.Fprintln(stdout, mutagen.Version); err != nil {
+			return fail(err)
+		}
 		return 0
 	}
 
@@ -434,13 +471,14 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Perform operations other than running commands.
 	var activity string
 	var code int
+	output := &checkedWriter{Writer: stdout}
 	switch {
 	case options.sessions:
-		activity, err = "listing sessions", printSessions(ctx, directory, options.defaultSession, stdout)
+		activity, err = "listing sessions", printSessions(ctx, directory, options.defaultSession, output)
 	case options.active():
-		activity, err = "resolving conflicts", runConflicts(ctx, directory, options, stdout, stderr)
+		activity, err = "resolving conflicts", runConflicts(ctx, directory, options, output, stderr)
 	case options.jobs:
-		activity, err = "listing jobs", listJobs(router, stdout)
+		activity, err = "listing jobs", listJobs(router, output)
 	case options.wait != "":
 		activity = "waiting for the job"
 		code, err = waitJob(router, options, stdout)
@@ -459,16 +497,19 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		activity, err = "terminating the job", killJob(router, options.kill)
 	case options.ignores:
 		activity = "checking ignores"
-		code, err = printIgnores(router, options.arguments, stdout)
+		code, err = printIgnores(router, options.arguments, output)
 	case options.pull:
 		activity, err = "pulling", pull(router, options.arguments)
 	default:
 		return runCommand(router, options, request, stdin, stdout, stderr, interrupted)
 	}
+	if output.err != nil {
+		err = errors.Join(err, fmt.Errorf("unable to print output: %w", output.err))
+	}
 	if interruptedCode, ok := interrupted(activity); ok {
 		return interruptedCode
 	} else if errors.Is(err, errReported) {
-		return failureExitCode
+		return errorExitCode(err)
 	} else if err != nil {
 		return fail(err)
 	}
@@ -557,7 +598,7 @@ func (r *router) warn(format string, arguments ...any) {
 func runCommand(router *router, options *options, request *remote.Request, stdin io.Reader, stdout, stderr io.Writer, interrupted func(string) (int, bool)) int {
 	fail := func(err error) int {
 		fmt.Fprintln(stderr, "remote:", err)
-		return failureExitCode
+		return errorExitCode(err)
 	}
 
 	// Synchronize local changes before the command. Failure to locate the
@@ -610,7 +651,7 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 			if code != 0 {
 				return code
 			}
-			return failureExitCode
+			return errorExitCode(err)
 		}
 		return 0
 	}
@@ -622,9 +663,9 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 		// lost, which happens whenever the session stops synchronizing, so
 		// synchronizing afterwards isn't attempted.
 		if options.noFlush {
-			return fail(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated"))
+			return fail(remote.ConnectionError(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated")))
 		}
-		return fail(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated and the session wasn't synchronized afterwards"))
+		return fail(remote.ConnectionError(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated and the session wasn't synchronized afterwards")))
 	} else if err != nil {
 		// Startup failures such as missing commands report conventional exit
 		// codes (126 or 127) alongside the error.
@@ -632,7 +673,7 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 		if code != 0 {
 			return code
 		}
-		return failureExitCode
+		return errorExitCode(err)
 	}
 
 	// Synchronize the command's changes back. Once the command has finished,

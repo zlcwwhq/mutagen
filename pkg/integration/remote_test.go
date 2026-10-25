@@ -233,7 +233,7 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 	} else if code, output, errorOutput := runRemote(t, filepath.Join(betaRoot, "sub"), "--diff", "shared", "file"); code != 1 ||
 		output != "--- shared (local)\n+++ shared (remote)\n@@ -1 +1 @@\n-remote\n+local\n" {
 		t.Fatalf("paths not compared from beta: %d, %q, %q", code, output, errorOutput)
-	} else if code, _, errorOutput := runRemote(t, filepath.Join(alphaRoot, "sub"), "--diff", "missing"); code != 255 ||
+	} else if code, _, errorOutput := runRemote(t, filepath.Join(alphaRoot, "sub"), "--diff", "missing"); code != 125 ||
 		!strings.Contains(errorOutput, "missing doesn't exist locally or remotely") {
 		t.Fatalf("nonexistent path not reported: %d, %q", code, errorOutput)
 	}
@@ -405,7 +405,7 @@ func TestRemoteSessionSelection(t *testing.T) {
 	// Explicitly selecting a session whose roots don't contain the directory
 	// fails while another session's root does, without running the command or
 	// synchronizing, unless the directory is specified explicitly.
-	if code, _, errorOutput := runRemote(t, submission, "-s", "first", "rm", "-rf", "sub/build"); code != 255 ||
+	if code, _, errorOutput := runRemote(t, submission, "-s", "first", "rm", "-rf", "sub/build"); code != 125 ||
 		!strings.Contains(errorOutput, "is synchronized by session second") {
 		t.Fatalf("explicit session redirected a command: %d, %q", code, errorOutput)
 	}
@@ -469,7 +469,7 @@ func TestRemoteNestedSessionSelection(t *testing.T) {
 	// rather than running the command through the enclosing session.
 	if err := synchronizationManager.Pause(context.Background(), &selection.Selection{Specifications: []string{innerID}}, ""); err != nil {
 		t.Fatal("unable to pause session:", err)
-	} else if code, output, errorOutput := runRemote(t, submission, "-s", "inner", "sh", "-c", "pwd -P"); code != 255 || output != "" ||
+	} else if code, output, errorOutput := runRemote(t, submission, "-s", "inner", "sh", "-c", "pwd -P"); code != 125 || output != "" ||
 		!strings.Contains(errorOutput, `no connected session matching "inner"`) {
 		t.Fatalf("paused session not reported: %d, %q, %q", code, output, errorOutput)
 	}
@@ -540,7 +540,7 @@ func TestRemoteNestedSessionExcluded(t *testing.T) {
 	// directory is specified explicitly.
 	if err := synchronizationManager.Pause(context.Background(), &selection.Selection{Specifications: []string{innerID}}, ""); err != nil {
 		t.Fatal("unable to pause session:", err)
-	} else if code, output, errorOutput := runRemote(t, submission, pwd...); code != 255 || output != "" ||
+	} else if code, output, errorOutput := runRemote(t, submission, pwd...); code != 125 || output != "" ||
 		!strings.Contains(errorOutput, "inner/sub is inside inner, which session outer ignores") || !strings.Contains(errorOutput, "--cwd .") {
 		t.Fatalf("command in an excluded directory not refused: %d, %q, %q", code, output, errorOutput)
 	}
@@ -827,7 +827,7 @@ func TestRemoteDetachedJobs(t *testing.T) {
 				t.Fatalf("incorrect kill result: %d, %q", code, errorOutput)
 			} else if code, _, errorOutput := runRemote(t, submitting, "--wait", id, "--no-flush"); code != 143 || !strings.Contains(errorOutput, "terminated by remote --kill") {
 				t.Fatalf("incorrect wait result for a killed job: %d, %q", code, errorOutput)
-			} else if code, _, errorOutput := runRemote(t, submitting, "--wait", "00000000"); code != 255 || !strings.Contains(errorOutput, "no job 00000000") {
+			} else if code, _, errorOutput := runRemote(t, submitting, "--wait", "00000000"); code != 125 || !strings.Contains(errorOutput, "no job 00000000") {
 				t.Fatalf("incorrect wait result for a nonexistent job: %d, %q", code, errorOutput)
 			}
 		})
@@ -1036,9 +1036,9 @@ func TestRemotePullIgnored(t *testing.T) {
 	}
 
 	// Synchronized and missing paths aren't pulled.
-	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "train.py"); code != 255 || !strings.Contains(errorOutput, "the session synchronizes it") {
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "train.py"); code != 125 || !strings.Contains(errorOutput, "the session synchronizes it") {
 		t.Fatalf("synchronized path pulled: %d, %q", code, errorOutput)
-	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "missing.log"); code != 255 || !strings.Contains(errorOutput, "doesn't exist on the opposite endpoint") {
+	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "missing.log"); code != 125 || !strings.Contains(errorOutput, "doesn't exist on the opposite endpoint") {
 		t.Fatalf("missing path pulled: %d, %q", code, errorOutput)
 	}
 }
@@ -1083,7 +1083,7 @@ func TestRemotePullSynchronizedContent(t *testing.T) {
 	write(betaRoot, decomposed, "remote\n")
 	write(betaRoot, composed, "remote\n")
 	for _, name := range []string{decomposed, composed} {
-		if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", name); code != 255 || !strings.Contains(errorOutput, "only some Unicode normalization forms") {
+		if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", name); code != 125 || !strings.Contains(errorOutput, "only some Unicode normalization forms") {
 			t.Fatalf("partially ignored name pulled: %d, %q", code, errorOutput)
 		}
 	}
@@ -1110,14 +1110,14 @@ func TestRemotePullSynchronizedContent(t *testing.T) {
 	for _, path := range []string{"results/data", "results/new", "results/run1/metrics.json", "link-cache/data", "scratch/data"} {
 		write(betaRoot, path, "remote\n")
 	}
-	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/data"); code != 255 ||
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/data"); code != 125 ||
 		!strings.Contains(errorOutput, "it resolves to src/data through a symbolic link, and the session synchronizes that") {
 		t.Fatalf("synchronized file pulled through a symbolic link: %d, %q", code, errorOutput)
 	} else if read(filepath.Join(alphaRoot, "src", "data")) != "synchronized\n" {
 		t.Fatal("synchronized file overwritten through a symbolic link")
-	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/new"); code != 255 || !strings.Contains(errorOutput, "resolves to src/new") {
+	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/new"); code != 125 || !strings.Contains(errorOutput, "resolves to src/new") {
 		t.Fatalf("new file pulled into synchronized content: %d, %q", code, errorOutput)
-	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/run1/metrics.json"); code != 255 || !strings.Contains(errorOutput, "results/run1 resolves to src/run1") {
+	} else if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/run1/metrics.json"); code != 125 || !strings.Contains(errorOutput, "results/run1 resolves to src/run1") {
 		t.Fatalf("parent created in synchronized content: %d, %q", code, errorOutput)
 	} else if entries, err := os.ReadDir(filepath.Join(alphaRoot, "src")); err != nil || len(entries) != 1 {
 		t.Fatalf("synchronized content modified: %v, %v", entries, err)
@@ -1127,7 +1127,7 @@ func TestRemotePullSynchronizedContent(t *testing.T) {
 
 	// A symbolic link that's pulled over is replaced rather than followed,
 	// so a directory isn't merged through it.
-	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results"); code != 255 || !strings.Contains(errorOutput, "exists locally but isn't a directory") {
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results"); code != 125 || !strings.Contains(errorOutput, "exists locally but isn't a directory") {
 		t.Fatalf("directory merged through a symbolic link: %d, %q", code, errorOutput)
 	} else if target, err := os.Readlink(filepath.Join(alphaRoot, "results")); err != nil || target != "src" {
 		t.Fatalf("symbolic link modified: %q, %v", target, err)

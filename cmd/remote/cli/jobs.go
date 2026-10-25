@@ -112,11 +112,13 @@ func describeState(job *remote.Job) string {
 func startJob(ctx context.Context, connection net.Conn, target *remote.Target, request *remote.Request, stdout, stderr io.Writer) (int, error) {
 	job, code, err := remote.StartJob(ctx, connection, request)
 	if errors.Is(err, remote.ErrConnectionLost) {
-		return 0, errors.New("the connection to the executing endpoint was lost while starting the job, which may be running; remote --jobs lists the jobs")
+		return 0, remote.ConnectionError(errors.New("the connection to the executing endpoint was lost while starting the job, which may be running; remote --jobs lists the jobs"))
 	} else if err != nil {
 		return code, err
 	}
-	fmt.Fprintln(stdout, job.ID)
+	if _, err := fmt.Fprintln(stdout, job.ID); err != nil {
+		return 0, fmt.Errorf("job %s started, but its identifier couldn't be printed: %w", job.ID, err)
+	}
 	locator := newLocator(target)
 	fmt.Fprintf(stderr, "remote: started job %[1]s on %[2]s with output in %[3]s; remote --wait %[1]s waits for it, and remote --kill %[1]s terminates it\n",
 		job.ID, executing(target), describeLog(locator, job))
@@ -317,8 +319,7 @@ func waitJob(router *router, options *options, output io.Writer) (int, error) {
 		// session. An attempt that waited for longer than the retry period
 		// before failing, such as one that followed a log for hours, starts
 		// a new retry period.
-		var jobError *remote.JobError
-		if router.ctx.Err() != nil || errors.As(err, &jobError) || router.selection.Target == nil {
+		if router.ctx.Err() != nil || remote.ClassifyError(err) != remote.ErrorKindConnection || router.selection.Target == nil {
 			return 0, err
 		} else if deadline.IsZero() || time.Since(started) > waitRetryPeriod {
 			deadline = time.Now().Add(waitRetryPeriod)

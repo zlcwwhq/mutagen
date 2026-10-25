@@ -687,7 +687,7 @@ func (w *digestWriter) Write(data []byte) (int, error) {
 }
 
 // errCorruptCopy indicates that a copy wasn't received as it was read.
-var errCorruptCopy = errors.New("the copy was received incompletely or corrupted; check out again")
+var errCorruptCopy = remote.ConnectionError(errors.New("the copy was received incompletely or corrupted; check out again"))
 
 // writeCopy creates a private file with a copy written by a function that
 // returns the copy's entry, as read at its source, and verifies that the data
@@ -758,6 +758,8 @@ type outcome struct {
 	Path string
 	// Error describes why the operation failed, if it did.
 	Error string `json:",omitempty"`
+	// ErrorKind classifies a failed path independently of the batch's status.
+	ErrorKind remote.ErrorKind `json:",omitempty"`
 	// Local, Remote, Base, and Merged are the paths of a workspace's copies,
 	// the copies' common ancestor (if found), and the merged file.
 	Local  string `json:",omitempty"`
@@ -799,16 +801,16 @@ type printer struct {
 	// headings indicates whether text outcomes are preceded by their paths,
 	// which distinguishes them when operating on several paths.
 	headings bool
-	// failed records whether any operation failed.
-	failed bool
+	// failures retain the causes of failures whose diagnostics were printed.
+	failures []error
 }
 
 // print prints the outcome of an operation on a path.
 func (p *printer) print(path string, result *outcome, err error) {
 	if err != nil {
-		p.failed = true
+		p.failures = append(p.failures, err)
 		fmt.Fprintf(p.errors, "remote: %s: %v\n", terminal.NeutralizeControlCharacters(path), err)
-		result = &outcome{Path: path, Error: err.Error()}
+		result = &outcome{Path: path, Error: err.Error(), ErrorKind: remote.ClassifyError(err)}
 		if !p.json {
 			return
 		}
@@ -864,9 +866,11 @@ func runConflicts(ctx context.Context, directory string, o *options, output, err
 		}
 	}
 	if err != nil {
-		return err
-	} else if p.failed {
-		return errReported
+		fmt.Fprintln(errorOutput, "remote:", err)
+		p.failures = append(p.failures, err)
+	}
+	if len(p.failures) > 0 {
+		return errors.Join(append([]error{errReported}, p.failures...)...)
 	}
 	return nil
 }

@@ -25,6 +25,8 @@ type JobLog struct {
 	// Error reports why the log couldn't be read. It doesn't affect the job's
 	// exit status, and Data is empty if it's non-empty.
 	Error string `json:",omitempty"`
+	// ErrorKind classifies this non-fatal log diagnostic.
+	ErrorKind ErrorKind `json:",omitempty"`
 }
 
 // readJobLog reads a bounded snapshot of the final lines of a job's log. It
@@ -34,24 +36,24 @@ func readJobLog(ctx context.Context, path string, lines int64) *JobLog {
 	if lines == 0 {
 		return &JobLog{}
 	} else if err := ctx.Err(); err != nil {
-		return &JobLog{Error: err.Error()}
+		return &JobLog{Error: err.Error(), ErrorKind: ClassifyError(err)}
 	}
 	file, err := openJobLog(path)
 	if err != nil {
-		return &JobLog{Error: err.Error()}
+		return &JobLog{Error: err.Error(), ErrorKind: ClassifyError(err)}
 	}
 	defer file.Close()
 	stop := context.AfterFunc(ctx, func() { file.Close() })
 	defer stop()
 	info, err := file.Stat()
 	if err != nil {
-		return &JobLog{Error: err.Error()}
+		return &JobLog{Error: err.Error(), ErrorKind: ClassifyError(err)}
 	}
 	data, truncated, err := readTail(file, info.Size(), lines)
 	if err != nil {
-		return &JobLog{Error: err.Error()}
+		return &JobLog{Error: err.Error(), ErrorKind: ClassifyError(err)}
 	} else if err := ctx.Err(); err != nil {
-		return &JobLog{Error: err.Error()}
+		return &JobLog{Error: err.Error(), ErrorKind: ClassifyError(err)}
 	}
 	return &JobLog{Data: data, Truncated: truncated}
 }
@@ -222,19 +224,19 @@ func WaitJobWithOptions(ctx context.Context, connection io.ReadWriteCloser, id s
 		}
 		return nil, nil, err
 	} else if response.Error != "" {
-		return nil, nil, &JobError{response.Error}
+		return nil, nil, receivedError(response.ErrorKind, &JobError{response.Error})
 	} else if response.Job == nil {
-		return nil, nil, errors.New("no job received")
+		return nil, nil, ConnectionError(errors.New("no job received"))
 	} else if response.Job.State == JobRunning && request.Timeout == 0 {
-		return nil, nil, errors.New("the executing endpoint returned a running job")
+		return nil, nil, ConnectionError(errors.New("the executing endpoint returned a running job"))
 	} else if request.Tail == 0 {
 		return response.Job, nil, nil
 	}
 	log := response.JobLog
 	if log == nil {
-		log = &JobLog{Error: "the executing endpoint doesn't support log tails"}
+		log = &JobLog{Error: "the executing endpoint doesn't support log tails", ErrorKind: ErrorKindOperation}
 	} else if buffer.overflow {
-		log = &JobLog{Error: "the executing endpoint returned a log tail larger than 1 MiB"}
+		log = &JobLog{Error: "the executing endpoint returned a log tail larger than 1 MiB", ErrorKind: ErrorKindConnection}
 	} else if log.Error == "" {
 		log.Data = buffer.data
 	}

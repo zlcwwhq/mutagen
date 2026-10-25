@@ -558,7 +558,7 @@ func probeTier(ctx context.Context, tier []*candidate) ([]liveEndpoint, error) {
 				continue
 			}
 			closeEndpoints(live)
-			return nil, fmt.Errorf("unable to connect to session %s: %w", describe(c.Session, c.Name), err)
+			return nil, ConnectionError(fmt.Errorf("unable to connect to session %s: %w", describe(c.Session, c.Name), err))
 		}
 		resolved[key] = true
 		live = append(live, liveEndpoint{connection, c})
@@ -850,7 +850,7 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 		return nil, nil, ctx.Err()
 	} else if err != nil {
 		connection.Close()
-		return nil, nil, fmt.Errorf("unable to handshake with session %s: %w", describe(c.Session, c.Name), err)
+		return nil, nil, ConnectionError(fmt.Errorf("unable to handshake with session %s: %w", describe(c.Session, c.Name), err))
 	}
 	return connection, c.target(overlapping), nil
 }
@@ -1092,8 +1092,8 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 	// returns the specified error otherwise.
 	mismatched := func(considered []*candidate, err error) error {
 		if versions := versions(considered); len(versions) > 0 {
-			return fmt.Errorf("matching sessions are registered by Mutagen %s, but this is Mutagen %s; use the remote executable installed with that version",
-				strings.Join(versions, ", "), mutagen.Version)
+			return ConnectionError(fmt.Errorf("matching sessions are registered by Mutagen %s, but this is Mutagen %s; use the remote executable installed with that version",
+				strings.Join(versions, ", "), mutagen.Version))
 		}
 		return err
 	}
@@ -1109,8 +1109,8 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 		if err != nil {
 			return nil, err
 		} else if len(live) == 0 {
-			return nil, fmt.Errorf("session %s is no longer connected for remote commands on this system (it may have been paused or terminated, or be reconnecting)",
-				describe(s.Target.Session, s.Target.Name))
+			return nil, ConnectionError(fmt.Errorf("session %s is no longer connected for remote commands on this system (it may have been paused or terminated, or be reconnecting)",
+				describe(s.Target.Session, s.Target.Name)))
 		}
 		return single(live, selectedAmbiguity(fmt.Sprintf("%q", s.Target.Session)))
 	}
@@ -1149,8 +1149,11 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 		if err != nil {
 			return nil, err
 		} else if len(live) == 0 {
-			return nil, mismatched(filter(incompatible, selected),
-				fmt.Errorf("no connected session matching %q has remote commands enabled on this system (remote --sessions lists them)", s.Session))
+			err := fmt.Errorf("no connected session matching %q has remote commands enabled on this system (remote --sessions lists them)", s.Session)
+			if len(filter(compatible, selected)) > 0 {
+				return nil, ConnectionError(err)
+			}
+			return nil, mismatched(filter(incompatible, selected), err)
 		}
 		return single(live, selectedAmbiguity(fmt.Sprintf("%q", s.Session)))
 	}
@@ -1189,7 +1192,7 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 			return c.contained || preferred(c)
 		})
 		return nil, mismatched(considered,
-			fmt.Errorf("no connected session with remote commands enabled contains %s or matches %s (remote --sessions lists them)", directory, label))
+			ConnectionError(fmt.Errorf("no connected session with remote commands enabled contains %s or matches %s (remote --sessions lists them)", directory, label)))
 	}
 
 	// Otherwise, the most specific containing root is used.
@@ -1198,7 +1201,7 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 		return nil, err
 	} else if len(live) == 0 {
 		return nil, mismatched(filter(incompatible, containing),
-			fmt.Errorf("no connected session with remote commands enabled contains %s (remote --sessions lists them)", directory))
+			ConnectionError(fmt.Errorf("no connected session with remote commands enabled contains %s (remote --sessions lists them)", directory)))
 	}
 	return first(live), nil
 }

@@ -330,7 +330,9 @@ func compare(ctx context.Context, directory string, target *remote.Target, repor
 		}
 		if difference := compareEntries(locator.display(path), local, opposite); difference != "" {
 			differ = true
-			io.WriteString(output, difference)
+			if _, err := io.WriteString(output, difference); err != nil {
+				return differ, fmt.Errorf("unable to print differences: %w", err)
+			}
 		}
 	}
 	return differ, nil

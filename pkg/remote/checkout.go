@@ -56,6 +56,8 @@ type CheckoutStatus struct {
 type checkoutResponse struct {
 	// Error is the claim, release, or routing error, if any.
 	Error string `json:",omitempty"`
+	// ErrorKind classifies Error independently of its diagnostic text.
+	ErrorKind ErrorKind `json:",omitempty"`
 	// CheckoutStatus is the outcome, if there was no error.
 	CheckoutStatus
 }
@@ -75,15 +77,17 @@ func exchangeCheckout(ctx context.Context, connection io.ReadWriteCloser, path, 
 	// A hop that rejects the submission may close the connection before
 	// reading the request, so write errors are ignored in favor of the status
 	// read next.
-	writeMessage(connection, &checkoutRequest{Path: path, Token: token})
+	if err := writeMessage(connection, &checkoutRequest{Path: path, Token: token}); err != nil && ClassifyError(err) != ErrorKindConnection {
+		return nil, err
+	}
 	var response checkoutResponse
 	if err := readMessage(connection, &response); err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("unable to receive checkout status: %w", err)
+		return nil, ConnectionError(fmt.Errorf("unable to receive checkout status: %w", err))
 	} else if response.Error != "" {
-		return nil, errors.New(response.Error)
+		return nil, receivedError(response.ErrorKind, errors.New(response.Error))
 	}
 	return &response.CheckoutStatus, nil
 }
@@ -115,7 +119,7 @@ func ClaimCheckout(ctx context.Context, connection io.ReadWriteCloser, path, tok
 	} else if status.Sequence != 0 {
 		return status.Sequence, "", nil
 	} else if !status.Held || status.Token == "" || status.Token == token {
-		return 0, "", errors.New("invalid checkout claim status")
+		return 0, "", ConnectionError(errors.New("invalid checkout claim status"))
 	}
 	return 0, status.Token, nil
 }
@@ -150,7 +154,7 @@ func ReceiveCheckout(ctx context.Context, connection io.ReadWriteCloser) (string
 	if !stop() {
 		return "", "", fmt.Errorf("checkout request not received: %w", ctx.Err())
 	} else if err != nil {
-		return "", "", fmt.Errorf("unable to receive checkout request: %w", err)
+		return "", "", ConnectionError(fmt.Errorf("unable to receive checkout request: %w", err))
 	} else if !validConflictRoot(request.Path) {
 		return "", "", errors.New("invalid conflict root")
 	}
@@ -163,7 +167,7 @@ func ReceiveCheckout(ctx context.Context, connection io.ReadWriteCloser) (string
 func RespondToCheckout(connection io.ReadWriteCloser, status CheckoutStatus, err error) error {
 	defer connection.Close()
 	if err != nil {
-		return writeMessage(connection, &checkoutResponse{Error: err.Error()})
+		return writeMessage(connection, &checkoutResponse{Error: err.Error(), ErrorKind: ClassifyError(err)})
 	}
 	return writeMessage(connection, &checkoutResponse{CheckoutStatus: status})
 }

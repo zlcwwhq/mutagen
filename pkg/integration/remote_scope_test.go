@@ -57,7 +57,7 @@ func TestRemotePullOtherSession(t *testing.T) {
 	// Pulling content that the other session synchronizes is refused, which
 	// leaves the local content unchanged. The session is labeled by
 	// identifier, since its endpoints don't know its name.
-	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/data"); code != 255 ||
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results/data"); code != 125 ||
 		errorOutput != "remote: unable to pull results/data: it's synchronized by "+inner+", so remote doesn't write it\n" {
 		t.Errorf("content synchronized by another session pulled: %d, %q", code, errorOutput)
 	}

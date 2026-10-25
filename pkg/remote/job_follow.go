@@ -41,6 +41,8 @@ type logFrame struct {
 	// It's sent in the final frame, after which the wait continues without
 	// streaming.
 	Error string `json:",omitempty"`
+	// ErrorKind classifies this non-fatal log diagnostic.
+	ErrorKind ErrorKind `json:",omitempty"`
 }
 
 // logStreamer streams a job's log as frames (see logFrame) while JobWait waits
@@ -176,7 +178,7 @@ func (s *logStreamer) send(frame logFrame, data []byte) error {
 // stop stops streaming, closing the log, and reports why in a final frame.
 func (s *logStreamer) stop(reason string) error {
 	s.close()
-	return s.send(logFrame{Error: reason}, nil)
+	return s.send(logFrame{Error: reason, ErrorKind: ErrorKindOperation}, nil)
 }
 
 // close closes the log, if it's open.
