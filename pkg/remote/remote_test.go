@@ -587,7 +587,7 @@ func TestRouteRejection(t *testing.T) {
 }
 
 func TestReceiveSubmission(t *testing.T) {
-	receive := func(ctx context.Context, header *submission) (Operation, error) {
+	receive := func(ctx context.Context, header any) (*Submission, error) {
 		client, server := net.Pipe()
 		defer client.Close()
 		if header != nil {
@@ -598,12 +598,24 @@ func TestReceiveSubmission(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for _, operation := range []Operation{OperationExecute, OperationFlush, OperationConflicts, OperationClaim, OperationRelease} {
-		if received, err := receive(ctx, &submission{Operation: operation}); err != nil || received != operation {
-			t.Fatalf("operation %d received incorrectly: %d, %v", operation, received, err)
+		for _, progress := range []bool{false, true} {
+			sent := &Submission{Operation: operation, Progress: progress}
+			if received, err := receive(ctx, sent); err != nil || *received != *sent {
+				t.Fatalf("header %+v received incorrectly: %+v, %v", sent, received, err)
+			}
 		}
 	}
-	if _, err := receive(ctx, &submission{Operation: OperationRelease + 1}); err == nil {
+	if _, err := receive(ctx, &Submission{Operation: OperationRelease + 1}); err == nil {
 		t.Fatal("unsupported operation accepted")
+	}
+
+	// Headers of earlier versions, which only specify the operation, don't
+	// request progress, and progress isn't encoded unless it's requested, so
+	// that headers of operations without it are unchanged.
+	if received, err := receive(ctx, &struct{ Operation Operation }{OperationFlush}); err != nil || received.Operation != OperationFlush || received.Progress {
+		t.Fatalf("earlier header received incorrectly: %+v, %v", received, err)
+	} else if data, err := json.Marshal(&Submission{Operation: OperationFlush}); err != nil || string(data) != `{"Operation":1}` {
+		t.Fatalf("header without progress encoded incorrectly: %s, %v", data, err)
 	}
 
 	// Cancellation interrupts the wait for a header.

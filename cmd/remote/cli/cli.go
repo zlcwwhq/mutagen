@@ -62,6 +62,10 @@ type options struct {
 	// noFlush indicates that the session should not be synchronized before
 	// and after the command.
 	noFlush bool
+	// progress indicates whether synchronization progress was explicitly
+	// enabled or disabled, or is nil if progress is only shown when standard
+	// error is a terminal (see newProgressOutput).
+	progress *bool
 	// script is the path of a local script to run instead of a command, or -
 	// for standard input, in which case the arguments are its arguments.
 	script string
@@ -73,6 +77,12 @@ type options struct {
 	jobs bool
 	// wait is the identifier of a detached job to wait for, if any.
 	wait string
+	// tail is the number of final log lines to print after waiting for a job,
+	// or with which following its log starts.
+	tail int64
+	// follow indicates that a job's log should be printed while waiting for
+	// the job.
+	follow bool
 	// kill is the identifier of a detached job to terminate, if any.
 	kill string
 	// diff indicates that local and remote copies of the paths specified by
@@ -149,11 +159,15 @@ func parse(arguments []string) (*options, error) {
 	flags.BoolVar(&result.noPrologue, "no-prologue", false, "Don't source the workspace or configured remote prologue")
 	flags.BoolVar(&result.noFlush, "no-flush", false, "Don't synchronize before and after the command (only for commands that use no synchronized files)")
 	flags.BoolVar(&result.flush, "flush", false, "Synchronize the session; without a command, do only that")
+	var progress bool
+	flags.BoolVar(&progress, "progress", false, "Show the progress of synchronizations that take over 3 seconds (automatic on terminals; --progress=false disables it)")
 	flags.BoolVar(&result.detach, "detach", false, "Run the command as a detached job, which keeps running after remote exits, and print its identifier")
 	flags.StringVar(&result.log, "log", "", "With --detach, write the job's output to `FILE` (relative to the command's directory), a regular file or character device")
 	flags.BoolVar(&result.jobs, "jobs", false, "List the detached jobs started at the session's root on the opposite endpoint, and processes that ended jobs left running")
 	flags.StringVar(&result.wait, "wait", "", "Wait for the detached job `ID` to end, synchronize, and exit with its status")
-	flags.StringVar(&result.kill, "kill", "", "Terminate the detached job `ID`")
+	flags.Int64Var(&result.tail, "tail", 0, "With --wait, print the final `N` log lines when the job ends or --timeout expires (at most 1 MiB; 0 disables output)")
+	flags.BoolVar(&result.follow, "follow", false, "With --wait, print the job's log as it's written, from its beginning or the final --tail lines")
+	flags.StringVar(&result.kill, "kill", "", "Terminate the detached job `ID` without synchronizing (--no-flush is accepted but has no effect)")
 	flags.BoolVar(&result.diff, "diff", false, "Synchronize, then diff the given paths (or conflicting files) against their remote copies")
 	flags.BoolVar(&result.ignores, "ignores", false, "Show the session's ignores, or whether the given paths are ignored")
 	flags.BoolVar(&result.pull, "pull", false, "Copy the given paths, which the session must ignore, from the opposite endpoint")
@@ -179,6 +193,9 @@ func parse(arguments []string) (*options, error) {
 	result.flags = flags
 	if !flags.Changed("session") {
 		result.defaultSession = os.Getenv(remote.SessionVariable)
+	}
+	if flags.Changed("progress") {
+		result.progress = &progress
 	}
 	if result.help || result.version {
 		return result, nil
@@ -233,15 +250,21 @@ var modes = []struct {
 }{
 	{"sessions", nil},
 	{"jobs", []string{"session"}},
-	{"wait", []string{"session", "timeout", "no-flush"}},
-	{"kill", []string{"session", "timeout"}},
+	{"wait", []string{"session", "timeout", "no-flush", "tail", "follow", "progress"}},
+	{"kill", []string{"session", "timeout", "no-flush", "progress"}},
 	{"ignores", []string{"session"}},
 	{"pull", []string{"session", "timeout"}},
 }
 
 // validate checks the combination of options other than conflict options.
 func (o *options) validate(flags *pflag.FlagSet) error {
-	if o.timeout < 0 {
+	if flags.Changed("tail") && !flags.Changed("wait") {
+		return errors.New("--tail requires --wait")
+	} else if flags.Changed("follow") && !flags.Changed("wait") {
+		return errors.New("--follow requires --wait")
+	} else if o.tail < 0 {
+		return errors.New("tail count must not be negative")
+	} else if o.timeout < 0 {
 		return errors.New("timeout must not be negative")
 	}
 	for _, mode := range modes {
@@ -404,7 +427,8 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			Default:       options.defaultSession,
 			Corresponding: request != nil && options.directory == "",
 		},
-		stderr: stderr,
+		stderr:   stderr,
+		progress: options.progress,
 	}
 
 	// Perform operations other than running commands.
@@ -419,8 +443,15 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		activity, err = "listing jobs", listJobs(router, stdout)
 	case options.wait != "":
 		activity = "waiting for the job"
-		code, err = waitJob(router, options.wait, !options.noFlush)
-		if interruptedCode, ok := interrupted(activity); ok {
+		code, err = waitJob(router, options, stdout)
+		interruptedCode, ok := interrupted(activity)
+		if !ok && errors.Is(err, errJobRunning) {
+			// The executing endpoint returned the running job shortly before
+			// the timeout (see remote.WaitOptions.Deadline).
+			fmt.Fprintf(stderr, "remote: timed out after %v while %s\n", options.timeout, activity)
+			interruptedCode, ok = timeoutExitCode, true
+		}
+		if ok {
 			fmt.Fprintf(stderr, "remote: job %s is still running; remote --wait %[1]s resumes waiting, and remote --kill %[1]s terminates it\n", options.wait)
 			return interruptedCode
 		}
@@ -454,8 +485,10 @@ type router struct {
 	// selection selects the session, and is pinned to the endpoint that the
 	// first submission locates.
 	selection *remote.Selection
-	// stderr receives warnings.
+	// stderr receives warnings and synchronization progress.
 	stderr io.Writer
+	// progress is the --progress setting (see options.progress).
+	progress *bool
 	// reports prints synchronization reports, once created by synchronize.
 	reports *reporter
 }
@@ -466,7 +499,12 @@ type router struct {
 // sessions connect or disconnect in between, such as a nested session
 // reconnecting after the enclosing session was synchronized.
 func (r *router) dial(operation remote.Operation) (net.Conn, *remote.Target, error) {
-	connection, target, err := r.selection.Dial(r.ctx, r.directory, operation)
+	return r.submit(&remote.Submission{Operation: operation})
+}
+
+// submit is dial with the specified submission header.
+func (r *router) submit(header *remote.Submission) (net.Conn, *remote.Target, error) {
+	connection, target, err := r.selection.Submit(r.ctx, r.directory, header)
 	if err == nil && r.selection.Target == nil {
 		warnOverlapping(r.stderr, target)
 		r.selection = &remote.Selection{Target: target}
@@ -487,16 +525,19 @@ func (r *router) locate() (*remote.Target, error) {
 	return target, err
 }
 
-// synchronize forces a synchronization cycle for the session and warns about
-// content that couldn't be synchronized, omitting warnings issued by previous
-// cycles. It returns the target if the session was located, along with the
-// report.
+// synchronize forces a synchronization cycle for the session, showing its
+// progress if enabled (see newProgressOutput), and warns about content that
+// couldn't be synchronized, omitting warnings issued by previous cycles. It
+// returns the target if the session was located, along with the report.
 func (r *router) synchronize() (*remote.Target, *remote.Report, error) {
-	connection, target, err := r.dial(remote.OperationFlush)
+	output := newProgressOutput(r.stderr, r.progress)
+	connection, target, err := r.submit(&remote.Submission{Operation: remote.OperationFlush, Progress: output.writer != nil})
 	if err != nil {
 		return nil, nil, err
 	}
-	report, err := remote.Flush(r.ctx, connection)
+	display := newProgressDisplay(output, target)
+	report, err := remote.FlushWithProgress(r.ctx, connection, display.begin())
+	display.finish(r.ctx, err)
 	if err != nil {
 		return target, nil, err
 	} else if r.reports == nil {

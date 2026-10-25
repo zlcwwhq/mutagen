@@ -12,6 +12,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/logging"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
 	urlpkg "github.com/mutagen-io/mutagen/pkg/url"
 )
 
@@ -19,6 +20,18 @@ const (
 	// commandRouteOpenTimeout bounds the time spent opening a route to an
 	// executing endpoint.
 	commandRouteOpenTimeout = 30 * time.Second
+)
+
+var (
+	// progressSampleInterval is the interval at which the progress of a
+	// session is sampled for each submission that waits for a synchronization
+	// cycle and requested progress (see remote.ReportProgress). It's a
+	// variable so that tests can shorten it.
+	progressSampleInterval = time.Second
+	// progressHeartbeatInterval is the longest interval between progress
+	// messages while the progress doesn't change. It's a variable so that
+	// tests can shorten it.
+	progressHeartbeatInterval = 10 * time.Second
 )
 
 // CommandProtocolHandler is an optional extension of ProtocolHandler for
@@ -54,6 +67,9 @@ type commandRelay struct {
 	flushRequests chan chan error
 	// report reports content that the session couldn't synchronize.
 	report func() *remote.Report
+	// progress samples the session's progress for submissions that request
+	// it, or is nil if progress isn't reported.
+	progress func() *remote.Progress
 	// conflicts lists the session's conflicts and checkouts for resolution, or
 	// is nil if the session's synchronization mode doesn't support resolution,
 	// in which case claim and release are nil too.
@@ -99,6 +115,7 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		logger:        c.logger.Sublogger("commands"),
 		flushRequests: c.flushRequests,
 		report:        c.remoteReport,
+		progress:      c.remoteProgress,
 	}
 
 	// Resolution writes the same result to both endpoints, which is only
@@ -226,18 +243,20 @@ func (r *commandRelay) accept(ctx context.Context, index int, channel remote.Cha
 // route handles a submission by performing a flush or by connecting it to the
 // executor of the specified endpoint.
 func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser, target int) {
-	operation, err := remote.ReceiveSubmission(ctx, submission)
+	header, err := remote.ReceiveSubmission(ctx, submission)
 	if err != nil {
 		remote.Reject(submission, err)
 		return
-	} else if operation == remote.OperationConflicts {
+	}
+	operation := header.Operation
+	if operation == remote.OperationConflicts {
 		r.logger.Debug("Forcing synchronization cycle for conflict listing")
 		stop := context.AfterFunc(ctx, func() { submission.Close() })
 		defer stop()
 		var listing *remote.Listing
 		if r.conflicts == nil {
 			err = errResolutionUnsupported
-		} else if err = r.flush(ctx); err == nil {
+		} else if err = r.flushReporting(ctx, submission, header.Progress); err == nil {
 			listing, err = r.conflicts()
 		}
 		if err := remote.RespondWithConflicts(submission, listing, err); err != nil {
@@ -266,7 +285,7 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		stop := context.AfterFunc(ctx, func() { submission.Close() })
 		defer stop()
 		var report *remote.Report
-		if err = r.flush(ctx); err == nil {
+		if err = r.flushReporting(ctx, submission, header.Progress); err == nil {
 			report = r.report()
 			report.Resolution = r.conflicts != nil
 		}
@@ -307,6 +326,54 @@ func (r *commandRelay) flush(ctx context.Context) error {
 	case <-ctx.Done():
 		return errFlushTerminated
 	}
+}
+
+// flushReporting performs a flush (see flush) for a submission, sending it
+// progress messages while it waits if it requested them (see
+// remote.ReportProgress). Messages stop before it returns, so that the final
+// response follows them. Submissions that don't request progress, such as
+// those of earlier versions, which expect a single response, receive none.
+func (r *commandRelay) flushReporting(ctx context.Context, submission io.Writer, progress bool) error {
+	if !progress || r.progress == nil {
+		return r.flush(ctx)
+	}
+	stop, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		remote.ReportProgress(submission, r.progress, progressSampleInterval, progressHeartbeatInterval, stop)
+	}()
+	err := r.flush(ctx)
+	close(stop)
+	<-stopped
+	return err
+}
+
+// remoteProgress samples the session's synchronization status and staging
+// progress for submissions that wait for a synchronization cycle and requested
+// progress (see remote.Submission.Progress). The staging endpoint's progress
+// is copied while the state lock is held, since it's updated in place.
+func (c *controller) remoteProgress() *remote.Progress {
+	c.stateLock.Lock()
+	defer c.stateLock.UnlockWithoutNotify()
+	status, _ := c.state.Status.MarshalText()
+	progress := &remote.Progress{Status: string(status)}
+	var staging *rsync.ReceiverState
+	if c.state.Status == Status_StagingAlpha {
+		staging = c.state.GetAlphaState().GetStagingProgress()
+	} else if c.state.Status == Status_StagingBeta {
+		staging = c.state.GetBetaState().GetStagingProgress()
+	}
+	if staging != nil {
+		progress.Staging = &remote.StagingProgress{
+			ReceivedFiles:    staging.ReceivedFiles,
+			ExpectedFiles:    staging.ExpectedFiles,
+			ReceivedSize:     staging.TotalReceivedSize,
+			Path:             staging.Path,
+			FileReceivedSize: staging.ReceivedSize,
+			FileExpectedSize: staging.ExpectedSize,
+		}
+	}
+	return progress
 }
 
 // remoteReport reports the content that the session couldn't synchronize in

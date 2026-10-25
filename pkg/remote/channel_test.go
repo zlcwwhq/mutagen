@@ -787,8 +787,8 @@ func TestAgentChannel(t *testing.T) {
 		submission, err := channel.Accept()
 		if err != nil {
 			return
-		} else if operation, err := ReceiveSubmission(context.Background(), submission); err != nil || operation != OperationExecute {
-			t.Error("incorrect submission:", operation, err)
+		} else if header, err := ReceiveSubmission(context.Background(), submission); err != nil || header.Operation != OperationExecute {
+			t.Error("incorrect submission:", header, err)
 			submission.Close()
 			return
 		}
@@ -1108,8 +1108,8 @@ func TestLocalChannel(t *testing.T) {
 		submission, err := channel.Accept()
 		if err != nil {
 			return
-		} else if operation, err := ReceiveSubmission(context.Background(), submission); err != nil || operation != OperationExecute {
-			t.Error("incorrect submission:", operation, err)
+		} else if header, err := ReceiveSubmission(context.Background(), submission); err != nil || header.Operation != OperationExecute {
+			t.Error("incorrect submission:", header, err)
 			submission.Close()
 			return
 		}
@@ -1162,8 +1162,8 @@ func TestFlush(t *testing.T) {
 			submission, err := channel.Accept()
 			if err != nil {
 				return
-			} else if operation, err := ReceiveSubmission(context.Background(), submission); err != nil || operation != OperationFlush {
-				t.Error("incorrect submission:", operation, err)
+			} else if header, err := ReceiveSubmission(context.Background(), submission); err != nil || header.Operation != OperationFlush {
+				t.Error("incorrect submission:", header, err)
 				submission.Close()
 				continue
 			}

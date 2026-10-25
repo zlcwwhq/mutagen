@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -746,7 +747,7 @@ func TestRemoteDetachedJobs(t *testing.T) {
 			// Start a job that waits for a release marker, keeping its markers
 			// outside the roots. Only its identifier is printed.
 			started, release := filepath.Join(directory, "started"), filepath.Join(directory, "release")
-			script := `echo > "$1"; while [ ! -e "$2" ]; do sleep 0.1; done; echo done; exit 3`
+			script := `echo started; echo > "$1"; while [ ! -e "$2" ]; do sleep 0.1; done; echo done; exit 3`
 			code, output, errorOutput := runRemote(t, submitting, "--detach", "--log", "out.log", "sh", "-c", script, "sh", started, release)
 			id := strings.TrimSpace(output)
 			if code != 0 || len(id) != 8 || !strings.Contains(errorOutput, "remote --wait "+id) {
@@ -757,8 +758,26 @@ func TestRemoteDetachedJobs(t *testing.T) {
 				t.Fatalf("incorrect job listing: %d, %q", code, output)
 			}
 
+			// A wait whose timeout expires while the job runs prints the
+			// log's current tail.
+			if code, output, errorOutput := runRemote(t, submitting, "--wait", id, "--tail", "1", "--timeout", "2", "--no-flush"); code != 124 || output != "started\n" || !strings.Contains(errorOutput, "job "+id+" is still running") {
+				t.Fatalf("incorrect timed out wait: %d, %q, %q", code, output, errorOutput)
+			}
+
+			// Following the log prints it while the job runs.
+			var followOutput, followErrors lockedBuffer
+			followed := make(chan int, 1)
+			go func() {
+				followed <- cli.Run([]string{"--wait", id, "--follow"}, strings.NewReader(""), &followOutput, &followErrors)
+			}()
+			for deadline := time.Now().Add(30 * time.Second); followOutput.String() != "started\n"; time.Sleep(10 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("log wasn't followed: %q, %q", followOutput.String(), followErrors.String())
+				}
+			}
+
 			// The job keeps running while the session is paused, unlike
-			// commands.
+			// commands, and following resumes once it reconnects.
 			specification := &selection.Selection{Specifications: []string{sessionID}}
 			if err := synchronizationManager.Pause(context.Background(), specification, ""); err != nil {
 				t.Fatal("unable to pause session:", err)
@@ -771,12 +790,28 @@ func TestRemoteDetachedJobs(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// Waiting returns the job's status, once the session has been
-			// synchronized, so the log is present locally.
-			if code, _, errorOutput := runRemote(t, submitting, "--wait", id); code != 3 || !strings.Contains(errorOutput, "exited with status 3") {
-				t.Fatalf("incorrect wait result: %d, %q", code, errorOutput)
-			} else if data, err := os.ReadFile(filepath.Join(submitting, "out.log")); err != nil || string(data) != "done\n" {
+			// The followed wait prints the rest of the log exactly once,
+			// despite the lost connection, and returns the job's status after
+			// synchronization.
+			select {
+			case code := <-followed:
+				if code != 3 || followOutput.String() != "started\ndone\n" || !strings.Contains(followErrors.String(), "so remote retries") || !strings.Contains(followErrors.String(), "exited with status 3") {
+					t.Fatalf("incorrect followed wait result: %d, %q, %q", code, followOutput.String(), followErrors.String())
+				}
+			case <-time.After(time.Minute):
+				t.Fatal("followed wait didn't return")
+			}
+
+			// Waiting prints the requested tail and returns the job's status
+			// after synchronization, so the log is also present locally.
+			if code, output, errorOutput := runRemote(t, submitting, "--wait", id, "--tail", "1"); code != 3 || output != "done\n" || !strings.Contains(errorOutput, "exited with status 3") {
+				t.Fatalf("incorrect wait result: %d, %q, %q", code, output, errorOutput)
+			} else if data, err := os.ReadFile(filepath.Join(submitting, "out.log")); err != nil || string(data) != "started\ndone\n" {
 				t.Fatalf("log not synchronized: %q, %v", data, err)
+			}
+
+			if code, output, errorOutput := runRemote(t, submitting, "--wait", id, "--no-flush"); code != 3 || output != "" {
+				t.Fatalf("plain wait unexpectedly printed a log: %d, %q, %q", code, output, errorOutput)
 			}
 
 			// Killing a job terminates it, and waiting for it reports the
@@ -792,6 +827,95 @@ func TestRemoteDetachedJobs(t *testing.T) {
 				t.Fatalf("incorrect wait result for a killed job: %d, %q", code, errorOutput)
 			} else if code, _, errorOutput := runRemote(t, submitting, "--wait", "00000000"); code != 255 || !strings.Contains(errorOutput, "no job 00000000") {
 				t.Fatalf("incorrect wait result for a nonexistent job: %d, %q", code, errorOutput)
+			}
+		})
+	}
+}
+
+// progressLine matches synchronization progress lines, with the phase if the
+// daemon has reported it.
+var progressLine = regexp.MustCompile(`^remote: synchronizing for \d+s(: .+)?$`)
+
+// progressSummary matches synchronization progress summaries.
+var progressSummary = regexp.MustCompile(`^remote: synchronized in \d+s(: .+)?$`)
+
+func TestRemoteProgress(t *testing.T) {
+	// Commands rely on a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+
+	// Show progress at once, so that fast synchronizations show it too.
+	delay := cli.ProgressDelay
+	cli.ProgressDelay = 0
+	t.Cleanup(func() { cli.ProgressDelay = delay })
+
+	// Submissions from beta pass through its agent-style executor's channel,
+	// and those from alpha through the daemon's local channel.
+	for _, alphaExecutes := range []bool{false, true} {
+		name := "from alpha"
+		if alphaExecutes {
+			name = "from beta"
+		}
+		t.Run(name, func(t *testing.T) {
+			directory, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			alphaRoot, betaRoot := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta")
+			if err := os.Mkdir(alphaRoot, 0700); err != nil {
+				t.Fatal(err)
+			}
+			createRemoteSession(t, "progress", alphaRoot, betaRoot, alphaExecutes)
+			submitting := alphaRoot
+			if alphaExecutes {
+				submitting = betaRoot
+			}
+
+			// Without --progress, progress isn't shown on standard error,
+			// which isn't a terminal, so the output is unchanged.
+			if code, output, errorOutput := runRemote(t, submitting, "--flush"); code != 0 || output != "" || errorOutput != "" {
+				t.Fatalf("incorrect flush without progress: %d, %q, %q", code, output, errorOutput)
+			} else if code, output, errorOutput := runRemote(t, submitting, "--progress=false", "sh", "-c", "echo out > out"); code != 0 || output != "" || errorOutput != "" {
+				t.Fatalf("incorrect command without progress: %d, %q, %q", code, output, errorOutput)
+			}
+
+			// Flushes that request progress receive it through every hop
+			// before their report, since the daemon reports the session's
+			// status when it starts waiting.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			connection, _, err := remote.Submit(ctx, submitting, "", &remote.Submission{Operation: remote.OperationFlush, Progress: true})
+			if err != nil {
+				t.Fatal("unable to submit flush:", err)
+			}
+			var statuses []string
+			if report, err := remote.FlushWithProgress(ctx, connection, func(progress *remote.Progress) {
+				statuses = append(statuses, progress.Status)
+			}); err != nil || report == nil || len(statuses) == 0 || statuses[0] == "" {
+				t.Fatalf("incorrect flush with progress: %+v, %v, %q", report, err, statuses)
+			}
+
+			// With --progress, each flush, such as those before and after a
+			// command, prints progress lines followed by a summary.
+			code, output, errorOutput := runRemote(t, submitting, "--progress", "sh", "-c", "echo changed > out")
+			if code != 0 || output != "" {
+				t.Fatalf("incorrect command with progress: %d, %q, %q", code, output, errorOutput)
+			}
+			t.Logf("progress output: %q", errorOutput)
+			lines := strings.Split(strings.TrimSuffix(errorOutput, "\n"), "\n")
+			summaries := 0
+			for _, line := range lines {
+				if progressSummary.MatchString(line) {
+					summaries++
+				} else if !progressLine.MatchString(line) {
+					t.Fatalf("unexpected output with progress: %q", errorOutput)
+				}
+			}
+			if summaries != 2 || !progressSummary.MatchString(lines[len(lines)-1]) {
+				t.Fatalf("incorrect progress output: %q", errorOutput)
+			} else if data, err := os.ReadFile(filepath.Join(submitting, "out")); err != nil || string(data) != "changed\n" {
+				t.Fatalf("command's changes not synchronized: %q, %v", data, err)
 			}
 		})
 	}

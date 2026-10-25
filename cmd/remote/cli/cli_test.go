@@ -132,7 +132,7 @@ func TestHelp(t *testing.T) {
 		t.Fatal("help failed:", code)
 	}
 	help := output.String()
-	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--diff", "--script FILE", "--detach", "--log FILE", "--wait ID", "--kill ID", "--jobs", "--ignores", "--pull"} {
+	for _, expected := range []string{"Usage: remote", "Exit status", "--env NAME[=VALUE]", "--cwd DIR", "--timeout DURATION", "--no-flush", "--flush", "--progress", "--diff", "--script FILE", "--detach", "--log FILE", "--wait ID", "--tail N", "--follow", "--kill ID", "--jobs", "--ignores", "--pull"} {
 		if !strings.Contains(help, expected) {
 			t.Errorf("help is missing %q", expected)
 		}
@@ -148,8 +148,9 @@ func TestHelp(t *testing.T) {
 	// Every listed topic has its own help.
 	expectations := map[string][]string{
 		"sessions":    {"MUTAGEN_REMOTE_SESSION"},
+		"sync":        {fmt.Sprintf("take over %d seconds", ProgressDelay/time.Second), "--progress=false", fmt.Sprintf("every %d seconds", progressLineInterval/time.Second), "staging on alpha"},
 		"termination": {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second)},
-		"jobs":        {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second), "--log FILE"},
+		"jobs":        {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second), "--log FILE", "[--follow]", "--follow prints the log", "status 124"},
 		"scripts":     {fmt.Sprintf("limited to %d KiB", remote.MaximumScriptSize/1024), "or with " + remote.DefaultScriptInterpreter + " if it has none"},
 		"conflicts":   {"--conflict-checkout", "--take SIDE", "--base FILE", "--json"},
 	}
@@ -232,8 +233,16 @@ func TestParseModes(t *testing.T) {
 		{"--jobs"},
 		{"-s", "name", "--jobs"},
 		{"--wait", "0123abcd"},
+		{"--wait", "0123abcd", "--tail", "20", "--no-flush"},
+		{"--wait", "0123abcd", "--tail", "0"},
+		{"--wait", "0123abcd", "--follow"},
+		{"--wait", "0123abcd", "--follow=false"},
+		{"--follow", "--tail", "20", "--wait", "0123abcd", "--timeout", "1h", "--no-flush", "-s", "name"},
+		{"--wait", "0123abcd", "--follow", "--tail", "0"},
 		{"--wait", "0123abcd", "--timeout", "10", "--no-flush", "-s", "name"},
 		{"--kill", "0123abcd", "--timeout", "10"},
+		{"--kill", "0123abcd", "--no-flush"},
+		{"--no-flush", "--kill", "0123abcd", "--timeout", "10", "-s", "name"},
 		{"--ignores"},
 		{"--ignores", "results", "a.log"},
 		{"--pull", "results", "a.log"},
@@ -244,9 +253,37 @@ func TestParseModes(t *testing.T) {
 		{"--script", "sweep.sh", "a", "--help"},
 		{"--script", "-", "--detach", "--log", "sweep.log", "--timeout", "0"},
 		{"--script", "-", "--timeout", "10m", "-C", "/tmp", "--flush"},
+		// Progress options are accepted wherever synchronization options are,
+		// with no effect for --kill, and for every operation that
+		// synchronizes.
+		{"--progress", "true"},
+		{"--progress=false", "--flush"},
+		{"--no-flush", "--progress", "nvidia-smi"},
+		{"--progress", "--detach", "python"},
+		{"--wait", "0123abcd", "--progress", "--tail", "5"},
+		{"--wait", "0123abcd", "--progress=false"},
+		{"--kill", "0123abcd", "--progress"},
+		{"--progress", "--diff", "a"},
+		{"--progress", "--conflicts"},
+		{"--conflict-apply", "--progress", "a"},
 	} {
 		if _, err := parse(arguments); err != nil {
 			t.Errorf("valid arguments %v rejected: %v", arguments, err)
+		}
+	}
+	for _, test := range []struct {
+		arguments []string
+		expected  *bool
+	}{
+		{[]string{"--flush"}, nil},
+		{[]string{"--progress", "--flush"}, &[]bool{true}[0]},
+		{[]string{"--progress=false", "--flush"}, &[]bool{false}[0]},
+		{[]string{"--progress=true", "--wait", "0123abcd"}, &[]bool{true}[0]},
+	} {
+		if options, err := parse(test.arguments); err != nil {
+			t.Errorf("valid arguments %v rejected: %v", test.arguments, err)
+		} else if (options.progress == nil) != (test.expected == nil) || options.progress != nil && *options.progress != *test.expected {
+			t.Errorf("progress parsed incorrectly from %v: %v", test.arguments, options.progress)
 		}
 	}
 	// The arguments that follow a script are its own, even if they look like
@@ -280,9 +317,25 @@ func TestParseModes(t *testing.T) {
 		{"--jobs", "--conflicts"},
 		{"--wait"},
 		{"--wait", ""},
+		{"--wait", "0123abcd", "--tail", "-1"},
+		{"--wait", "0123abcd", "--tail", "abc"},
+		{"--wait", "0123abcd", "--tail", "9999999999999999999999999"},
+		{"--tail", "1", "true"},
+		{"--tail", "0", "true"},
+		{"--jobs", "--tail", "1"},
+		{"--kill", "0123abcd", "--tail", "1"},
+		{"--follow", "true"},
+		{"--follow"},
+		{"--jobs", "--follow"},
+		{"--kill", "0123abcd", "--follow"},
+		{"--detach", "--follow", "python"},
+		{"--wait", "0123abcd", "--follow", "--tail", "-1"},
+		{"--wait", "0123abcd", "--follow", "x"},
 		{"--wait", "0123abcd", "x"},
 		{"--wait", "0123abcd", "-C", "sub"},
-		{"--kill", "0123abcd", "--no-flush"},
+		{"--kill", "0123abcd", "--flush"},
+		{"--kill", "0123abcd", "--no-flush", "--flush"},
+		{"--kill", "0123abcd", "--no-flush", "echo"},
 		{"--kill", "0123abcd", "--wait", "0123abcd"},
 		{"--ignores", "--timeout", "10"},
 		{"--ignores", "--diff"},
@@ -301,6 +354,11 @@ func TestParseModes(t *testing.T) {
 		{"--conflicts", "--script", "-"},
 		{"--detach", "--conflict-discard", "a"},
 		{"--jobs", "--script", "-"},
+		{"--jobs", "--progress"},
+		{"--sessions", "--progress"},
+		{"--ignores", "--progress"},
+		{"--pull", "--progress", "a"},
+		{"--progress=maybe", "--flush"},
 	} {
 		if _, err := parse(arguments); err == nil {
 			t.Errorf("invalid arguments %v accepted", arguments)

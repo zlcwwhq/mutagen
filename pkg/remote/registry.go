@@ -719,8 +719,14 @@ func excludedError(directory string, c *candidate, excluded string) error {
 // with the session named by SessionVariable, if set, as the selection's
 // default (see Selection.Dial).
 func Dial(ctx context.Context, directory, session string, operation Operation) (net.Conn, *Target, error) {
+	return Submit(ctx, directory, session, &Submission{Operation: operation})
+}
+
+// Submit is Dial with the specified submission header, which can request more
+// than the operation (see Submission).
+func Submit(ctx context.Context, directory, session string, header *Submission) (net.Conn, *Target, error) {
 	selection := &Selection{Session: session, Default: os.Getenv(SessionVariable)}
-	return selection.Dial(ctx, directory, operation)
+	return selection.Submit(ctx, directory, header)
 }
 
 // relate loads the registrations and relates each one to the specified
@@ -771,6 +777,12 @@ func relateResolved(name, directory string) ([]*candidate, []*candidate, error) 
 // other functions that complete the operation, and the returned target
 // describes the endpoint, which can pin subsequent selections.
 func (s *Selection) Dial(ctx context.Context, directory string, operation Operation) (net.Conn, *Target, error) {
+	return s.Submit(ctx, directory, &Submission{Operation: operation})
+}
+
+// Submit is Dial with the specified submission header, which can request more
+// than the operation (see Submission).
+func (s *Selection) Submit(ctx context.Context, directory string, header *Submission) (net.Conn, *Target, error) {
 	directory, compatible, incompatible, err := relate(directory)
 	if err != nil {
 		return nil, nil, err
@@ -822,7 +834,7 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 		// A hop that rejects the submission may close the connection before
 		// reading the header, so write errors are ignored in favor of the
 		// status that the caller reads next.
-		writeMessage(connection, &submission{Operation: operation})
+		writeMessage(connection, header)
 	}
 	if !stop() {
 		return nil, nil, ctx.Err()

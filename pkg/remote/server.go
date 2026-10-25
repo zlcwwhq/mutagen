@@ -40,8 +40,9 @@ var terminationGracePeriod = TerminationGracePeriod
 // command's environment. Serve owns and closes the connection and cancels the
 // command if the client disconnects.
 func Serve(ctx context.Context, connection io.ReadWriteCloser, root, prologue string, alpha bool) error {
-	// Report that the route has reached an executing endpoint.
-	if err := writeMessage(connection, &status{}); err != nil {
+	// Report that the route has reached an executing endpoint, along with the
+	// protocol features that it supports.
+	if err := writeMessage(connection, &status{Features: executorFeatures}); err != nil {
 		connection.Close()
 		return fmt.Errorf("unable to send route status: %w", err)
 	}
