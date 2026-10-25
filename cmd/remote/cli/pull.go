@@ -365,11 +365,23 @@ func (s *pullSummary) merge(source, destination, display string) {
 	// Compare the staged file's actual time so that the destination
 	// filesystem's precision is already accounted for. Even metadata-only
 	// changes replace the file atomically: changing the destination's time
-	// directly would follow symbolic links and modify other hard links.
+	// directly would follow symbolic links and modify other hard links. Since
+	// only the time is meant to change, such a replacement takes the
+	// destination's permissions, which may be stricter than the staged file's
+	// default ones (sameEntries already compared executability). It's still a
+	// new file, so it doesn't share the destination's hard links, owner, or
+	// extended attributes.
 	metadataChanged := same && sourceInfo.Mode().IsRegular() && !sourceInfo.ModTime().Equal(destinationInfo.ModTime())
 	if same && !metadataChanged {
 		s.unchanged++
-	} else if err := os.Rename(source, destination); err != nil {
+		return
+	} else if metadataChanged {
+		if err := os.Chmod(source, destinationInfo.Mode().Perm()); err != nil {
+			problem("couldn't be replaced: unable to keep its permissions: %v", err)
+			return
+		}
+	}
+	if err := os.Rename(source, destination); err != nil {
 		problem("couldn't be replaced: %v", err)
 	} else if metadataChanged {
 		s.metadataUpdated++

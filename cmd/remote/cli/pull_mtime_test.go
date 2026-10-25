@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -30,7 +31,7 @@ func TestPullModificationTimes(t *testing.T) {
 	mtime := time.Unix(1700000000, 876543210)
 	expected := make(map[string]time.Time)
 	for _, path := range []string{"results/replaced", "results/metadata", "results/sub/added"} {
-		expected[path] = setPullModificationTime(t, filepath.Join(beta, filepath.FromSlash(path)), mtime).Round(time.Second)
+		expected[path] = setPullModificationTime(t, filepath.Join(beta, filepath.FromSlash(path)), mtime).Truncate(time.Second)
 	}
 	setPullModificationTime(t, filepath.Join(alpha, "results", "metadata"), mtime.Add(-time.Hour))
 
@@ -104,5 +105,37 @@ func TestPullModificationTimeLinks(t *testing.T) {
 				t.Fatalf("original contents changed: %q, %v", data, err)
 			}
 		})
+	}
+}
+
+func TestPullMetadataUpdatePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows only records whether files are read-only")
+	}
+	// A metadata-only update keeps the local file's permissions, even when
+	// they're stricter than the staged copy's default ones, while a content
+	// change takes the staged copy's permissions as before.
+	for _, test := range []struct {
+		contents string
+		expected os.FileMode
+	}{{"same", 0600}, {"different", 0644}} {
+		directory := t.TempDir()
+		source, destination := filepath.Join(directory, "staged"), filepath.Join(directory, "destination")
+		writeFiles(t, directory, map[string]string{"staged": test.contents, "destination": "same"})
+		for path, mode := range map[string]os.FileMode{source: 0644, destination: 0600} {
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+		}
+		setPullModificationTime(t, source, time.Unix(1700000000, 0))
+		summary := &pullSummary{}
+		summary.merge(source, destination, "destination")
+		if len(summary.problems) != 0 || summary.metadataUpdated+summary.replaced != 1 {
+			t.Fatalf("incorrect merge of %q: %s, %v", test.contents, summary, summary.problems)
+		} else if info, err := os.Stat(destination); err != nil {
+			t.Fatal(err)
+		} else if info.Mode().Perm() != test.expected {
+			t.Errorf("%q: permissions %v, expected %v", test.contents, info.Mode().Perm(), test.expected)
+		}
 	}
 }

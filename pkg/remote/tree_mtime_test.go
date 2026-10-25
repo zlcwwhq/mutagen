@@ -34,7 +34,7 @@ func TestArchiveModificationTimes(t *testing.T) {
 		} else if info, err := os.Stat(source); err != nil {
 			t.Fatal(err)
 		} else {
-			expected[path] = info.ModTime().Round(time.Second)
+			expected[path] = info.ModTime().Truncate(time.Second)
 		}
 	}
 	if changed, err := Snapshot(ctx, root, "files"); err != nil || !SameContents(original, changed) {

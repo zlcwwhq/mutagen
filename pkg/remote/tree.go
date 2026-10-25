@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 )
@@ -82,10 +83,12 @@ func snapshotLeaf(ctx context.Context, root *os.Root, path, name string, info os
 		var output io.Writer = io.Discard
 		if archive != nil {
 			header.Typeflag, header.Size = tar.TypeReg, info.Size()
-			// Keep the default format, which rounds modification times to
-			// seconds. PAX subsecond times add 1 KiB per file, doubling the
-			// archive size for small files.
-			header.ModTime = info.ModTime()
+			// Keep the default format, which stores whole seconds: PAX
+			// subsecond times add 1 KiB per file, doubling the archive size
+			// for small files. Truncate rather than let the writer round, so
+			// that a copy is never newer than its source, which tools such as
+			// make would take for an up-to-date output.
+			header.ModTime = info.ModTime().Truncate(time.Second)
 			if err := archive.WriteHeader(header); err != nil {
 				return nil, err
 			}
@@ -178,7 +181,7 @@ func Snapshot(ctx context.Context, directory, path string) (*Entry, error) {
 
 // ArchiveEntry writes an archive of the entry at a slash-separated path
 // relative to a root (see openFile) to output and returns its snapshot. Regular
-// file modification times are preserved to the nearest second and don't
+// file modification times are preserved, truncated to whole seconds, and don't
 // participate in snapshots or content comparisons.
 func ArchiveEntry(ctx context.Context, directory, path string, output io.Writer) (*Entry, error) {
 	root, path, _, err := openFile(directory, path)

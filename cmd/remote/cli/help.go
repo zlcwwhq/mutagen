@@ -134,11 +134,14 @@ values: ~/ means the executing user's home; older records show unknown.
     session ignores, and never one at the path itself, which a pulled file or
     link replaces.
   - --pull preserves regular files' modification times, including files in
-    directories, rounded to the nearest second. Times use the executing
-    endpoint's clock; clock skew is preserved. Directory and link times and
-    access/change times aren't preserved. Identical contents with a changed
-    mtime are atomically replaced and counted as metadata updated; repeated
-    pulls leave identical files and times unchanged.
+    directories, truncated to whole seconds, so copies are never newer than
+    their sources. Times use the executing endpoint's clock; clock skew is
+    preserved. Directory and link times and access/change times aren't
+    preserved. Added and replaced files get default permissions (executable
+    if the remote copy is). Identical contents with a changed mtime are
+    atomically replaced, keeping local permissions but not hard links, owner,
+    or extended attributes, and counted as metadata updated; repeated pulls
+    leave identical files and times unchanged.
   - --pull also refuses paths that another session synchronizes, whether or
     not that session runs remote commands, but it only knows sessions whose
     endpoints on this system are connected and run by this version of

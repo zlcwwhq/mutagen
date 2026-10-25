@@ -419,10 +419,13 @@ elsewhere in the root, only if the session also ignores where they lead.
 `--pull` only follows links that the session ignores, and never one at the path
 itself, which a pulled file or link replaces. Regular files, including files
 inside pulled directories, retain the executing copy's modification time,
-rounded to the nearest second. Clock skew between endpoints is preserved.
-Directory and symbolic-link timestamps, atime, and ctime aren't preserved.
-Files with identical contents but different mtime are atomically replaced
-and counted as `metadata updated`; another pull leaves matching files unchanged.
+truncated to whole seconds, so a copy is never newer than its source. Clock
+skew between endpoints is preserved. Directory and symbolic-link timestamps,
+atime, and ctime aren't preserved. Added and replaced files get default
+permissions, executable if the remote copy is. Files with identical contents
+but different mtime are atomically replaced, keeping their local permissions
+(but not hard links, owner, or extended attributes), and counted as
+`metadata updated`; another pull leaves matching files unchanged.
 
 After each flush, `remote` also warns about content that the session couldn't
 synchronize: conflicts (paths modified on both endpoints, which aren't
