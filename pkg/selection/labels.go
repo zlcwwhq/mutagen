@@ -9,6 +9,11 @@ import (
 	k8svalidation "github.com/mutagen-io/mutagen/pkg/selection/internal/third_party/apimachinery/util/validation"
 )
 
+// ProjectLabelKey identifies the project that owns an orchestrated session.
+// It lives with shared selection metadata so session validation and project
+// orchestration agree without depending on one another.
+const ProjectLabelKey = "io.mutagen.project"
+
 // LabelSelector is a type that performs matching against a set of labels.
 type LabelSelector interface {
 	// Matches checks whether or not a set of labels is matched by the selector.

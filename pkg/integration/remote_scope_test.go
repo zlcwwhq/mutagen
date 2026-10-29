@@ -42,7 +42,7 @@ func TestRemotePullOtherSession(t *testing.T) {
 		&url.URL{Protocol: netpipe.Protocol_Netpipe, Path: copyRoot},
 		&synchronization.Configuration{WatchMode: synchronization.WatchMode_WatchModeNoWatch},
 		&synchronization.Configuration{}, &synchronization.Configuration{},
-		"pull-inner", nil, false, "",
+		"pull-inner", nil, nil, false, "",
 	)
 	if err != nil {
 		t.Fatal(err)

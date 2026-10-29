@@ -315,7 +315,7 @@ func TestReplaceExclusion(t *testing.T) {
 	defer cancel()
 	replace := func(ctx context.Context, result string, sequence uint64) error {
 		client, server := net.Pipe()
-		go Serve(ctx, server, root, "", false)
+		go Serve(ctx, server, root, "", false, "")
 		replacement := &Replacement{
 			Path:     "file",
 			Expected: []*Entry{contentsEntry("local\n"), contentsEntry("remote\n"), contentsEntry("merged\n")},

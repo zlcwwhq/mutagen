@@ -95,6 +95,8 @@ type SynchronizationConfiguration struct {
 
 // Configuration is the orchestration configuration object type.
 type Configuration struct {
+	// Tree declares a directory workspace tree, expanded into pair sessions.
+	Tree *TreeConfiguration `yaml:"tree"`
 	// BeforeCreate are setup commands to be run before session creation.
 	BeforeCreate []string `yaml:"beforeCreate"`
 	// AfterCreate are setup commands to be run after session creation.

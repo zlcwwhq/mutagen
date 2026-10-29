@@ -27,6 +27,8 @@ type Session struct {
 	Name string `json:"name,omitempty"`
 	// Label are the session labels.
 	Labels map[string]string `json:"labels,omitempty"`
+	// Tree identifies the session as an edge of a workspace tree, if it is one.
+	Tree *TreeMembership `json:"tree,omitempty"`
 	// Paused indicates whether or not the session is paused.
 	Paused bool `json:"paused"`
 	// Status is the session status.
@@ -34,6 +36,20 @@ type Session struct {
 	// SessionState stores state fields relevant to running sessions. It is
 	// non-nil if and only if the session is unpaused.
 	*SessionState
+}
+
+// TreeMembership identifies a session as the edge of a workspace tree that
+// joins a parent node, the session's alpha, to a child node, its beta.
+type TreeMembership struct {
+	// Identifier identifies the tree, which is the identifier of the project
+	// that declares it.
+	Identifier string `json:"identifier"`
+	// Root names the tree's structural root node.
+	Root string `json:"root"`
+	// Parent names the node whose workspace is the session's alpha.
+	Parent string `json:"parent"`
+	// Child names the node whose workspace is the session's beta.
+	Child string `json:"child"`
 }
 
 // SessionState encodes fields relevant to unpaused sessions.
@@ -67,6 +83,14 @@ func (s *Session) loadFromInternal(state *synchronization.State) {
 	)
 	s.Name = state.Session.Name
 	s.Labels = state.Session.Labels
+	if tree := state.Session.Tree; tree != nil {
+		s.Tree = &TreeMembership{
+			Identifier: tree.Identifier,
+			Root:       tree.Root,
+			Parent:     tree.Alpha,
+			Child:      tree.Beta,
+		}
+	}
 	s.Paused = state.Session.Paused
 	s.Status = state.Status
 

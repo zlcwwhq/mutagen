@@ -283,6 +283,10 @@ func relaySession(t *testing.T, session string, alpha, beta string, ignores *rem
 				defer routes.Done()
 				if header, err := remote.ReceiveSubmission(context.Background(), submission); err != nil {
 					remote.Reject(submission, err)
+				} else if !replyTestRoute(submission, header, session) {
+					return
+				} else if header.Operation == remote.OperationNodes {
+					replyTestNodes(submission, session, alpha, beta)
 				} else if header.Operation != remote.OperationExecute {
 					remote.Reject(submission, errors.New("unsupported operation"))
 				} else if execution, err := executing.Open(context.Background()); err != nil {

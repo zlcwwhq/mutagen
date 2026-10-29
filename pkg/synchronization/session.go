@@ -74,6 +74,5 @@ func (s *Session) EnsureValid() error {
 		}
 	}
 
-	// Success.
-	return nil
+	return validateTreeMembership(s)
 }

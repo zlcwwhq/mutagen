@@ -58,34 +58,20 @@ func TestParseTimeout(t *testing.T) {
 	}
 }
 
-func TestParseSessions(t *testing.T) {
-	if options, err := parse([]string{"--sessions"}); err != nil || !options.sessions {
-		t.Fatal("--sessions rejected:", err)
-	}
-	for _, arguments := range [][]string{{"--sessions", "true"}, {"--sessions", "-s", "name"}, {"--sessions", "--flush"}, {"--sessions", "--conflicts"}} {
-		if _, err := parse(arguments); err == nil {
-			t.Errorf("invalid arguments accepted: %v", arguments)
+func TestParseNodesAndDeprecatedSelectors(t *testing.T) {
+	for _, args := range [][]string{{"--nodes"}, {"--nodes", "--json"}} {
+		if options, err := parse(args); err != nil || !options.nodes {
+			t.Fatalf("nodes rejected: %v", err)
 		}
 	}
-}
-
-func TestWarnOverlapping(t *testing.T) {
-	var output strings.Builder
-	warnOverlapping(&output, &remote.Target{Session: "sync_inner", Name: "inner"})
-	if output.Len() != 0 {
-		t.Fatal("warned without overlapping sessions:", output.String())
+	for _, args := range [][]string{{"--nodes", "true"}, {"--nodes", "--node", "gpu"}, {"--nodes", "--flush"}, {"--nodes", "--conflicts"}} {
+		if _, err := parse(args); err == nil {
+			t.Fatalf("invalid arguments accepted: %v", args)
+		}
 	}
-	for _, test := range []struct {
-		overlapping []string
-		expected    string
-	}{
-		{[]string{"gpu1", "gpu2"}, "remote: warning: sessions gpu1 and gpu2 both synchronize the current directory; using gpu1 (select one with -s)\n"},
-		{[]string{"gpu1", "sync_x", "gpu3"}, "remote: warning: sessions gpu1, sync_x, and gpu3 all synchronize the current directory; using gpu1 (select one with -s)\n"},
-	} {
-		output.Reset()
-		warnOverlapping(&output, &remote.Target{Overlapping: test.overlapping})
-		if output.String() != test.expected {
-			t.Errorf("incorrect warning: %q", output.String())
+	for _, args := range [][]string{{"--sessions"}, {"--session", "x", "true"}, {"-s", "x", "true"}, {"--session=x", "--help"}} {
+		if _, err := parse(args); err == nil || !strings.Contains(err.Error(), "deprecated") || !strings.Contains(err.Error(), "--nodes") {
+			t.Fatalf("missing migration error: %v %v", args, err)
 		}
 	}
 }
@@ -149,7 +135,7 @@ func TestHelp(t *testing.T) {
 
 	// Every listed topic has its own help.
 	expectations := map[string][]string{
-		"sessions":    {"MUTAGEN_REMOTE_SESSION"},
+		"nodes":       {"--nodes", "--node"},
 		"sync":        {fmt.Sprintf("take over %d seconds", ProgressDelay/time.Second), "--progress=false", fmt.Sprintf("every %d seconds", progressLineInterval/time.Second), "staging on alpha"},
 		"termination": {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second)},
 		"jobs":        {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second), "--log FILE", "[--follow]", "--follow prints the log", "status 124"},
@@ -182,6 +168,9 @@ func TestHelp(t *testing.T) {
 	}
 	conflicts := output.String()
 	options.flags.VisitAll(func(flag *pflag.Flag) {
+		if flag.Hidden {
+			return
+		}
 		text := help
 		if options.conflictFlags.Lookup(flag.Name) != nil {
 			text = conflicts
@@ -195,15 +184,12 @@ func TestHelp(t *testing.T) {
 	}
 }
 
-func TestSessionEnvironmentDefault(t *testing.T) {
-	// The environment variable is only a default, which can't redirect
-	// submissions from inside another session's root, so it's kept separate
-	// from an explicit selection, which takes precedence.
+func TestSessionEnvironmentDeprecated(t *testing.T) {
 	t.Setenv("MUTAGEN_REMOTE_SESSION", "from-environment")
-	if options, err := parse([]string{"true"}); err != nil || options.session != "" || options.defaultSession != "from-environment" {
-		t.Fatalf("session environment variable parsed incorrectly: %+v, %v", options, err)
-	} else if options, err := parse([]string{"-s", "explicit", "true"}); err != nil || options.session != "explicit" || options.defaultSession != "" {
-		t.Fatalf("explicit session did not take precedence: %+v, %v", options, err)
+	for _, args := range [][]string{{"true"}, {"--node", "beta", "true"}, {"--nodes"}} {
+		if _, err := parse(args); err == nil || !strings.Contains(err.Error(), "deprecated") {
+			t.Fatalf("deprecated default accepted: %v", err)
+		}
 	}
 }
 
@@ -218,7 +204,7 @@ func TestRunFailures(t *testing.T) {
 	for _, arguments := range [][]string{{"true"}, {"--no-flush", "true"}, {"--flush"}, {"--diff"}} {
 		errorOutput.Reset()
 		if code := Run(arguments, strings.NewReader(""), &output, &errorOutput); code != connectionExitCode ||
-			strings.Count(errorOutput.String(), "no connected session") != 1 || strings.Contains(errorOutput.String(), "remote: warning:") {
+			strings.Count(errorOutput.String(), "no connected node") != 1 || strings.Contains(errorOutput.String(), "remote: warning:") {
 			t.Fatalf("missing session not reported by %v: %d, %q", arguments, code, errorOutput.String())
 		}
 	}
@@ -253,22 +239,22 @@ func TestParseModes(t *testing.T) {
 	// Each mode accepts its own options and arguments.
 	for _, arguments := range [][]string{
 		{"--jobs"},
-		{"-s", "name", "--jobs"},
+		{"--node", "name", "--jobs"},
 		{"--wait", "0123abcd"},
 		{"--wait", "0123abcd", "--tail", "20", "--no-flush"},
 		{"--wait", "0123abcd", "--tail", "0"},
 		{"--wait", "0123abcd", "--follow"},
 		{"--wait", "0123abcd", "--follow=false"},
-		{"--follow", "--tail", "20", "--wait", "0123abcd", "--timeout", "1h", "--no-flush", "-s", "name"},
+		{"--follow", "--tail", "20", "--wait", "0123abcd", "--timeout", "1h", "--no-flush", "--node", "name"},
 		{"--wait", "0123abcd", "--follow", "--tail", "0"},
-		{"--wait", "0123abcd", "--timeout", "10", "--no-flush", "-s", "name"},
+		{"--wait", "0123abcd", "--timeout", "10", "--no-flush", "--node", "name"},
 		{"--kill", "0123abcd", "--timeout", "10"},
 		{"--kill", "0123abcd", "--no-flush"},
-		{"--no-flush", "--kill", "0123abcd", "--timeout", "10", "-s", "name"},
+		{"--no-flush", "--kill", "0123abcd", "--timeout", "10", "--node", "name"},
 		{"--ignores"},
 		{"--ignores", "results", "a.log"},
 		{"--pull", "results", "a.log"},
-		{"-s", "name", "--timeout", "1m", "--pull", "results"},
+		{"--node", "name", "--timeout", "1m", "--pull", "results"},
 		{"--detach", "python", "train.py"},
 		{"--detach", "--log", "train.log", "-C", "sub", "-e", "X=1", "--no-flush", "--no-prologue", "python"},
 		{"--script", "-"},
@@ -316,7 +302,7 @@ func TestParseModes(t *testing.T) {
 		{[]string{"--script", "sweep.sh", "--help", "x"}, []string{"--help", "x"}},
 		{[]string{"--script=sweep.sh", "--lr", "3e-4"}, []string{"--lr", "3e-4"}},
 		{[]string{"-e", "--script", "--script", "-", "-e", "X"}, []string{"-e", "X"}},
-		{[]string{"-sname", "-C", "sub", "--no-flush", "--script", "-"}, nil},
+		{[]string{"--node=name", "-C", "sub", "--no-flush", "--script", "-"}, nil},
 		{[]string{"--script", "-", "--", "x"}, []string{"--", "x"}},
 	} {
 		options, err := parse(test.arguments)

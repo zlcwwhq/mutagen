@@ -423,9 +423,24 @@ func TestEndpointMaximumEntryCountRepeatedRefusal(t *testing.T) {
 	// Repeatedly change the second file on the source and propagate it. Each
 	// version is staged on the target before being refused, and none of them
 	// should remain in staging afterward.
+	//
+	// The versions have the same size and are written in place, so they keep
+	// the same file ID, and with coarse timestamps (e.g. on Linux without
+	// multigrain timestamps), consecutive writes can receive the same
+	// modification time. Scans rehash such recently modified files rather than
+	// reusing their racy digests (see core.CacheEntry.Racy), but this test is
+	// about entry count refusals rather than racy digests (which core tests
+	// cover), so we give each version a distinct modification time in the
+	// past, independently of timing. We use whole-second steps, which
+	// filesystems that store coarser timestamps still keep distinct.
+	modificationTime := time.Now().Add(-time.Hour).Truncate(time.Second)
 	for i := 0; i < 3; i++ {
 		version := fmt.Sprintf("version %d", i)
 		writeFiles(t, sourceRoot, map[string]string{"b": version})
+		modificationTime = modificationTime.Add(time.Second)
+		if err := os.Chtimes(filepath.Join(sourceRoot, "b"), modificationTime, modificationTime); err != nil {
+			t.Fatal("unable to set modification time:", err)
+		}
 		problems, err := propagate(t, source, target, nil)
 		if err != nil {
 			t.Fatal("unable to stage files:", err)

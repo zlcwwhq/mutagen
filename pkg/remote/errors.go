@@ -87,7 +87,12 @@ func receivedError(kind ErrorKind, cause error) error {
 
 // failedResult serializes an operation failure without losing its category.
 func failedResult(err error) result {
-	return result{Error: err.Error(), ErrorKind: ClassifyError(err)}
+	response := result{Error: err.Error(), ErrorKind: ClassifyError(err)}
+	var directory *DirectoryError
+	if errors.As(err, &directory) {
+		response.DirectoryError, response.Directory = directory.Kind, directory.Path
+	}
+	return response
 }
 
 // connectionReader and connectionWriter identify transport failures even when

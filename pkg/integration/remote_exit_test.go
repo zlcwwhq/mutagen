@@ -35,8 +35,8 @@ func TestRemoteExitInputStatus(t *testing.T) {
 		{"unset-environment", []string{"-e", unset, "true"}, 125, "not set"},
 		{"missing-environment-file", []string{"--env-file", missing, "true"}, 125, "environment file"},
 		{"missing-script", []string{"--script", missing}, 125, "script"},
-		{"invalid-selection", []string{"--no-flush", "-s", "mutagen-no-such-exit-test-session", "true"}, 125, "matching"},
-		{"unreachable-session", []string{"--no-flush", "true"}, 255, "no connected session"},
+		{"invalid-selection", []string{"--no-flush", "-s", "mutagen-no-such-exit-test-session", "true"}, 125, "deprecated"},
+		{"unreachable-session", []string{"--no-flush", "true"}, 255, "no connected node"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			code, output, errorOutput := runRemote(t, directory, test.arguments...)

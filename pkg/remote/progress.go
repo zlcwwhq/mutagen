@@ -63,20 +63,29 @@ func equalProgress(first, second *Progress) bool {
 // can send the final response, or at the first failure to send, such as when
 // the submitter abandons the wait, which doesn't affect synchronization.
 func ReportProgress(connection io.Writer, sample func() *Progress, interval, heartbeat time.Duration, stop <-chan struct{}) {
+	MonitorProgress(func(progress *Progress) error {
+		return writeMessage(connection, &progressMessage{Progress: progress})
+	}, sample, interval, heartbeat, stop)
+}
+
+// MonitorProgress sends sampled progress through a caller's structured
+// transport, using the same sampling and heartbeat policy as flush reporting.
+// It stops on the first transport error, allowing callers to cancel their wait.
+func MonitorProgress(emit func(*Progress) error, sample func() *Progress, interval, heartbeat time.Duration, stop <-chan struct{}) error {
 	// Send the first sample.
 	var last *Progress
 	var sent time.Time
-	send := func(progress *Progress) bool {
+	send := func(progress *Progress) error {
 		if progress == nil {
-			return true
-		} else if err := writeMessage(connection, &progressMessage{Progress: progress}); err != nil {
-			return false
+			return nil
+		} else if err := emit(progress); err != nil {
+			return err
 		}
 		last, sent = progress, time.Now()
-		return true
+		return nil
 	}
-	if !send(sample()) {
-		return
+	if err := send(sample()); err != nil {
+		return err
 	}
 
 	// Send later samples that differ from the last one, or are due as
@@ -86,14 +95,14 @@ func ReportProgress(connection io.Writer, sample func() *Progress, interval, hea
 	for {
 		select {
 		case <-stop:
-			return
+			return nil
 		case <-ticker.C:
 		}
 		progress := sample()
 		if equalProgress(progress, last) && time.Since(sent) < heartbeat {
 			continue
-		} else if !send(progress) {
-			return
+		} else if err := send(progress); err != nil {
+			return err
 		}
 	}
 }

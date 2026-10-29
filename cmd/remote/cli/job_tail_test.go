@@ -40,7 +40,7 @@ func TestWaitJobTail(t *testing.T) {
 				t.Fatal(err)
 			}
 			var output, errors bytes.Buffer
-			code := Run([]string{"-s", "sync_outer", "--wait", job.ID, "--tail", "1", "--no-flush"}, strings.NewReader(""), &output, &errors)
+			code := Run([]string{"--node", "beta", "--wait", job.ID, "--tail", "1", "--no-flush"}, strings.NewReader(""), &output, &errors)
 			if code != 7 || !strings.Contains(errors.String(), "exited with status 7") {
 				t.Fatalf("job status wasn't preserved: %d, %q", code, errors.String())
 			}
@@ -64,7 +64,7 @@ func TestWaitJobTail(t *testing.T) {
 				}
 				output.Reset()
 				errors.Reset()
-				code := Run([]string{"-s", "sync_outer", "--wait", job.ID, "--tail", "1", "--no-flush"}, strings.NewReader(""), &output, &errors)
+				code := Run([]string{"--node", "beta", "--wait", job.ID, "--tail", "1", "--no-flush"}, strings.NewReader(""), &output, &errors)
 				if code != failureExitCode || output.String() != "last\n" || !strings.Contains(errors.String(), "without recording its exit status") {
 					t.Fatalf("lost job result changed: %d, %q, %q", code, output.String(), errors.String())
 				}
@@ -112,7 +112,7 @@ func TestWaitJobTailTimeout(t *testing.T) {
 		{[]string{"--follow", "--tail", "0"}, "", false},
 	} {
 		var output, errors bytes.Buffer
-		arguments := append([]string{"-s", "sync_outer", "--wait", job.ID, "--no-flush", "--timeout", "1"}, test.options...)
+		arguments := append([]string{"--node", "beta", "--wait", job.ID, "--no-flush", "--timeout", "1"}, test.options...)
 		started := time.Now()
 		if code := Run(arguments, strings.NewReader(""), &output, &errors); code != timeoutExitCode || output.String() != test.output || errors.String() != report {
 			t.Fatalf("incorrect timed out wait with %v: %d, %q, %q", test.options, code, output.String(), errors.String())
@@ -124,7 +124,7 @@ func TestWaitJobTailTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output, errors bytes.Buffer
-	if code := Run([]string{"-s", "sync_outer", "--wait", job.ID, "--tail", "1", "--no-flush"}, strings.NewReader(""), &output, &errors); code != 0 || output.String() != "finished\n" {
+	if code := Run([]string{"--node", "beta", "--wait", job.ID, "--tail", "1", "--no-flush"}, strings.NewReader(""), &output, &errors); code != 0 || output.String() != "finished\n" {
 		t.Fatalf("wait couldn't be resumed: %d, %q, %q", code, output.String(), errors.String())
 	}
 }
@@ -222,7 +222,7 @@ func TestWaitJobFollow(t *testing.T) {
 			// The log is printed while the job runs, or a log that can't be
 			// followed is reported once, and the job's status is preserved.
 			var output, errors syncBuffer
-			code := runInBackground([]string{"-s", "sync_outer", "--wait", job.ID, "--follow", "--no-flush"}, &output, &errors)
+			code := runInBackground([]string{"--node", "beta", "--wait", job.ID, "--follow", "--no-flush"}, &output, &errors)
 			if logPath == "/dev/null" {
 				errors.waitFor(t, "/dev/null is not a regular file")
 			} else {
@@ -259,7 +259,7 @@ func TestWaitJobFollow(t *testing.T) {
 				{nil, "first\nprogress\rlast"},
 			} {
 				var output, errors bytes.Buffer
-				arguments := append([]string{"-s", "sync_outer", "--wait", job.ID, "--follow", "--no-flush"}, test.options...)
+				arguments := append([]string{"--node", "beta", "--wait", job.ID, "--follow", "--no-flush"}, test.options...)
 				if code := Run(arguments, strings.NewReader(""), &output, &errors); code != 7 || output.String() != test.output {
 					t.Fatalf("incorrect follow of an ended job with %v: %d, %q, %q", test.options, code, output.String(), errors.String())
 				}
@@ -298,6 +298,10 @@ func relayDroppableSession(t *testing.T, session string, alpha, beta string) fun
 				defer routes.Done()
 				if header, err := remote.ReceiveSubmission(context.Background(), submission); err != nil {
 					remote.Reject(submission, err)
+				} else if !replyTestRoute(submission, header, session) {
+					return
+				} else if header.Operation == remote.OperationNodes {
+					replyTestNodes(submission, session, alpha, beta)
 				} else if header.Operation != remote.OperationExecute {
 					remote.Reject(submission, errors.New("unsupported operation"))
 				} else if execution, err := executing.Open(context.Background()); err != nil {
@@ -338,7 +342,7 @@ func TestWaitJobFollowReconnect(t *testing.T) {
 	drop := relayDroppableSession(t, "sync_follow", t.TempDir(), beta)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	connection, _, err := remote.Dial(ctx, beta, "sync_follow", remote.OperationExecute)
+	connection, _, err := (&remote.Selection{Target: &remote.Target{SourceSession: "sync_follow", SourceAlpha: true}}).Dial(ctx, beta, remote.OperationExecute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +359,7 @@ func TestWaitJobFollowReconnect(t *testing.T) {
 	// remote retry, and the retried wait resumes where the lost one stopped,
 	// so that no output is repeated or skipped.
 	var output, errors syncBuffer
-	code := runInBackground([]string{"-s", "sync_follow", "--wait", job.ID, "--follow", "--no-flush"}, &output, &errors)
+	code := runInBackground([]string{"--node", "beta", "--wait", job.ID, "--follow", "--no-flush"}, &output, &errors)
 	output.waitFor(t, "one\n")
 	drop()
 	errors.waitFor(t, "so remote retries for up to")
@@ -379,7 +383,7 @@ func TestDetachIgnoredLogWarning(t *testing.T) {
 		{"train.log", false},
 	} {
 		var output, errors bytes.Buffer
-		arguments := []string{"-s", "sync_outer", "--detach", "--log", test.log, "--no-flush", "sh", "-c", "printf 'done\\n'"}
+		arguments := []string{"--node", "beta", "--detach", "--log", test.log, "--no-flush", "sh", "-c", "printf 'done\\n'"}
 		if code := Run(arguments, strings.NewReader(""), &output, &errors); code != 0 {
 			t.Fatalf("unable to start job: %d, %q", code, errors.String())
 		}
@@ -393,7 +397,7 @@ func TestDetachIgnoredLogWarning(t *testing.T) {
 		}
 		output.Reset()
 		errors.Reset()
-		if code := Run([]string{"-s", "sync_outer", "--wait", id, "--tail", "1", "--no-flush"}, strings.NewReader(""), &output, &errors); code != 0 || output.String() != "done\n" {
+		if code := Run([]string{"--node", "beta", "--wait", id, "--tail", "1", "--no-flush"}, strings.NewReader(""), &output, &errors); code != 0 || output.String() != "done\n" {
 			t.Fatalf("suggested wait didn't print the log: %d, %q, %q", code, output.String(), errors.String())
 		}
 	}

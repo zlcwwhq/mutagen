@@ -33,7 +33,7 @@ func TestPrintIgnores(t *testing.T) {
 	var output, errorOutput strings.Builder
 	if code, err := printIgnores(pinnedRouter(target, &errorOutput), nil, &output); err != nil || code != 0 {
 		t.Fatalf("listing failed: %d, %v", code, err)
-	} else if !strings.HasPrefix(output.String(), "Session gpu ignores (Mutagen syntax):\n  results/\n  *.log\n  VCS directories") {
+	} else if !strings.HasPrefix(output.String(), "Node gpu ignores (Mutagen syntax):\n  results/\n  *.log\n  VCS directories") {
 		t.Fatalf("incorrect listing: %q", output.String())
 	}
 
@@ -71,7 +71,7 @@ func TestPrintIgnores(t *testing.T) {
 	// Sessions may ignore nothing.
 	output.Reset()
 	target.Ignores = &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen}
-	if _, err := printIgnores(pinnedRouter(target, &errorOutput), nil, &output); err != nil || output.String() != "Session gpu ignores nothing.\n" {
+	if _, err := printIgnores(pinnedRouter(target, &errorOutput), nil, &output); err != nil || output.String() != "Node gpu ignores nothing.\n" {
 		t.Fatalf("incorrect listing: %q, %v", output.String(), err)
 	}
 }

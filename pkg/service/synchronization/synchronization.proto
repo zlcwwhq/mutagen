@@ -6,6 +6,7 @@ option go_package = "github.com/mutagen-io/mutagen/pkg/service/synchronization";
 
 import "selection/selection.proto";
 import "synchronization/configuration.proto";
+import "synchronization/session.proto";
 import "synchronization/state.proto";
 import "url/url.proto";
 
@@ -32,6 +33,9 @@ message CreationSpecification {
     map<string, string> labels = 7;
     // Paused indicates whether or not to create the session pre-paused.
     bool paused = 8;
+    // Tree identifies the session as an edge of a workspace tree, if non-nil.
+    // Only project orchestration sets it (see synchronization.Session.Tree).
+    synchronization.TreeMembership tree = 9;
 }
 
 // CreateRequest encodes a request for session creation.

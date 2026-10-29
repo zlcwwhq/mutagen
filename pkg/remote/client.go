@@ -34,7 +34,13 @@ func commandMultiplexerConfiguration() *multiplexing.Configuration {
 // error wrapping ErrConnectionLost. The caller must unblock a blocking stdin
 // reader after return if it needs to reclaim the input forwarding goroutine.
 func Execute(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
-	response, err := execute(ctx, connection, request, stdin, stdout, stderr)
+	return ExecuteWithEvents(ctx, connection, request, stdin, stdout, stderr, nil)
+}
+
+// ExecuteWithEvents is Execute with structured synchronization updates from a
+// coordinating daemon. Command output remains confined to stdout and stderr.
+func ExecuteWithEvents(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer, event func(*CommandEvent)) (int, error) {
+	response, err := executeWithEvents(ctx, connection, request, stdin, stdout, stderr, event)
 	if err != nil {
 		return 0, err
 	} else if response.Error != "" {
@@ -45,10 +51,14 @@ func Execute(ctx context.Context, connection io.ReadWriteCloser, request *Reques
 
 // execute implements Execute, returning the result sent by the executor.
 func execute(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer) (*result, error) {
+	return executeWithEvents(ctx, connection, request, stdin, stdout, stderr, nil)
+}
+
+func executeWithEvents(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer, event func(*CommandEvent)) (*result, error) {
 	if _, err := connect(ctx, connection); err != nil {
 		return nil, err
 	}
-	return exchange(ctx, connection, request, stdin, stdout, stderr)
+	return exchangeWithEvents(ctx, connection, request, stdin, stdout, stderr, event)
 }
 
 // connect waits for a route to reach an executing endpoint and returns the
@@ -76,6 +86,10 @@ func connect(ctx context.Context, connection io.ReadWriteCloser) (*status, error
 // (see connect), forwards the command's streams, and returns the result sent
 // by the executor. It owns and closes the connection.
 func exchange(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer) (*result, error) {
+	return exchangeWithEvents(ctx, connection, request, stdin, stdout, stderr, nil)
+}
+
+func exchangeWithEvents(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer, event func(*CommandEvent)) (*result, error) {
 	// Keep control and all three standard streams independent so that blocked
 	// command input cannot prevent output, exit status, or cancellation.
 	mux := multiplexing.Multiplex(multiplexing.NewCarrierFromStream(connection), true, commandMultiplexerConfiguration())
@@ -127,7 +141,17 @@ func exchange(ctx context.Context, connection io.ReadWriteCloser, request *Reque
 	// Wait for both output streams before acknowledging the result. This keeps
 	// the server alive until its final buffered output has been received.
 	var response result
-	responseErr := readMessage(control, &response)
+	var responseErr error
+	for {
+		response = result{}
+		responseErr = readMessage(control, &response)
+		if responseErr != nil || response.Event == nil {
+			break
+		}
+		if event != nil {
+			event(response.Event)
+		}
+	}
 	if responseErr != nil {
 		mux.Close()
 	}

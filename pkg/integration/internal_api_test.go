@@ -64,6 +64,7 @@ func testSessionLifecycle(ctx context.Context, prompter string, alpha, beta *url
 		&synchronization.Configuration{},
 		"testSynchronizationSession",
 		nil,
+		nil,
 		false,
 		prompter,
 	)

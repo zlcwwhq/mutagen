@@ -93,15 +93,18 @@ func printIgnores(router *router, paths []string, output io.Writer) (int, error)
 	if target.Name != "" {
 		session = terminal.NeutralizeControlCharacters(target.Name)
 	}
+	if target.SourceNode != "" {
+		session = terminal.NeutralizeControlCharacters(target.SourceNode)
+	}
 	if len(paths) == 0 {
 		if ignores == nil {
-			fmt.Fprintf(output, "The ignores of session %s aren't known.\n", session)
+			fmt.Fprintf(output, "The ignores of node %s aren't known.\n", session)
 			return 0, nil
 		} else if len(ignores.Patterns) == 0 && !ignores.VCS {
-			fmt.Fprintf(output, "Session %s ignores nothing.\n", session)
+			fmt.Fprintf(output, "Node %s ignores nothing.\n", session)
 			return 0, nil
 		}
-		fmt.Fprintf(output, "Session %s ignores (%s syntax):\n", session, ignores.Syntax.Description())
+		fmt.Fprintf(output, "Node %s ignores (%s syntax):\n", session, ignores.Syntax.Description())
 		for _, pattern := range ignores.Patterns {
 			fmt.Fprintf(output, "  %s\n", terminal.NeutralizeControlCharacters(pattern))
 		}

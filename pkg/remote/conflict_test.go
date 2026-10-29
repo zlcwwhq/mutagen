@@ -32,7 +32,7 @@ func TestCopyAndReplace(t *testing.T) {
 	defer cancel()
 	route := func() net.Conn {
 		client, server := net.Pipe()
-		go Serve(ctx, server, root, "", false)
+		go Serve(ctx, server, root, "", false, "")
 		return client
 	}
 

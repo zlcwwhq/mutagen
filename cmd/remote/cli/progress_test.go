@@ -304,6 +304,13 @@ func TestProgressFlush(t *testing.T) {
 				submission.Close()
 				continue
 			}
+			if !replyTestRoute(submission, header, "sync_progress") {
+				continue
+			}
+			if header.Operation == remote.OperationNodes {
+				replyTestNodes(submission, "sync_progress", root, root)
+				continue
+			}
 			requested <- header.Progress
 			if reporting.Load() && header.Progress {
 				stop := make(chan struct{})

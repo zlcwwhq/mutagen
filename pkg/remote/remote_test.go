@@ -102,7 +102,7 @@ func executeInRootTest(t *testing.T, ctx context.Context, root, prologue string,
 	t.Helper()
 	client, server := net.Pipe()
 	served := make(chan error, 1)
-	go func() { served <- Serve(context.Background(), server, root, prologue, false) }()
+	go func() { served <- Serve(context.Background(), server, root, prologue, false, "") }()
 	if input == nil {
 		input = strings.NewReader("")
 	}
@@ -233,7 +233,7 @@ func TestExecuteConnectionLoss(t *testing.T) {
 	executorCtx, closeExecutor := context.WithCancel(context.Background())
 	defer closeExecutor()
 	served := make(chan error, 1)
-	go func() { served <- Serve(executorCtx, server, "", "", false) }()
+	go func() { served <- Serve(executorCtx, server, "", "", false, "") }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_, err := Execute(ctx, client, helperRequest(t, "wait"), strings.NewReader(""), &readyWriter{ready: closeExecutor}, io.Discard)
@@ -359,7 +359,7 @@ func TestFetch(t *testing.T) {
 	// included only up to the comparison limit.
 	for name, entry := range expected {
 		client, server := net.Pipe()
-		go Serve(context.Background(), server, root, "", false)
+		go Serve(context.Background(), server, root, "", false, "")
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		fetched, err := Fetch(ctx, client, name)
 		cancel()
@@ -387,7 +387,7 @@ func TestFetchFileRoot(t *testing.T) {
 	}
 	for _, path := range []string{"", "."} {
 		client, server := net.Pipe()
-		go Serve(context.Background(), server, root, "", false)
+		go Serve(context.Background(), server, root, "", false, "")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		entry, err := Fetch(ctx, client, path)
 		cancel()
@@ -597,7 +597,7 @@ func TestReceiveSubmission(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	for _, operation := range []Operation{OperationExecute, OperationFlush, OperationConflicts, OperationClaim, OperationRelease} {
+	for _, operation := range []Operation{OperationExecute, OperationFlush, OperationConflicts, OperationClaim, OperationRelease, OperationTreeExecute, OperationNodes, OperationNodeConflicts, OperationResolve} {
 		for _, progress := range []bool{false, true} {
 			sent := &Submission{Operation: operation, Progress: progress}
 			if received, err := receive(ctx, sent); err != nil || *received != *sent {
@@ -605,7 +605,7 @@ func TestReceiveSubmission(t *testing.T) {
 			}
 		}
 	}
-	if _, err := receive(ctx, &Submission{Operation: OperationRelease + 1}); err == nil {
+	if _, err := receive(ctx, &Submission{Operation: OperationResolve + 1}); err == nil {
 		t.Fatal("unsupported operation accepted")
 	}
 

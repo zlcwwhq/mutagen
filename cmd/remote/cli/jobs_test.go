@@ -30,7 +30,7 @@ func TestKillNoFlush(t *testing.T) {
 	defer cancel()
 	dial := func() io.ReadWriteCloser {
 		t.Helper()
-		connection, _, err := remote.Dial(ctx, root, "sync_kill", remote.OperationExecute)
+		connection, _, err := (&remote.Selection{Target: &remote.Target{SourceSession: "sync_kill", SourceAlpha: true}}).Dial(ctx, root, remote.OperationExecute)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -53,7 +53,7 @@ func TestKillNoFlush(t *testing.T) {
 	// Explicitly disabling --no-flush must also leave the behavior unchanged.
 	expected := "remote: job " + job.ID + " had already exited with status 0\n"
 	for _, option := range []string{"", "--no-flush", "--no-flush=false"} {
-		arguments := []string{"-s", "sync_kill", "--timeout", "10", "--kill", job.ID}
+		arguments := []string{"--node", "beta", "--timeout", "10", "--kill", job.ID}
 		if option != "" {
 			arguments = append(arguments, option)
 		}
@@ -147,7 +147,7 @@ func TestPrintJobs(t *testing.T) {
 	output.Reset()
 	if err := printJobs(&output, locator, "alpha", nil, 1); err != nil {
 		t.Fatal(err)
-	} else if output.String() != "No jobs were started at this session's root on alpha.\n(1 job started at another root on alpha isn't shown.)\n" {
+	} else if output.String() != "No jobs were started at this node's root on alpha.\n(1 job started at another root on alpha isn't shown.)\n" {
 		t.Fatalf("incorrect empty listing: %q", output.String())
 	}
 }

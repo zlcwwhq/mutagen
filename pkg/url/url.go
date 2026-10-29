@@ -134,7 +134,7 @@ func (u *URL) EnsureValid() error {
 		// If this is a Docker URL, we can actually do a bit of additional
 		// validation.
 		if u.Protocol == Protocol_Docker {
-			if !(u.Path[0] == '/' || u.Path[0] == '~' || isWindowsPath(u.Path)) {
+			if !(u.Path[0] == '/' || u.Path[0] == '~' || IsWindowsDrivePath(u.Path)) {
 				return errors.New("incorrect first path character")
 			}
 		}

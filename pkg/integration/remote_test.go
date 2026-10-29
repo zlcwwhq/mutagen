@@ -29,7 +29,7 @@ func runRemoteCommand(directory string, arguments ...string) (string, int, error
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		connection, target, err := remote.Dial(ctx, directory, "", remote.OperationExecute)
+		connection, target, err := (&remote.Selection{}).Dial(ctx, directory, remote.OperationExecute)
 		var output bytes.Buffer
 		var code int
 		if err == nil {
@@ -52,7 +52,7 @@ func flushRemote(directory string) (*remote.Report, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		connection, _, err := remote.Dial(ctx, directory, "", remote.OperationFlush)
+		connection, _, err := (&remote.Selection{}).Dial(ctx, directory, remote.OperationFlush)
 		var report *remote.Report
 		if err == nil {
 			report, err = remote.Flush(ctx, connection)
@@ -119,6 +119,7 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 		&synchronization.Configuration{RemotePrologue: alphaPrologue},
 		&synchronization.Configuration{RemotePrologue: "prologue.sh"},
 		"remoteCommands",
+		nil,
 		nil,
 		false,
 		"",
@@ -254,7 +255,7 @@ func TestRemoteCommandsInMemory(t *testing.T) {
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if _, _, err := remote.Dial(dialCtx, alphaRoot, "", remote.OperationExecute); err == nil {
+	if _, _, err := (&remote.Selection{}).Dial(dialCtx, alphaRoot, remote.OperationExecute); err == nil {
 		t.Fatal("registration remained after termination")
 	}
 }
@@ -292,7 +293,7 @@ func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaEx
 			Ignores:           ignores,
 		},
 		&synchronization.Configuration{}, &synchronization.Configuration{},
-		name, nil, false, "",
+		name, nil, nil, false, "",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -306,7 +307,7 @@ func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaEx
 	readyContext, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
-		connection, _, err := remote.Dial(readyContext, submitting, sessionID, remote.OperationFlush)
+		connection, _, err := (&remote.Selection{Target: &remote.Target{SourceSession: sessionID, SourceAlpha: !alphaExecutes}}).Dial(readyContext, submitting, remote.OperationFlush)
 		if err == nil {
 			_, err = remote.Flush(readyContext, connection)
 		}
@@ -321,7 +322,7 @@ func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaEx
 	// The executor channel connects independently of synchronization. Wait
 	// until it can serve entries before exercising the command line.
 	for {
-		connection, _, err := remote.Dial(readyContext, submitting, sessionID, remote.OperationExecute)
+		connection, _, err := (&remote.Selection{Target: &remote.Target{SourceSession: sessionID, SourceAlpha: !alphaExecutes}}).Dial(readyContext, submitting, remote.OperationExecute)
 		if err == nil {
 			_, err = remote.Fetch(readyContext, connection, "")
 		}
@@ -347,12 +348,12 @@ func TestRemoteWorkspacePrologueOutsideRoot(t *testing.T) {
 	// Only beta executes, so --session identifies a unique route even when
 	// invoked outside both roots. An invalid override must then be ignored,
 	// regardless of whether --cwd points back into the executing root.
-	sessionID := createRemoteDiffSession(t, alphaRoot, betaRoot)
+	createRemoteDiffSession(t, alphaRoot, betaRoot)
 	if err := os.WriteFile(filepath.Join(alphaRoot, ".remote-prologue.sh"), []byte("exit 1\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	for _, cwd := range []string{directory, betaRoot} {
-		code, output, errorOutput := runRemote(t, directory, "--session", sessionID, "--cwd", cwd,
+		code, output, errorOutput := runRemote(t, directory, "--node", "beta", "--cwd", cwd,
 			"sh", "-c", `printf %s "$MUTAGEN_REMOTE_ENDPOINT"`)
 		if code != 0 || output != "beta" {
 			t.Fatalf("outside submission sourced override: %d, %q, %q", code, output, errorOutput)
@@ -389,44 +390,25 @@ func TestRemoteSessionSelection(t *testing.T) {
 	submission := filepath.Join(secondAlpha, "sub")
 	pwd := []string{"sh", "-c", "pwd -P"}
 
-	// MUTAGEN_REMOTE_SESSION doesn't redirect commands submitted from inside
-	// another session's root, but it selects a session outside every root,
-	// where commands run at the root of the session's opposite endpoint.
+	// Deprecated selectors fail before any command is sent.
 	t.Setenv("MUTAGEN_REMOTE_SESSION", "first")
-	for _, test := range []struct{ from, expected string }{
-		{submission, filepath.Join(secondBeta, "sub")},
-		{directory, firstBeta},
-	} {
-		if code, output, errorOutput := runRemote(t, test.from, pwd...); code != 0 || output != test.expected+"\n" {
-			t.Fatalf("incorrect directory for submission from %s: %d, %q, %q", test.from, code, output, errorOutput)
-		}
+	if code, _, diagnostic := runRemote(t, submission, pwd...); code != 125 || !strings.Contains(diagnostic, "deprecated") {
+		t.Fatalf("deprecated environment accepted: %d %s", code, diagnostic)
 	}
-
-	// Explicitly selecting a session whose roots don't contain the directory
-	// fails while another session's root does, without running the command or
-	// synchronizing, unless the directory is specified explicitly.
-	if code, _, errorOutput := runRemote(t, submission, "-s", "first", "rm", "-rf", "sub/build"); code != 125 ||
-		!strings.Contains(errorOutput, "is synchronized by session second") {
-		t.Fatalf("explicit session redirected a command: %d, %q", code, errorOutput)
+	t.Setenv("MUTAGEN_REMOTE_SESSION", "")
+	if code, output, diagnostic := runRemote(t, submission, append([]string{"--node", "beta"}, pwd...)...); code != 0 || output != filepath.Join(secondBeta, "sub")+"\n" {
+		t.Fatalf("node selection failed: %d %q %s", code, output, diagnostic)
+	}
+	if code, _, diagnostic := runRemote(t, submission, "-s", "first", "rm", "-rf", "sub/build"); code != 125 || !strings.Contains(diagnostic, "deprecated") {
+		t.Fatalf("deprecated selector executed: %d %s", code, diagnostic)
 	}
 	for _, root := range []string{firstAlpha, firstBeta} {
 		if _, err := os.Stat(filepath.Join(root, "sub", "build", "output")); err != nil {
-			t.Fatal("redirected command ran:", err)
+			t.Fatal("wrong node modified", err)
 		}
 	}
-	explicit := append([]string{"-s", "first", "--cwd", "sub"}, pwd...)
-	if code, output, errorOutput := runRemote(t, submission, explicit...); code != 0 || output != filepath.Join(firstBeta, "sub")+"\n" {
-		t.Fatalf("explicit directory not used: %d, %q, %q", code, output, errorOutput)
-	}
-
-	// Explicit selections still apply to operations that don't run in a
-	// corresponding directory, and to commands outside every root.
-	if code, _, errorOutput := runRemote(t, submission, "-s", "first", "--flush"); code != 0 {
-		t.Fatalf("explicitly selected session not synchronized: %d, %q", code, errorOutput)
-	}
-	t.Setenv("MUTAGEN_REMOTE_SESSION", "")
-	if code, output, errorOutput := runRemote(t, directory, append([]string{"-s", "second"}, pwd...)...); code != 0 || output != secondBeta+"\n" {
-		t.Fatalf("explicit session not used outside every root: %d, %q, %q", code, output, errorOutput)
+	if code, _, diagnostic := runRemote(t, directory, append([]string{"--node", "beta"}, pwd...)...); code != 125 || !strings.Contains(diagnostic, "ambiguous source") {
+		t.Fatalf("ambiguous outside source selected: %d %s", code, diagnostic)
 	}
 }
 
@@ -447,31 +429,19 @@ func TestRemoteNestedSessionSelection(t *testing.T) {
 	createRemoteSession(t, "outer", outer, outerBeta, false)
 	innerID := createRemoteSession(t, "inner", inner, innerBeta, false)
 
-	// Commands submitted inside the nested session's root run through it, with
-	// a warning, since the enclosing session also synchronizes the directory,
-	// unless the session is selected explicitly.
+	// The nearest source workspace determines its implicit two-node graph.
 	submission := filepath.Join(inner, "sub")
-	if code, output, errorOutput := runRemote(t, submission, "sh", "-c", "pwd -P"); code != 0 || output != filepath.Join(innerBeta, "sub")+"\n" ||
-		errorOutput != "remote: warning: sessions inner and outer both synchronize the current directory; using inner (select one with -s)\n" {
-		t.Fatalf("nested session not used with a warning: %d, %q, %q", code, output, errorOutput)
-	} else if code, _, errorOutput := runRemote(t, submission, "-s", "inner", "true"); code != 0 || errorOutput != "" {
-		t.Fatalf("explicitly selected session warned: %d, %q", code, errorOutput)
+	if code, output, diagnostic := runRemote(t, submission, "--node", "beta", "sh", "-c", "pwd -P"); code != 0 || output != filepath.Join(innerBeta, "sub")+"\n" || diagnostic != "" {
+		t.Fatalf("nested node selection failed: %d %q %s", code, output, diagnostic)
 	}
-
-	// Both sessions are listed, with the one that's used marked.
-	if code, output, errorOutput := runRemote(t, submission, "--sessions"); code != 0 ||
-		!strings.Contains(output, "inner: local root "+inner+" (alpha); runs on unknown:"+innerBeta+"; cwd "+filepath.Join(innerBeta, "sub")+" (used by default)") ||
-		!strings.Contains(output, "outer: local root "+outer+" (alpha); runs on unknown:"+outerBeta+"; cwd "+filepath.Join(outerBeta, "inner", "sub")) {
-		t.Fatalf("incorrect session listing: %d, %q, %q", code, output, errorOutput)
+	if code, output, diagnostic := runRemote(t, submission, "--nodes"); code != 0 || !strings.Contains(output, innerBeta) || strings.Contains(output, outerBeta) {
+		t.Fatalf("incorrect scoped node graph: %d %q %s", code, output, diagnostic)
 	}
-
-	// While the nested session is paused, selecting it explicitly fails,
-	// rather than running the command through the enclosing session.
 	if err := synchronizationManager.Pause(context.Background(), &selection.Selection{Specifications: []string{innerID}}, ""); err != nil {
-		t.Fatal("unable to pause session:", err)
-	} else if code, output, errorOutput := runRemote(t, submission, "-s", "inner", "sh", "-c", "pwd -P"); code != 125 || output != "" ||
-		!strings.Contains(errorOutput, `no connected session matching "inner"`) {
-		t.Fatalf("paused session not reported: %d, %q, %q", code, output, errorOutput)
+		t.Fatal(err)
+	}
+	if code, _, diagnostic := runRemote(t, submission, "--session", "inner", "true"); code != 125 || !strings.Contains(diagnostic, "deprecated") {
+		t.Fatalf("deprecated selector accepted: %d %s", code, diagnostic)
 	}
 }
 
@@ -494,22 +464,12 @@ func TestRemoteSharedRootSelection(t *testing.T) {
 	submission := filepath.Join(root, "sub")
 	pwd := []string{"sh", "-c", "pwd -P"}
 
-	// The session created first is used, with a warning, unless a session is
-	// selected.
-	if code, output, errorOutput := runRemote(t, submission, pwd...); code != 0 || output != filepath.Join(firstBeta, "sub")+"\n" ||
-		errorOutput != "remote: warning: sessions gpu1 and gpu2 both synchronize the current directory; using gpu1 (select one with -s)\n" {
-		t.Fatalf("first session not used with a warning: %d, %q, %q", code, output, errorOutput)
-	} else if code, output, errorOutput := runRemote(t, submission, append([]string{"-s", "gpu2"}, pwd...)...); code != 0 ||
-		output != filepath.Join(secondBeta, "sub")+"\n" || errorOutput != "" {
-		t.Fatalf("selected session not used: %d, %q, %q", code, output, errorOutput)
-	}
-	t.Setenv("MUTAGEN_REMOTE_SESSION", "gpu2")
-	if code, output, errorOutput := runRemote(t, submission, pwd...); code != 0 || output != filepath.Join(secondBeta, "sub")+"\n" || errorOutput != "" {
-		t.Fatalf("default session not used: %d, %q, %q", code, output, errorOutput)
-	} else if code, output, errorOutput := runRemote(t, submission, "--sessions"); code != 0 ||
-		!strings.Contains(output, "gpu1: local root "+root+" (alpha); runs on unknown:"+firstBeta+"; cwd "+filepath.Join(firstBeta, "sub")+"\n") ||
-		!strings.Contains(output, "gpu2: local root "+root+" (alpha); runs on unknown:"+secondBeta+"; cwd "+filepath.Join(secondBeta, "sub")+" (used by default)") {
-		t.Fatalf("incorrect session listing: %d, %q, %q", code, output, errorOutput)
+	// Multiple pair graphs with the same source root require a declared tree;
+	// creation order and availability cannot choose a destination silently.
+	for _, arguments := range [][]string{pwd, {"--nodes"}, append([]string{"--node", "beta"}, pwd...)} {
+		if code, _, diagnostic := runRemote(t, submission, arguments...); code != 125 || !strings.Contains(diagnostic, "ambiguous source node") {
+			t.Fatalf("overlapping pair chosen: %d %s", code, diagnostic)
+		}
 	}
 }
 
@@ -639,7 +599,7 @@ func TestRemoteDiffFileRoot(t *testing.T) {
 	if err := os.WriteFile(alphaRoot, []byte("base\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	sessionID := createRemoteDiffSession(t, alphaRoot, betaRoot)
+	createRemoteDiffSession(t, alphaRoot, betaRoot)
 	if err := os.WriteFile(alphaRoot, []byte("local\n"), 0600); err != nil {
 		t.Fatal(err)
 	} else if err := os.WriteFile(betaRoot, []byte("remote\n"), 0600); err != nil {
@@ -649,7 +609,7 @@ func TestRemoteDiffFileRoot(t *testing.T) {
 	// Both automatic conflict comparison and an explicit root path must
 	// compare the file, even though submission occurs outside the root.
 	for _, paths := range [][]string{nil, {alphaRoot}} {
-		arguments := append([]string{"--timeout", "5s", "--session", sessionID, "--diff"}, paths...)
+		arguments := append([]string{"--timeout", "5s", "--node", "beta", "--diff"}, paths...)
 		code, output, errorOutput := runRemote(t, directory, arguments...)
 		if code != 1 || !strings.Contains(output, "-local\n+remote\n") {
 			t.Fatalf("root file wasn't compared: %d, %q, %q", code, output, errorOutput)
@@ -887,7 +847,7 @@ func TestRemoteProgress(t *testing.T) {
 			// status when it starts waiting.
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			connection, _, err := remote.Submit(ctx, submitting, "", &remote.Submission{Operation: remote.OperationFlush, Progress: true})
+			connection, _, err := (&remote.Selection{}).Submit(ctx, submitting, &remote.Submission{Operation: remote.OperationFlush, Progress: true})
 			if err != nil {
 				t.Fatal("unable to submit flush:", err)
 			}

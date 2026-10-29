@@ -134,23 +134,12 @@ func TestSynchronizingScopes(t *testing.T) {
 		t.Error("dead scope registration not pruned")
 	}
 
-	// Scopes don't accept submissions, so they're neither listed nor
-	// selected: submissions from the results session's root are made through
-	// the outer session, and selecting the results session fails.
+	// Scopes don't accept submissions, so they're never selected: submissions
+	// from the results session's root are made through the outer session, and
+	// selecting the results session fails.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	listed, err := (&Selection{}).Sessions(ctx, filepath.Join(results, "data"))
-	if err != nil {
-		t.Fatal("unable to list sessions:", err)
-	}
-	var labels []string
-	for _, session := range listed {
-		labels = append(labels, session.Label)
-	}
-	if !slices.Equal(labels, []string{"outer", "other"}) {
-		t.Errorf("incorrect sessions listed: %v", labels)
-	}
-	if connection, target, err := Dial(ctx, filepath.Join(results, "data"), "", OperationExecute); err != nil {
+	if connection, target, err := (&Selection{}).Dial(ctx, filepath.Join(results, "data"), OperationExecute); err != nil {
 		t.Error("unable to dial from inside a scope:", err)
 	} else {
 		connection.Close()
@@ -158,8 +147,8 @@ func TestSynchronizingScopes(t *testing.T) {
 			t.Errorf("incorrect target: %+v", target)
 		}
 	}
-	if _, _, err := Dial(ctx, filepath.Join(results, "data"), "sync_results", OperationExecute); err == nil ||
-		!strings.Contains(err.Error(), "no connected session matching") {
+	if _, _, err := (&Selection{Target: &Target{SourceSession: "sync_results", SourceAlpha: true}}).Dial(ctx, filepath.Join(results, "data"), OperationExecute); err == nil ||
+		!strings.Contains(err.Error(), "no longer connected") {
 		t.Error("session known only from its scope selected:", err)
 	}
 	if target, err := (&Selection{}).Locate(ctx, nested); err != nil || target.Session != "sync_outer" {

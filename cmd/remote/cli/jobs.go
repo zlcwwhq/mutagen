@@ -35,6 +35,9 @@ const (
 // executing names the endpoint that executes operations submitted through a
 // target.
 func executing(target *remote.Target) string {
+	if target.Node != "" {
+		return terminal.NeutralizeControlCharacters(target.Node)
+	}
 	if target.Alpha {
 		return "beta"
 	}
@@ -110,7 +113,12 @@ func describeState(job *remote.Job) string {
 // printing the job's identifier to stdout and how to follow it to stderr. It
 // returns the exit code for failures to start the job along with the error.
 func startJob(ctx context.Context, connection net.Conn, target *remote.Target, request *remote.Request, stdout, stderr io.Writer) (int, error) {
-	job, code, err := remote.StartJob(ctx, connection, request)
+	return startJobWithEvents(ctx, connection, target, request, stdout, stderr, nil)
+}
+
+// startJobWithEvents renders a daemon-coordinated job's synchronization events.
+func startJobWithEvents(ctx context.Context, connection net.Conn, target *remote.Target, request *remote.Request, stdout, stderr io.Writer, event func(*remote.CommandEvent)) (int, error) {
+	job, code, err := remote.StartJobWithEvents(ctx, connection, request, event)
 	if errors.Is(err, remote.ErrConnectionLost) {
 		return 0, remote.ConnectionError(errors.New("the connection to the executing endpoint was lost while starting the job, which may be running; remote --jobs lists the jobs"))
 	} else if err != nil {
@@ -206,7 +214,7 @@ func describeLeftoverReport(id string, job *remote.Job, kill bool) string {
 // by a line that lists them.
 func printJobs(output io.Writer, locator *locator, endpoint string, jobs []*remote.Job, hidden int) error {
 	if len(jobs) == 0 {
-		fmt.Fprintf(output, "No jobs were started at this session's root on %s.\n", endpoint)
+		fmt.Fprintf(output, "No jobs were started at this node's root on %s.\n", endpoint)
 	} else {
 		// Format the table separately, since lines without cells, such as
 		// those listing leftover processes, would break its alignment. Each

@@ -61,6 +61,10 @@ var ambiguousRefusals = slices.Contains([]string{"darwin", "ios", "freebsd", "ne
 // record is the on-disk description of a registered endpoint, or of the scope
 // of a synchronization endpoint (see RegisterScope).
 type record struct {
+	// Tree and Node identify a workspace tree submission endpoint.
+	Tree     string `json:",omitempty"`
+	Node     string `json:",omitempty"`
+	PeerNode string `json:",omitempty"`
 	// Version is the Mutagen version of the registering process.
 	Version string
 	// Session is the session identifier.
@@ -199,6 +203,9 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 	}
 	prune(context.Background(), directory)
 	return registerIn(directory, &record{
+		Tree:           endpoint.Tree,
+		Node:           endpoint.Node,
+		PeerNode:       endpoint.PeerNode,
 		Session:        endpoint.Session,
 		Name:           endpoint.Name,
 		Root:           root,
@@ -338,9 +345,24 @@ func RegisterScope(session string, alpha bool, root string, ignores *Ignores) (i
 
 // Target describes the endpoint from which a command is submitted.
 type Target struct {
-	// Session is the session identifier.
+	// SourceSession and SourceAlpha identify the local registration through
+	// which the command is submitted, and they alone pin later submissions
+	// (see Selection.Target), so targets built by hand must set them. They
+	// never change when the daemon selects another edge of the same node.
+	SourceSession string
+	SourceAlpha   bool
+	// Tree identifies a declared workspace tree at the submitting registration.
+	Tree bool
+	// Resolved marks a destination selected by the daemon. Revision pins it.
+	Resolved bool
+	Revision string
+	// SourceNode and Node identify the submitting and selected workspaces.
+	SourceNode string
+	Node       string
+	// Session identifies the selected adjacent edge for checkout ownership.
+	// SourceSession, not this field, pins subsequent local submissions.
 	Session string
-	// Name is the session name, if any.
+	// Name is the name of the source session (see SourceSession), if any.
 	Name string
 	// Alpha indicates whether the submitting endpoint is alpha, in which case
 	// the command runs on beta (and vice versa).
@@ -354,99 +376,54 @@ type Target struct {
 	// in which case Path identifies the corresponding directory on the
 	// opposite endpoint.
 	Contained bool
-	// Overlapping labels the sessions whose roots contain the submission
-	// directory and that synchronize it (see Session.Label), starting with the
-	// located session and continuing in the order of preference, if there are
-	// several and the session was located without being selected (by
-	// Selection.Session or a matching Selection.Default), since the submission
-	// may then have been meant for another one. It's empty otherwise, and for
-	// pinned selections.
-	Overlapping []string
 	// Ignores are the session's ignores, if known (see Endpoint.Ignores), which
 	// determine the paths that the session doesn't synchronize.
 	Ignores *Ignores
 }
 
-// Session describes a session endpoint on this system through which
-// operations can be submitted, as listed by Selection.Sessions.
-type Session struct {
-	// Session is the session identifier.
-	Session string
-	// Name is the session name, if any.
-	Name string
-	// Label is the session name, or the identifier if the session is unnamed
-	// or another registered session shares its name, so that it selects the
-	// session unambiguously.
-	Label string
-	// Alpha indicates whether the endpoint is alpha.
-	Alpha bool
-	// Root is the endpoint's synchronization root.
-	Root string
-	// ExecutionHost and ExecutionRoot describe the opposite endpoint for
-	// display (see Endpoint). They are empty for older registrations.
-	ExecutionHost string
-	ExecutionRoot string
-	// Path is the slash-separated submission directory relative to Root, as
-	// mapped for command execution. It is empty outside Root.
-	Path string
-	// Version is the Mutagen version that registered the endpoint, which must
-	// match this version for submissions through it.
-	Version string
-	// Contained indicates whether Root contains the directory.
-	Contained bool
-	// Excluded indicates whether the session's ignores exclude the directory,
-	// or a parent of it inside Root, in any form in which scans could see it
-	// (see Ignores.ExcludedInAnyForm), so that the session may not synchronize
-	// it, and operations corresponding to it are refused (see
-	// Selection.Corresponding).
-	Excluded bool
-	// Selected indicates whether the selection locates the endpoint for the
-	// directory.
-	Selected bool
-}
-
-// SessionVariable is the environment variable that selects a session, by
-// identifier or name, for the remote executable when none is selected
-// explicitly. Unlike an explicit selection, it never redirects submissions from
-// inside one session's root to another session (see Selection.Default).
+// SessionVariable is the environment variable that formerly selected a
+// session, by identifier or name, for the remote executable. Session selectors
+// are deprecated in favor of nodes, and the variable is no longer consulted
+// here: the remote executable refuses to run while it's set, rather than
+// silently ignoring a selection that the user expects to apply.
 const SessionVariable = "MUTAGEN_REMOTE_SESSION"
 
 // Selection determines the session, and the endpoint of that session, through
 // which Dial submits an operation from a directory.
 type Selection struct {
-	// Session is the identifier or name of an explicitly selected session. If
-	// non-empty, then only that session's endpoints are considered, and the
-	// directory may lie outside their roots, in which case the submission
-	// applies to the root, although endpoints whose roots contain the
-	// directory are preferred.
-	Session string
-	// Default is the value of SessionVariable, if any. It's ignored if Session
-	// is non-empty. Otherwise, it selects among the sessions whose roots
-	// contain the directory: if any of them matches it, then the most specific
-	// of their roots is used, and if none does, then it's ignored, and the
-	// most specific containing root is used, as if it were unset. Only if no
-	// session's root contains the directory does it select a session in the
-	// same way as Session.
-	Default string
+	// Workspace selects the source workspace by node rather than by session:
+	// the most specific live workspace containing the directory, which may be
+	// registered by several endpoints only if they identify the same node of
+	// the same tree, as incident edges do (see locateWorkspace). Neither
+	// creation order nor session names choose among distinct workspaces. It's
+	// ignored if Target is non-nil.
+	Workspace bool
+	// WorkspaceOutside allows a workspace selection from a directory outside
+	// all live workspaces, such as for an explicit node selection, in which
+	// case the only live workspace on this system is used, and its root
+	// applies, if there's exactly one.
+	WorkspaceOutside bool
+	// Node is resolved by the daemon on the actual operation connection.
+	Node string
+	// Resolve requests destination resolution, including for an omitted Node.
+	Resolve bool
 	// Corresponding indicates that the operation applies to the directory
 	// corresponding to the submission directory, as commands do unless their
-	// working directory is specified explicitly. Dial then refuses to submit
-	// it through a session selected by Session whose roots don't contain the
-	// directory if another session's root does, since it would apply to the
-	// root of the selected session, rather than to anything corresponding to
-	// the directory. Dial also refuses to submit it through a session whose
+	// working directory is specified explicitly. Dial refuses a submission whose
 	// ignores exclude the directory or a parent of it inside the root (see
 	// Ignores), since the session doesn't synchronize the corresponding
 	// directory. Such a directory is typically the root of a nested session
 	// that isn't connected for remote commands on this system, and through
 	// which the submission would otherwise have been made.
 	Corresponding bool
-	// Target, if non-nil, restricts the selection to the session and endpoint
-	// that it identifies, which were typically located by a previous
-	// submission, so that related submissions can't reach different sessions
-	// as sessions connect and disconnect in between. Dial then fails if that
-	// endpoint is no longer registered, rather than selecting another, and
-	// Session, Default, and Corresponding are ignored.
+	// Target, if non-nil, restricts the selection to the local registration
+	// that its SourceSession and SourceAlpha identify, which was typically
+	// located by a previous submission, so that related submissions can't
+	// reach different sessions as sessions connect and disconnect in between.
+	// Its Session and Alpha, which may identify another edge selected by the
+	// daemon, don't affect the registration. Dial then fails if that
+	// registration is no longer live, rather than selecting another, and
+	// Workspace is ignored; Corresponding still validates the first submission.
 	Target *Target
 }
 
@@ -491,14 +468,6 @@ func excluding(c *candidate) bool {
 	return !c.contained
 }
 
-// matching returns a candidate predicate that identifies the registrations of
-// sessions with the specified identifier or name.
-func matching(session string) func(*candidate) bool {
-	return func(c *candidate) bool {
-		return c.Session == session || c.Name == session
-	}
-}
-
 // versions returns the distinct Mutagen versions of candidates.
 func versions(candidates []*candidate) []string {
 	var result []string
@@ -508,6 +477,19 @@ func versions(candidates []*candidate) []string {
 		}
 	}
 	return result
+}
+
+// mismatchedVersions explains that the endpoints that a submission would
+// otherwise have been made through, which the specified candidates registered
+// by other versions of Mutagen describe, can't be used by this version, with
+// the specified subject (such as "matching sessions are"). Running the remote
+// executable of another version, such as an outdated one that's still on the
+// PATH after an upgrade, is the most common cause of failing to locate an
+// endpoint, so the wording ("registered by Mutagen X, but this is Mutagen Y")
+// is relied on by troubleshooting documentation and should be kept.
+func mismatchedVersions(subject string, candidates []*candidate) error {
+	return ConnectionError(fmt.Errorf("%s registered by Mutagen %s, but this is Mutagen %s; use the remote executable installed with that version",
+		subject, strings.Join(versions(candidates), ", "), mutagen.Version))
 }
 
 // liveEndpoint is a connection to the submission socket of a registered
@@ -648,22 +630,9 @@ func liveSessions(ctx context.Context, candidates []*candidate) ([]*candidate, e
 	return result, nil
 }
 
-// synchronizing describes the sessions that synchronizingSessions returns.
-func synchronizing(ctx context.Context, candidates []*candidate) ([]string, error) {
-	sessions, err := synchronizingSessions(ctx, candidates)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]string, len(sessions))
-	for s, c := range sessions {
-		result[s] = describe(c.Session, c.Name)
-	}
-	return result, nil
-}
-
 // labeler returns a function that labels sessions by name, or by identifier if
 // they're unnamed or another session among the candidates shares their name,
-// so that labels select sessions unambiguously (see matching).
+// so that labels identify sessions unambiguously in diagnostics.
 func labeler(candidates []*candidate) func(*candidate) string {
 	named := make(map[string]map[string]bool)
 	for _, c := range candidates {
@@ -722,21 +691,6 @@ func excludedError(c *candidate, session, excluded string) error {
 		location = fmt.Sprintf("%s is inside %s, which session %s ignores", c.path, excluded, session)
 	}
 	return fmt.Errorf("%s. If it's another session's root, that session isn't running commands now: don't use --cwd. If it exists separately on each side, --cwd . runs in the other side's own copy.", location)
-}
-
-// Dial submits the specified operation through the endpoint that a selection of
-// the specified session, if non-empty, locates for the specified directory,
-// with the session named by SessionVariable, if set, as the selection's
-// default (see Selection.Dial).
-func Dial(ctx context.Context, directory, session string, operation Operation) (net.Conn, *Target, error) {
-	return Submit(ctx, directory, session, &Submission{Operation: operation})
-}
-
-// Submit is Dial with the specified submission header, which can request more
-// than the operation (see Submission).
-func Submit(ctx context.Context, directory, session string, header *Submission) (net.Conn, *Target, error) {
-	selection := &Selection{Session: session, Default: os.Getenv(SessionVariable)}
-	return selection.Submit(ctx, directory, header)
 }
 
 // relate loads the registrations and relates each one to the specified
@@ -808,35 +762,29 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 	// Refuse operations corresponding to a directory that the session doesn't
 	// synchronize (see Selection.Corresponding), or that it might not, since
 	// running them anyway could run them in an outdated or missing directory.
-	if s.Target == nil && s.Corresponding && c.contained {
+	if s.Corresponding && c.contained {
 		if excluded := c.Ignores.ExcludedInAnyForm(c.path, true); excluded != "" {
 			connection.Close()
 			return nil, nil, excludedError(c, labeler(slices.Concat(compatible, incompatible))(c), excluded)
 		}
 	}
 
-	// Label the sessions that synchronize the directory if there are several
-	// and the session wasn't selected (see Target.Overlapping). Sessions whose
-	// ignores exclude the directory in some form aren't labeled, since
-	// selecting them would be refused, as for the located session.
-	var overlapping []string
-	if s.Target == nil && s.Session == "" && c.contained && (s.Default == "" || !matching(s.Default)(c)) {
-		all := slices.Concat(compatible, incompatible)
-		others, err := synchronizingSessions(ctx, filter(all, func(other *candidate) bool {
-			return other.Session != c.Session && other.Ignores.ExcludedInAnyForm(other.path, true) == ""
-		}))
-		if err != nil {
-			connection.Close()
-			return nil, nil, err
-		} else if len(others) > 0 {
-			label := labeler(all)
-			overlapping = append(overlapping, label(c))
-			for _, other := range others {
-				overlapping = append(overlapping, label(other))
+	// Resolve destinations on the operation connection. Pinned targets retain
+	// both the original source registration and the selected destination.
+	submitted := *header
+	header = &submitted
+	if s.Resolve || s.Target != nil && s.Target.Resolved {
+		header.Resolve = true
+		if header.Node == "" {
+			header.Node = s.Node
+			if header.Node == "" && s.Target != nil && s.Target.Resolved {
+				header.Node = s.Target.Node
 			}
 		}
+		if header.Revision == "" && s.Target != nil && s.Target.Resolved {
+			header.Revision = s.Target.Revision
+		}
 	}
-
 	// Perform the version handshake and submit the operation.
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
 	err = mutagen.ClientVersionHandshake(connection)
@@ -852,21 +800,52 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 		connection.Close()
 		return nil, nil, ConnectionError(fmt.Errorf("unable to handshake with session %s: %w", describe(c.Session, c.Name), err))
 	}
-	return connection, c.target(overlapping), nil
+	target := c.target()
+	if header.Resolve {
+		route, err := receiveResolvedRoute(ctx, connection)
+		if err != nil {
+			connection.Close()
+			return nil, nil, err
+		}
+		target.Session, target.Alpha = route.Session, route.Alpha
+		target.Node, target.SourceNode = route.Node, route.SourceNode
+		target.Tree, target.Resolved, target.Revision = route.Tree, true, route.Revision
+		if route.Ignores != nil {
+			target.Ignores = route.Ignores
+		}
+	}
+	return connection, target, nil
 }
 
-// target describes the endpoint of a candidate as a target, with the specified
-// overlapping sessions (see Target.Overlapping).
-func (c *candidate) target(overlapping []string) *Target {
+// target describes the endpoint of a candidate as a target. Endpoints of
+// implicit pairs, which don't record node names, are named for their roles.
+func (c *candidate) target() *Target {
+	source, peer := c.Node, c.PeerNode
+	if source == "" {
+		if c.Alpha {
+			source = "alpha"
+		} else {
+			source = "beta"
+		}
+	}
+	if peer == "" {
+		if c.Alpha {
+			peer = "beta"
+		} else {
+			peer = "alpha"
+		}
+	}
 	return &Target{
-		Session:     c.Session,
-		Name:        c.Name,
-		Alpha:       c.Alpha,
-		Root:        c.Root,
-		Path:        c.path,
-		Contained:   c.contained,
-		Overlapping: overlapping,
-		Ignores:     c.Ignores,
+		SourceSession: c.Session, SourceAlpha: c.Alpha, Tree: c.Tree != "",
+		SourceNode: source,
+		Node:       peer,
+		Session:    c.Session,
+		Name:       c.Name,
+		Alpha:      c.Alpha,
+		Root:       c.Root,
+		Path:       c.path,
+		Contained:  c.contained,
+		Ignores:    c.Ignores,
 	}
 }
 
@@ -874,7 +853,7 @@ func (c *candidate) target(overlapping []string) *Target {
 // operation from the specified directory, as Dial does, but without submitting
 // one, such as to inspect the session's ignores. Since nothing is submitted,
 // ignores that exclude the directory don't prevent it from being located (see
-// Selection.Corresponding), and overlapping sessions aren't labeled.
+// Selection.Corresponding).
 func (s *Selection) Locate(ctx context.Context, directory string) (*Target, error) {
 	directory, compatible, incompatible, err := relate(directory)
 	if err != nil {
@@ -885,7 +864,7 @@ func (s *Selection) Locate(ctx context.Context, directory string) (*Target, erro
 		return nil, err
 	}
 	endpoint.connection.Close()
-	return endpoint.candidate.target(nil), nil
+	return endpoint.candidate.target(), nil
 }
 
 // Synchronizing describes the sessions that may synchronize content written to
@@ -962,246 +941,65 @@ func Synchronizing(ctx context.Context, path string, directory bool) ([]string, 
 	return result, nil
 }
 
-// Sessions lists the endpoints on this system through which operations can be
-// submitted, including those registered by other versions of Mutagen, relating
-// each to the specified directory: endpoints whose roots contain it come
-// first, most specific first and then in the order of preference (see
-// precedes), followed by the others, ordered by root. The endpoint that the
-// selection locates for the directory, if it locates one, is marked as
-// selected, though ignores that exclude the directory would prevent operations
-// corresponding to it. Dead registrations are pruned, while registrations
-// whose liveness can't be determined are assumed to be live.
-func (s *Selection) Sessions(ctx context.Context, directory string) ([]Session, error) {
-	directory, compatible, incompatible, err := relate(directory)
-	if err != nil {
-		return nil, err
-	}
-
-	// Probe the newest registration of each endpoint, falling back to older
-	// ones as dead registrations are pruned, as probeTier does.
-	candidates := slices.Concat(compatible, incompatible)
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].Created.After(candidates[j].Created)
-	})
-	var live []*candidate
-	resolved := make(map[string]bool)
-	for _, c := range candidates {
-		key := fmt.Sprintf("%s/%t", c.Session, c.Alpha)
-		if resolved[key] {
-			continue
-		}
-		connection, err := dialRegistration(ctx, c.base+socketExtension)
-		if err == nil {
-			connection.Close()
-		} else if ctx.Err() != nil {
-			return nil, ctx.Err()
-		} else if isDead(err) {
-			c.remove()
-			continue
-		}
-		resolved[key] = true
-		live = append(live, c)
-	}
-	sort.SliceStable(live, func(i, j int) bool {
-		if live[i].contained != live[j].contained {
-			return live[i].contained
-		} else if live[i].depth != live[j].depth {
-			return live[i].depth > live[j].depth
-		} else if !live[i].contained && live[i].Root != live[j].Root {
-			return live[i].Root < live[j].Root
-		}
-		return precedes(live[i], live[j])
-	})
-
-	// Determine the endpoint that the selection locates. Failures to locate one,
-	// such as ambiguity, leave every endpoint unselected.
-	var selected *candidate
-	if endpoint, err := s.locate(ctx, directory, compatible, incompatible); err == nil {
-		endpoint.connection.Close()
-		selected = endpoint.candidate
-	} else if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	label := labeler(candidates)
-	result := make([]Session, len(live))
-	for l, c := range live {
-		result[l] = Session{
-			Session:       c.Session,
-			Name:          c.Name,
-			Label:         label(c),
-			Alpha:         c.Alpha,
-			Root:          c.Root,
-			ExecutionHost: c.ExecutionHost,
-			ExecutionRoot: c.ExecutionRoot,
-			Path:          c.path,
-			Version:       c.Version,
-			Contained:     c.contained,
-			Excluded:      c.contained && c.Ignores.ExcludedInAnyForm(c.path, true) != "",
-			Selected:      selected != nil && c.Session == selected.Session && c.Alpha == selected.Alpha,
-		}
-	}
-	return result, nil
-}
-
 // locate connects to the endpoint through which to submit an operation from the
 // specified directory, given the registrations related to it that are
 // compatible with this version of Mutagen and those that aren't.
 func (s *Selection) locate(ctx context.Context, directory string, compatible, incompatible []*candidate) (*liveEndpoint, error) {
-	// single returns the only live endpoint, or reports ambiguity using the
-	// specified function if there are several.
-	single := func(live []liveEndpoint, ambiguous func(sessions []string) error) (*liveEndpoint, error) {
-		if len(live) > 1 {
-			closeEndpoints(live)
-			return nil, ambiguous(describeEndpoints(live))
-		}
-		return &live[0], nil
-	}
-
-	// selectedAmbiguity reports ambiguity among the endpoints of the sessions
-	// matching a selection, which label describes.
-	selectedAmbiguity := func(label string) func([]string) error {
-		return func(sessions []string) error {
-			if len(sessions) == 1 {
-				return fmt.Errorf("both endpoints of session %s are on this system; run from inside one of their roots", sessions[0])
-			}
-			return fmt.Errorf("multiple sessions match %s (%s); use a session identifier to select one", label, strings.Join(sessions, ", "))
-		}
-	}
-
-	// first returns the preferred live endpoint among those whose roots
-	// contain the directory equally specifically (see precedes), rather than
-	// report ambiguity, since Dial labels the other sessions for a warning
-	// (see Target.Overlapping).
-	first := func(live []liveEndpoint) *liveEndpoint {
-		best := 0
-		for l := range live {
-			if precedes(live[l].candidate, live[best].candidate) {
-				best = l
-			}
-		}
-		for l := range live {
-			if l != best {
-				live[l].connection.Close()
-			}
-		}
-		return &live[best]
-	}
-
-	// mismatched explains a failure to locate an endpoint if registrations by
-	// other versions of Mutagen would otherwise have been considered, and
-	// returns the specified error otherwise.
-	mismatched := func(considered []*candidate, err error) error {
-		if versions := versions(considered); len(versions) > 0 {
-			return ConnectionError(fmt.Errorf("matching sessions are registered by Mutagen %s, but this is Mutagen %s; use the remote executable installed with that version",
-				strings.Join(versions, ", "), mutagen.Version))
-		}
-		return err
-	}
-
-	// A pinned selection only considers the endpoint that it identifies, which
-	// may have reconnected in the meantime, and fails rather than falling back
-	// to another endpoint.
+	// A pinned selection only considers the source registration that it
+	// identifies, which may have reconnected in the meantime, and fails rather
+	// than falling back to another endpoint. The daemon-selected edge (Session
+	// and Alpha) never chooses the registration, even if the source is unset.
 	if s.Target != nil {
+		source := s.Target.SourceSession
+		if source == "" {
+			return nil, errors.New("pinned target doesn't identify a source registration")
+		}
 		pinned := func(c *candidate) bool {
-			return c.Session == s.Target.Session && c.Alpha == s.Target.Alpha
+			return c.Session == source && c.Alpha == s.Target.SourceAlpha
 		}
 		live, err := locate(ctx, filter(compatible, pinned))
 		if err != nil {
 			return nil, err
 		} else if len(live) == 0 {
-			return nil, ConnectionError(fmt.Errorf("session %s is no longer connected for remote commands on this system (it may have been paused or terminated, or be reconnecting)",
-				describe(s.Target.Session, s.Target.Name)))
+			endpoint := "beta endpoint"
+			if s.Target.SourceAlpha {
+				endpoint = "alpha endpoint"
+			}
+			if s.Target.Tree && s.Target.SourceNode != "" {
+				endpoint = fmt.Sprintf("%s (node %s)", endpoint, s.Target.SourceNode)
+			}
+			return nil, ConnectionError(fmt.Errorf("the %s of session %s is no longer connected for remote commands on this system (it may have been paused or terminated, or be reconnecting)",
+				endpoint, describe(source, s.Target.Name)))
 		}
-		return single(live, selectedAmbiguity(fmt.Sprintf("%q", s.Target.Session)))
+		return &live[0], nil
 	}
 
-	// An explicitly selected session is used even if its roots don't contain
-	// the directory, but not for operations corresponding to the directory
-	// while another session's root contains it: they would apply to the root
-	// of the selected session's opposite endpoint, as if they had been
-	// submitted from outside every root, which is easily mistaken for the
-	// directory corresponding to the one inside the other session's root.
-	if s.Session != "" {
-		selected := matching(s.Session)
-		live, err := locate(ctx, filter(compatible, selected, containing))
-		if err == nil && len(live) == 0 {
-			live, err = locate(ctx, filter(compatible, selected, excluding))
-			if err == nil && len(live) > 0 && s.Corresponding {
-				others := filter(slices.Concat(compatible, incompatible), func(c *candidate) bool {
-					return !selected(c)
-				})
-				synchronized, err := synchronizing(ctx, others)
-				if err != nil || len(synchronized) > 0 {
-					closeEndpoints(live)
-				}
-				if err != nil {
-					return nil, err
-				} else if len(synchronized) > 0 {
-					by := "session " + synchronized[0]
-					if len(synchronized) > 1 {
-						by = "sessions " + strings.Join(synchronized, ", ")
-					}
-					return nil, fmt.Errorf("%s is synchronized by %s, not %s; to run the command on the opposite endpoint of %s anyway, use --cwd to choose the directory there, or run remote from outside every synchronized root",
-						directory, by, strings.Join(describeEndpoints(live), ", "), s.Session)
-				}
-			}
-		}
-		if err != nil {
-			return nil, err
-		} else if len(live) == 0 {
-			err := fmt.Errorf("no connected session matching %q has remote commands enabled on this system (remote --sessions lists them)", s.Session)
-			if len(filter(compatible, selected)) > 0 {
-				return nil, ConnectionError(err)
-			}
-			return nil, mismatched(filter(incompatible, selected), err)
-		}
-		return single(live, selectedAmbiguity(fmt.Sprintf("%q", s.Session)))
+	// A workspace selection is resolved by node (see locateWorkspace).
+	if s.Workspace {
+		return locateWorkspace(ctx, compatible, incompatible, s.WorkspaceOutside)
 	}
 
-	// A default session only selects among the sessions whose roots contain
-	// the directory, if there are any. If none of them matches it, then the
-	// preferred one among the most specific is used, as without a default.
-	if s.Default != "" {
-		preferred := matching(s.Default)
-		label := fmt.Sprintf("%s=%q", SessionVariable, s.Default)
-		live, err := locate(ctx, filter(compatible, preferred, containing))
-		if err == nil && len(live) > 0 {
-			return single(live, selectedAmbiguity(label))
-		} else if err == nil {
-			live, err = locate(ctx, filter(compatible, containing))
-		}
-		if err != nil {
-			return nil, err
-		} else if len(live) > 0 {
-			return first(live), nil
-		}
-
-		// Outside every root, the default selects a session as an explicit
-		// selection does, unless a session registered by another version of
-		// Mutagen synchronizes the directory.
-		if synchronized, err := synchronizing(ctx, incompatible); err != nil {
-			return nil, err
-		} else if len(synchronized) == 0 {
-			if live, err = locate(ctx, filter(compatible, preferred, excluding)); err != nil {
-				return nil, err
-			} else if len(live) > 0 {
-				return single(live, selectedAmbiguity(label))
-			}
-		}
-		considered := filter(incompatible, func(c *candidate) bool {
-			return c.contained || preferred(c)
-		})
-		return nil, mismatched(considered,
-			ConnectionError(fmt.Errorf("no connected session with remote commands enabled contains %s or matches %s (remote --sessions lists them)", directory, label)))
-	}
-
-	// Otherwise, the most specific containing root is used.
+	// Otherwise, the most specific containing root is used, and among equally
+	// specific roots, the preferred session (see precedes).
 	live, err := locate(ctx, filter(compatible, containing))
 	if err != nil {
 		return nil, err
 	} else if len(live) == 0 {
-		return nil, mismatched(filter(incompatible, containing),
-			ConnectionError(fmt.Errorf("no connected session with remote commands enabled contains %s (remote --sessions lists them)", directory)))
+		if mismatched := filter(incompatible, containing); len(mismatched) > 0 {
+			return nil, mismatchedVersions("matching sessions are", mismatched)
+		}
+		return nil, ConnectionError(fmt.Errorf("no connected session with remote commands enabled contains %s", directory))
 	}
-	return first(live), nil
+	best := 0
+	for l := range live {
+		if precedes(live[l].candidate, live[best].candidate) {
+			best = l
+		}
+	}
+	for l := range live {
+		if l != best {
+			live[l].connection.Close()
+		}
+	}
+	return &live[best], nil
 }

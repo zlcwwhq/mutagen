@@ -66,6 +66,14 @@ func (s *CreationSpecification) ensureValid() error {
 		}
 	}
 
+	// Verify that tree membership is valid, if specified. The daemon also
+	// checks that the configuration is suitable for a tree.
+	if s.Tree != nil {
+		if err := s.Tree.EnsureValid(); err != nil {
+			return fmt.Errorf("invalid tree membership: %w", err)
+		}
+	}
+
 	// There's no need to validate the Paused field - either value is valid.
 
 	// Success.

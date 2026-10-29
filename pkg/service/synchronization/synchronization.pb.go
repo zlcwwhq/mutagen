@@ -47,7 +47,10 @@ type CreationSpecification struct {
 	// Labels are the labels for the session object.
 	Labels map[string]string `protobuf:"bytes,7,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Paused indicates whether or not to create the session pre-paused.
-	Paused        bool `protobuf:"varint,8,opt,name=paused,proto3" json:"paused,omitempty"`
+	Paused bool `protobuf:"varint,8,opt,name=paused,proto3" json:"paused,omitempty"`
+	// Tree identifies the session as an edge of a workspace tree, if non-nil.
+	// Only project orchestration sets it (see synchronization.Session.Tree).
+	Tree          *synchronization.TreeMembership `protobuf:"bytes,9,opt,name=tree,proto3" json:"tree,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -136,6 +139,13 @@ func (x *CreationSpecification) GetPaused() bool {
 		return x.Paused
 	}
 	return false
+}
+
+func (x *CreationSpecification) GetTree() *synchronization.TreeMembership {
+	if x != nil {
+		return x.Tree
+	}
+	return nil
 }
 
 // CreateRequest encodes a request for session creation.
@@ -823,7 +833,7 @@ var File_service_synchronization_synchronization_proto protoreflect.FileDescript
 
 const file_service_synchronization_synchronization_proto_rawDesc = "" +
 	"\n" +
-	"-service/synchronization/synchronization.proto\x12\x0fsynchronization\x1a\x19selection/selection.proto\x1a#synchronization/configuration.proto\x1a\x1bsynchronization/state.proto\x1a\rurl/url.proto\"\xec\x03\n" +
+	"-service/synchronization/synchronization.proto\x12\x0fsynchronization\x1a\x19selection/selection.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/session.proto\x1a\x1bsynchronization/state.proto\x1a\rurl/url.proto\"\xa1\x04\n" +
 	"\x15CreationSpecification\x12\x1e\n" +
 	"\x05alpha\x18\x01 \x01(\v2\b.url.URLR\x05alpha\x12\x1c\n" +
 	"\x04beta\x18\x02 \x01(\v2\b.url.URLR\x04beta\x12D\n" +
@@ -832,7 +842,8 @@ const file_service_synchronization_synchronization_proto_rawDesc = "" +
 	"\x11configurationBeta\x18\x05 \x01(\v2\x1e.synchronization.ConfigurationR\x11configurationBeta\x12\x12\n" +
 	"\x04name\x18\x06 \x01(\tR\x04name\x12J\n" +
 	"\x06labels\x18\a \x03(\v22.synchronization.CreationSpecification.LabelsEntryR\x06labels\x12\x16\n" +
-	"\x06paused\x18\b \x01(\bR\x06paused\x1a9\n" +
+	"\x06paused\x18\b \x01(\bR\x06paused\x123\n" +
+	"\x04tree\x18\t \x01(\v2\x1f.synchronization.TreeMembershipR\x04tree\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"y\n" +
@@ -893,26 +904,27 @@ func file_service_synchronization_synchronization_proto_rawDescGZIP() []byte {
 
 var file_service_synchronization_synchronization_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_service_synchronization_synchronization_proto_goTypes = []any{
-	(*CreationSpecification)(nil),         // 0: synchronization.CreationSpecification
-	(*CreateRequest)(nil),                 // 1: synchronization.CreateRequest
-	(*CreateResponse)(nil),                // 2: synchronization.CreateResponse
-	(*ListRequest)(nil),                   // 3: synchronization.ListRequest
-	(*ListResponse)(nil),                  // 4: synchronization.ListResponse
-	(*FlushRequest)(nil),                  // 5: synchronization.FlushRequest
-	(*FlushResponse)(nil),                 // 6: synchronization.FlushResponse
-	(*PauseRequest)(nil),                  // 7: synchronization.PauseRequest
-	(*PauseResponse)(nil),                 // 8: synchronization.PauseResponse
-	(*ResumeRequest)(nil),                 // 9: synchronization.ResumeRequest
-	(*ResumeResponse)(nil),                // 10: synchronization.ResumeResponse
-	(*ResetRequest)(nil),                  // 11: synchronization.ResetRequest
-	(*ResetResponse)(nil),                 // 12: synchronization.ResetResponse
-	(*TerminateRequest)(nil),              // 13: synchronization.TerminateRequest
-	(*TerminateResponse)(nil),             // 14: synchronization.TerminateResponse
-	nil,                                   // 15: synchronization.CreationSpecification.LabelsEntry
-	(*url.URL)(nil),                       // 16: url.URL
-	(*synchronization.Configuration)(nil), // 17: synchronization.Configuration
-	(*selection.Selection)(nil),           // 18: selection.Selection
-	(*synchronization.State)(nil),         // 19: synchronization.State
+	(*CreationSpecification)(nil),          // 0: synchronization.CreationSpecification
+	(*CreateRequest)(nil),                  // 1: synchronization.CreateRequest
+	(*CreateResponse)(nil),                 // 2: synchronization.CreateResponse
+	(*ListRequest)(nil),                    // 3: synchronization.ListRequest
+	(*ListResponse)(nil),                   // 4: synchronization.ListResponse
+	(*FlushRequest)(nil),                   // 5: synchronization.FlushRequest
+	(*FlushResponse)(nil),                  // 6: synchronization.FlushResponse
+	(*PauseRequest)(nil),                   // 7: synchronization.PauseRequest
+	(*PauseResponse)(nil),                  // 8: synchronization.PauseResponse
+	(*ResumeRequest)(nil),                  // 9: synchronization.ResumeRequest
+	(*ResumeResponse)(nil),                 // 10: synchronization.ResumeResponse
+	(*ResetRequest)(nil),                   // 11: synchronization.ResetRequest
+	(*ResetResponse)(nil),                  // 12: synchronization.ResetResponse
+	(*TerminateRequest)(nil),               // 13: synchronization.TerminateRequest
+	(*TerminateResponse)(nil),              // 14: synchronization.TerminateResponse
+	nil,                                    // 15: synchronization.CreationSpecification.LabelsEntry
+	(*url.URL)(nil),                        // 16: url.URL
+	(*synchronization.Configuration)(nil),  // 17: synchronization.Configuration
+	(*synchronization.TreeMembership)(nil), // 18: synchronization.TreeMembership
+	(*selection.Selection)(nil),            // 19: selection.Selection
+	(*synchronization.State)(nil),          // 20: synchronization.State
 }
 var file_service_synchronization_synchronization_proto_depIdxs = []int32{
 	16, // 0: synchronization.CreationSpecification.alpha:type_name -> url.URL
@@ -921,33 +933,34 @@ var file_service_synchronization_synchronization_proto_depIdxs = []int32{
 	17, // 3: synchronization.CreationSpecification.configurationAlpha:type_name -> synchronization.Configuration
 	17, // 4: synchronization.CreationSpecification.configurationBeta:type_name -> synchronization.Configuration
 	15, // 5: synchronization.CreationSpecification.labels:type_name -> synchronization.CreationSpecification.LabelsEntry
-	0,  // 6: synchronization.CreateRequest.specification:type_name -> synchronization.CreationSpecification
-	18, // 7: synchronization.ListRequest.selection:type_name -> selection.Selection
-	19, // 8: synchronization.ListResponse.sessionStates:type_name -> synchronization.State
-	18, // 9: synchronization.FlushRequest.selection:type_name -> selection.Selection
-	18, // 10: synchronization.PauseRequest.selection:type_name -> selection.Selection
-	18, // 11: synchronization.ResumeRequest.selection:type_name -> selection.Selection
-	18, // 12: synchronization.ResetRequest.selection:type_name -> selection.Selection
-	18, // 13: synchronization.TerminateRequest.selection:type_name -> selection.Selection
-	1,  // 14: synchronization.Synchronization.Create:input_type -> synchronization.CreateRequest
-	3,  // 15: synchronization.Synchronization.List:input_type -> synchronization.ListRequest
-	5,  // 16: synchronization.Synchronization.Flush:input_type -> synchronization.FlushRequest
-	7,  // 17: synchronization.Synchronization.Pause:input_type -> synchronization.PauseRequest
-	9,  // 18: synchronization.Synchronization.Resume:input_type -> synchronization.ResumeRequest
-	11, // 19: synchronization.Synchronization.Reset:input_type -> synchronization.ResetRequest
-	13, // 20: synchronization.Synchronization.Terminate:input_type -> synchronization.TerminateRequest
-	2,  // 21: synchronization.Synchronization.Create:output_type -> synchronization.CreateResponse
-	4,  // 22: synchronization.Synchronization.List:output_type -> synchronization.ListResponse
-	6,  // 23: synchronization.Synchronization.Flush:output_type -> synchronization.FlushResponse
-	8,  // 24: synchronization.Synchronization.Pause:output_type -> synchronization.PauseResponse
-	10, // 25: synchronization.Synchronization.Resume:output_type -> synchronization.ResumeResponse
-	12, // 26: synchronization.Synchronization.Reset:output_type -> synchronization.ResetResponse
-	14, // 27: synchronization.Synchronization.Terminate:output_type -> synchronization.TerminateResponse
-	21, // [21:28] is the sub-list for method output_type
-	14, // [14:21] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	18, // 6: synchronization.CreationSpecification.tree:type_name -> synchronization.TreeMembership
+	0,  // 7: synchronization.CreateRequest.specification:type_name -> synchronization.CreationSpecification
+	19, // 8: synchronization.ListRequest.selection:type_name -> selection.Selection
+	20, // 9: synchronization.ListResponse.sessionStates:type_name -> synchronization.State
+	19, // 10: synchronization.FlushRequest.selection:type_name -> selection.Selection
+	19, // 11: synchronization.PauseRequest.selection:type_name -> selection.Selection
+	19, // 12: synchronization.ResumeRequest.selection:type_name -> selection.Selection
+	19, // 13: synchronization.ResetRequest.selection:type_name -> selection.Selection
+	19, // 14: synchronization.TerminateRequest.selection:type_name -> selection.Selection
+	1,  // 15: synchronization.Synchronization.Create:input_type -> synchronization.CreateRequest
+	3,  // 16: synchronization.Synchronization.List:input_type -> synchronization.ListRequest
+	5,  // 17: synchronization.Synchronization.Flush:input_type -> synchronization.FlushRequest
+	7,  // 18: synchronization.Synchronization.Pause:input_type -> synchronization.PauseRequest
+	9,  // 19: synchronization.Synchronization.Resume:input_type -> synchronization.ResumeRequest
+	11, // 20: synchronization.Synchronization.Reset:input_type -> synchronization.ResetRequest
+	13, // 21: synchronization.Synchronization.Terminate:input_type -> synchronization.TerminateRequest
+	2,  // 22: synchronization.Synchronization.Create:output_type -> synchronization.CreateResponse
+	4,  // 23: synchronization.Synchronization.List:output_type -> synchronization.ListResponse
+	6,  // 24: synchronization.Synchronization.Flush:output_type -> synchronization.FlushResponse
+	8,  // 25: synchronization.Synchronization.Pause:output_type -> synchronization.PauseResponse
+	10, // 26: synchronization.Synchronization.Resume:output_type -> synchronization.ResumeResponse
+	12, // 27: synchronization.Synchronization.Reset:output_type -> synchronization.ResetResponse
+	14, // 28: synchronization.Synchronization.Terminate:output_type -> synchronization.TerminateResponse
+	22, // [22:29] is the sub-list for method output_type
+	15, // [15:22] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_service_synchronization_synchronization_proto_init() }

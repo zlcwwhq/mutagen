@@ -72,13 +72,16 @@ func (w *checkedWriter) Write(data []byte) (int, error) {
 
 // options are the parsed command line options.
 type options struct {
+	// node selects an execution node in the current workspace tree.
+	node string
+	// nodes requests a read-only node graph listing.
+	nodes bool
+	// target is the resolved adjacent route, kept internal to node selection.
+	target *remote.Target
 	conflictOptions
-	// session selects a session by identifier or name.
-	session string
-	// defaultSession is the value of remote.SessionVariable if session wasn't
-	// specified, which only selects among the sessions whose roots contain the
-	// working directory, unless none does (see remote.Selection).
-	defaultSession string
+	// Deprecated selectors are parsed solely to report migration errors.
+	deprecatedSession  string
+	deprecatedSessions bool
 	// directory overrides the working directory.
 	directory string
 	// environment contains NAME=VALUE entries or names to forward.
@@ -128,9 +131,6 @@ type options struct {
 	// pull indicates that the ignored paths specified by arguments should be
 	// copied from the opposite endpoint.
 	pull bool
-	// sessions indicates that the sessions through which operations can be
-	// submitted should be listed.
-	sessions bool
 	// help indicates that usage information was requested, for the topic
 	// specified as an argument, if any.
 	help bool
@@ -184,7 +184,9 @@ func parse(arguments []string) (*options, error) {
 	flags.SetInterspersed(false)
 	flags.SortFlags = false
 	// Names in backquotes are used as value placeholders in usage information.
-	flags.StringVarP(&result.session, "session", "s", "", "Select session `NAME` or identifier")
+	flags.StringVarP(&result.deprecatedSession, "session", "s", "", "Deprecated; use --node")
+	flags.StringVar(&result.node, "node", "", "Select destination node `NAME`")
+	flags.BoolVar(&result.nodes, "nodes", false, "List nodes, paths, and connection availability")
 	flags.StringVarP(&result.directory, "cwd", "C", "", "Override execution directory with `DIR`")
 	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set or forward `NAME[=VALUE]` (repeatable)")
 	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read NAME=VALUE from `FILE` (repeatable)")
@@ -205,7 +207,9 @@ func parse(arguments []string) (*options, error) {
 	flags.BoolVar(&result.diff, "diff", false, "Sync, then compare paths or conflicts")
 	flags.BoolVar(&result.ignores, "ignores", false, "Show ignore rules or check given paths")
 	flags.BoolVar(&result.pull, "pull", false, "Pull ignored paths, preserving file mtime")
-	flags.BoolVar(&result.sessions, "sessions", false, "List sessions, execution hosts, and cwd")
+	flags.BoolVar(&result.deprecatedSessions, "sessions", false, "Deprecated; use --nodes")
+	flags.MarkHidden("session")
+	flags.MarkHidden("sessions")
 	result.conflictFlags = pflag.NewFlagSet("conflicts", pflag.ContinueOnError)
 	result.conflictFlags.SortFlags = false
 	result.conflictOptions.register(result.conflictFlags)
@@ -225,14 +229,16 @@ func parse(arguments []string) (*options, error) {
 	}
 	result.arguments = append(flags.Args(), operands...)
 	result.flags = flags
-	if !flags.Changed("session") {
-		result.defaultSession = os.Getenv(remote.SessionVariable)
+	if flags.Changed("session") || flags.Changed("sessions") {
+		return nil, errors.New("--session, -s, and --sessions are deprecated and no longer supported; use --nodes to discover targets and --node NAME to select one")
 	}
 	if flags.Changed("progress") {
 		result.progress = &progress
 	}
 	if result.help || result.version {
 		return result, nil
+	} else if os.Getenv(remote.SessionVariable) != "" {
+		return nil, errors.New("MUTAGEN_REMOTE_SESSION is deprecated and no longer supported; unset it and select a destination with --node NAME")
 	} else if err := result.validate(flags); err != nil {
 		return nil, err
 	} else if err := result.validateConflicts(); err != nil {
@@ -282,16 +288,21 @@ var modes = []struct {
 	// accepted are the names of the other options that it accepts.
 	accepted []string
 }{
-	{"sessions", nil},
-	{"jobs", []string{"session"}},
-	{"wait", []string{"session", "timeout", "no-flush", "tail", "follow", "progress"}},
-	{"kill", []string{"session", "timeout", "no-flush", "progress"}},
-	{"ignores", []string{"session"}},
-	{"pull", []string{"session", "timeout"}},
+	{"nodes", []string{"json", "timeout"}},
+	{"jobs", []string{"node"}},
+	{"wait", []string{"node", "timeout", "no-flush", "tail", "follow", "progress"}},
+	{"kill", []string{"node", "timeout", "no-flush", "progress"}},
+	{"ignores", []string{"node"}},
+	{"pull", []string{"node", "timeout"}},
 }
 
 // validate checks the combination of options other than conflict options.
 func (o *options) validate(flags *pflag.FlagSet) error {
+	if flags.Changed("node") {
+		if o.node == "" {
+			return errors.New("--node requires a node name")
+		}
+	}
 	if flags.Changed("tail") && !flags.Changed("wait") {
 		return errors.New("--tail requires --wait")
 	} else if flags.Changed("follow") && !flags.Changed("wait") {
@@ -316,8 +327,8 @@ func (o *options) validate(flags *pflag.FlagSet) error {
 		}
 	}
 	paths := o.pull || o.ignores
-	if (o.sessions || o.jobs || flags.Changed("wait") || flags.Changed("kill")) && len(o.arguments) > 0 {
-		return errors.New("--sessions, --jobs, --wait, and --kill don't accept arguments")
+	if (o.nodes || o.jobs || flags.Changed("wait") || flags.Changed("kill")) && len(o.arguments) > 0 {
+		return errors.New("--nodes, --jobs, --wait, and --kill don't accept arguments")
 	} else if (flags.Changed("wait") && o.wait == "") || (flags.Changed("kill") && o.kill == "") {
 		return errors.New("--wait and --kill require a job identifier")
 	} else if o.pull && len(o.arguments) == 0 {
@@ -345,7 +356,7 @@ func (o *options) validate(flags *pflag.FlagSet) error {
 // mode indicates whether an option that selects an operation other than
 // running a command, comparing copies, or resolving conflicts is specified.
 func (o *options) mode() bool {
-	return o.sessions || o.jobs || o.wait != "" || o.kill != "" || o.ignores || o.pull
+	return o.nodes || o.jobs || o.wait != "" || o.kill != "" || o.ignores || o.pull
 }
 
 // command indicates whether the options request running a command (or script).
@@ -356,6 +367,9 @@ func (o *options) command() bool {
 // Run executes the command line (excluding the executable name) and returns the
 // exit code.
 func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// Remote stderr, progress refreshes, and daemon reports may arrive on
+	// different goroutines. Cancellation diagnostics use this writer too.
+	stderr = &commandErrorOutput{writer: stderr}
 	fail := func(err error) int {
 		fmt.Fprintln(stderr, "remote:", err)
 		return errorExitCode(err)
@@ -452,20 +466,41 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(fmt.Errorf("unable to determine working directory: %w", err))
 	}
-
-	// Commands run in the directory corresponding to the working directory
-	// unless --cwd is specified, so an explicitly selected session can't run
-	// them at its root while another session synchronizes the directory.
-	router := &router{
-		ctx:       ctx,
-		directory: directory,
-		selection: &remote.Selection{
-			Session:       options.session,
-			Default:       options.defaultSession,
-			Corresponding: request != nil && options.directory == "",
-		},
-		stderr:   stderr,
-		progress: options.progress,
+	// Discovery is explicit; all other operations resolve their destination
+	// on the same daemon connection that performs the operation.
+	if options.nodes {
+		graph, _, err := queryNodes(ctx, directory, false, true)
+		if status, ok := interrupted("querying nodes"); ok {
+			return status
+		}
+		if err != nil {
+			return fail(err)
+		}
+		if err := printNodes(graph, options.json, stdout); err != nil {
+			return fail(err)
+		}
+		return 0
+	}
+	router := &router{ctx: ctx, directory: directory, selection: options.selection(request != nil && options.directory == ""), stderr: stderr, progress: options.progress}
+	if request != nil {
+		// Registrations already identify whether the source belongs to a tree.
+		// This local lookup needs no daemon graph query or remote round trip.
+		selection, source, err := options.locateSource(ctx, directory, options.directory == "")
+		if err != nil {
+			return fail(err)
+		}
+		router.selection = selection
+		if source.Tree {
+			return runNode(ctx, directory, options, request, selection, stdin, stdout, stderr, interrupted)
+		}
+	}
+	if (options.ignores || options.discard) && options.node != "" {
+		connection, target, err := router.submit(&remote.Submission{Operation: remote.OperationResolve})
+		if err != nil {
+			return fail(err)
+		}
+		connection.Close()
+		options.target = target
 	}
 
 	// Perform operations other than running commands.
@@ -473,8 +508,8 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	var code int
 	output := &checkedWriter{Writer: stdout}
 	switch {
-	case options.sessions:
-		activity, err = "listing sessions", printSessions(ctx, directory, options.defaultSession, output)
+	case options.conflicts:
+		activity, err = "listing path conflicts", printPathConflicts(ctx, directory, options, output, stderr)
 	case options.active():
 		activity, err = "resolving conflicts", runConflicts(ctx, directory, options, output, stderr)
 	case options.jobs:
@@ -546,8 +581,7 @@ func (r *router) dial(operation remote.Operation) (net.Conn, *remote.Target, err
 // submit is dial with the specified submission header.
 func (r *router) submit(header *remote.Submission) (net.Conn, *remote.Target, error) {
 	connection, target, err := r.selection.Submit(r.ctx, r.directory, header)
-	if err == nil && r.selection.Target == nil {
-		warnOverlapping(r.stderr, target)
+	if err == nil {
 		r.selection = &remote.Selection{Target: target}
 	}
 	return connection, target, err

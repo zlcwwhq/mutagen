@@ -41,7 +41,7 @@ func useTestJobs(t *testing.T) string {
 // jobRoute opens a route to an executor with the specified root.
 func jobRoute(ctx context.Context, root string) net.Conn {
 	client, server := net.Pipe()
-	go Serve(ctx, server, root, "", false)
+	go Serve(ctx, server, root, "", false, "")
 	return client
 }
 
@@ -56,7 +56,7 @@ func trackedJobRoute(t *testing.T, ctx context.Context, root string) net.Conn {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		Serve(ctx, server, root, "", false)
+		Serve(ctx, server, root, "", false, "")
 	}()
 	t.Cleanup(func() {
 		select {

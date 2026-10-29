@@ -136,7 +136,7 @@ func TestRunningScriptSurvivesPruning(t *testing.T) {
 	output := &firstLineWriter{line: make(chan string, 1)}
 	client, server := net.Pipe()
 	served := make(chan error, 1)
-	go func() { served <- Serve(context.Background(), server, "", "", false) }()
+	go func() { served <- Serve(context.Background(), server, "", "", false, "") }()
 	type outcome struct {
 		code int
 		err  error

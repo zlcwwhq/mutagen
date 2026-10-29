@@ -31,6 +31,11 @@ var (
 // Endpoint describes one endpoint of a synchronization session for the
 // purposes of command routing.
 type Endpoint struct {
+	// Tree and Node identify this workspace in a project tree, if any.
+	Tree string `json:",omitempty"`
+	Node string `json:",omitempty"`
+	// PeerNode names the adjacent workspace on the opposite endpoint.
+	PeerNode string `json:",omitempty"`
 	// Session is the session identifier.
 	Session string
 	// Name is the session name, if any.
@@ -84,6 +89,8 @@ type Channel interface {
 
 // localChannel implements Channel for an endpoint on the daemon's system.
 type localChannel struct {
+	// node is the stable tree node name, independent of endpoint role.
+	node string
 	// root is the normalized synchronization root.
 	root string
 	// alpha indicates whether this is the alpha endpoint.
@@ -121,6 +128,7 @@ func NewLocalChannel(logger *logging.Logger, endpoint *Endpoint) (Channel, error
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	channel := &localChannel{
+		node:     endpoint.Node,
 		root:     root,
 		alpha:    endpoint.Alpha,
 		execute:  endpoint.Execute,
@@ -162,7 +170,7 @@ func (c *localChannel) Open(_ context.Context) (io.ReadWriteCloser, error) {
 	c.tasks.Add(1)
 	go func() {
 		defer c.tasks.Done()
-		Serve(c.ctx, server, c.root, c.prologue, c.alpha)
+		Serve(c.ctx, server, c.root, c.prologue, c.alpha, c.node)
 	}()
 	return client, nil
 }
@@ -477,7 +485,7 @@ func ServeChannel(ctx context.Context, logger *logging.Logger, stream io.ReadWri
 			defer tasks.Done()
 			if !endpoint.Execute {
 				Reject(stream, errExecutionDisabled)
-			} else if err := Serve(ctx, stream, root, prologue, endpoint.Alpha); err != nil {
+			} else if err := Serve(ctx, stream, root, prologue, endpoint.Alpha, endpoint.Node); err != nil {
 				logger.Debug("Command route failed:", err)
 			}
 		}()

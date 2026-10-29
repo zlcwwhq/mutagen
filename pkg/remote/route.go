@@ -33,7 +33,7 @@ func ReceiveSubmission(ctx context.Context, connection io.ReadWriteCloser) (*Sub
 		return nil, fmt.Errorf("submission not received: %w", ctx.Err())
 	} else if err != nil {
 		return nil, ConnectionError(fmt.Errorf("unable to receive submission: %w", err))
-	} else if header.Operation > OperationRelease {
+	} else if header.Operation > OperationResolve {
 		return nil, fmt.Errorf("unsupported submission operation: %d", header.Operation)
 	}
 	return header, nil

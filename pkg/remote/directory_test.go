@@ -73,7 +73,7 @@ func TestStartJobDirectoryError(t *testing.T) {
 	request.Job = &JobRequest{Operation: JobStart}
 	client, server := net.Pipe()
 	served := make(chan error, 1)
-	go func() { served <- Serve(context.Background(), server, root, "", false) }()
+	go func() { served <- Serve(context.Background(), server, root, "", false, "") }()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, code, err := StartJob(ctx, client, request)

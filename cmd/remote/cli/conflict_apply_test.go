@@ -38,7 +38,7 @@ func TestApplySuperseded(t *testing.T) {
 	a := &application{w: w, result: w.Local, target: &remote.Target{Root: roots[0]}}
 	write := func(sequence uint64) error {
 		client, server := net.Pipe()
-		go remote.Serve(ctx, server, roots[1], "", false)
+		go remote.Serve(ctx, server, roots[1], "", false, "")
 		return a.write(ctx, client, w.file(localName), sequence)
 	}
 	applied := func() int {

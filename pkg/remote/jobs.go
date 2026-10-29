@@ -475,7 +475,13 @@ func resolveLog(directory, log string) (string, error) {
 // start the job report exit codes as Execute does. Unlike commands run by
 // Execute, the job keeps running when the connection closes.
 func StartJob(ctx context.Context, connection io.ReadWriteCloser, request *Request) (*Job, int, error) {
-	response, err := execute(ctx, connection, request, strings.NewReader(""), io.Discard, io.Discard)
+	return StartJobWithEvents(ctx, connection, request, nil)
+}
+
+// StartJobWithEvents is StartJob with structured synchronization preflight
+// updates. It preserves the detached job metadata returned by its executor.
+func StartJobWithEvents(ctx context.Context, connection io.ReadWriteCloser, request *Request, event func(*CommandEvent)) (*Job, int, error) {
+	response, err := executeWithEvents(ctx, connection, request, strings.NewReader(""), io.Discard, io.Discard, event)
 	if err != nil {
 		return nil, 0, err
 	} else if response.Error != "" {

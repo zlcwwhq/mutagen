@@ -33,7 +33,7 @@ func testSessionStates(specifications *SessionSpecifications) ([]*forwarding.Sta
 	var synchronizationStates []*synchronization.State
 	for _, s := range specifications.Synchronization {
 		synchronizationStates = append(synchronizationStates, &synchronization.State{Session: &synchronization.Session{
-			Identifier: "sync-" + s.Name, Name: s.Name, Labels: s.Labels,
+			Identifier: "sync-" + s.Name, Name: s.Name, Labels: s.Labels, Tree: s.Tree,
 			Alpha: s.Alpha, Beta: s.Beta, Configuration: s.Configuration,
 			ConfigurationAlpha: s.ConfigurationAlpha, ConfigurationBeta: s.ConfigurationBeta,
 			Paused: s.Paused,
