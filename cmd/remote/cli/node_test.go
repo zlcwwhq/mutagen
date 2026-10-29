@@ -70,6 +70,7 @@ func TestNodeListing(t *testing.T) {
 		"  gpu: available; host:~/project; one-way-safe\n",
 		"  local: center; current; laptop:/work\n",
 		"  offline: unavailable: node is paused or disconnected; offline:~/project; two-way-safe\n",
+		"Available means that a node executes commands and the edge to it is connected at both ends, not that it's in sync;",
 		"report conflicts unless given --no-flush",
 	} {
 		if !strings.Contains(output.String(), expected) {
@@ -152,4 +153,40 @@ func replyTestRoute(connection io.ReadWriteCloser, header *remote.Submission, se
 		return false
 	}
 	return true
+}
+
+// TestFollowUpCommand verifies that the remote command lines that remote
+// suggests repeat an explicit node selection, which a star's center with
+// several other nodes requires, quoting names that the daemon hasn't accepted
+// and keeping them on one line.
+func TestFollowUpCommand(t *testing.T) {
+	for node, expected := range map[string]string{
+		"":         "remote",
+		"gpu":      "remote --node gpu",
+		"gpu-2":    "remote --node gpu-2",
+		"a b":      "remote --node 'a b'",
+		"x\ny":     "remote --node 'x\\ny'",
+		"it's":     "remote --node 'it'\\''s'",
+		"\x1b[31m": "remote --node '^[[31m'",
+	} {
+		if command := followUpCommand(node); command != expected {
+			t.Errorf("incorrect command for %q: %q (expected %q)", node, command, expected)
+		}
+		if command := (&router{node: node}).followUp(); command != expected {
+			t.Errorf("incorrect router command for %q: %q (expected %q)", node, command, expected)
+		}
+	}
+
+	// Commands suggested before any operation, when options are refused,
+	// repeat the node too.
+	var output strings.Builder
+	if code := Run([]string{"--node", "gpu", "--detach", "--timeout", "5", "make"}, strings.NewReader(""), io.Discard, &output); code != failureExitCode ||
+		!strings.Contains(output.String(), "such as remote --node gpu --detach timeout 1h make bench") {
+		t.Fatalf("refusal didn't repeat the node: %d, %q", code, output.String())
+	}
+	output.Reset()
+	if code := Run([]string{"--detach", "--timeout", "5", "make"}, strings.NewReader(""), io.Discard, &output); code != failureExitCode ||
+		!strings.Contains(output.String(), "such as remote --detach timeout 1h make bench") {
+		t.Fatalf("refusal without a node changed: %d, %q", code, output.String())
+	}
 }

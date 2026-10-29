@@ -66,7 +66,9 @@ workspace. Sessions share a workspace if their endpoints are equal or nested on
 the same configured host (aliases and remote symbolic links aren't recognized).
 A group of sessions connected this way is flushed in D+1 rounds, where D is the
 largest number of steps between two of them: two rounds for a star and k rounds
-for a chain of k sessions, while a session that shares no workspace is flushed
+for a chain of k sessions, or k rounds for k sessions whose workspaces form a
+cycle, since sessions that ignore a change or synchronize in one direction can
+force it the long way around. A session that shares no workspace is flushed
 once. If a flush fails, nothing is terminated or created: fix the session and
 apply again, or, if its unsynchronized changes don't matter, terminate it with
 `mutagen sync terminate` and apply again. A retained session can instead be
@@ -211,7 +213,9 @@ for a pair, the edge must be connected for commands at both of its ends: while
 it isn't connected at the center, such as while it reconnects, the node is
 unavailable, and operations on it from the center fail with status 255, so
 retry once it reconnects. Commands use the corresponding relative directory;
-`--cwd` overrides it.
+`--cwd` overrides it. Repeat `--node` for later operations on the same node,
+such as `--wait` and `--kill` for a detached job; the commands that `remote`
+suggests, such as when it starts a job, include it.
 `MUTAGEN_REMOTE_NODE` identifies the executing node; use it in prologues shared
 by several nodes instead of `MUTAGEN_REMOTE_ENDPOINT`, since the center is alpha
 on every edge and every other node is beta.
@@ -219,11 +223,11 @@ on every edge and every other node is beta.
 `remote --nodes` lists the nodes that the current node can reach: from the
 center, every node, including paused or disconnected ones, and from another
 node, itself and the center. It marks the current node and the center, and shows
-each node's host and root, the mode of the edge to it, and its connection
-availability: a node is available while it executes commands, as the remote
-setting of the edge to it permits, and that edge is connected for commands at
-both ends. Operations on a node that doesn't execute commands fail with status
-125. `--nodes --json` provides machine-readable output. Discovery
+each node's host and root, the mode of the edge to it, and its availability: a
+node is available while it executes commands, as the remote setting of the edge
+to it permits, and that edge is connected for commands at both ends. Operations
+on a node that doesn't execute commands fail with status 125. `--nodes --json`
+provides machine-readable output. Discovery
 neither synchronizes files nor executes commands; available doesn't imply
 conflict-free. Terminating an edge only removes its node. The daemon refuses
 star edges that disagree with the star's existing edges on the center or its

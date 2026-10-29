@@ -92,13 +92,17 @@ type reporter struct {
 	locator *locator
 	// alpha indicates whether the submitting endpoint is alpha.
 	alpha bool
+	// followUp starts the remote command lines that reports suggest (see
+	// followUpCommand).
+	followUp string
 	// printed records printed lines.
 	printed map[string]bool
 }
 
-// newReporter creates a reporter for the target of a submission.
-func newReporter(output io.Writer, target *remote.Target) *reporter {
-	return &reporter{output: output, locator: newLocator(target), alpha: target.Alpha, printed: make(map[string]bool)}
+// newReporter creates a reporter for the target of a submission, whose
+// suggested remote command lines start with followUp (see followUpCommand).
+func newReporter(output io.Writer, target *remote.Target, followUp string) *reporter {
+	return &reporter{output: output, locator: newLocator(target), alpha: target.Alpha, followUp: followUp, printed: make(map[string]bool)}
 }
 
 // print prints a report.
@@ -114,9 +118,9 @@ func (r *reporter) print(report *remote.Report) {
 		conflicts = append(conflicts, fmt.Sprintf("...and %d more conflicts", report.ExcludedConflicts))
 	}
 	// Only sessions that support resolution refer to it.
-	heading := "these conflicts aren't synchronized until one side's copy is deleted (see remote --diff):"
+	heading := fmt.Sprintf("these conflicts aren't synchronized until one side's copy is deleted (see %s --diff):", r.followUp)
 	if report.Resolution {
-		heading = "these conflicts aren't synchronized until resolved (see remote --diff and remote --help conflicts):"
+		heading = fmt.Sprintf("these conflicts aren't synchronized until resolved (see %s --diff and remote --help conflicts):", r.followUp)
 	}
 	r.section(heading, conflicts)
 	var problems []string
@@ -178,7 +182,7 @@ func (r *reporter) describeConflict(conflict remote.Conflict) string {
 		}
 	}
 	if conflict.ExcludedChanges > 0 {
-		changes = append(changes, fmt.Sprintf("...and %d more changes (specify paths with remote --diff to compare them)", conflict.ExcludedChanges))
+		changes = append(changes, fmt.Sprintf("...and %d more changes (specify paths with %s --diff to compare them)", conflict.ExcludedChanges, r.followUp))
 	}
 	return r.locator.display(conflict.Root) + ": " + strings.Join(changes, ", ")
 }

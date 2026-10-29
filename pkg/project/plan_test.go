@@ -561,8 +561,8 @@ func testCheckOperations(t *testing.T, operations *testSessionOperations, expect
 
 // TestPlanApplyConvergesStar verifies that replacing every edge of a star
 // flushes all of its running edges in two rounds before any session is
-// terminated, since they all share the center, and that paused edges aren't
-// flushed.
+// terminated, however many there are, since they all share the center and
+// their workspaces form a tree, and that paused edges aren't flushed.
 func TestPlanApplyConvergesStar(t *testing.T) {
 	t.Chdir(t.TempDir())
 	const star = `
@@ -573,22 +573,26 @@ star:
     local: {endpoint: ./local}
     server: {endpoint: ./server}
     gpu: {endpoint: ./gpu}
+    cloud: {endpoint: ./cloud}
     offline: {endpoint: ./offline}
 `
 	operations := &testSessionOperations{}
 	if err := testApply(t, fmt.Sprintf(star, "old"), fmt.Sprintf(star, "new"), testPause("star-offline"), operations); err != nil {
 		t.Fatal(err)
 	}
-	testCheckOperations(t, operations, []string{
-		"flush synchronization sync-star-gpu",
-		"flush synchronization sync-star-server",
-		"flush synchronization sync-star-gpu",
-		"flush synchronization sync-star-server",
-		"terminate synchronization sync-star-gpu,sync-star-offline,sync-star-server",
+	var expected []string
+	for range 2 {
+		for _, name := range []string{"cloud", "gpu", "server"} {
+			expected = append(expected, "flush synchronization sync-star-"+name)
+		}
+	}
+	testCheckOperations(t, operations, append(expected,
+		"terminate synchronization sync-star-cloud,sync-star-gpu,sync-star-offline,sync-star-server",
+		"create synchronization star-cloud paused=false",
 		"create synchronization star-gpu paused=false",
 		"create synchronization star-offline paused=true",
 		"create synchronization star-server paused=false",
-	})
+	))
 }
 
 // TestPlanApplyConvergesChain verifies that replacing a chain of three
@@ -633,6 +637,114 @@ sync:
 			"create synchronization a paused=false",
 			"create synchronization b paused=false",
 			"create synchronization c paused=false",
+		})
+	}
+}
+
+// TestPlanApplyWorkspaceTopologies verifies that a component whose
+// workspaces form a tree is flushed in D+1 rounds, where D is its diameter,
+// even if it has more sessions, and that a component whose workspaces form a
+// cycle is flushed in as many rounds as it has sessions, even if its diameter
+// is shorter. A session whose endpoints overlap, or two sessions between the
+// same workspaces, count as cycles.
+func TestPlanApplyWorkspaceTopologies(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, test := range []struct {
+		// name is the scenario name.
+		name string
+		// configuration is the project configuration, which includes a
+		// placeholder for a maximum entry count that's changed to replace
+		// every session.
+		configuration string
+		// sessions are the names of the sessions, in name order.
+		sessions []string
+		// rounds is the expected number of rounds.
+		rounds int
+	}{
+		{
+			// No session in a cycle of five is more than two hops from
+			// another, but if the session that closes the cycle ignores a
+			// file, then the file's deletion on w1 has to traverse all four
+			// of the other sessions, and each round only carries it through
+			// one of them, since they're flushed starting from the other end.
+			name: "cycle",
+			configuration: `
+sync:
+  defaults: {maxEntryCount: %d}
+  a: {alpha: ./w4, beta: ./w5}
+  b: {alpha: ./w3, beta: ./w4}
+  c: {alpha: ./w2, beta: ./w3}
+  d: {alpha: ./w1, beta: ./w2}
+  e: {alpha: ./w5, beta: ./w1, ignore: {paths: [file]}}
+`,
+			sessions: []string{"a", "b", "c", "d", "e"},
+			rounds:   5,
+		},
+		{
+			// Three sessions share w0, and a fourth extends one of them, so
+			// no session is more than two hops from another.
+			name: "branching tree",
+			configuration: `
+sync:
+  defaults: {maxEntryCount: %d}
+  a: {alpha: ./w0, beta: ./w1}
+  b: {alpha: ./w0, beta: ./w2}
+  c: {alpha: ./w0, beta: ./w3}
+  d: {alpha: ./w3, beta: ./w4}
+`,
+			sessions: []string{"a", "b", "c", "d"},
+			rounds:   3,
+		},
+		{
+			// All three sessions share w0, but the endpoints of c overlap.
+			name: "self-loop",
+			configuration: `
+sync:
+  defaults: {maxEntryCount: %d}
+  a: {alpha: ./w0, beta: ./w1}
+  b: {alpha: ./w0, beta: ./w2}
+  c: {alpha: ./w0, beta: ./w0/sub}
+`,
+			sessions: []string{"a", "b", "c"},
+			rounds:   3,
+		},
+		{
+			// All three sessions share w0, but a and b both connect w0 and
+			// w1, which b's endpoint is nested in.
+			name: "parallel sessions",
+			configuration: `
+sync:
+  defaults: {maxEntryCount: %d}
+  a: {alpha: ./w0, beta: ./w1}
+  b: {alpha: ./w0, beta: ./w1/sub}
+  c: {alpha: ./w0, beta: ./w2}
+`,
+			sessions: []string{"a", "b", "c"},
+			rounds:   3,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			operations := &testSessionOperations{}
+			if err := testApply(t,
+				fmt.Sprintf(test.configuration, 100), fmt.Sprintf(test.configuration, 200), nil, operations,
+			); err != nil {
+				t.Fatal(err)
+			}
+			var expected []string
+			for range test.rounds {
+				for _, name := range test.sessions {
+					expected = append(expected, "flush synchronization sync-"+name)
+				}
+			}
+			var identifiers []string
+			for _, name := range test.sessions {
+				identifiers = append(identifiers, "sync-"+name)
+			}
+			expected = append(expected, "terminate synchronization "+strings.Join(identifiers, ","))
+			for _, name := range test.sessions {
+				expected = append(expected, "create synchronization "+name+" paused=false")
+			}
+			testCheckOperations(t, operations, expected)
 		})
 	}
 }
@@ -699,9 +811,9 @@ func TestPlanApplyConvergesRetainedSessions(t *testing.T) {
 }
 
 // TestPlanApplyPausedSessions verifies that paused sessions are neither
-// flushed, whether retained or replaced, nor shorten the paths between running
-// sessions: a chain of four running sessions needs four rounds, even though
-// paused sessions close it into a cycle, which would only need three.
+// flushed, whether retained or replaced, nor counted in the number of rounds:
+// a chain of four running sessions is flushed in four rounds, even though two
+// paused sessions close it into a cycle of six sessions.
 func TestPlanApplyPausedSessions(t *testing.T) {
 	t.Chdir(t.TempDir())
 	operations := &testSessionOperations{}

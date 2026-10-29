@@ -367,7 +367,7 @@ func (o *options) validate(flags *pflag.FlagSet) error {
 	} else if flags.Changed("log") && !o.detach {
 		return errors.New("--log requires --detach")
 	} else if o.detach && o.timeout > 0 {
-		return errors.New("--timeout can't be combined with --detach, which returns once the job starts; to limit the job's duration, run it with timeout, such as remote --detach timeout 1h make bench")
+		return fmt.Errorf("--timeout can't be combined with --detach, which returns once the job starts; to limit the job's duration, run it with timeout, such as %s --detach timeout 1h make bench", followUpCommand(o.node))
 	} else if o.detach && o.script == "" && len(o.arguments) == 0 {
 		return errors.New("--detach requires a command or --script")
 	} else if !o.flush && !o.diff && !o.active() && !o.mode() && o.script == "" && len(o.arguments) == 0 {
@@ -509,7 +509,10 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	router := &router{ctx: ctx, directory: directory, selection: options.selection(request != nil && options.directory == ""), stderr: stderr, progress: options.progress}
+	router := &router{
+		ctx: ctx, directory: directory, selection: options.selection(request != nil && options.directory == ""),
+		node: options.node, stderr: stderr, progress: options.progress,
+	}
 	if (options.ignores || options.discard) && options.node != "" {
 		target, err := router.resolve()
 		if err != nil {
@@ -540,7 +543,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			interruptedCode, ok = timeoutExitCode, true
 		}
 		if ok {
-			fmt.Fprintf(stderr, "remote: job %s is still running; remote --wait %[1]s resumes waiting, and remote --kill %[1]s terminates it\n", options.wait)
+			fmt.Fprintf(stderr, "remote: job %[2]s is still running; %[1]s --wait %[2]s resumes waiting, and %[1]s --kill %[2]s terminates it\n", router.followUp(), options.wait)
 			return interruptedCode
 		}
 	case options.kill != "":
@@ -576,6 +579,9 @@ type router struct {
 	// selection selects the session, and is pinned to the endpoint that the
 	// first submission locates.
 	selection *remote.Selection
+	// node is the destination node selected with --node, if any, which the
+	// remote command lines that remote suggests repeat (see followUp).
+	node string
 	// stderr receives warnings and synchronization progress.
 	stderr io.Writer
 	// progress is the --progress setting (see options.progress).
@@ -651,7 +657,7 @@ func (r *router) synchronize() (*remote.Target, *remote.Report, error) {
 	if err != nil {
 		return target, nil, err
 	} else if r.reports == nil {
-		r.reports = newReporter(r.stderr, target)
+		r.reports = newReporter(r.stderr, target, r.followUp())
 	}
 	r.reports.print(report)
 	return target, report, nil
@@ -660,6 +666,12 @@ func (r *router) synchronize() (*remote.Target, *remote.Report, error) {
 // warn prints a warning.
 func (r *router) warn(format string, arguments ...any) {
 	fmt.Fprintf(r.stderr, "remote: warning: "+format+"\n", arguments...)
+}
+
+// followUp returns the start of the remote command lines that remote suggests
+// for later operations on the destination (see followUpCommand).
+func (r *router) followUp() string {
+	return followUpCommand(r.node)
 }
 
 // runCommand synchronizes the session, if requested, and then runs a command,
@@ -712,7 +724,7 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 	request.Path = target.Path
 	request.Prologue = target.Contained && !options.noPrologue
 	if request.Job != nil {
-		code, err := startJob(router.ctx, connection, target, request, stdout, stderr)
+		code, err := startJob(router.ctx, connection, target, request, router.followUp(), stdout, stderr)
 		if interruptedCode, ok := interrupted("starting the job"); ok {
 			return interruptedCode
 		} else if err != nil {

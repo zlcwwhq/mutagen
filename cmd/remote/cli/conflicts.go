@@ -218,7 +218,7 @@ func checkTake(o *options, files bool, takable []string) error {
 	if !files && (o.take == "" || o.executable != "") {
 		return errors.New("the copies aren't both files, so they can only be resolved with --take local or --take remote")
 	} else if o.take != "" && !files && !slices.Contains(takable, o.take) {
-		return fmt.Errorf("the %s copy can't be taken for this conflict (see remote --conflicts)", o.take)
+		return fmt.Errorf("the %s copy can't be taken for this conflict (see %s --conflicts)", o.take, followUpCommand(o.node))
 	}
 	return nil
 }
@@ -1041,7 +1041,7 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 		return ""
 	}
 	conflicts := make([]listedConflict, len(listing.Conflicts))
-	reports := newReporter(errorOutput, target)
+	reports := newReporter(errorOutput, target, followUpCommand(o.node))
 	for c := range listing.Conflicts {
 		conflict := &listing.Conflicts[c]
 		localChanges, remoteChanges := reports.sides(conflict.Changes())
@@ -1262,9 +1262,9 @@ func checkoutLocked(ctx context.Context, directory string, o *options, listing *
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, 0, err
 	} else if conflict == nil {
-		return nil, 0, errors.New("isn't a conflict root (see remote --conflicts)")
+		return nil, 0, fmt.Errorf("isn't a conflict root (see %s --conflicts)", followUpCommand(o.node))
 	} else if !conflict.Resolvable() {
-		return nil, 0, errors.New("isn't a conflict that remote can resolve (see remote --conflicts)")
+		return nil, 0, fmt.Errorf("isn't a conflict that remote can resolve (see %s --conflicts)", followUpCommand(o.node))
 	} else if o.base != "" && !conflict.Files {
 		return nil, 0, errors.New("--base requires a conflict between two files")
 	}
@@ -1509,7 +1509,7 @@ func resolution(ctx context.Context, w *workspace, o *options) (*remote.Entry, s
 	if selected != nil && selected.Kind == remote.EntrySymbolicLink {
 		return &remote.Entry{Kind: remote.EntrySymbolicLink, Target: selected.Target}, "", nil
 	} else if selected != nil && selected.Kind != remote.EntryFile {
-		return nil, "", fmt.Errorf("the %s copy can't be taken for this conflict (see remote --conflicts)", o.take)
+		return nil, "", fmt.Errorf("the %s copy can't be taken for this conflict (see %s --conflicts)", o.take, followUpCommand(o.node))
 	}
 	result, err := remote.ReadEntry(ctx, source)
 	if err != nil {
@@ -1581,6 +1581,9 @@ type application struct {
 	target *remote.Target
 	// locator maps paths for display.
 	locator *locator
+	// followUp starts the remote command lines that errors suggest (see
+	// followUpCommand).
+	followUp string
 }
 
 // applyAll applies the resolutions of the specified conflicts, then
@@ -1719,7 +1722,7 @@ func apply(ctx context.Context, directory string, o *options, argument string, e
 			}()
 		}
 	} else if errors.Is(err, os.ErrNotExist) {
-		return nil, unlock, errors.New("isn't checked out (see remote --conflict-checkout)")
+		return nil, unlock, fmt.Errorf("isn't checked out (see %s --conflict-checkout)", followUpCommand(o.node))
 	}
 	if err != nil {
 		return nil, unlock, err
@@ -1734,7 +1737,7 @@ func apply(ctx context.Context, directory string, o *options, argument string, e
 	if err != nil {
 		return nil, unlock, err
 	}
-	a := &application{argument: argument, w: w, result: result, target: target, locator: newLocator(target)}
+	a := &application{argument: argument, w: w, result: result, target: target, locator: newLocator(target), followUp: followUpCommand(o.node)}
 	if expected != nil && (target.Session != expected.Session || target.Alpha != expected.Alpha) {
 		connection.Close()
 		return nil, unlock, errors.New("the session was located differently while resolving the conflict")
@@ -1771,10 +1774,11 @@ func apply(ctx context.Context, directory string, o *options, argument string, e
 }
 
 // supersededHint adds advice to an error caused by a later apply of the
-// conflict, which replaced a copy (or tried to) first.
-func supersededHint(err error) error {
+// conflict, which replaced a copy (or tried to) first, suggesting a remote
+// command line that starts with followUp (see followUpCommand).
+func supersededHint(err error, followUp string) error {
 	if errors.Is(err, remote.ErrSuperseded) {
-		return fmt.Errorf("%w; list conflicts (remote --conflicts) to see whether it resolved the conflict", err)
+		return fmt.Errorf("%w; list conflicts (%s --conflicts) to see whether it resolved the conflict", err, followUp)
 	}
 	return staleHint(err)
 }
@@ -1844,7 +1848,7 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 		if errors.Is(err, remote.ErrStale) || errors.Is(err, remote.ErrSuperseded) {
 			forget()
 		}
-		return fmt.Errorf("unable to update the remote copy: %w", supersededHint(err))
+		return fmt.Errorf("unable to update the remote copy: %w", supersededHint(err, a.followUp))
 	}
 	if input, err = open(); err != nil {
 		return err
@@ -1852,7 +1856,7 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 	err = remote.ReplaceFile(ctx, a.target.Root, replacement, input)
 	input.Close()
 	if err != nil {
-		return fmt.Errorf("updated the remote copy, but unable to update the local copy: %w", supersededHint(err))
+		return fmt.Errorf("updated the remote copy, but unable to update the local copy: %w", supersededHint(err, a.followUp))
 	}
 	return nil
 }
@@ -1923,7 +1927,7 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 	// The checkout is released once the workspace is set aside. One left
 	// behind is released by the next listing (see releaseAbandoned).
 	if _, err := release(ctx, directory, a.target, w.Path, w.Token); err != nil {
-		lines = append(lines, fmt.Sprintf("Unable to release the checkout (%v); remote --conflicts releases it.", err))
+		lines = append(lines, fmt.Sprintf("Unable to release the checkout (%v); %s --conflicts releases it.", err, followUpCommand(o.node)))
 	}
 	return &outcome{Path: a.argument, Resolved: true, Backup: backup, lines: lines}, nil
 }

@@ -459,7 +459,10 @@ func ServeChannel(ctx context.Context, logger *logging.Logger, stream io.ReadWri
 		}
 	}()
 
-	// Forward local submissions to the daemon.
+	// Forward local submissions to the daemon. Termination closes each
+	// forwarded submission, which ends forwarding blocked on it, such as
+	// output that the submitter doesn't read, since closing the stream to the
+	// daemon can't, while termination waits for forwarding.
 	if listener != nil {
 		tasks.Add(1)
 		go func() {
@@ -470,6 +473,8 @@ func ServeChannel(ctx context.Context, logger *logging.Logger, stream io.ReadWri
 					Reject(connection, ConnectionError(fmt.Errorf("unable to reach the Mutagen daemon: %w", err)))
 					return
 				}
+				stop := context.AfterFunc(ctx, func() { connection.Close() })
+				defer stop()
 				Splice(connection, stream)
 			})
 		}()

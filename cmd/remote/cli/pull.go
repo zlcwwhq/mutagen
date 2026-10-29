@@ -89,14 +89,15 @@ func pullPath(router *router, target *remote.Target, locator *locator, argument 
 	// Check that the session ignores the path as some kind of entry before
 	// creating its parents, and check where writes to it land once they
 	// exist, before transferring anything.
-	fileErr, directoryErr := checkIgnored(target.Ignores, relative, false), checkIgnored(target.Ignores, relative, true)
+	followUp := router.followUp()
+	fileErr, directoryErr := checkIgnored(target.Ignores, relative, false, followUp), checkIgnored(target.Ignores, relative, true, followUp)
 	if fileErr != nil && directoryErr != nil {
 		if target.Ignores.ExcludedInAnyForm(relative, true) != "" {
 			return nil, directoryErr
 		}
 		return nil, fileErr
 	}
-	root, landing, err := prepareParents(router.ctx, target, locator, relative)
+	root, landing, err := prepareParents(router.ctx, target, locator, relative, followUp)
 	if err != nil {
 		return nil, err
 	} else if err := checkLanding(target, locator, root, landing, false, "it", "write it"); err != nil &&
@@ -139,7 +140,7 @@ func pullPath(router *router, target *remote.Target, locator *locator, argument 
 	default:
 		return nil, errors.New("it isn't a file, directory, or symbolic link on the opposite endpoint")
 	}
-	if err := checkIgnored(target.Ignores, relative, directory); err != nil {
+	if err := checkIgnored(target.Ignores, relative, directory, followUp); err != nil {
 		return nil, err
 	} else if err := checkLanding(target, locator, root, landing, directory, "it", "write it"); err != nil {
 		return nil, err
@@ -172,16 +173,17 @@ const partiallyIgnored = "the session ignores it in only some Unicode normalizat
 // the root, which is a directory if directory is true, in every form in which
 // scans could see it (see remote.Ignores.ExcludedInEveryForm), since remote
 // only writes content that the session doesn't synchronize. Otherwise, it
-// explains why remote doesn't write it.
-func checkIgnored(ignores *remote.Ignores, relative string, directory bool) error {
+// explains why remote doesn't write it, suggesting remote command lines that
+// start with followUp (see followUpCommand).
+func checkIgnored(ignores *remote.Ignores, relative string, directory bool, followUp string) error {
 	if ignores.ExcludedInEveryForm(relative, directory) != "" {
 		return nil
 	} else if ignores.ExcludedInAnyForm(relative, directory) != "" {
-		return errors.New(partiallyIgnored + ", so remote doesn't write it; remote --ignores shows what the session ignores")
+		return fmt.Errorf("%s, so remote doesn't write it; %s --ignores shows what the session ignores", partiallyIgnored, followUp)
 	} else if directory {
 		return errors.New("the session synchronizes some content beneath it, so remote doesn't pull it as a whole; pull the ignored content beneath it instead")
 	}
-	return errors.New("the session synchronizes it, so remote doesn't write it; remote --flush synchronizes it, and remote --ignores shows what the session ignores")
+	return fmt.Errorf("the session synchronizes it, so remote doesn't write it; %[1]s --flush synchronizes it, and %[1]s --ignores shows what the session ignores", followUp)
 }
 
 // within determines whether a path lies inside a root, both with symbolic
@@ -254,8 +256,9 @@ func checkLanding(target *remote.Target, locator *locator, root, landing string,
 // remote.Synchronizing), since another session's root may lie in content that
 // the session ignores, and that session would propagate them even if the pull
 // were refused afterwards. Inside the root, the session's own endpoints don't
-// count, since it ignores the parents where they land.
-func prepareParents(ctx context.Context, target *remote.Target, locator *locator, relative string) (string, string, error) {
+// count, since it ignores the parents where they land. Refusals suggest remote
+// command lines that start with followUp (see followUpCommand).
+func prepareParents(ctx context.Context, target *remote.Target, locator *locator, relative, followUp string) (string, string, error) {
 	root, err := filepath.EvalSymlinks(target.Root)
 	if err != nil {
 		return "", "", fmt.Errorf("unable to access the synchronization root: %w", err)
@@ -272,7 +275,7 @@ func prepareParents(ctx context.Context, target *remote.Target, locator *locator
 				if target.Ignores.ExcludedInAnyForm(parent, true) != "" {
 					return "", "", fmt.Errorf("%s doesn't exist locally, and %s, so remote doesn't create it", display, partiallyIgnored)
 				}
-				return "", "", fmt.Errorf("%s doesn't exist locally, but the session synchronizes it, so remote doesn't create it; remote --flush synchronizes it", display)
+				return "", "", fmt.Errorf("%s doesn't exist locally, but the session synchronizes it, so remote doesn't create it; %s --flush synchronizes it", display, followUp)
 			} else if err := checkLanding(target, locator, root, native, true, display, "create it"); err != nil {
 				return "", "", err
 			} else if sessions, err := remote.Synchronizing(ctx, native, true); err != nil {

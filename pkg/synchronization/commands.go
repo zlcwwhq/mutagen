@@ -195,9 +195,10 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		}()
 	}
 	return func() {
-		// Routes observe the cancellation through the relay's context. The
-		// relay's channels close before the wait, which ends routes spliced to
-		// them.
+		// Routes observe the cancellation through the relay's context, which
+		// closes their submissions (see route), so that a submitter can't
+		// delay the wait, such as by not reading a response. The relay's
+		// channels also close before the wait.
 		cancel()
 		c.stars.setRelay(c, nil)
 		maintainers.Wait()
@@ -282,7 +283,27 @@ func (r *commandRelay) accept(ctx context.Context, index int, channel remote.Cha
 // executor of the specified endpoint, which is always the opposite endpoint of
 // this relay's session: a submission that selects a node on another edge is
 // refused (see resolveSubmission).
+//
+// The route ends once the context is cancelled, when the relay stops, since
+// stopping it waits for every route: the cancellation closes the submission,
+// which interrupts any read or write blocked on it, such as a response that
+// the submitter doesn't read, or output that a splice forwards to it. Closing
+// the relay's channels can't interrupt them, since a local channel doesn't
+// close the submissions that it delivered, and an executor's channel only
+// closes the other half of a splice. Every operation closes the submission
+// once it's handled, which makes closing it again harmless, and the closure
+// completes before the route returns.
 func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser, target int) {
+	closed := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(closed)
+		submission.Close()
+	})
+	defer func() {
+		if !stop() {
+			<-closed
+		}
+	}()
 	header, err := remote.ReceiveSubmission(ctx, submission)
 	if err != nil {
 		remote.Reject(submission, err)
@@ -303,7 +324,9 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 	r.routeResolved(ctx, submission, target, header)
 }
 
-// routeResolved executes an operation after its destination is resolved.
+// routeResolved executes an operation after its destination is resolved. The
+// submission is closed once the context is cancelled (see route), which also
+// interrupts the progress messages that a flush sends while it waits.
 func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWriteCloser, target int, header *remote.Submission) {
 	var err error
 	operation := header.Operation
@@ -317,8 +340,6 @@ func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWrit
 		return
 	} else if operation == remote.OperationConflicts {
 		r.logger.Debug("Forcing synchronization cycle for conflict listing")
-		stop := context.AfterFunc(ctx, func() { submission.Close() })
-		defer stop()
 		var listing *remote.Listing
 		if r.conflicts == nil {
 			err = errResolutionUnsupported
@@ -348,8 +369,6 @@ func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWrit
 		return
 	} else if operation == remote.OperationFlush {
 		r.logger.Debug("Forcing synchronization cycle for submission")
-		stop := context.AfterFunc(ctx, func() { submission.Close() })
-		defer stop()
 		var report *remote.Report
 		if err = r.flushReporting(ctx, submission, header.Progress); err == nil {
 			report = r.report()

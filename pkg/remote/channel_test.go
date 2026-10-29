@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -723,6 +724,67 @@ func TestServeChannelInitializationCancellation(t *testing.T) {
 		daemon.Close()
 		executor.Close()
 		cancel()
+	}
+}
+
+func TestServeChannelDisconnectionWithBlockedSubmission(t *testing.T) {
+	// Connect an executor that registers its endpoint for submissions.
+	useTestRegistry(t)
+	root := resolveSymbolicLinks(t.TempDir())
+	daemon, executor := net.Pipe()
+	served := make(chan error, 1)
+	go func() { served <- ServeChannel(context.Background(), nil, executor, nil) }()
+	channel, err := NewChannel(context.Background(), nil, daemon, &Endpoint{Session: "sync_test", Root: root, Submit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer channel.Close()
+
+	// The daemon sends output to a local submission until sending fails, while
+	// the submitter reads nothing, which blocks forwarding once the socket's
+	// buffers are full. The submitter's closure releases blocked forwarding.
+	var sent atomic.Int64
+	go func() {
+		submission, err := channel.Accept()
+		if err != nil {
+			return
+		}
+		defer submission.Close()
+		if _, err := ReceiveSubmission(context.Background(), submission); err != nil {
+			return
+		}
+		data := make([]byte, 32*1024)
+		for {
+			count, err := submission.Write(data)
+			sent.Add(int64(count))
+			if err != nil {
+				return
+			}
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	connection, _, err := (&Selection{}).Dial(ctx, root, OperationExecute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	for previous := int64(-1); ; previous = sent.Load() {
+		if ctx.Err() != nil {
+			t.Fatal("output not blocked")
+		}
+		time.Sleep(100 * time.Millisecond)
+		if current := sent.Load(); current > 0 && current == previous {
+			break
+		}
+	}
+
+	// Disconnection terminates the executor, including forwarding.
+	channel.Close()
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("executor with a blocked submission not terminated by disconnection")
 	}
 }
 

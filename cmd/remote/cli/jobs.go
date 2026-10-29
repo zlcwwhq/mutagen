@@ -26,10 +26,10 @@ const (
 	// maximumShownLeftovers is the maximum number of the processes that a job
 	// left running that are shown for the job.
 	maximumShownLeftovers = 5
-	// groupListingCommand is the command suggested for listing processes with
-	// their process groups where the processes that a job left running can't
-	// be listed.
-	groupListingCommand = "remote -- ps -A -o pid,pgid,args"
+	// groupListingArguments are the arguments of the remote command line (see
+	// followUpCommand) suggested for listing processes with their process
+	// groups where the processes that a job left running can't be listed.
+	groupListingArguments = "-- ps -A -o pid,pgid,args"
 )
 
 // executing names the endpoint that executes operations submitted through a
@@ -110,12 +110,14 @@ func describeState(job *remote.Job) string {
 }
 
 // startJob starts a command as a detached job over an established route,
-// printing the job's identifier to stdout and how to follow it to stderr. It
-// returns the exit code for failures to start the job along with the error.
-func startJob(ctx context.Context, connection net.Conn, target *remote.Target, request *remote.Request, stdout, stderr io.Writer) (int, error) {
+// printing the job's identifier to stdout and how to follow it to stderr, with
+// the remote command lines that it suggests starting with followUp (see
+// followUpCommand). It returns the exit code for failures to start the job
+// along with the error.
+func startJob(ctx context.Context, connection net.Conn, target *remote.Target, request *remote.Request, followUp string, stdout, stderr io.Writer) (int, error) {
 	job, code, err := remote.StartJob(ctx, connection, request)
 	if errors.Is(err, remote.ErrConnectionLost) {
-		return 0, remote.ConnectionError(errors.New("the connection to the executing endpoint was lost while starting the job, which may be running; remote --jobs lists the jobs"))
+		return 0, remote.ConnectionError(fmt.Errorf("the connection to the executing endpoint was lost while starting the job, which may be running; %s --jobs lists the jobs", followUp))
 	} else if err != nil {
 		return code, err
 	}
@@ -123,8 +125,8 @@ func startJob(ctx context.Context, connection net.Conn, target *remote.Target, r
 		return 0, fmt.Errorf("job %s started, but its identifier couldn't be printed: %w", job.ID, err)
 	}
 	locator := newLocator(target)
-	fmt.Fprintf(stderr, "remote: started job %[1]s on %[2]s with output in %[3]s; remote --wait %[1]s waits for it, and remote --kill %[1]s terminates it\n",
-		job.ID, executing(target), describeLog(locator, job))
+	fmt.Fprintf(stderr, "remote: started job %[1]s on %[2]s with output in %[3]s; %[4]s --wait %[1]s waits for it, and %[4]s --kill %[1]s terminates it\n",
+		job.ID, executing(target), describeLog(locator, job), followUp)
 	if job.LogPath != "" {
 		// The log isn't synchronized if the session ignores it in every form
 		// in which scans could see its path, and remote --pull copies it
@@ -133,11 +135,11 @@ func startJob(ctx context.Context, connection net.Conn, target *remote.Target, r
 		// remote.Ignores.ExcludedInEveryForm). Reading it, including with
 		// remote --wait --tail, works in either case.
 		if excluded := target.Ignores.ExcludedInEveryForm(job.LogPath, false); excluded != "" {
-			fmt.Fprintf(stderr, "remote: warning: the session ignores %s, so the log isn't synchronized; read it with remote cat or remote --wait %s --tail <lines>, or copy it with remote --pull\n",
-				locator.display(excluded), job.ID)
+			fmt.Fprintf(stderr, "remote: warning: the session ignores %[1]s, so the log isn't synchronized; read it with %[3]s cat or %[3]s --wait %[2]s --tail <lines>, or copy it with %[3]s --pull\n",
+				locator.display(excluded), job.ID, followUp)
 		} else if excluded := target.Ignores.ExcludedInAnyForm(job.LogPath, false); excluded != "" {
-			fmt.Fprintf(stderr, "remote: warning: the session ignores %s in only some Unicode normalization forms of its path, so the log may not be synchronized; read it with remote cat or remote --wait %s --tail <lines>\n",
-				locator.display(excluded), job.ID)
+			fmt.Fprintf(stderr, "remote: warning: the session ignores %[1]s in only some Unicode normalization forms of its path, so the log may not be synchronized; read it with %[3]s cat or %[3]s --wait %[2]s --tail <lines>\n",
+				locator.display(excluded), job.ID, followUp)
 		}
 	}
 	return 0, nil
@@ -154,7 +156,7 @@ func listJobs(router *router, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return printJobs(output, newLocator(target), executing(target), jobs, hidden)
+	return printJobs(output, newLocator(target), executing(target), router.followUp(), jobs, hidden)
 }
 
 // describeLeftovers describes the processes that an ended job left running, if
@@ -172,9 +174,10 @@ func describeLeftovers(job *remote.Job) string {
 }
 
 // leftoverKillCommand returns the command that terminates the processes that an
-// ended job left running, as listed by the executing endpoint.
-func leftoverKillCommand(job *remote.Job) string {
-	words := []string{"remote", "--", "kill"}
+// ended job left running, as listed by the executing endpoint, as a remote
+// command line starting with followUp (see followUpCommand).
+func leftoverKillCommand(followUp string, job *remote.Job) string {
+	words := []string{followUp, "--", "kill"}
 	for _, process := range job.Leftovers {
 		words = append(words, strconv.Itoa(process.PID))
 	}
@@ -183,31 +186,33 @@ func leftoverKillCommand(job *remote.Job) string {
 
 // describeLeftoverReport reports the processes that an ended job left running,
 // if any, or, where they can't be listed, that its process group may still
-// have processes. The report is a warning for remote --wait, while for remote
-// --kill it notes that remote --kill doesn't terminate them. It's empty if
-// there's nothing to report.
-func describeLeftoverReport(id string, job *remote.Job, kill bool) string {
+// have processes, suggesting remote command lines that start with followUp
+// (see followUpCommand). The report is a warning for remote --wait, while for
+// remote --kill it notes that remote --kill doesn't terminate them. It's empty
+// if there's nothing to report.
+func describeLeftoverReport(followUp, id string, job *remote.Job, kill bool) string {
 	if len(job.Leftovers) > 0 {
 		if kill {
 			return fmt.Sprintf("remote: job %s left processes running, which remote --kill doesn't terminate: %s; %s terminates them\n",
-				id, describeLeftovers(job), leftoverKillCommand(job))
+				id, describeLeftovers(job), leftoverKillCommand(followUp, job))
 		}
 		return fmt.Sprintf("remote: warning: job %s left processes running: %s; %s terminates them\n",
-			id, describeLeftovers(job), leftoverKillCommand(job))
+			id, describeLeftovers(job), leftoverKillCommand(followUp, job))
 	} else if job.GroupMayRemain {
 		if kill {
-			return fmt.Sprintf("remote: process group %d of job %s may still have processes that the job left running, which remote --kill doesn't terminate; %s lists processes with their groups\n",
-				job.Group, id, groupListingCommand)
+			return fmt.Sprintf("remote: process group %d of job %s may still have processes that the job left running, which remote --kill doesn't terminate; %s %s lists processes with their groups\n",
+				job.Group, id, followUp, groupListingArguments)
 		}
-		return fmt.Sprintf("remote: warning: process group %d of job %s may still have processes that the job left running; %s lists processes with their groups\n",
-			job.Group, id, groupListingCommand)
+		return fmt.Sprintf("remote: warning: process group %d of job %s may still have processes that the job left running; %s %s lists processes with their groups\n",
+			job.Group, id, followUp, groupListingArguments)
 	}
 	return ""
 }
 
 // printJobs prints a job listing. Jobs that left processes running are followed
-// by a line that lists them.
-func printJobs(output io.Writer, locator *locator, endpoint string, jobs []*remote.Job, hidden int) error {
+// by a line that lists them, and the listing then ends with remote command
+// lines that deal with them, which start with followUp (see followUpCommand).
+func printJobs(output io.Writer, locator *locator, endpoint, followUp string, jobs []*remote.Job, hidden int) error {
 	if len(jobs) == 0 {
 		fmt.Fprintf(output, "No jobs were started at this node's root on %s.\n", endpoint)
 	} else {
@@ -246,10 +251,10 @@ func printJobs(output io.Writer, locator *locator, endpoint string, jobs []*remo
 			}
 		}
 		if leftovers {
-			listing.WriteString("(Processes that jobs left running aren't part of them, so remote --kill doesn't terminate them; remote -- kill PID... does.)\n")
+			fmt.Fprintf(&listing, "(Processes that jobs left running aren't part of them, so remote --kill doesn't terminate them; %s -- kill PID... does.)\n", followUp)
 		}
 		if groups {
-			fmt.Fprintf(&listing, "(%s lists processes with their groups.)\n", groupListingCommand)
+			fmt.Fprintf(&listing, "(%s %s lists processes with their groups.)\n", followUp, groupListingArguments)
 		}
 		if _, err := io.WriteString(output, listing.String()); err != nil {
 			return err
@@ -384,7 +389,7 @@ func waitJob(router *router, options *options, output io.Writer) (int, error) {
 		fmt.Fprintf(router.stderr, "remote: job %s ended without recording its exit status, such as because it was killed with SIGKILL or %s restarted; output in %s\n", id, executing(target), log)
 		code = failureExitCode
 	}
-	fmt.Fprint(router.stderr, describeLeftoverReport(id, job, false))
+	fmt.Fprint(router.stderr, describeLeftoverReport(router.followUp(), id, job, false))
 	return code, nil
 }
 
@@ -398,7 +403,7 @@ func killJob(router *router, id string) error {
 	if err != nil {
 		return err
 	}
-	report, err := describeKill(id, job)
+	report, err := describeKill(router.followUp(), id, job)
 	if err != nil {
 		return err
 	}
@@ -408,8 +413,8 @@ func killJob(router *router, id string) error {
 
 // describeKill reports the state of a job returned by remote --kill, followed
 // by any processes that the job left running, which remote --kill doesn't
-// terminate.
-func describeKill(id string, job *remote.Job) (string, error) {
+// terminate (see describeLeftoverReport).
+func describeKill(followUp, id string, job *remote.Job) (string, error) {
 	var report string
 	switch job.State {
 	case remote.JobKilled:
@@ -427,5 +432,5 @@ func describeKill(id string, job *remote.Job) (string, error) {
 	default:
 		return "", fmt.Errorf("job %s is still running", id)
 	}
-	return report + describeLeftoverReport(id, job, true), nil
+	return report + describeLeftoverReport(followUp, id, job, true), nil
 }

@@ -111,7 +111,7 @@ func printIgnores(router *router, paths []string, output io.Writer) (int, error)
 		if ignores.VCS {
 			fmt.Fprintln(output, "  VCS directories (.git, .svn, .hg, .bzr, and _darcs)")
 		}
-		fmt.Fprintln(output, "Ignored paths aren't synchronized; remote --ignores <path> checks a path, and remote --pull <path> copies ignored paths from the opposite endpoint.")
+		fmt.Fprintf(output, "Ignored paths aren't synchronized; %[1]s --ignores <path> checks a path, and %[1]s --pull <path> copies ignored paths from the opposite endpoint.\n", router.followUp())
 		return 0, nil
 	}
 

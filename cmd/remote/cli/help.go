@@ -69,7 +69,9 @@ disables execution there fail with 125.
     beta.
   - Omit --node only when there is exactly one other node, as from a
     non-center node; an offline node still counts. Creation order and
-    availability never choose among several targets.
+    availability never choose among several targets. Repeat --node for later
+    operations on the node, such as --wait and --kill for a detached job;
+    the commands that remote suggests include it.
   - The current directory identifies the source workspace. A star's edges
     share the center's root; independent pairs sharing a root are ambiguous
     and should be declared as one star. Outside every root, explicit --node
