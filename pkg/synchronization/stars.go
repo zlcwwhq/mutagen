@@ -16,10 +16,11 @@ var errNodeGraphChanged = errors.New("node graph changed after target selection;
 
 // commandStars indexes the daemon's sessions and their running command relays
 // for node discovery and destination selection. Every star edge is an
-// ordinary pair session, so each operation crosses exactly one edge: the only
-// routing decision is which edge carries a submission that arrives at a star's
-// center, since every edge registers the center's workspace. The index holds
-// no derived state, so membership changes never need to cancel operations.
+// ordinary pair session, and each operation crosses exactly one edge: the edge
+// through which it was submitted, which, at a star's center, where every edge
+// registers the center's workspace, must be the selected node's own (see
+// resolveSubmission). The index holds no derived state, so membership changes
+// never need to cancel operations.
 type commandStars struct {
 	sync.Mutex
 	// controllers includes paused and disconnected sessions.
@@ -116,6 +117,27 @@ func connectedLocked(relay *commandRelay, index int) bool {
 // unavailableReason explains why a node's edge can't carry operations.
 const unavailableReason = "node is paused, disconnected, or has commands disabled"
 
+// centerUnavailableReason explains why a node can't be reached from a star's
+// center although its edge may run: the edge's command channel at the center,
+// which registers the center's workspace for submissions through the edge,
+// isn't connected, or the submission couldn't reach that registration, so that
+// it entered through another edge (see resolveSubmission).
+const centerUnavailableReason = "its edge isn't connected for remote commands at the center (it may be paused, terminated, or reconnecting), so retry once it reconnects"
+
+// starEdgeAvailableLocked reports whether a star's edge can carry operations
+// from the center, and otherwise explains why not. Both of the edge's command
+// channels must be connected: the channel at the center registers the center's
+// workspace, through which operations on the node are submitted, and the
+// channel at the node executes them. The index lock must be held.
+func starEdgeAvailableLocked(relay *commandRelay) (bool, string) {
+	if !connectedLocked(relay, 1) {
+		return false, unavailableReason
+	} else if !connectedLocked(relay, 0) {
+		return false, centerUnavailableReason
+	}
+	return true, ""
+}
+
 // nodes describes the nodes that the source can reach, including paused and
 // disconnected ones, and their connection availability, without synchronizing,
 // inspecting file contents, or opening any route. A star's center reaches
@@ -160,9 +182,10 @@ func pairNodesLocked(source *commandRelay, index int) *remote.NodeGraph {
 }
 
 // starNodesLocked describes a star from one of its nodes. The center lists
-// every node, each over its own edge, while any other node lists itself and
-// the center, over its own edge. A star problem makes every node unavailable
-// from the center, whose identity is then ambiguous.
+// every node, each over its own edge, which is available while it's connected
+// at both ends (see starEdgeAvailableLocked), while any other node lists
+// itself and the center, over its own edge. A star problem makes every node
+// unavailable from the center, whose identity is then ambiguous.
 func (s *commandStars) starNodesLocked(source *commandRelay, index int) *remote.NodeGraph {
 	session := source.controller.session
 	members := s.membersLocked(session.Star.Identifier)
@@ -198,8 +221,8 @@ func (s *commandStars) starNodesLocked(source *commandRelay, index int) *remote.
 		node := remote.Node{Name: name, Host: host, Root: root, Path: []string{from, name}, Mode: synchronizationModeName(edge), Session: edge.Identifier, Alpha: true}
 		if problem != nil {
 			node.Reason = problem.Error()
-		} else if node.Available = connectedLocked(s.relays[edge.Identifier], 1); !node.Available {
-			node.Reason = unavailableReason
+		} else {
+			node.Available, node.Reason = starEdgeAvailableLocked(s.relays[edge.Identifier])
 		}
 		graph.Nodes = append(graph.Nodes, node)
 	}
@@ -219,23 +242,29 @@ func (s *commandStars) starHasNode(identifier, name string) bool {
 	return false
 }
 
-// resolveSubmission selects the destination of an operation, which is always
-// the opposite endpoint of a single edge, along with the relay of that edge.
-// The source is identified by the submitting endpoint, never by client input.
-// A submission at a star's center normally enters through the selected node's
-// own edge (see remote.Selection.Workspace), and is otherwise redirected to
-// it; all other submissions use their own edge. A pinned revision only refers
-// to the selected edge, so that changes to other edges don't fail later
-// submissions of an operation.
-func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) (*commandRelay, int, *remote.ResolvedRoute, error) {
+// resolveSubmission selects the destination of an operation submitted from
+// the specified endpoint of the relay's session, which is always the opposite
+// endpoint of the same edge, and describes the route. The source is identified
+// by the submitting endpoint, never by client input. Operations are never
+// redirected to another edge, so that they don't depend on any other edge. At
+// a star's center, where every edge registers the center's workspace, remote
+// submits through the selected node's own edge (see
+// remote.Selection.Workspace). A submission that enters through another edge,
+// because the selected edge's registration isn't live, is refused as a
+// connection failure, just as operations on a pair fail while its local
+// registration isn't live. Other errors, such as an unknown node or a star
+// problem, are reported whichever edge the submission entered through. A
+// pinned revision only refers to the selected edge, so that changes to other
+// edges don't fail later submissions of an operation.
+func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) (*remote.ResolvedRoute, error) {
 	graph, err := r.stars.nodes(r, source)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, err
 	}
 	name := header.Node
 	if name == "" {
 		if len(graph.Nodes) != 2 {
-			return nil, 0, nil, errors.New("multiple destination nodes; use --nodes to inspect them and --node NAME to select one")
+			return nil, errors.New("multiple destination nodes; use --nodes to inspect them and --node NAME to select one")
 		}
 		for _, node := range graph.Nodes {
 			if !node.Current {
@@ -252,53 +281,50 @@ func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) 
 	}
 	pinned := header.Revision != ""
 	if pinned && (selected == nil || selected.Current || edgeRevision(selected.Session) != header.Revision) {
-		return nil, 0, nil, errNodeGraphChanged
+		return nil, errNodeGraphChanged
 	}
 	star := r.controller.session.Star
 	if selected == nil {
 		if star != nil && r.stars.starHasNode(star.Identifier, name) {
-			return nil, 0, nil, fmt.Errorf("stars have no multi-hop: node %s is reachable only from the center node %s; run the command from %s", name, star.Center, star.Center)
+			return nil, fmt.Errorf("stars have no multi-hop: node %s is reachable only from the center node %s; run the command from %s", name, star.Center, star.Center)
 		}
-		return nil, 0, nil, fmt.Errorf("unknown node %q; use --nodes to list configured nodes", name)
+		return nil, fmt.Errorf("unknown node %q; use --nodes to list configured nodes", name)
 	} else if selected.Current {
-		return nil, 0, nil, errors.New("target is the current node; run the command locally")
+		return nil, errors.New("target is the current node; run the command locally")
 	} else if star != nil && source == 0 && graph.Problem != "" && !pinned {
-		return nil, 0, nil, fmt.Errorf("operations from the center node %s are unavailable until the star is repaired, such as by applying the project again: %s", star.Center, graph.Problem)
+		return nil, fmt.Errorf("operations from the center node %s are unavailable until the star is repaired, such as by applying the project again: %s", star.Center, graph.Problem)
 	}
 	// An operation that selected its edge before a star problem arose keeps
 	// using that edge, which the problem doesn't change, subject only to the
 	// edge's connection: other edges never affect it.
 	available, reason := selected.Available, selected.Reason
-	if !available && pinned && graph.Problem != "" {
+	if !available && pinned && source == 0 && graph.Problem != "" {
 		r.stars.Lock()
-		available, reason = connectedLocked(r.stars.relays[selected.Session], 1), unavailableReason
+		available, reason = starEdgeAvailableLocked(r.stars.relays[selected.Session])
 		r.stars.Unlock()
 	}
 	if !available {
-		return nil, 0, nil, remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, reason))
+		return nil, remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, reason))
 	}
-	relay := r
+
+	// The selected edge must be the one through which the submission entered.
+	// They only differ at a star's center, when the client couldn't reach the
+	// selected edge's registration there, even if the daemon still considers
+	// the edge connected, such as while it reconnects.
 	if selected.Session != r.controller.session.Identifier {
-		r.stars.Lock()
-		relay = r.stars.relays[selected.Session]
-		r.stars.Unlock()
-		if relay == nil {
-			return nil, 0, nil, remote.ConnectionError(errors.New("selected node disconnected"))
-		}
+		return nil, remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, centerUnavailableReason))
 	}
-	target := 0
-	configuration := relay.controller.mergedBetaConfiguration
+	configuration := r.controller.mergedBetaConfiguration
 	if selected.Alpha {
-		target = 1
-		configuration = relay.controller.mergedAlphaConfiguration
+		configuration = r.controller.mergedAlphaConfiguration
 	}
 	if configuration == nil {
-		configuration = relay.controller.session.Configuration
+		configuration = r.controller.session.Configuration
 	}
 	revision := edgeRevision(selected.Session)
 	header.Node, header.Revision = name, revision
-	return relay, target, &remote.ResolvedRoute{
-		Ignores:    EffectiveIgnores(configuration, relay.controller.session.Version),
+	return &remote.ResolvedRoute{
+		Ignores:    EffectiveIgnores(configuration, r.controller.session.Version),
 		Session:    selected.Session,
 		Alpha:      selected.Alpha,
 		SourceNode: graph.Source,

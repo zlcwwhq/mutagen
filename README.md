@@ -194,17 +194,22 @@ flushed before and after commands, conflicts produce warnings rather than
 preventing commands, and detached jobs, `--no-flush`, `--flush`, `--pull`,
 `--diff`, `--ignores`, and conflict resolution work as they do for pairs.
 An operation depends only on its own edge: pausing, replacing, removing, or
-adding other nodes doesn't affect it. Commands use the corresponding relative
-directory; `--cwd` overrides it.
+adding other nodes doesn't affect it, and no operation uses another edge. As
+for a pair, the edge must be connected for commands at both of its ends: while
+it isn't connected at the center, such as while it reconnects, the node is
+unavailable, and operations on it from the center fail with status 255, so
+retry once it reconnects. Commands use the corresponding relative directory;
+`--cwd` overrides it.
 `MUTAGEN_REMOTE_NODE` identifies the executing node; use it in prologues shared
 by several nodes instead of `MUTAGEN_REMOTE_ENDPOINT`, since the center is alpha
 on every edge and every other node is beta.
 
 `remote --nodes` lists the nodes that the current node can reach: from the
 center, every node, including paused or disconnected ones, and from another
-node, itself and the center. It marks the current node and the center, and
-shows each node's host and root, the mode of the edge to it, and its connection
-availability. `--nodes --json` provides machine-readable output. Discovery
+node, itself and the center. It marks the current node and the center, and shows
+each node's host and root, the mode of the edge to it, and its connection
+availability: a node is available while the edge to it is connected for commands
+at both ends. `--nodes --json` provides machine-readable output. Discovery
 neither synchronizes files nor executes commands; available doesn't imply
 conflict-free. Terminating an edge only removes its node. The daemon refuses
 star edges that disagree with the star's existing edges on the center or its

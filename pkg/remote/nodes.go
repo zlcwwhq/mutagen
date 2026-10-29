@@ -88,9 +88,9 @@ func ListNodes(ctx context.Context, connection io.ReadWriteCloser) (*NodeGraph, 
 
 // ResolvedRoute acknowledges destination selection on an operation connection.
 // Session and Alpha describe the selected edge for checkout ownership and
-// conflict direction, and identify its registration at the submitting node,
-// which later submissions prefer (see Selection.Target). Revision pins the
-// selected edge for them.
+// conflict direction. It's always the edge whose registration the submission
+// entered through, since the daemon refuses submissions that would cross
+// another edge. Revision pins the selected edge for later submissions.
 type ResolvedRoute struct {
 	// Ignores belong to the selected edge.
 	Ignores    *Ignores `json:",omitempty"`

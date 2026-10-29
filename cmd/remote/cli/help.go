@@ -56,8 +56,8 @@ A node is a workspace. --nodes asks the daemon which nodes the current
 workspace can reach, including paused or disconnected ones. It marks the
 current node and a star's center, and shows each node's configured host and
 root and the synchronization mode of the edge to it. This is read-only: it
-neither synchronizes files nor executes commands. Available means connected,
-not conflict-free.
+neither synchronizes files nor executes commands. Available means that the
+edge to the node is connected at both ends, not that it's conflict-free.
 
   - A project's star names its nodes. Its center is joined to every other
     node by its own synchronization pair, so the center reaches every node,
@@ -85,7 +85,10 @@ not conflict-free.
     --flush, --no-flush, --pull, --diff, --ignores, and conflicts (see
     --help sync and --help conflicts). Conflicts produce warnings rather than
     preventing commands. Pausing, replacing, removing, or adding other nodes
-    doesn't affect an operation.
+    doesn't affect an operation, and no operation uses another edge: while a
+    node's edge isn't connected at the center, such as while it reconnects,
+    the node is unavailable and operations on it fail with 255, so retry once
+    it reconnects.
   - Each non-center node's mode configures its own edge. One-way modes flow
     from the center to the node, so the node's changes, including files that
     commands write there, don't reach the center.

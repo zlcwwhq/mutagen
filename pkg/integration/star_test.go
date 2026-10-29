@@ -607,6 +607,69 @@ func TestStarIndependentEdges(t *testing.T) {
 	}
 }
 
+// TestStarCenterChannelDisconnected verifies that while one edge's command
+// channel at the center is disconnected, with the node's own channel and the
+// other edges still connected, the node is unavailable from the center, and an
+// operation on it fails with 255 before running or synchronizing anything,
+// rather than entering through another edge, whose pausing would then end it.
+// Once the channel reconnects, the operation succeeds.
+func TestStarCenterChannelDisconnected(t *testing.T) {
+	f := newStarFixture(t)
+	release := centerChannels.hold(f.sessions["star-server"])
+	defer release()
+
+	// Changes at the center that a flush of either edge would propagate.
+	if err := os.WriteFile(filepath.Join(f.roots["local"], "probe"), []byte("probe"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// From the center, the server is unavailable, unlike the gpu node.
+	listing, output := listStar(t, f.roots["local"])
+	for _, node := range listing.Nodes {
+		if node.Name == "server" && (node.Available || !strings.Contains(node.Reason, "isn't connected for remote commands at the center")) {
+			t.Fatalf("node whose edge is disconnected at the center misreported: %s", output)
+		} else if node.Name == "gpu" && !node.Available {
+			t.Fatalf("other node affected: %s", output)
+		}
+	}
+
+	// An operation on the server fails without running or synchronizing
+	// anything, through any edge.
+	code, output, diagnostic := runRemote(t, f.roots["local"], "--node", "server", "sh", "-c", `printf ran > ignored/ran; printf ran`)
+	if code != 255 || output != "" || !strings.Contains(diagnostic, "node server is unavailable: its edge isn't connected for remote commands at the center") ||
+		!strings.Contains(diagnostic, "retry once it reconnects") {
+		t.Fatalf("operation on a node whose edge is disconnected at the center not refused: %d %q %s", code, output, diagnostic)
+	}
+	for _, node := range []string{"server", "gpu"} {
+		for _, path := range []string{filepath.Join("ignored", "ran"), "probe"} {
+			if _, err := os.Stat(filepath.Join(f.roots[node], path)); !os.IsNotExist(err) {
+				t.Fatalf("refused operation affected %s through %s: %v", node, path, err)
+			}
+		}
+	}
+
+	// Once the channel reconnects, after the relay's reconnection interval,
+	// the operation succeeds over the server's own edge.
+	release()
+	deadline := time.Now().Add(45 * time.Second)
+	for !f.available(f.roots["local"], "local", "server") {
+		if time.Now().After(deadline) {
+			t.Fatal("edge didn't reconnect at the center")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	code, output, diagnostic = runRemote(t, f.roots["local"], "--node", "server", "sh", "-c", `cat probe; printf ran > result`)
+	if code != 0 || output != "probe" {
+		t.Fatalf("operation after reconnection failed: %d %q %s", code, output, diagnostic)
+	}
+	if contents, err := os.ReadFile(filepath.Join(f.roots["local"], "result")); err != nil || string(contents) != "ran" {
+		t.Fatalf("result didn't return to the center: %q %v", contents, err)
+	}
+	if _, err := os.Stat(filepath.Join(f.roots["gpu"], "probe")); !os.IsNotExist(err) {
+		t.Fatal("operation on the server synchronized the gpu edge:", err)
+	}
+}
+
 // TestStarProblem verifies that the daemon refuses to create an edge that
 // disagrees on the center's endpoint, and that persisted edges disagreeing on
 // it are reported by --nodes and refuse operations from the center with 125,

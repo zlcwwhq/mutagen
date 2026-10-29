@@ -348,11 +348,11 @@ func RegisterScope(session string, alpha bool, root string, ignores *Ignores) (i
 type Target struct {
 	// SourceSession and SourceAlpha identify the local registration through
 	// which the command is submitted, and they pin later submissions (see
-	// Selection.Target), so targets built by hand must set them. At a star's
-	// center, which every edge registers, a submission enters through the
-	// selected node's own edge while that edge's registration is live, so
-	// that the operation doesn't depend on other edges; otherwise the daemon
-	// redirects it from the edge through which it entered (see Session).
+	// Selection.Target), so targets built by hand must set them. The daemon
+	// only accepts an operation that crosses the edge through which it was
+	// submitted, so once resolved, they identify the selected edge (see
+	// Session), which, at a star's center, where every edge registers, is the
+	// selected node's own.
 	SourceSession string
 	SourceAlpha   bool
 	// Star identifies a declared star workspace at the submitting registration.
@@ -365,9 +365,8 @@ type Target struct {
 	// SourceNode and Node identify the submitting and selected workspaces.
 	SourceNode string
 	Node       string
-	// Session identifies the selected edge, such as for checkout ownership,
-	// and, with Alpha, its local registration, which later submissions prefer
-	// to SourceSession at a star node (see Selection.Target).
+	// Session identifies the selected edge, such as for checkout ownership.
+	// Once resolved, it's SourceSession (see SourceSession).
 	Session string
 	// Name is the name of the source session (see SourceSession), if any.
 	Name string
@@ -404,8 +403,8 @@ type Selection struct {
 	// the same star, as the edges at its center do (see locateWorkspace). Neither
 	// creation order nor session names choose among distinct workspaces. Among
 	// the registrations of one star node, the one whose peer is Node is used,
-	// if any, so that the submission enters through the selected edge itself.
-	// It's ignored if Target is non-nil.
+	// if any, since the daemon only accepts operations that cross the edge
+	// through which they were submitted. It's ignored if Target is non-nil.
 	Workspace bool
 	// WorkspaceOutside allows a workspace selection from a directory outside
 	// all live workspaces, such as for an explicit node selection, in which
@@ -421,23 +420,24 @@ type Selection struct {
 	// working directory is specified explicitly. Dial refuses a submission whose
 	// ignores exclude the directory or a parent of it inside the root (see
 	// Ignores), since the session doesn't synchronize the corresponding
-	// directory. The ignores are those of the edge that carries the operation,
-	// which, at a star's center, may only be known once the daemon resolves
-	// the destination, before the operation reads or writes any file. Such a
-	// directory is typically the root of a nested session that isn't connected
-	// for remote commands on this system, and through which the submission
-	// would otherwise have been made.
+	// directory. The ignores are the registration's, whose edge is the only
+	// one that the daemon lets the operation cross. At a star node, unless the
+	// registration's peer is Node, the daemon may refuse the submission
+	// instead, such as when the selected node's edge isn't connected at the
+	// center, so the ignores are only checked once it accepts the route,
+	// before the operation reads or writes any file. Such a directory is
+	// typically the root of a nested session that isn't connected for remote
+	// commands on this system, and through which the submission would
+	// otherwise have been made.
 	Corresponding bool
 	// Target, if non-nil, restricts the selection to the local registration
 	// that its SourceSession and SourceAlpha identify, which was typically
 	// located by a previous submission, so that related submissions can't
 	// reach different sessions as sessions connect and disconnect in between.
-	// If the target was resolved at a star node and its Session and Alpha
-	// identify another registration of that node, the selected edge's own,
-	// that registration is preferred while it's live, so that the operation
-	// doesn't depend on the edge through which it first entered. Dial fails
-	// if neither registration is live, rather than selecting another, and
-	// Workspace is ignored; Corresponding still validates the first submission.
+	// Dial then fails if that registration is no longer live, rather than
+	// selecting another, even another registration of the same star node,
+	// and Workspace is ignored; Corresponding still validates the first
+	// submission.
 	Target *Target
 }
 
@@ -774,7 +774,7 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 	connection, c := endpoint.connection, endpoint.candidate
 
 	// Resolve destinations on the operation connection. Pinned targets retain
-	// both the original source registration and the selected destination.
+	// the selected destination and the revision of its edge.
 	submitted := *header
 	header = &submitted
 	if s.Resolve || s.Target != nil && s.Target.Resolved {
@@ -793,28 +793,27 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 	// Refuse operations corresponding to a directory that the session doesn't
 	// synchronize (see Selection.Corresponding), or that it might not, since
 	// running them anyway could run them in an outdated or missing directory.
-	// The rules are those of the edge that carries the operation. At a star
-	// node, the daemon may select another edge than the registration's own,
-	// as when a star's center registration of the requested node's edge isn't
-	// live, so unless the registration's peer is the requested node, the
-	// selected edge's rules are checked once the route is resolved, before the
+	// The rules are the registration's, since the daemon only lets operations
+	// cross the registration's own edge. At a star node, unless the
+	// registration's peer is the requested node, the daemon may refuse the
+	// submission instead, such as when the selected node's edge isn't
+	// connected at the center, or when the node is unknown, which explains the
+	// failure, whereas the registration's rules would be irrelevant. They're
+	// then only applied once the daemon accepts the route, before the
 	// operation reads or writes any file.
-	excludedLabel := func(session string) string {
-		label := labeler(slices.Concat(compatible, incompatible))
-		for _, other := range compatible {
-			if other.Session == session {
-				return label(other)
-			}
-		}
-		return session
+	var excluded string
+	if s.Corresponding && c.contained {
+		excluded = c.Ignores.ExcludedInAnyForm(c.path, true)
+	}
+	refuse := func() error {
+		connection.Close()
+		return excludedError(c, labeler(slices.Concat(compatible, incompatible))(c), excluded)
 	}
 	deferred := header.Resolve && c.Star != "" && c.PeerNode != header.Node
-	if s.Corresponding && c.contained && !deferred {
-		if excluded := c.Ignores.ExcludedInAnyForm(c.path, true); excluded != "" {
-			connection.Close()
-			return nil, nil, excludedError(c, excludedLabel(c.Session), excluded)
-		}
+	if excluded != "" && !deferred {
+		return nil, nil, refuse()
 	}
+
 	// Perform the version handshake and submit the operation.
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
 	err = mutagen.ClientVersionHandshake(connection)
@@ -844,11 +843,8 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 			target.Ignores = route.Ignores
 		}
 	}
-	if s.Corresponding && c.contained && deferred {
-		if excluded := target.Ignores.ExcludedInAnyForm(c.path, true); excluded != "" {
-			connection.Close()
-			return nil, nil, excludedError(c, excludedLabel(target.Session), excluded)
-		}
+	if excluded != "" {
+		return nil, nil, refuse()
 	}
 	return connection, target, nil
 }
@@ -986,10 +982,14 @@ func Synchronizing(ctx context.Context, path string, directory bool) ([]string, 
 // they identify the same node of the same star, as the endpoints of a star's
 // edges at its center do; anything else is reported as ambiguous rather than
 // resolved by creation order. Among those, the registration whose peer is the
-// requested destination node is used, if any, so that the submission enters
-// through the selected edge and doesn't depend on any other edge, which the
-// daemon would otherwise redirect it from. Any of them serves discovery or an
-// omitted node, which the daemon only accepts with a single destination.
+// requested destination node is used, if any, since the daemon only accepts
+// operations that cross the edge through which they were submitted, so that
+// they don't depend on any other edge. Any of them serves discovery or an
+// omitted node, which the daemon only accepts with a single destination. If
+// the requested node's registration isn't live, such as while its edge
+// reconnects, another is used anyway, so that the daemon reports why the node
+// can't be used: it refuses the submission as unavailable, unless the node is
+// unknown, can't be reached from this node, or the star has a problem.
 //
 // Registrations whose processes no longer listen are pruned and otherwise
 // ignored, exactly as if they had been removed cleanly, as the registrations
@@ -1095,25 +1095,14 @@ func locateWorkspace(ctx context.Context, compatible, incompatible []*candidate,
 func (s *Selection) locate(ctx context.Context, directory string, compatible, incompatible []*candidate) (*liveEndpoint, error) {
 	// A pinned selection only considers the source registration that it
 	// identifies, which may have reconnected in the meantime, and fails rather
-	// than falling back to another endpoint. At a star node, the selected
-	// edge's own registration of the same node is preferred, so that later
-	// submissions don't depend on the edge through which the first one
-	// entered (see Selection.Target). The daemon-selected edge never chooses
-	// the registration otherwise, even if the source is unset.
+	// than falling back to another endpoint, including another registration
+	// of the same star node, since the daemon only accepts operations through
+	// the edge that they cross. The daemon-selected edge (Session and Alpha)
+	// never chooses the registration, even if the source is unset.
 	if s.Target != nil {
 		source := s.Target.SourceSession
 		if source == "" {
 			return nil, errors.New("pinned target doesn't identify a source registration")
-		}
-		if t := s.Target; t.Resolved && t.Star && t.Session != "" && (t.Session != source || t.Alpha != t.SourceAlpha) {
-			selected := func(c *candidate) bool {
-				return c.Session == t.Session && c.Alpha == t.Alpha && c.Star != "" && c.Node == t.SourceNode && c.PeerNode == t.Node
-			}
-			if live, err := locate(ctx, filter(compatible, selected)); err != nil {
-				return nil, err
-			} else if len(live) > 0 {
-				return &live[0], nil
-			}
 		}
 		pinned := func(c *candidate) bool {
 			return c.Session == source && c.Alpha == s.Target.SourceAlpha

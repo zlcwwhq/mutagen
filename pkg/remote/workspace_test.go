@@ -3,6 +3,7 @@ package remote
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,12 +81,14 @@ func TestStarSourceSelection(t *testing.T) {
 	}
 }
 
-// TestStarSourcePrefersSelectedEdge verifies that a submission at a star's
+// TestStarSourceEntersSelectedEdge verifies that a submission at a star's
 // center enters through the registration of the selected node's own edge,
-// whatever the registration order, so that it doesn't depend on other edges,
-// and that pinned submissions prefer that registration too, falling back to
-// their original source registration only while it's unavailable.
-func TestStarSourcePrefersSelectedEdge(t *testing.T) {
+// whatever the registration order, since the daemon only accepts operations
+// that cross the edge through which they were submitted, and that any
+// registration is used otherwise, so that the daemon can report the problem.
+// Pinned submissions only use their source registration, never another
+// registration of the same node.
+func TestStarSourceEntersSelectedEdge(t *testing.T) {
 	for _, order := range [][]string{{"b", "c"}, {"c", "b"}} {
 		useTestRegistry(t)
 		root := resolveSymbolicLinks(t.TempDir())
@@ -111,33 +114,42 @@ func TestStarSourcePrefersSelectedEdge(t *testing.T) {
 			}
 		}
 
-		// A pinned target whose first submission entered through another edge
-		// prefers the selected edge's registration while it's live.
-		pinned := &Target{SourceSession: "center-b", SourceAlpha: true, Star: true, Resolved: true, SourceNode: "center", Node: "c", Session: "center-c", Alpha: true}
-		if target, err := locateWorkspaceTest(&Selection{Target: pinned}, root); err != nil || target.SourceSession != "center-c" {
-			t.Fatalf("pinned target didn't prefer the selected edge: %+v %v", target, err)
+		// A pinned target's selected edge never chooses its registration, even
+		// if it names another live registration of the same node.
+		mismatched := &Target{SourceSession: "center-b", SourceAlpha: true, Star: true, Resolved: true, SourceNode: "center", Node: "c", Session: "center-c", Alpha: true}
+		if target, err := locateWorkspaceTest(&Selection{Target: mismatched}, root); err != nil || target.SourceSession != "center-b" {
+			t.Fatalf("pinned target didn't keep its source registration: %+v %v", target, err)
 		}
-		unresolved := *pinned
-		unresolved.Resolved = false
-		if target, err := locateWorkspaceTest(&Selection{Target: &unresolved}, root); err != nil || target.SourceSession != "center-b" {
-			t.Fatalf("unresolved target didn't keep its source: %+v %v", target, err)
-		}
+
+		// Once the selected node's registration isn't live, another one is
+		// located, through which the daemon refuses the submission (see
+		// TestStarUnavailableNodeIgnores).
 		channels["c"].Close()
-		if target, err := locateWorkspaceTest(&Selection{Target: pinned}, root); err != nil || target.SourceSession != "center-b" {
-			t.Fatalf("pinned target didn't fall back to its source: %+v %v", target, err)
+		if target, err := locateWorkspaceTest(&Selection{Workspace: true, Node: "c"}, root); err != nil || target.SourceSession != "center-b" {
+			t.Fatalf("center not located for a node whose registration isn't live: %+v %v", target, err)
 		}
-		channels["b"].Close()
-		if _, err := locateWorkspaceTest(&Selection{Target: pinned}, root); err == nil || !strings.Contains(err.Error(), "no longer connected") {
-			t.Fatal("pinned target selected another registration:", err)
+
+		// A pinned target only uses its source registration, even while another
+		// registration of the same node is live.
+		pinned := &Target{SourceSession: "center-c", SourceAlpha: true, Star: true, Resolved: true, SourceNode: "center", Node: "c", Session: "center-c", Alpha: true}
+		if _, err := locateWorkspaceTest(&Selection{Target: pinned}, root); err == nil || !strings.Contains(err.Error(), "no longer connected") || ClassifyError(err) != ErrorKindConnection {
+			t.Fatal("pinned target selected another registration of its node:", err)
+		}
+		pinned = &Target{SourceSession: "center-b", SourceAlpha: true, Star: true, Resolved: true, SourceNode: "center", Node: "b", Session: "center-b", Alpha: true}
+		if target, err := locateWorkspaceTest(&Selection{Target: pinned}, root); err != nil || target.SourceSession != "center-b" {
+			t.Fatalf("pinned target didn't use its source registration: %+v %v", target, err)
 		}
 	}
 }
 
-// TestStarRedirectIgnores verifies that the ignores of the edge that the
-// daemon selects decide whether a submission directory may be used, rather than
-// those of the registration through which the submission enters, which differ
-// when the selected edge's own registration at the center isn't live.
-func TestStarRedirectIgnores(t *testing.T) {
+// TestStarUnavailableNodeIgnores verifies that, at a star's center, the
+// daemon's refusal of a submission that enters through another edge's
+// registration, because the selected node's own registration isn't live, is
+// reported rather than the entry registration's ignores, which don't apply to
+// the selected node, while those ignores are checked before anything is
+// submitted for the registration's own node, and once the daemon accepts the
+// route otherwise.
+func TestStarUnavailableNodeIgnores(t *testing.T) {
 	useTestRegistry(t)
 	root := resolveSymbolicLinks(t.TempDir())
 	for _, directory := range []string{"a/sub", "b/sub"} {
@@ -145,14 +157,12 @@ func TestStarRedirectIgnores(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ignoring := func(pattern string) *Ignores {
-		return &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{pattern}}
-	}
+	ignoring := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"a"}}
 
 	// The center's registration of the edge to b, which ignores a, is the only
-	// live one, so a submission for c enters through it, while the daemon
-	// selects the edge to c, which ignores b.
-	channel, err := NewLocalChannel(nil, &Endpoint{Session: "center-b", Name: "star-b", Alpha: true, Star: "project", Node: "center", PeerNode: "b", Root: root, Submit: true, Ignores: ignoring("a")})
+	// live one. The daemon refuses submissions for c through it, as it does
+	// when c's own registration isn't live, and accepts those for b.
+	channel, err := NewLocalChannel(nil, &Endpoint{Session: "center-b", Name: "star-b", Alpha: true, Star: "project", Node: "center", PeerNode: "b", Root: root, Submit: true, Ignores: ignoring})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,11 +185,11 @@ func TestStarRedirectIgnores(t *testing.T) {
 			lock.Lock()
 			submitted = append(submitted, header.Node)
 			lock.Unlock()
-			route := &ResolvedRoute{Session: "center-" + header.Node, Alpha: true, SourceNode: "center", Node: header.Node, Star: true, Revision: header.Node, Ignores: ignoring("a")}
 			if header.Node == "c" {
-				route.Ignores = ignoring("b")
+				Reject(connection, ConnectionError(errors.New("node c is unavailable: its edge isn't connected for remote commands at the center")))
+				continue
 			}
-			RespondWithRoute(connection, route)
+			RespondWithRoute(connection, &ResolvedRoute{Session: "center-b", Alpha: true, SourceNode: "center", Node: "b", Star: true, Revision: "b", Ignores: ignoring})
 			connection.Close()
 		}
 	}()
@@ -191,37 +201,47 @@ func TestStarRedirectIgnores(t *testing.T) {
 		connection, target, err := selection.Submit(ctx, filepath.Join(root, directory), &Submission{Operation: OperationFlush})
 		if err == nil {
 			connection.Close()
-			if target.Session != "center-"+node {
-				t.Fatalf("incorrect edge selected for node %s: %+v", node, target)
+			if target.Session != "center-b" || target.SourceSession != "center-b" || target.Node != "b" {
+				t.Fatalf("incorrect edge selected for node %q: %+v", node, target)
 			}
 		}
 		return err
 	}
-	excluded := func(err error, location string) bool {
-		return err != nil && strings.Contains(err.Error(), location) && strings.Contains(err.Error(), "--cwd . runs in the other side's own copy")
+	excluded := func(err error) bool {
+		return err != nil && strings.Contains(err.Error(), "a/sub is inside a, which session star-b ignores") &&
+			strings.Contains(err.Error(), "--cwd . runs in the other side's own copy")
+	}
+	count := func() int {
+		lock.Lock()
+		defer lock.Unlock()
+		return len(submitted)
 	}
 
-	// Ignored only by the entry registration's edge.
-	if err := submit("c", "a/sub"); err != nil {
-		t.Fatal("directory refused by the ignores of an edge that doesn't carry the operation:", err)
-	}
-
-	// Ignored only by the selected edge.
-	if err := submit("c", "b/sub"); !excluded(err, "b/sub is inside b, which session center-c ignores") {
-		t.Fatal("directory ignored by the selected edge accepted:", err)
+	// A directory ignored only by the entry registration's edge doesn't hide
+	// the daemon's refusal.
+	if err := submit("c", "a/sub"); err == nil || ClassifyError(err) != ErrorKindConnection || !strings.Contains(err.Error(), "node c is unavailable") {
+		t.Fatal("refusal of a node whose registration isn't live not reported:", err)
 	}
 
 	// The registration's own edge is checked before anything is submitted.
-	lock.Lock()
-	before := len(submitted)
-	lock.Unlock()
-	if err := submit("b", "a/sub"); !excluded(err, "a/sub is inside a, which session star-b ignores") {
+	before := count()
+	if err := submit("b", "a/sub"); !excluded(err) {
 		t.Fatal("directory ignored by the registration's own edge accepted:", err)
+	} else if count() != before {
+		t.Fatal("excluded directory submitted")
+	}
+	if err := submit("b", "b/sub"); err != nil {
+		t.Fatal("synchronized directory refused:", err)
+	}
+
+	// An omitted node is checked once the daemon accepts the route.
+	if err := submit("", "a/sub"); !excluded(err) {
+		t.Fatal("directory ignored by the edge that carries the operation accepted:", err)
 	}
 	lock.Lock()
 	defer lock.Unlock()
-	if len(submitted) != before || before != 2 {
-		t.Fatalf("unexpected submissions: %v", submitted)
+	if strings.Join(submitted, ",") != "c,b," {
+		t.Fatalf("unexpected submissions: %q", submitted)
 	}
 }
 
