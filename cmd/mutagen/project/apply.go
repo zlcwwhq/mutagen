@@ -47,9 +47,9 @@ resume it before applying to synchronize them first.
 
 Docker environment variables (such as DOCKER_HOST) captured by endpoint URLs are
 not compared. Retained sessions keep the environment they were created with,
-while new and recreated pair sessions use the current environment. In a
-workspace tree, new or recreated edges reuse the endpoint of a node's retained
-edges, including its captured environment, so the node retains one identity.
+while new and recreated pair sessions use the current environment. In a star,
+new or recreated edges reuse the center's endpoint from the star's retained
+edges, including its captured environment, so the center retains one identity.
 
 Creation hooks run only when starting a project. Applying changes to an existing
 project does not run lifecycle hooks. flushOnCreate applies only to sessions

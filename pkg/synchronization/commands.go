@@ -66,11 +66,13 @@ var errRelayStopping = remote.ConnectionError(errors.New("selected edge stopped 
 // needs connectivity to the other, regardless of where the daemon runs. It also
 // performs flushes requested by submissions.
 type commandRelay struct {
-	// Tree routing shares the daemon's membership registry and pins this
-	// particular synchronization loop for the duration of each invocation.
-	trees      *commandTrees
+	// stars is the daemon's index of sessions and relays, which selects the
+	// edge that carries a submission (see resolveSubmission).
+	stars *commandStars
+	// controller is the session's controller.
 	controller *controller
-	ctx        context.Context
+	// ctx is cancelled when the relay stops.
+	ctx context.Context
 	// logger is the relay logger.
 	logger *logging.Logger
 	// flushRequests is the synchronization loop's flush request channel.
@@ -195,20 +197,20 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 	// merged configurations specify the same ones.
 	ignores := EffectiveIgnores(c.mergedAlphaConfiguration, c.session.Version)
 	ctx, cancel := context.WithCancel(ctx)
-	relay.trees, relay.controller, relay.ctx = c.trees, c, ctx
-	c.trees.setRelay(c, relay)
+	relay.stars, relay.controller, relay.ctx = c.stars, c, ctx
+	c.stars.setRelay(c, relay)
 	var maintainers sync.WaitGroup
 	urls := [2]*urlpkg.URL{c.session.Alpha, c.session.Beta}
 	for index, url := range urls {
 		executionHost, executionRoot := commandExecutionLocation(urls[1-index])
-		// Tree endpoints are named by their nodes, and the endpoints of other
-		// sessions form an implicit pair graph of alpha and beta.
+		// Star endpoints are named by their nodes, and the endpoints of other
+		// sessions form an implicit pair of nodes named alpha and beta.
 		names := []string{"alpha", "beta"}
-		if c.session.Tree != nil {
-			names = []string{c.session.Tree.Alpha, c.session.Tree.Beta}
+		if c.session.Star != nil {
+			names = []string{c.session.Star.Center, c.session.Star.Node}
 		}
 		endpoint := &remote.Endpoint{
-			Tree:           c.session.GetTree().GetIdentifier(),
+			Star:           c.session.GetStar().GetIdentifier(),
 			Node:           names[index],
 			PeerNode:       names[1-index],
 			Session:        c.session.Identifier,
@@ -236,7 +238,7 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		// before the wait, which ends routes spliced to them.
 		relay.refuseRoutes()
 		cancel()
-		c.trees.setRelay(c, nil)
+		c.stars.setRelay(c, nil)
 		maintainers.Wait()
 		relay.routes.Wait()
 	}
@@ -375,18 +377,10 @@ func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWrit
 		return
 	}
 	if operation == remote.OperationNodes {
-		graph, err := r.trees.nodes(r, 1-target)
+		graph, err := r.stars.nodes(r, 1-target)
 		remote.RespondWithNodes(submission, graph, err)
 		return
-	} else if operation == remote.OperationNodeConflicts {
-		r.serveNodeConflicts(ctx, submission, 1-target, header)
-		return
-	}
-	if operation == remote.OperationTreeExecute {
-		r.serveTree(ctx, submission, 1-target, header)
-		return
-	}
-	if operation == remote.OperationConflicts {
+	} else if operation == remote.OperationConflicts {
 		r.logger.Debug("Forcing synchronization cycle for conflict listing")
 		stop := context.AfterFunc(ctx, func() { submission.Close() })
 		defer stop()

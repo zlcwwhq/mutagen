@@ -49,26 +49,30 @@ var helpTopics = []struct {
 	// text is the topic's help text.
 	text string
 }{
-	{"nodes", "node discovery, target selection, and workspace trees", `Usage: remote --nodes [--json]
+	{"nodes", "node discovery, target selection, and stars", `Usage: remote --nodes [--json]
        remote --node NAME [options] <command> [<args>...]
 
-A node is a workspace. --nodes queries the current workspace's daemon for all
-nodes in its graph, including paused/disconnected members. It marks the current
-node, shows configured host/root and the unique path to each destination, and
-reports unavailable paths. This is read-only: it neither synchronizes files
-nor executes commands. Available means connected, not conflict-free. In --json,
-adjacent marks a neighbor whose own edge is connected, which operations on
-adjacent nodes require.
+A node is a workspace. --nodes asks the daemon which nodes the current
+workspace can reach, including paused or disconnected ones. It marks the
+current node and a star's center, and shows each node's configured host and
+root and the synchronization mode of the edge to it. This is read-only: it
+neither synchronizes files nor executes commands. Available means connected,
+not conflict-free.
 
-  - A declared tree uses its configured node names. An ordinary pair is an
-    implicit graph with nodes alpha and beta. Omit --node only when there is
-    exactly one other node; an offline node still counts. Creation order and
+  - A project's star names its nodes. Its center is joined to every other
+    node by its own synchronization pair, so the center reaches every node,
+    while every other node reaches only the center. A command from one
+    non-center node to another fails with 125: stars have no multi-hop
+    routes, so run it from the center. An ordinary pair has nodes alpha and
+    beta.
+  - Omit --node only when there is exactly one other node, as from a
+    non-center node; an offline node still counts. Creation order and
     availability never choose among several targets.
-  - The current directory identifies the source workspace. Multiple incident
-    edges of one tree node are allowed; overlapping independent pair graphs
-    are ambiguous and should be configured as one tree. Outside every root,
-    explicit --node (or --nodes) requires one unambiguous source workspace on
-    this system; commands then use the destination root and skip its prologue.
+  - The current directory identifies the source workspace. A star's edges
+    share the center's root; independent pairs sharing a root are ambiguous
+    and should be declared as one star. Outside every root, explicit --node
+    (or --nodes) requires one unambiguous source workspace on this system;
+    commands then use the destination root and skip its prologue.
   - --session, -s, --sessions, and MUTAGEN_REMOTE_SESSION are deprecated and
     produce errors. Unset the environment variable, query --nodes, and select
     --node NAME. Session identifiers are internal synchronization handles.
@@ -76,64 +80,33 @@ adjacent nodes require.
     overrides the mapped directory; absolute and quoted ~ paths belong to the
     target system. Ignored directories require an explicit --cwd, and ignored
     content isn't synchronized. --ignores without --node inspects local rules.
-  - Foreground commands and scripts can target any node in a declared tree.
-    The daemon synchronizes path edges in order, executes directly on the
-    target's agent, and synchronizes the path in reverse. Other branches keep
-    synchronizing in the background and needn't finish for this call.
-  - Tree command preflight stops on any conflict, scan/transition problem,
-    or synchronization failure. Failure to sync back returns 125 and reports
-    the command's exit status. --detach also requires strict preflight on
-    its adjacent edge; a failed preflight never starts the job. Its later
-    results arrive through background synchronization or --wait.
-    Timeout and interruption retain their normal statuses. Neither failures
-    nor reconnects automatically retry commands or change their target.
-  - --no-flush skips both path synchronizations and their checks, so the
-    command runs even if path edges have conflicts. It neither synchronizes
-    nor waits for synchronization; background synchronization continues as
-    configured, but conflicts, paused or disconnected edges, or disabled
-    watching can keep the command's changes from propagating. As for pairs,
-    use it only for commands that neither read nor write synchronized files
-    (see --help sync). The tree must still be valid and the path connected.
-  - --conflicts can inspect a multi-edge path. Each listing identifies the
-    actual adjacent nodes holding its copies. Paths on the first edge are
-    relative to the current directory, as for pairs, and those on later edges
-    to their roots. Resolve from one of that edge's endpoints using --node for
-    its peer, after listing its conflicts again there.
-    --conflicts --json always returns an edges array, even for one edge or an
-    implicit pair; each entry has alpha, beta, source, target, and listing
-    fields. Local and remote changes in that listing refer to its source
-    and target, which may be intermediate nodes.
-    Checkout/apply/discard, jobs, diff/pull, and --flush require an adjacent
-    target. A saved checkout can be discarded from outside the roots without
-    selecting a node: its metadata identifies the owning pair.
-  - A tree problem, such as a terminated or inconsistent edge or a session
-    overlapping a node, refuses tree commands and path conflict listings with
-    125 until the user repairs the tree (such as by reapplying the project).
-    --nodes still shows the problem and the nodes known from existing edges.
-    Operations on an adjacent node (existing jobs, conflicts, diff/pull,
-    --flush, --ignores) only need its edge to be connected. New detached jobs
-    still require a valid tree, even with --no-flush.
-  - Target selection pins the source and destination. Lost path or submission
-    connections, replaced path edges, and new problems that make the path
-    unsafe invalidate a running tree command. Changes to unrelated, valid
-    branches don't cancel it unless they close its submission connection.
-    An interrupted command may have written files
-    without synchronizing them back; inspect before retrying.
+  - Every operation crosses exactly one edge, which is an ordinary pair
+    session, and behaves as for a pair: commands, scripts, detached jobs,
+    --flush, --no-flush, --pull, --diff, --ignores, and conflicts (see
+    --help sync and --help conflicts). Conflicts produce warnings rather than
+    preventing commands.
+  - Each non-center node's mode configures its own edge. One-way modes flow
+    from the center to the node, so the node's changes, including files that
+    commands write there, don't reach the center.
+  - If a star's edges disagree on the center's endpoint, such as after a
+    partial mutagen project apply, --nodes reports the star problem, and
+    operations from the center fail with 125 until the project is applied
+    again. Other nodes keep using their own edges. A terminated edge only
+    removes its node.
   - Execution uses the target's remotePrologue or workspace override.
     MUTAGEN_REMOTE_NODE identifies the target and overrides submitted values.
-    Use it in shared scripts; alpha/beta roles depend on the incident edge.
+    Use it in shared scripts: the center is alpha on every edge.
 
-Tree edges use two-way-safe with shared synchronization and ignore settings.
-Ordered path synchronization does not provide snapshots, writer isolation, or
-whole-tree atomic consistency. Tree parents are not SSH jump hosts: the same
-daemon must reach every endpoint. tree.remote explicitly enables commands
-between all nodes; prologues come only from each node's remotePrologue, never
-from synchronization defaults. A tree root has no precedence when resolving
-conflicts.
+Any node can be the center, but only the center reaches every node, so put it
+where you usually work, such as where agents run. The daemon relays every
+edge, so every endpoint must be reachable from the daemon, which relays a
+center on another system as it relays a pair whose endpoints are both
+remote. star.remote explicitly enables commands between the center and every
+node; prologues come only from each node's remotePrologue, never from
+synchronization defaults.
 `},
-	{"sync", "synchronization, ignored paths, --pull, and --diff", `Tree foreground commands and detached job starts require strict preflight,
-and foreground commands also synchronize back, unless --no-flush skips both
-(see --help nodes). For an implicit pair and other adjacent operations:
+	{"sync", "synchronization, ignored paths, --pull, and --diff", `Each operation synchronizes the pair session that it crosses, such as the edge
+between a star's center and one of its nodes:
 
   - The session is synchronized before and after the command. Failure to
     synchronize only produces a warning. Keep these synchronizations: without
@@ -224,8 +197,8 @@ and foreground commands also synchronize back, unless --no-flush skips both
     even with --no-prologue or when submitting from outside the root.
     Detached jobs also receive MUTAGEN_REMOTE_JOB, set to their ID.
     MUTAGEN_REMOTE_NODE is set likewise to the stable node name (alpha or
-    beta for an ordinary pair); use it in tree scripts, since alpha/beta roles
-    depend on the incident edge.
+    beta for an ordinary pair); use it in star scripts, since a star's
+    center is alpha on every edge and each other node is beta.
 
 No terminal is allocated. Programs may buffer output or disable colors:
   remote -e PYTHONUNBUFFERED=1 python train.py
@@ -245,7 +218,8 @@ Example .remote-prologue.sh, activating a conda environment on beta only:
 remote's own input errors and operation failures exit with 125; read the
 remote: diagnostic and correct the cause before retrying. Connection setup,
 lost connections, protocol failures, and an unreachable node exit with 255.
-An unknown node or a workspace tree problem is 125. Commands and completed
+An unknown node, a node that only the center reaches, or a star problem is
+125. Commands and completed
 jobs pass through their own statuses unchanged, including 125 and 255, so
 status alone cannot always identify who failed. --diff/--ignores use 1 only for a result;
 their failures follow the same 125/255 distinction. For batches, interruption
@@ -374,8 +348,6 @@ exits:
 Resolve conflicting files in two-way-safe and one-way-safe sessions.
 For conflict checkout/apply/discard, local and remote mean the submitting
 and opposite endpoints.
-For multi-edge conflict listings, each edge's source and target identify the
-nodes whose local and remote changes are listed.
 
 To keep one side (no checkout needed):
   remote --conflict-apply --take local app.go
@@ -400,9 +372,9 @@ Failed apply can leave a partial result: retry using the retained workspace.
 If a copy changed or the conflict disappeared, inspect the current files and
 workspace before discarding it. Successful apply and discard retain original
 copies as backups. --json prints machine-readable results.
-For --conflicts, the JSON result always has an edges array; each entry names
-alpha and beta, identifies source and target, and contains their listing,
-including for a single edge.
+For --conflicts, the JSON result has an edges array with a single entry, which
+names the edge's alpha and beta nodes and the listing's source and target, and
+contains the listing.
 
 See remote --help conflict-details for merge limitations, backup retention,
 and recovery after changed copies, interruptions, or damaged workspaces.

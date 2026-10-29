@@ -33,9 +33,13 @@ message CreationSpecification {
     map<string, string> labels = 7;
     // Paused indicates whether or not to create the session pre-paused.
     bool paused = 8;
-    // Tree identifies the session as an edge of a workspace tree, if non-nil.
-    // Only project orchestration sets it (see synchronization.Session.Tree).
-    synchronization.TreeMembership tree = 9;
+    // Field 9 specified the membership of a workspace tree edge, which star
+    // workspaces replaced.
+    reserved 9;
+    reserved "tree";
+    // Star identifies the session as an edge of a star workspace, if non-nil.
+    // Only project orchestration sets it (see synchronization.Session.Star).
+    synchronization.StarMembership star = 10;
 }
 
 // CreateRequest encodes a request for session creation.

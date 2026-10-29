@@ -31,10 +31,11 @@ var (
 // Endpoint describes one endpoint of a synchronization session for the
 // purposes of command routing.
 type Endpoint struct {
-	// Tree and Node identify this workspace in a project tree, if any.
-	Tree string `json:",omitempty"`
+	// Star identifies the star workspace of the session, if any.
+	Star string `json:",omitempty"`
+	// Node names this workspace in its star, if any.
 	Node string `json:",omitempty"`
-	// PeerNode names the adjacent workspace on the opposite endpoint.
+	// PeerNode names the workspace on the opposite endpoint in its star.
 	PeerNode string `json:",omitempty"`
 	// Session is the session identifier.
 	Session string
@@ -89,7 +90,7 @@ type Channel interface {
 
 // localChannel implements Channel for an endpoint on the daemon's system.
 type localChannel struct {
-	// node is the stable tree node name, independent of endpoint role.
+	// node is the stable star node name, independent of endpoint role.
 	node string
 	// root is the normalized synchronization root.
 	root string

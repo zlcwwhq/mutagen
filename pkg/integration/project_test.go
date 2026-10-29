@@ -47,7 +47,7 @@ func (o *managerSessionOperations) CreateSynchronization(s *synchronizationsvc.C
 	return synchronizationManager.Create(o.ctx,
 		s.Alpha, s.Beta,
 		s.Configuration, s.ConfigurationAlpha, s.ConfigurationBeta,
-		s.Name, s.Labels, s.Tree, s.Paused, "",
+		s.Name, s.Labels, s.Star, s.Paused, "",
 	)
 }
 

@@ -34,8 +34,9 @@ const (
 // are safe for concurrent usage, so it can be easily exported via an RPC
 // interface.
 type Manager struct {
-	// trees provides node routing across this manager's pair sessions.
-	trees *commandTrees
+	// stars provides node discovery and destination selection across this
+	// manager's sessions.
+	stars *commandStars
 	// logger is the underlying logger.
 	logger *logging.Logger
 	// tracker tracks changes to session states.
@@ -54,7 +55,7 @@ func NewManager(logger *logging.Logger) (*Manager, error) {
 
 	// Create the session registry.
 	sessions := make(map[string]*controller)
-	trees := newCommandTrees()
+	stars := newCommandStars()
 
 	// Load existing sessions.
 	logger.Info("Looking for existing sessions")
@@ -73,7 +74,7 @@ func NewManager(logger *logging.Logger) (*Manager, error) {
 			continue
 		}
 		logger.Info("Loading session", id)
-		if controller, err := loadSession(logger.Sublogger(identifier.Truncated(id)), tracker, trees, id); err != nil {
+		if controller, err := loadSession(logger.Sublogger(identifier.Truncated(id)), tracker, stars, id); err != nil {
 			logger.Warnf("Failed to load session %s: %v", id, err)
 			continue
 		} else {
@@ -84,7 +85,7 @@ func NewManager(logger *logging.Logger) (*Manager, error) {
 	// Success.
 	logger.Info("Session manager initialized")
 	return &Manager{
-		trees:        trees,
+		stars:        stars,
 		logger:       logger,
 		tracker:      tracker,
 		sessionsLock: sessionsLock,
@@ -206,15 +207,15 @@ func (m *Manager) Shutdown() {
 	}
 }
 
-// Create tells the manager to create a new session. If tree is non-nil, then the
-// session is an edge of a workspace tree (see Session.Tree).
+// Create tells the manager to create a new session. If star is non-nil, then
+// the session is an edge of a star workspace (see Session.Star).
 func (m *Manager) Create(
 	ctx context.Context,
 	alpha, beta *url.URL,
 	configuration, configurationAlpha, configurationBeta *Configuration,
 	name string,
 	labels map[string]string,
-	tree *TreeMembership,
+	star *StarMembership,
 	paused bool,
 	prompter string,
 ) (string, error) {
@@ -229,13 +230,13 @@ func (m *Manager) Create(
 		ctx,
 		m.logger.Sublogger(identifier.Truncated(id)),
 		m.tracker,
-		m.trees,
+		m.stars,
 		id,
 		alpha, beta,
 		configuration, configurationAlpha, configurationBeta,
 		name,
 		labels,
-		tree,
+		star,
 		paused,
 		prompter,
 	)
@@ -448,7 +449,7 @@ func (m *Manager) Terminate(ctx context.Context, selection *selection.Selection,
 		m.sessionsLock.Lock()
 		delete(m.sessions, controller.session.Identifier)
 		m.sessionsLock.Unlock()
-		m.trees.update(controller, true)
+		m.stars.update(controller, true)
 	}
 
 	// Success.

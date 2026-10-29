@@ -113,12 +113,7 @@ func describeState(job *remote.Job) string {
 // printing the job's identifier to stdout and how to follow it to stderr. It
 // returns the exit code for failures to start the job along with the error.
 func startJob(ctx context.Context, connection net.Conn, target *remote.Target, request *remote.Request, stdout, stderr io.Writer) (int, error) {
-	return startJobWithEvents(ctx, connection, target, request, stdout, stderr, nil)
-}
-
-// startJobWithEvents renders a daemon-coordinated job's synchronization events.
-func startJobWithEvents(ctx context.Context, connection net.Conn, target *remote.Target, request *remote.Request, stdout, stderr io.Writer, event func(*remote.CommandEvent)) (int, error) {
-	job, code, err := remote.StartJobWithEvents(ctx, connection, request, event)
+	job, code, err := remote.StartJob(ctx, connection, request)
 	if errors.Is(err, remote.ErrConnectionLost) {
 		return 0, remote.ConnectionError(errors.New("the connection to the executing endpoint was lost while starting the job, which may be running; remote --jobs lists the jobs"))
 	} else if err != nil {

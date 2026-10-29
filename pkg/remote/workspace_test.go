@@ -36,32 +36,37 @@ func registered(t *testing.T, registry, session string) bool {
 	return false
 }
 
-func TestTreeSourceSelection(t *testing.T) {
+func TestStarSourceSelection(t *testing.T) {
 	useTestRegistry(t)
 	root := resolveSymbolicLinks(t.TempDir())
-	add := func(session, tree, node, directory string) Channel {
+	add := func(session, star, node, directory string) Channel {
 		t.Helper()
-		channel, err := NewLocalChannel(nil, &Endpoint{Session: session, Tree: tree, Node: node, Root: directory, Submit: true, Execute: true})
+		channel, err := NewLocalChannel(nil, &Endpoint{Session: session, Star: star, Node: node, Root: directory, Submit: true, Execute: true})
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { channel.Close() })
 		return channel
 	}
-	add("ab", "project", "b", root)
-	add("bc", "project", "b", root)
+	add("center-b", "project", "center", root)
+	add("center-c", "project", "center", root)
 	selection := &Selection{Workspace: true}
-	if target, err := locateWorkspaceTest(selection, root); err != nil || target.Root != root || target.SourceNode != "b" {
-		t.Fatalf("incident edges did not select one source node: %+v %v", target, err)
+	if target, err := locateWorkspaceTest(selection, root); err != nil || target.Root != root || target.SourceNode != "center" || !target.Star {
+		t.Fatalf("a star's edges did not select its center as one source node: %+v %v", target, err)
 	}
-	other := add("other", "another-project", "b", root)
-	if _, err := locateWorkspaceTest(selection, root); err == nil || !strings.Contains(err.Error(), "ambiguous source node") {
-		t.Fatal("ambiguous source tree accepted:", err)
+	other := add("other", "another-project", "center", root)
+	if _, err := locateWorkspaceTest(selection, root); err == nil || !strings.Contains(err.Error(), "ambiguous source node") || !strings.Contains(err.Error(), "one star") {
+		t.Fatal("ambiguous source star accepted:", err)
 	}
 	other.Close()
+	pair := add("pair", "", "", root)
+	if _, err := locateWorkspaceTest(selection, root); err == nil || !strings.Contains(err.Error(), "ambiguous source node") {
+		t.Fatal("pair sharing a star's root accepted:", err)
+	}
+	pair.Close()
 
 	// A nested pair is the more specific workspace, so it's the source rather
-	// than the enclosing tree.
+	// than the enclosing star.
 	nested := filepath.Join(root, "nested")
 	if err := os.Mkdir(nested, 0700); err != nil {
 		t.Fatal(err)
@@ -71,7 +76,7 @@ func TestTreeSourceSelection(t *testing.T) {
 		t.Fatalf("nested pair not selected: %+v %v", target, err)
 	}
 	if _, err := locateWorkspaceTest(selection, t.TempDir()); err == nil || !strings.Contains(err.Error(), "no connected node contains") {
-		t.Fatal("source outside tree accepted:", err)
+		t.Fatal("source outside star accepted:", err)
 	}
 }
 
@@ -156,8 +161,8 @@ func TestWorkspaceDeadNestedRegistration(t *testing.T) {
 	var lock sync.Mutex
 	var accepted []string
 	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"inner"}}
-	registerTest(t, &Endpoint{Session: "sync_outer", Tree: "project", Node: "a", Root: outer, Alpha: true, Ignores: ignores}, "outer", &accepted, &lock)
-	nested := registerTest(t, &Endpoint{Session: "sync_inner", Tree: "nested", Node: "b", Root: inner}, "inner", &accepted, &lock)
+	registerTest(t, &Endpoint{Session: "sync_outer", Star: "project", Node: "a", Root: outer, Alpha: true, Ignores: ignores}, "outer", &accepted, &lock)
+	nested := registerTest(t, &Endpoint{Session: "sync_inner", Star: "nested", Node: "b", Root: inner}, "inner", &accepted, &lock)
 	if target, err := locateWorkspaceTest(&Selection{Workspace: true}, directory); err != nil || target.Session != "sync_inner" || target.SourceNode != "b" {
 		t.Fatalf("incorrect nested selection: %+v, %v", target, err)
 	}

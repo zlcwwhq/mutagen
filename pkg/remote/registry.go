@@ -61,8 +61,9 @@ var ambiguousRefusals = slices.Contains([]string{"darwin", "ios", "freebsd", "ne
 // record is the on-disk description of a registered endpoint, or of the scope
 // of a synchronization endpoint (see RegisterScope).
 type record struct {
-	// Tree and Node identify a workspace tree submission endpoint.
-	Tree     string `json:",omitempty"`
+	// Star, Node, and PeerNode identify a star workspace's submission
+	// endpoint (see Endpoint).
+	Star     string `json:",omitempty"`
 	Node     string `json:",omitempty"`
 	PeerNode string `json:",omitempty"`
 	// Version is the Mutagen version of the registering process.
@@ -203,7 +204,7 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 	}
 	prune(context.Background(), directory)
 	return registerIn(directory, &record{
-		Tree:           endpoint.Tree,
+		Star:           endpoint.Star,
 		Node:           endpoint.Node,
 		PeerNode:       endpoint.PeerNode,
 		Session:        endpoint.Session,
@@ -351,15 +352,15 @@ type Target struct {
 	// never change when the daemon selects another edge of the same node.
 	SourceSession string
 	SourceAlpha   bool
-	// Tree identifies a declared workspace tree at the submitting registration.
-	Tree bool
+	// Star identifies a declared star workspace at the submitting registration.
+	Star bool
 	// Resolved marks a destination selected by the daemon. Revision pins it.
 	Resolved bool
 	Revision string
 	// SourceNode and Node identify the submitting and selected workspaces.
 	SourceNode string
 	Node       string
-	// Session identifies the selected adjacent edge for checkout ownership.
+	// Session identifies the selected edge for checkout ownership.
 	// SourceSession, not this field, pins subsequent local submissions.
 	Session string
 	// Name is the name of the source session (see SourceSession), if any.
@@ -394,7 +395,7 @@ type Selection struct {
 	// Workspace selects the source workspace by node rather than by session:
 	// the most specific live workspace containing the directory, which may be
 	// registered by several endpoints only if they identify the same node of
-	// the same tree, as incident edges do (see locateWorkspace). Neither
+	// the same star, as the edges at its center do (see locateWorkspace). Neither
 	// creation order nor session names choose among distinct workspaces. It's
 	// ignored if Target is non-nil.
 	Workspace bool
@@ -809,7 +810,7 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 		}
 		target.Session, target.Alpha = route.Session, route.Alpha
 		target.Node, target.SourceNode = route.Node, route.SourceNode
-		target.Tree, target.Resolved, target.Revision = route.Tree, true, route.Revision
+		target.Star, target.Resolved, target.Revision = route.Star, true, route.Revision
 		if route.Ignores != nil {
 			target.Ignores = route.Ignores
 		}
@@ -836,7 +837,7 @@ func (c *candidate) target() *Target {
 		}
 	}
 	return &Target{
-		SourceSession: c.Session, SourceAlpha: c.Alpha, Tree: c.Tree != "",
+		SourceSession: c.Session, SourceAlpha: c.Alpha, Star: c.Star != "",
 		SourceNode: source,
 		Node:       peer,
 		Session:    c.Session,
@@ -941,6 +942,104 @@ func Synchronizing(ctx context.Context, path string, directory bool) ([]string, 
 	return result, nil
 }
 
+// locateWorkspace selects the source workspace for a workspace selection (see
+// Selection.Workspace), given the registrations related to the submission
+// directory that are compatible with this version of Mutagen and those that
+// aren't. The most specific live workspace containing the directory is used,
+// or, if outside is true and no live workspace contains it, the only live
+// workspace on this system. Several live registrations are only accepted when
+// they identify the same node of the same star, as the endpoints of a star's
+// edges at its center do; anything else is reported as ambiguous rather than
+// resolved by creation order.
+//
+// Registrations whose processes no longer listen are pruned and otherwise
+// ignored, exactly as if they had been removed cleanly, as the registrations
+// of paused or reconnecting sessions are. A more specific workspace that isn't
+// connected therefore can't be told apart from one that doesn't exist, and an
+// enclosing workspace is used instead. For operations corresponding to the
+// directory, the enclosing workspace's ignores, which typically exclude a
+// nested workspace's root, then refuse the submission (see
+// Selection.Corresponding).
+//
+// Live registrations by other versions of Mutagen can't be used, but they
+// aren't masked either: if one contains the directory at least as specifically
+// as the selected workspace, or no compatible workspace is found, the version
+// mismatch is reported (see mismatchedVersions), since the submission was
+// probably meant for it.
+func locateWorkspace(ctx context.Context, compatible, incompatible []*candidate, outside bool) (*liveEndpoint, error) {
+	// Determine the live registrations by other versions of Mutagen whose roots
+	// contain the directory, most specific first, pruning dead ones, so that a
+	// stale record can't block selection.
+	others, err := synchronizingSessions(ctx, incompatible)
+	if err != nil {
+		return nil, err
+	}
+
+	// Connect to the most specific live workspaces containing the directory,
+	// or, if permitted and none does, to all live workspaces. Dead
+	// registrations are pruned as tiers are probed, and the next tier is used
+	// if a tier has no live registrations (see locate).
+	live, err := locate(ctx, filter(compatible, func(c *candidate) bool {
+		return c.contained || outside
+	}))
+	if err != nil {
+		return nil, err
+	} else if len(live) == 0 {
+		subject := "the workspaces containing this directory are"
+		if len(others) == 0 && outside {
+			subject = "the workspaces on this system are"
+			if others, err = liveSessions(ctx, filter(incompatible, excluding)); err != nil {
+				return nil, err
+			}
+		}
+		if len(others) > 0 {
+			return nil, mismatchedVersions(subject, others)
+		}
+		return nil, ConnectionError(errors.New("no connected node contains the current directory; run from a workspace root or its subdirectory"))
+	}
+	chosen := live[0]
+
+	// Refuse to mask a live workspace registered by another version of Mutagen
+	// that contains the directory at least as specifically. Since the other
+	// registrations are ordered most specific first, the first one determines
+	// whether they're all equally specific.
+	var masking []*candidate
+	for _, c := range others {
+		if c.depth >= chosen.candidate.depth {
+			masking = append(masking, c)
+		}
+	}
+	if len(masking) > 0 {
+		closeEndpoints(live)
+		subject := "a more specific workspace containing this directory is"
+		if !chosen.candidate.contained {
+			subject = "a workspace containing this directory is"
+		} else if masking[0].depth == chosen.candidate.depth {
+			subject = "another workspace with the same root is"
+		}
+		return nil, mismatchedVersions(subject, masking)
+	}
+
+	// Several live registrations must identify the same node: a star's edges
+	// share its center's root, while distinct pairs or stars sharing a root
+	// are ambiguous.
+	for _, endpoint := range live[1:] {
+		first, other := chosen.candidate, endpoint.candidate
+		same := first.Star != "" && first.Star == other.Star && first.Node == other.Node
+		if first.Star == "" && other.Star == "" {
+			same = first.Session == other.Session && first.Alpha == other.Alpha
+		}
+		if !same {
+			closeEndpoints(live)
+			return nil, errors.New("ambiguous source node; declare the workspaces sharing this root as one star, or run from an unambiguous workspace")
+		}
+	}
+	for _, endpoint := range live[1:] {
+		endpoint.connection.Close()
+	}
+	return &chosen, nil
+}
+
 // locate connects to the endpoint through which to submit an operation from the
 // specified directory, given the registrations related to it that are
 // compatible with this version of Mutagen and those that aren't.
@@ -965,7 +1064,7 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 			if s.Target.SourceAlpha {
 				endpoint = "alpha endpoint"
 			}
-			if s.Target.Tree && s.Target.SourceNode != "" {
+			if s.Target.Star && s.Target.SourceNode != "" {
 				endpoint = fmt.Sprintf("%s (node %s)", endpoint, s.Target.SourceNode)
 			}
 			return nil, ConnectionError(fmt.Errorf("the %s of session %s is no longer connected for remote commands on this system (it may have been paused or terminated, or be reconnecting)",

@@ -353,7 +353,7 @@ func TestDialPinned(t *testing.T) {
 	} else if _, err := dialTest(&Selection{Target: &Target{Session: "sync_inner"}}, directory); err == nil ||
 		!strings.Contains(err.Error(), "doesn't identify a source registration") {
 		t.Fatal("target without a source registration pinned a selection:", err)
-	} else if _, err := dialTest(&Selection{Target: &Target{SourceSession: "sync_gone", SourceAlpha: true, Tree: true, SourceNode: "a", Session: "sync_inner"}}, directory); err == nil ||
+	} else if _, err := dialTest(&Selection{Target: &Target{SourceSession: "sync_gone", SourceAlpha: true, Star: true, SourceNode: "a", Session: "sync_inner"}}, directory); err == nil ||
 		!strings.Contains(err.Error(), "the alpha endpoint (node a) of session sync_gone is no longer connected") {
 		t.Fatal("disconnected source registration not described:", err)
 	}

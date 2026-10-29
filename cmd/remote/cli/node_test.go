@@ -14,53 +14,90 @@ import (
 func replyTestNodes(connection io.ReadWriteCloser, session, alpha, beta string) {
 	remote.RespondWithNodes(connection, &remote.NodeGraph{Source: "alpha", Revision: session, Nodes: []remote.Node{
 		{Name: "alpha", Root: alpha, Current: true, Available: true, Path: []string{"alpha"}},
-		{Name: "beta", Parent: "alpha", Root: beta, Available: true, Adjacent: true, Path: []string{"alpha", "beta"}, Session: session, Alpha: true},
+		{Name: "beta", Root: beta, Available: true, Mode: "two-way-safe", Path: []string{"alpha", "beta"}, Session: session, Alpha: true},
 	}}, nil)
 }
 
+// TestNodeListing verifies the listing of a star from its center in both
+// formats, which mark the center and show each edge's mode without exposing
+// daemon route handles.
 func TestNodeListing(t *testing.T) {
-	graph := &remote.NodeGraph{Source: "local", Nodes: []remote.Node{
-		{Name: "local", Current: true, Available: true, Path: []string{"local"}},
-		{Name: "gpu", Available: true, Adjacent: true, Host: "host", Root: "~/project", Path: []string{"local", "gpu"}, Session: "private-handle"},
-		{Name: "offline", Reason: "edge local <-> offline is paused", Path: []string{"local", "offline"}},
+	graph := &remote.NodeGraph{Source: "local", Star: true, Nodes: []remote.Node{
+		{Name: "gpu", Available: true, Host: "host", Root: "~/project", Mode: "one-way-safe", Path: []string{"local", "gpu"}, Session: "private-handle", Alpha: true},
+		{Name: "local", Center: true, Host: "laptop", Root: "/work", Current: true, Available: true, Path: []string{"local"}},
+		{Name: "offline", Host: "offline", Root: "project", Mode: "two-way-safe", Reason: "node is paused, disconnected, or has commands disabled", Path: []string{"local", "offline"}},
 	}}
 	var output strings.Builder
 	if err := printNodes(graph, true, &output); err != nil {
 		t.Fatal(err)
 	}
-	if !json.Valid([]byte(output.String())) || strings.Contains(output.String(), "private-handle") || strings.Contains(output.String(), "Session") {
-		t.Fatal("public node JSON leaked route handles", output.String())
+	if !json.Valid([]byte(output.String())) || strings.Contains(output.String(), "private-handle") || strings.Contains(output.String(), "Session") ||
+		strings.Contains(output.String(), "parent") || strings.Contains(output.String(), "adjacent") {
+		t.Fatal("public node JSON leaked route handles or tree fields", output.String())
+	}
+	var listing struct {
+		Current string `json:"current"`
+		Star    bool   `json:"star"`
+		Nodes   []struct {
+			Name      string   `json:"name"`
+			Center    bool     `json:"center"`
+			Host      string   `json:"host"`
+			Root      string   `json:"root"`
+			Path      []string `json:"path"`
+			Mode      string   `json:"mode"`
+			Current   bool     `json:"current"`
+			Available bool     `json:"available"`
+			Reason    string   `json:"reason"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(output.String()), &listing); err != nil {
+		t.Fatal(err)
+	} else if listing.Current != "local" || !listing.Star || len(listing.Nodes) != 3 {
+		t.Fatalf("incorrect listing: %+v", listing)
+	} else if node := listing.Nodes[0]; node.Name != "gpu" || node.Center || node.Mode != "one-way-safe" || !node.Available || strings.Join(node.Path, ",") != "local,gpu" {
+		t.Fatalf("incorrect node: %+v", node)
+	} else if node := listing.Nodes[1]; !node.Center || !node.Current || node.Mode != "" || node.Root != "/work" {
+		t.Fatalf("incorrect center: %+v", node)
+	} else if node := listing.Nodes[2]; node.Available || node.Reason == "" {
+		t.Fatalf("incorrect unavailable node: %+v", node)
 	}
 	output.Reset()
-	if err := printNodes(graph, false, &output); err != nil || !strings.Contains(output.String(), "local -> offline") || !strings.Contains(output.String(), "paused") {
-		t.Fatal("listing omitted unavailable path", err, output.String())
+	if err := printNodes(graph, false, &output); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"Current node: local\n",
+		"  gpu: available; host:~/project; one-way-safe\n",
+		"  local: center; current; laptop:/work\n",
+		"  offline: unavailable: node is paused, disconnected, or has commands disabled; offline:~/project; two-way-safe\n",
+		"report conflicts unless given --no-flush",
+	} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("listing omitted %q: %s", expected, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "problem") || strings.Contains(output.String(), "->") {
+		t.Fatal("listing described a problem or path that doesn't exist:", output.String())
 	}
 	if err := printNodes(graph, false, failedCommandIO{}); err == nil {
 		t.Fatal("listing ignored output failure")
 	}
-
 }
 
-// TestNodeSelectionWithTreeProblem verifies that a tree problem refuses strict
-// tree commands without blocking operations on connected adjacent nodes, and
-// that it never changes which destination an omitted --node means.
-func TestNodeListingWithTreeProblem(t *testing.T) {
-	problem := "node b is disconnected from tree root a"
-	graph := &remote.NodeGraph{Source: "c", Tree: true, Problem: problem, Nodes: []remote.Node{
-		{Name: "a", Reason: problem, Path: []string{}},
-		{Name: "b", Adjacent: true, Reason: problem, Path: []string{"c", "b"}, Session: "private-handle"},
-		{Name: "c", Current: true, Available: true, Path: []string{"c"}},
-		{Name: "e", Reason: "edge c <-> e is paused, disconnected, or has commands disabled", Path: []string{"c", "e"}},
-		{Name: "f", Reason: problem, Path: []string{"c", "e", "f"}},
+// TestNodeListingWithStarProblem verifies that a star problem is reported in
+// both formats, along with its consequence for operations from the center.
+func TestNodeListingWithStarProblem(t *testing.T) {
+	problem := "sessions a and b disagree on the endpoint of center node local"
+	graph := &remote.NodeGraph{Source: "local", Star: true, Problem: problem, Nodes: []remote.Node{
+		{Name: "gpu", Reason: problem, Mode: "two-way-safe", Path: []string{"local", "gpu"}},
+		{Name: "local", Center: true, Current: true, Available: true, Path: []string{"local"}},
 	}}
 	var output strings.Builder
 	if err := printNodes(graph, false, &output); err != nil {
 		t.Fatal(err)
 	}
-	// --no-flush skips synchronization and conflict checks, never the repair.
 	for _, expected := range []string{
-		"Tree problem: " + problem, "b: adjacent operations only (tree problem)", "a: unavailable: tree problem", "no path over existing edges", "e: unavailable: edge c <-> e",
-		"require a repaired tree, even with --no-flush", "check for conflicts unless given --no-flush",
+		"Star problem: " + problem, "gpu: unavailable: star problem", "Operations from the center fail until the star is repaired",
 	} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("listing omitted %q: %s", expected, output.String())
@@ -70,20 +107,10 @@ func TestNodeListingWithTreeProblem(t *testing.T) {
 	if err := printNodes(graph, true, &output); err != nil {
 		t.Fatal(err)
 	}
-	var listing struct {
-		Problem string
-		Nodes   []struct {
-			Name     string
-			Path     []string
-			Adjacent bool
-		}
+	var listing struct{ Problem string }
+	if err := json.Unmarshal([]byte(output.String()), &listing); err != nil || listing.Problem != problem {
+		t.Fatal("JSON listing omitted the problem", err, output.String())
 	}
-	if err := json.Unmarshal([]byte(output.String()), &listing); err != nil || listing.Problem != problem || strings.Contains(output.String(), "private-handle") {
-		t.Fatal("JSON listing omitted the problem or leaked handles", err, output.String())
-	} else if !strings.Contains(output.String(), `"path":[]`) || !listing.Nodes[1].Adjacent || listing.Nodes[0].Adjacent {
-		t.Fatal("JSON listing misreported adjacency or paths", output.String())
-	}
-
 }
 
 func TestParseNode(t *testing.T) {

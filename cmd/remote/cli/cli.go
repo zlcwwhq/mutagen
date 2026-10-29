@@ -72,11 +72,11 @@ func (w *checkedWriter) Write(data []byte) (int, error) {
 
 // options are the parsed command line options.
 type options struct {
-	// node selects an execution node in the current workspace tree.
+	// node selects the destination node.
 	node string
-	// nodes requests a read-only node graph listing.
+	// nodes requests a read-only listing of the nodes that can be reached.
 	nodes bool
-	// target is the resolved adjacent route, kept internal to node selection.
+	// target is the resolved route, kept internal to node selection.
 	target *remote.Target
 	conflictOptions
 	// Deprecated selectors are parsed solely to report migration errors.
@@ -186,7 +186,7 @@ func parse(arguments []string) (*options, error) {
 	// Names in backquotes are used as value placeholders in usage information.
 	flags.StringVarP(&result.deprecatedSession, "session", "s", "", "Deprecated; use --node")
 	flags.StringVar(&result.node, "node", "", "Select destination node `NAME`")
-	flags.BoolVar(&result.nodes, "nodes", false, "List nodes, paths, and connection availability")
+	flags.BoolVar(&result.nodes, "nodes", false, "List reachable nodes and their availability")
 	flags.StringVarP(&result.directory, "cwd", "C", "", "Override execution directory with `DIR`")
 	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set or forward `NAME[=VALUE]` (repeatable)")
 	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read NAME=VALUE from `FILE` (repeatable)")
@@ -367,9 +367,6 @@ func (o *options) command() bool {
 // Run executes the command line (excluding the executable name) and returns the
 // exit code.
 func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	// Remote stderr, progress refreshes, and daemon reports may arrive on
-	// different goroutines. Cancellation diagnostics use this writer too.
-	stderr = &commandErrorOutput{writer: stderr}
 	fail := func(err error) int {
 		fmt.Fprintln(stderr, "remote:", err)
 		return errorExitCode(err)
@@ -482,18 +479,6 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 	}
 	router := &router{ctx: ctx, directory: directory, selection: options.selection(request != nil && options.directory == ""), stderr: stderr, progress: options.progress}
-	if request != nil {
-		// Registrations already identify whether the source belongs to a tree.
-		// This local lookup needs no daemon graph query or remote round trip.
-		selection, source, err := options.locateSource(ctx, directory, options.directory == "")
-		if err != nil {
-			return fail(err)
-		}
-		router.selection = selection
-		if source.Tree {
-			return runNode(ctx, directory, options, request, selection, stdin, stdout, stderr, interrupted)
-		}
-	}
 	if (options.ignores || options.discard) && options.node != "" {
 		connection, target, err := router.submit(&remote.Submission{Operation: remote.OperationResolve})
 		if err != nil {
@@ -509,7 +494,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	output := &checkedWriter{Writer: stdout}
 	switch {
 	case options.conflicts:
-		activity, err = "listing path conflicts", printPathConflicts(ctx, directory, options, output, stderr)
+		activity, err = "listing conflicts", printConflicts(ctx, directory, options, output, stderr)
 	case options.active():
 		activity, err = "resolving conflicts", runConflicts(ctx, directory, options, output, stderr)
 	case options.jobs:

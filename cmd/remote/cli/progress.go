@@ -100,8 +100,6 @@ type progressPhase struct {
 // Daemons that predate progress messages send none, so only the elapsed time
 // is shown for them. A nil display shows nothing.
 type progressDisplay struct {
-	// Tree edge context identifies synchronization independently of command I/O.
-	edge, alphaNode, betaNode string
 	// output is the progress output.
 	output *progressOutput
 	// locator maps paths for display.
@@ -343,11 +341,7 @@ func (d *progressDisplay) clear() {
 // 13s: staging on alpha (local), 0 of 1 files, 1.2 MiB; out.bin: 1.2 MiB of
 // 5.0 MiB".
 func (d *progressDisplay) describe(now time.Time) string {
-	description := "remote: "
-	if d.edge != "" {
-		description += d.edge + ": "
-	}
-	description += "synchronizing for " + formatElapsed(now.Sub(d.start))
+	description := "remote: synchronizing for " + formatElapsed(now.Sub(d.start))
 	if d.latest == nil || d.latest.Status == "" {
 		return description
 	}
@@ -402,12 +396,6 @@ func (d *progressDisplay) label(status string) string {
 	label, ok := statusLabels[status]
 	if !ok {
 		return terminal.NeutralizeControlCharacters(status)
-	} else if alpha, ok := statusEndpoints[status]; ok && d.alphaNode != "" {
-		if alpha {
-			label = strings.Replace(label, "alpha", d.alphaNode, 1)
-		} else {
-			label = strings.Replace(label, "beta", d.betaNode, 1)
-		}
 	} else if alpha, ok := statusEndpoints[status]; ok && alpha == d.alpha {
 		label += " (local)"
 	} else if ok {
@@ -446,9 +434,6 @@ func (d *progressDisplay) finish(ctx context.Context, err error) {
 	}
 	if phases := d.describePhases(); phases != "" {
 		summary += ": " + phases
-	}
-	if d.edge != "" {
-		summary = d.edge + ": " + summary
 	}
 	fmt.Fprintln(d.output.writer, "remote: "+singleLine(summary))
 }
