@@ -118,7 +118,7 @@ func parseDocker(raw string, kind Kind, first bool) (*URL, error) {
 		// systems. At this point we already know that the path starts with "/"
 		// since we retained that as part of the path in the split operation
 		// above.
-		if isWindowsPath(path[1:]) {
+		if IsWindowsDrivePath(path[1:]) {
 			path = path[1:]
 		}
 	} else if kind == Kind_Forwarding {

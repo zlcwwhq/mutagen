@@ -34,7 +34,7 @@ func isSCPSSHURL(raw string, kind Kind) bool {
 	if kind == Kind_Synchronization {
 		// If we're on a Windows system and this is a Windows path, then reject
 		// it, because it should be treated as a local URL.
-		if runtime.GOOS == "windows" && isWindowsPath(raw) {
+		if runtime.GOOS == "windows" && IsWindowsDrivePath(raw) {
 			return false
 		}
 

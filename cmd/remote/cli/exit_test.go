@@ -46,7 +46,7 @@ func TestCommandLocalIOExitCode(t *testing.T) {
 			}
 		})
 	}
-	for _, arguments := range [][]string{{"--ignores", "file"}, {"--sessions"}, {"--version"}, {"--help"}} {
+	for _, arguments := range [][]string{{"--ignores", "file"}, {"--nodes"}, {"--version"}, {"--help"}} {
 		if code := Run(arguments, strings.NewReader(""), failedCommandIO{}, io.Discard); code != failureExitCode {
 			t.Fatalf("%v output failure returned %d, expected 125", arguments, code)
 		}
@@ -87,7 +87,11 @@ func TestPullBatchFailurePriority(t *testing.T) {
 			handlers.Add(1)
 			go func() {
 				defer handlers.Done()
-				remote.ReceiveSubmission(context.Background(), connection)
+				header, err := remote.ReceiveSubmission(context.Background(), connection)
+				if err == nil && header.Operation == remote.OperationNodes {
+					replyTestNodes(connection, "sync_mixed", root, root)
+					return
+				}
 				if interruptNext.Swap(false) {
 					// Receiving a submission proves Run installed its signal
 					// handler. Keep the route pending until cancellation closes

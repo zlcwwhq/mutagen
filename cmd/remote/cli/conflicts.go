@@ -127,8 +127,8 @@ func (o *options) validateConflicts() error {
 		return errors.New("no conflicting paths specified")
 	} else if paths && slices.ContainsFunc(o.arguments, func(argument string) bool { return strings.HasPrefix(argument, "-") }) {
 		return errors.New("options must precede paths (prefix paths starting with - with ./)")
-	} else if o.json && modes == 0 {
-		return errors.New("--json requires a conflict operation")
+	} else if o.json && modes == 0 && !o.nodes {
+		return errors.New("--json requires --nodes or a conflict operation")
 	} else if !o.apply && (o.take != "" || o.delete || o.executable != "") {
 		return errors.New("--take, --delete, and --executable require --conflict-apply")
 	} else if o.base != "" && (!o.checkout || len(o.arguments) != 1) {
@@ -474,7 +474,8 @@ func sessionWorkspaces(target *remote.Target) map[string]*workspace {
 func listConflicts(ctx context.Context, directory string, o *options, errorOutput io.Writer) (*remote.Listing, *remote.Target, error) {
 	output := newProgressOutput(errorOutput, o.progress)
 	header := &remote.Submission{Operation: remote.OperationConflicts, Progress: output.writer != nil}
-	connection, target, err := remote.Submit(ctx, directory, o.session, header)
+	selection := o.selection(false)
+	connection, target, err := selection.Submit(ctx, directory, header)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -496,8 +497,8 @@ func findConflict(listing *remote.Listing, path string) *remote.ConflictRoot {
 
 // dialSession submits an operation through the endpoint that the specified
 // target identifies, which must be the one located for the submission.
-func dialSession(ctx context.Context, directory, session string, operation remote.Operation, expected *remote.Target) (io.ReadWriteCloser, error) {
-	connection, target, err := remote.Dial(ctx, directory, session, operation)
+func dialSession(ctx context.Context, directory string, operation remote.Operation, expected *remote.Target) (io.ReadWriteCloser, error) {
+	connection, target, err := (&remote.Selection{Target: expected}).Dial(ctx, directory, operation)
 	if err != nil {
 		return nil, err
 	} else if target.Session != expected.Session || target.Alpha != expected.Alpha {
@@ -509,8 +510,8 @@ func dialSession(ctx context.Context, directory, session string, operation remot
 
 // dialOpposite opens a route to the opposite endpoint, which must be the one
 // that the specified target identifies.
-func dialOpposite(ctx context.Context, directory, session string, expected *remote.Target) (io.ReadWriteCloser, error) {
-	return dialSession(ctx, directory, session, remote.OperationExecute, expected)
+func dialOpposite(ctx context.Context, directory string, expected *remote.Target) (io.ReadWriteCloser, error) {
+	return dialSession(ctx, directory, remote.OperationExecute, expected)
 }
 
 // claimSequence records with the daemon that a conflict root is checked out
@@ -535,9 +536,9 @@ func dialOpposite(ctx context.Context, directory, session string, expected *remo
 // makes after claiming its checkout (see remote.Replacement.Sequence) after
 // those of all earlier applies of the conflict, including those whose clients
 // stopped waiting for them while the replacements kept running.
-func claimSequence(ctx context.Context, directory, session string, target *remote.Target, path, token string) (uint64, error) {
+func claimSequence(ctx context.Context, directory string, target *remote.Target, path, token string) (uint64, error) {
 	claimOnce := func() (uint64, string, error) {
-		connection, err := dialSession(ctx, directory, session, remote.OperationClaim, target)
+		connection, err := dialSession(ctx, directory, remote.OperationClaim, target)
 		if err != nil {
 			return 0, "", err
 		}
@@ -547,7 +548,7 @@ func claimSequence(ctx context.Context, directory, session string, target *remot
 	if err != nil || sequence != 0 {
 		return sequence, err
 	}
-	connection, err := dialSession(ctx, directory, session, remote.OperationRelease, target)
+	connection, err := dialSession(ctx, directory, remote.OperationRelease, target)
 	if err == nil {
 		_, _, err = remote.ReleaseCheckout(ctx, connection, path, held)
 	}
@@ -564,12 +565,12 @@ func claimSequence(ctx context.Context, directory, session string, target *remot
 // release removes the checkout of a conflict root held by the endpoint that
 // the specified target identifies, if any, and returns whether it held one
 // (see releaseOver).
-func release(ctx context.Context, directory, session string, target *remote.Target, path, token string) (bool, error) {
-	connection, err := dialSession(ctx, directory, session, remote.OperationRelease, target)
+func release(ctx context.Context, directory string, target *remote.Target, path, token string) (bool, error) {
+	connection, err := dialSession(ctx, directory, remote.OperationRelease, target)
 	if err != nil {
 		return false, err
 	}
-	return releaseOver(ctx, connection, directory, session, target, path, token)
+	return releaseOver(ctx, connection, directory, target, path, token)
 }
 
 // releaseOver removes the checkout of a conflict root held by the endpoint
@@ -591,12 +592,12 @@ func release(ctx context.Context, directory, session string, target *remote.Targ
 // conflict out again (see claimSequence). That includes a checkout without a token,
 // recorded by a build that didn't issue tokens, which a release without one
 // removes.
-func releaseOver(ctx context.Context, connection io.ReadWriteCloser, directory, session string, target *remote.Target, path, token string) (bool, error) {
+func releaseOver(ctx context.Context, connection io.ReadWriteCloser, directory string, target *remote.Target, path, token string) (bool, error) {
 	held, current, err := remote.ReleaseCheckout(ctx, connection, path, token)
 	if err != nil || !held || current == token {
 		return held, err
 	}
-	connection, err = dialSession(ctx, directory, session, remote.OperationRelease, target)
+	connection, err = dialSession(ctx, directory, remote.OperationRelease, target)
 	if err != nil {
 		return true, err
 	} else if stillHeld, remaining, err := remote.ReleaseCheckout(ctx, connection, path, current); err != nil {
@@ -637,7 +638,7 @@ func releaseIfAbandoned(ctx context.Context, directory string, target *remote.Ta
 	if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
-	_, err = release(ctx, directory, target.Session, target, checkout.Path, checkout.Token)
+	_, err = release(ctx, directory, target, checkout.Path, checkout.Token)
 	return err == nil
 }
 
@@ -992,11 +993,21 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 	if err != nil {
 		return err
 	}
-	warnOverlapping(errorOutput, target)
+	return renderConflicts(ctx, directory, o, output, errorOutput, listing, target, true)
+}
+
+// renderConflicts shares the public listing schema across adjacent and distant
+// edges. Only the first edge can have workspaces on the submitting system.
+func renderConflicts(ctx context.Context, directory string, o *options, output, errorOutput io.Writer, listing *remote.Listing, target *remote.Target, local bool) error {
 	l := newLocator(target)
-	workspaces := sessionWorkspaces(target)
+	workspaces := make(map[string]*workspace)
+	checkouts := listing.Checkouts
+	if local {
+		workspaces = sessionWorkspaces(target)
+		checkouts = releaseAbandoned(ctx, directory, target, checkouts, workspaces)
+	}
 	holders := make(map[string]bool)
-	for _, checkout := range releaseAbandoned(ctx, directory, target, listing.Checkouts, workspaces) {
+	for _, checkout := range checkouts {
 		holders[checkout.Path] = checkout.Alpha
 	}
 	// A checkout held by the opposite endpoint prevails over a local workspace,
@@ -1041,7 +1052,7 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 		delete(workspaces, conflict.Path)
 		delete(holders, conflict.Path)
 	}
-	var pending, elsewhere []string
+	var pending, elsewhere, remoteSourcePending []string
 	for path := range workspaces {
 		pending = append(pending, path)
 	}
@@ -1049,15 +1060,38 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 	for path, alpha := range holders {
 		if alpha != target.Alpha {
 			elsewhere = append(elsewhere, path)
+		} else if !local {
+			remoteSourcePending = append(remoteSourcePending, path)
 		}
 	}
 	slices.Sort(elsewhere)
+	slices.Sort(remoteSourcePending)
+	if !o.json {
+		reports.print(&remote.Report{Problems: listing.Problems})
+	}
 	if o.json {
+		// Every path edge retains scan/transition problems and checkout owners,
+		// including pending checkouts on intermediate nodes with no local merge
+		// workspace. Omit opaque checkout tokens from the public JSON.
+		type checkoutOwner struct{ Path, Node string }
 		listed := struct {
 			Conflicts     []listedConflict
 			Pending       []pendingResolution
 			RemotePending []string
-		}{Conflicts: conflicts, Pending: make([]pendingResolution, len(pending)), RemotePending: make([]string, len(elsewhere))}
+			Problems      []remote.Problem
+			Checkouts     []checkoutOwner
+		}{Conflicts: conflicts, Pending: make([]pendingResolution, len(pending)), RemotePending: make([]string, len(elsewhere)), Problems: make([]remote.Problem, len(listing.Problems)), Checkouts: make([]checkoutOwner, len(checkouts))}
+		copy(listed.Problems, listing.Problems)
+		for i := range listed.Problems {
+			listed.Problems[i].Path = l.local(listed.Problems[i].Path)
+		}
+		for i, checkout := range checkouts {
+			node := target.Node
+			if checkout.Alpha == target.Alpha {
+				node = target.SourceNode
+			}
+			listed.Checkouts[i] = checkoutOwner{l.local(checkout.Path), node}
+		}
 		for p, path := range pending {
 			w := workspaces[path]
 			listed.Pending[p] = pendingResolution{Path: l.local(path), Applied: w.applied(), Workspace: w.directory}
@@ -1066,7 +1100,7 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 			listed.RemotePending[p] = l.local(path)
 		}
 		return json.NewEncoder(output).Encode(&listed)
-	} else if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 {
+	} else if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 && len(remoteSourcePending) == 0 && len(listing.Problems) == 0 {
 		_, err := fmt.Fprintln(output, "No conflicts.")
 		return err
 	}
@@ -1093,7 +1127,7 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 	}
 	// Workspaces whose conflicts are no longer listed are listed with their
 	// locations, since they may hold the only copy of one side's changes.
-	var unfinished, unapplied, remotely []string
+	var unfinished, unapplied, remotely, atSource []string
 	for _, path := range pending {
 		w := workspaces[path]
 		line := fmt.Sprintf("%s (workspace: %s)", l.display(path), w.directory)
@@ -1106,6 +1140,9 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 	for _, path := range elsewhere {
 		remotely = append(remotely, l.display(path))
 	}
+	for _, path := range remoteSourcePending {
+		atSource = append(atSource, l.display(path))
+	}
 	for _, section := range []struct {
 		heading string
 		lines   []string
@@ -1114,6 +1151,7 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 		{fmt.Sprintf("Checked out, but no longer listed as conflicts, with nothing applied (resolved some other way, or ended by a change after checkout, which may have left one side's changes only in the workspace; compare the current file with the workspace's local and remote files before discarding, since discarded workspaces are deleted after %d days):",
 			int(backupRetention.Hours()/24)), unapplied},
 		{"Checked out through the opposite endpoint, but no longer listed as conflicts (possibly unfinished; leave them unchanged until applied or discarded there):", remotely},
+		{fmt.Sprintf("Checked out on node %s, but no longer listed as conflicts (possibly unfinished; inspect and apply or discard the workspace there):", terminal.NeutralizeControlCharacters(target.SourceNode)), atSource},
 	} {
 		if len(section.lines) == 0 {
 			continue
@@ -1134,7 +1172,6 @@ func checkoutAll(ctx context.Context, directory string, o *options, p *printer) 
 	if err != nil {
 		return err
 	}
-	warnOverlapping(p.errors, target)
 	for _, argument := range o.arguments {
 		result, err := checkout(ctx, directory, o, listing, target, argument)
 		p.print(argument, result, err)
@@ -1237,14 +1274,14 @@ func checkoutLocked(ctx context.Context, directory string, o *options, listing *
 	// without a workspace, such as one left by an interrupted checkout, is
 	// released first (see claimSequence).
 	token := rand.Text()[:8]
-	sequence, err := claimSequence(ctx, directory, o.session, target, path, token)
+	sequence, err := claimSequence(ctx, directory, target, path, token)
 	if err != nil {
 		return nil, 0, err
 	}
 	created := false
 	defer func() {
 		if !created {
-			release(ctx, directory, o.session, target, path, token)
+			release(ctx, directory, target, path, token)
 		}
 	}()
 	base, final, err := workspaceDirectory(local)
@@ -1266,7 +1303,7 @@ func checkoutLocked(ctx context.Context, directory string, o *options, listing *
 		err = checkoutFiles(ctx, conflict, local, o.base, w, func(output io.Writer) (*remote.Entry, error) {
 			return remote.CopyFile(ctx, target.Root, path, output)
 		}, func(output io.Writer) (*remote.Entry, error) {
-			connection, err := dialOpposite(ctx, directory, o.session, target)
+			connection, err := dialOpposite(ctx, directory, target)
 			if err != nil {
 				return nil, err
 			}
@@ -1367,7 +1404,7 @@ func checkoutEntries(ctx context.Context, directory string, o *options, target *
 		return fmt.Errorf("unable to copy the local copy: %w", err)
 	}
 	w.Remote, err = extractCopy(ctx, w.file(remoteName), func(output io.Writer) (*remote.Entry, error) {
-		connection, err := dialOpposite(ctx, directory, o.session, target)
+		connection, err := dialOpposite(ctx, directory, target)
 		if err != nil {
 			return nil, err
 		}
@@ -1565,8 +1602,7 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 					return nil, nil, preliminaryErr
 				}
 				selected = preliminaryTarget
-				o.session = preliminaryTarget.Session
-				warnOverlapping(p.errors, preliminaryTarget)
+				o.target = preliminaryTarget
 			}
 		}
 		return preliminary, preliminaryTarget, preliminaryErr
@@ -1596,7 +1632,7 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 		}
 		if a != nil {
 			selected = a.target
-			o.session = selected.Session
+			o.target = selected
 		}
 		if err != nil {
 			p.print(argument, nil, err)
@@ -1682,7 +1718,7 @@ func apply(ctx context.Context, directory string, o *options, argument string, e
 	if err != nil {
 		return nil, unlock, err
 	}
-	connection, target, err := remote.Dial(ctx, directory, o.session, remote.OperationExecute)
+	connection, target, err := o.selection(false).Dial(ctx, directory, remote.OperationExecute)
 	if err != nil {
 		return nil, unlock, err
 	}
@@ -1713,7 +1749,7 @@ func apply(ctx context.Context, directory string, o *options, argument string, e
 	// Automatic checkout already claimed this token and obtained the sequence
 	// while holding the same lock. Existing workspaces always claim anew.
 	if sequence == 0 {
-		sequence, err = claimSequence(ctx, directory, o.session, target, w.Path, w.Token)
+		sequence, err = claimSequence(ctx, directory, target, w.Path, w.Token)
 	}
 	if err != nil {
 		connection.Close()
@@ -1851,7 +1887,7 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 	if err != nil {
 		return nil, unverified(err)
 	}
-	connection, err := dialOpposite(ctx, directory, o.session, a.target)
+	connection, err := dialOpposite(ctx, directory, a.target)
 	if err != nil {
 		return nil, unverified(err)
 	}
@@ -1874,7 +1910,7 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 	lines := []string{resolved, retentionNote(backup)}
 	// The checkout is released once the workspace is set aside. One left
 	// behind is released by the next listing (see releaseAbandoned).
-	if _, err := release(ctx, directory, o.session, a.target, w.Path, w.Token); err != nil {
+	if _, err := release(ctx, directory, a.target, w.Path, w.Token); err != nil {
 		lines = append(lines, fmt.Sprintf("Unable to release the checkout (%v); remote --conflicts releases it.", err))
 	}
 	return &outcome{Path: a.argument, Resolved: true, Backup: backup, lines: lines}, nil
@@ -1892,8 +1928,21 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 // the checkout must be the one that it was checked out through, and it's
 // released starting with the workspace's token. Otherwise, the token is
 // unknown (see releaseOver).
-func releaseAt(ctx context.Context, local, session string, w *workspace) (bool, error) {
-	connection, target, err := remote.Dial(ctx, filepath.Dir(local), session, remote.OperationRelease)
+func releaseAt(ctx context.Context, local string, selected *remote.Target, w *workspace) (bool, error) {
+	selection := &remote.Selection{Workspace: true, Resolve: true, Target: selected}
+	if selected == nil && w != nil {
+		// A saved workspace identifies the local endpoint of the edge that owns
+		// its checkout, which is the registration to pin, whether the daemon
+		// selected that edge for another source registration of the same node
+		// or the workspace predates node-based routing, in which case the edge
+		// was the source registration itself. The target isn't resolved, so
+		// the release goes over that edge to its opposite endpoint directly.
+		selection = &remote.Selection{Target: &remote.Target{
+			SourceSession: w.Session, SourceAlpha: w.Alpha,
+			Session: w.Session, Alpha: w.Alpha,
+		}}
+	}
+	connection, target, err := selection.Dial(ctx, filepath.Dir(local), remote.OperationRelease)
 	if err != nil {
 		return false, err
 	}
@@ -1909,7 +1958,7 @@ func releaseAt(ctx context.Context, local, session string, w *workspace) (bool, 
 	if w != nil {
 		token = w.Token
 	}
-	return releaseOver(ctx, connection, filepath.Dir(local), session, target, path, token)
+	return releaseOver(ctx, connection, filepath.Dir(local), target, path, token)
 }
 
 // discard sets a workspace aside without changing either copy and releases its
@@ -1937,7 +1986,7 @@ func discard(ctx context.Context, o *options, argument string) (*outcome, error)
 	w, err := loadWorkspace(local)
 	var unreadable *unreadableWorkspace
 	if errors.Is(err, os.ErrNotExist) {
-		if held, err := releaseAt(ctx, local, o.session, nil); err != nil {
+		if held, err := releaseAt(ctx, local, o.target, nil); err != nil {
 			return nil, err
 		} else if !held {
 			return nil, errors.New("isn't checked out")
@@ -1953,7 +2002,7 @@ func discard(ctx context.Context, o *options, argument string) (*outcome, error)
 		backup, err := (&workspace{directory: unreadable.directory}).retire()
 		if err != nil {
 			return nil, fmt.Errorf("unable to set the workspace aside: %w", err)
-		} else if _, err := releaseAt(ctx, local, o.session, nil); err != nil {
+		} else if _, err := releaseAt(ctx, local, o.target, nil); err != nil {
 			return nil, fmt.Errorf("set the unreadable workspace aside without changing either copy (it's kept in %s; if anything was applied through it, check the copies against its files), but unable to release its checkout, so the opposite endpoint can't check the conflict out yet: %w; discard again to release it", backup, err)
 		}
 		return &outcome{Path: argument, Discarded: true, Backup: backup, lines: []string{
@@ -1963,15 +2012,17 @@ func discard(ctx context.Context, o *options, argument string) (*outcome, error)
 	} else if err != nil {
 		return nil, err
 	}
+	if o.target != nil && (w.Session != o.target.Session || w.Alpha != o.target.Alpha) {
+		return nil, errors.New("the checkout belongs to a different node pair")
+	}
 	backup, err := w.retire()
 	if err != nil {
 		return nil, fmt.Errorf("unable to set the workspace aside: %w", err)
 	}
-	// The workspace's session is selected by its identifier, so that it's
-	// found even if --session wasn't specified for a single-file session. A
-	// retry would find no workspace, so a failure to release the checkout
+	// The saved endpoint pins the checkout even outside a single-file
+	// workspace. A retry would find no workspace, so a release failure
 	// mentions anything applied through it as well.
-	if _, err := releaseAt(ctx, local, w.Session, w); err != nil {
+	if _, err := releaseAt(ctx, local, o.target, w); err != nil {
 		kept := "it's kept in " + backup
 		if w.applied() {
 			kept += ", and since results were applied through it, a copy may still have one, or one original copy may exist only in its local or remote file"

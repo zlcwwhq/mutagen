@@ -16,9 +16,10 @@ const usage = `Usage: remote [options] <command> [<args>...]
        remote [options] --script <file>|- [<args>...]
        remote [options] --flush | --diff [<path>...] | --pull <path>...
        remote [options] --jobs | --wait <id> | --kill <id>
-       remote --sessions | --ignores [<path>...] | --help <topic>
+       remote --nodes [--json] | --ignores [<path>...] | --help <topic>
 
-Run on the session's opposite endpoint, in the corresponding directory.
+Run on a destination node in the corresponding directory.
+Use --nodes to discover targets and --node NAME when there is more than one.
 Synchronize before and after; forward stdin, stdout, stderr, and exit status.
 Options precede the command. No terminal is allocated.
 
@@ -31,7 +32,7 @@ Examples:
 Your shell expands variables, globs, and ~ first; quote remote expressions.
 
 Exit status: command/job status, or 125 for remote's input/operation failures,
-  255 connection/protocol failure or unreachable session, 124 timeout,
+  255 connection/protocol failure or unreachable node, 124 timeout,
   126 unable to start, 127 command not found, 128+N signal.
   --diff: 0 identical, 1 different. --ignores: 0 synchronized, 1 ignored.
 
@@ -48,46 +49,85 @@ var helpTopics = []struct {
 	// text is the topic's help text.
 	text string
 }{
-	{"sessions", "which session and directory are used", `remote uses the session whose root most specifically contains the current
-directory, and runs commands in the corresponding directory on its opposite
-endpoint (remote pwd prints it). Among equally specific roots, such as one
-directory synchronized to several machines, the session created first is used.
-remote --sessions lists the connected sessions, marking the one used by default
-and those whose roots contain the current directory. Each entry shows its local
-root, the execution host/root (runs on), and the mapped cwd. Paths are configured
-values: ~/ means the executing user's home; older records show unknown.
+	{"nodes", "node discovery, target selection, and workspace trees", `Usage: remote --nodes [--json]
+       remote --node NAME [options] <command> [<args>...]
 
-  - --session selects a session by name or identifier instead, even if its
-    roots don't contain the current directory: commands then run at the root
-    of its opposite endpoint, or in --cwd (relative to that root), and require
-    --cwd if another session's root contains the directory.
-  - --cwd (-C) overrides the mapped directory. Absolute paths and quoted ~
-    paths belong to the executing system; relative paths start at the mapped
-    directory. Quote home paths: remote -C '~/project' pwd. Your shell expands
-    an unquoted ~ into the local home before remote sees it.
-  - An exported MUTAGEN_REMOTE_SESSION only selects among the sessions
-    containing the current directory, and is ignored if none of them matches
-    it; outside every root, it selects a session as --session does.
-  - If several sessions synchronize the current directory (their roots
-    contain it and they don't ignore it), remote names them in a warning,
-    unless the session was selected with --session or a matching
-    MUTAGEN_REMOTE_SESSION.
-  - Commands don't run in a directory that the session ignores (or inside
-    one), since the session doesn't synchronize it, unless --cwd is given:
-    if it's another session's root, that session isn't running commands now,
-    so don't use --cwd to work around it. Only when the directory exists
-    separately on both sides does --cwd . run in the other side's own copy.
-    remote --ignores lists the session's ignores.
-  - Sessions that are paused, disconnected, or don't run commands submitted
-    from this side can't be found, so inside the root of such a session that
-    is nested in another session's root, the enclosing session is used: if it
-    ignores the nested root, as it typically does, commands are refused, and
-    otherwise they run in its copy of the directory. --session selecting the
-    nested session makes them fail instead.
-  - Once remote has located the session, it doesn't switch to another, even
-    if that one disconnects.
+A node is a workspace. --nodes queries the current workspace's daemon for all
+nodes in its graph, including paused/disconnected members. It marks the current
+node, shows configured host/root and the unique path to each destination, and
+reports unavailable paths. This is read-only: it neither synchronizes files
+nor executes commands. Available means connected, not conflict-free. In --json,
+adjacent marks a neighbor whose own edge is connected, which operations on
+adjacent nodes require.
+
+  - A declared tree uses its configured node names. An ordinary pair is an
+    implicit graph with nodes alpha and beta. Omit --node only when there is
+    exactly one other node; an offline node still counts. Creation order and
+    availability never choose among several targets.
+  - The current directory identifies the source workspace. Multiple incident
+    edges of one tree node are allowed; overlapping independent pair graphs
+    are ambiguous and should be configured as one tree. Outside every root,
+    explicit --node (or --nodes) requires one unambiguous source workspace on
+    this system; commands then use the destination root and skip its prologue.
+  - --session, -s, --sessions, and MUTAGEN_REMOTE_SESSION are deprecated and
+    produce errors. Unset the environment variable, query --nodes, and select
+    --node NAME. Session identifiers are internal synchronization handles.
+  - Relative directories map from source root to target root. --cwd (-C)
+    overrides the mapped directory; absolute and quoted ~ paths belong to the
+    target system. Ignored directories require an explicit --cwd, and ignored
+    content isn't synchronized. --ignores without --node inspects local rules.
+  - Foreground commands and scripts can target any node in a declared tree.
+    The daemon synchronizes path edges in order, executes directly on the
+    target's agent, and synchronizes the path in reverse. Other branches keep
+    synchronizing in the background and needn't finish for this call.
+  - Tree command preflight stops on any conflict, scan/transition problem,
+    or synchronization failure. Failure to sync back returns 125 and reports
+    the command's exit status. --no-flush is unavailable for these commands.
+    --detach also requires strict preflight on its adjacent edge and rejects
+    --no-flush; a failed preflight never starts the job. Its later results
+    arrive through background synchronization or --wait.
+    Timeout and interruption retain their normal statuses. Neither failures
+    nor reconnects automatically retry commands or change their target.
+  - --conflicts can inspect a multi-edge path. Each listing identifies the
+    actual adjacent nodes holding its copies, and paths are relative to those
+    roots. Resolve from one of that edge's endpoints using --node for its peer.
+    --conflicts --json always returns an edges array, even for one edge or an
+    implicit pair; each entry has alpha, beta, source, target, and listing
+    fields. Local and remote changes in that listing refer to its source
+    and target, which may be intermediate nodes.
+    Checkout/apply/discard, jobs, diff/pull, and --flush require an adjacent
+    target. A saved checkout can be discarded from outside the roots without
+    selecting a node: its metadata identifies the owning pair.
+  - A tree problem, such as a terminated or inconsistent edge or a session
+    overlapping a node, refuses tree commands and path conflict listings with
+    125 until the user repairs the tree (such as by reapplying the project).
+    --nodes still shows the problem and the nodes known from existing edges.
+    Operations on an adjacent node (existing jobs, conflicts, diff/pull,
+    --flush, --ignores) only need its edge to be connected. New detached jobs
+    still require strict preflight.
+  - Target selection pins the source and destination. Lost path or submission
+    connections, replaced path edges, and new problems that make the path
+    unsafe invalidate a running tree command. Changes to unrelated, valid
+    branches don't cancel it unless they close its submission connection.
+    An interrupted command may have written files
+    without synchronizing them back; inspect before retrying.
+  - Execution uses the target's remotePrologue or workspace override.
+    MUTAGEN_REMOTE_NODE identifies the target and overrides submitted values.
+    Use it in shared scripts; alpha/beta roles depend on the incident edge.
+
+Tree edges use two-way-safe with shared synchronization and ignore settings.
+Ordered path synchronization does not provide snapshots, writer isolation, or
+whole-tree atomic consistency. Tree parents are not SSH jump hosts: the same
+daemon must reach every endpoint. tree.remote explicitly enables commands
+between all nodes; prologues come only from each node's remotePrologue, never
+from synchronization defaults. A tree root has no precedence when resolving
+conflicts.
 `},
-	{"sync", "synchronization, ignored paths, --pull, and --diff", `  - The session is synchronized before and after the command. Failure to
+	{"sync", "synchronization, ignored paths, --pull, and --diff", `Tree foreground commands and detached job starts require strict preflight;
+foreground commands also synchronize back (see --help nodes).
+For an implicit pair and other adjacent operations:
+
+  - The session is synchronized before and after the command. Failure to
     synchronize only produces a warning. Keep these synchronizations: without
     the first, a command can silently run outdated code, while an unneeded one
     only costs a rescan of both roots, which typically takes well under a
@@ -149,7 +189,7 @@ values: ~/ means the executing user's home; older records show unknown.
     sessions, or sessions of earlier versions, synchronize a path.
   - remote --diff shows how the remote copies of the given paths, or of the
     conflicting files, differ from the local copies, as a unified diff
-    (- local, + remote). For a single-file session, use --session from outside
+    (- local, + remote). For a single-file pair, use --node from outside
     its root. Large conflict reports may omit changes and say how many;
     specify paths to compare omitted files. --timeout also covers file reads.
 `},
@@ -175,6 +215,8 @@ values: ~/ means the executing user's home; older records show unknown.
     This overrides inherited values and those passed with -e or --env-file,
     even with --no-prologue or when submitting from outside the root.
     Detached jobs also receive MUTAGEN_REMOTE_JOB, set to their ID.
+    Tree endpoints also set MUTAGEN_REMOTE_NODE to their stable node name;
+    use it in tree scripts, since alpha/beta roles depend on the incident edge.
 
 No terminal is allocated. Programs may buffer output or disable colors:
   remote -e PYTHONUNBUFFERED=1 python train.py
@@ -193,10 +235,10 @@ Example .remote-prologue.sh, activating a conda environment on beta only:
 	{"termination", "timeouts, interruptions, and lost connections", `--timeout takes seconds, or a duration with a unit, such as 10m or 1h30m.
 remote's own input errors and operation failures exit with 125; read the
 remote: diagnostic and correct the cause before retrying. Connection setup,
-lost connections, protocol failures, and an unreachable session exit with 255.
-An invalid explicit session selection is 125. Commands and completed jobs pass
-through their own statuses unchanged, including 125 and 255, so status alone
-cannot always identify who failed. --diff/--ignores use 1 only for a result;
+lost connections, protocol failures, and an unreachable node exit with 255.
+An unknown node or a workspace tree problem is 125. Commands and completed
+jobs pass through their own statuses unchanged, including 125 and 255, so
+status alone cannot always identify who failed. --diff/--ignores use 1 only for a result;
 their failures follow the same 125/255 distinction. For batches, interruption
 or timeout takes precedence over connection failures, then operation failures.
 
@@ -321,7 +363,10 @@ exits:
        remote --conflict-discard [--json] <path>...
 
 Resolve conflicting files in two-way-safe and one-way-safe sessions.
-Local and remote always mean the submitting and opposite endpoints.
+For conflict checkout/apply/discard, local and remote mean the submitting
+and opposite endpoints.
+For multi-edge conflict listings, each edge's source and target identify the
+nodes whose local and remote changes are listed.
 
 To keep one side (no checkout needed):
   remote --conflict-apply --take local app.go
@@ -346,6 +391,9 @@ Failed apply can leave a partial result: retry using the retained workspace.
 If a copy changed or the conflict disappeared, inspect the current files and
 workspace before discarding it. Successful apply and discard retain original
 copies as backups. --json prints machine-readable results.
+For --conflicts, the JSON result always has an edges array; each entry names
+alpha and beta, identifies source and target, and contains their listing,
+including for a single edge.
 
 See remote --help conflict-details for merge limitations, backup retention,
 and recovery after changed copies, interruptions, or damaged workspaces.
@@ -455,6 +503,9 @@ alongside Error.
 // options and the list of help topics, or the help for the topic specified as
 // an argument. The conflicts topic ends with the conflict options.
 func printHelp(o *options, output io.Writer) error {
+	if len(o.arguments) == 1 && o.arguments[0] == "sessions" {
+		return fmt.Errorf("the sessions help topic is deprecated; use remote --help nodes")
+	}
 	if len(o.arguments) == 0 {
 		fmt.Fprint(output, usage, flagUsages(o.flags, func(flag *pflag.Flag) bool {
 			return o.conflictFlags.Lookup(flag.Name) == nil

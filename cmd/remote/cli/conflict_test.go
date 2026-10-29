@@ -759,7 +759,7 @@ func TestAutomaticCheckoutChecksTake(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	local := filepath.Join(root, "conflict")
-	target := &remote.Target{Session: "session", Alpha: true, Root: root}
+	target := &remote.Target{SourceSession: "session", SourceAlpha: true, Session: "session", Alpha: true, Root: root}
 	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{{Path: "conflict", AlphaTakable: true}}}
 	for _, test := range []struct {
 		options  conflictOptions

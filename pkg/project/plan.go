@@ -211,6 +211,11 @@ func forwardingSessionMatches(session *forwarding.Session, specification *forwar
 
 // synchronizationSessionMatches checks the session's declarative configuration.
 func synchronizationSessionMatches(session *synchronization.Session, specification *synchronizationsvc.CreationSpecification) bool {
+	// Tree membership changes command authorization and routing even when an
+	// edge's filesystem locations are unchanged.
+	if !proto.Equal(session.Tree, specification.Tree) {
+		return false
+	}
 	return endpointMatches(session.Alpha, specification.Alpha) &&
 		endpointMatches(session.Beta, specification.Beta) &&
 		session.Configuration.Equal(specification.Configuration) &&
@@ -279,6 +284,15 @@ func NewPlan(
 		synchronizationSessionMatches, pausedSynchronizationSpecification,
 	)
 	if err != nil {
+		return nil, err
+	}
+
+	// A retained tree node keeps its execution identity across every incident
+	// edge, including new and replaced edges. The initial matching pass uses
+	// declarative locations, while runtime tree membership compares exact URLs.
+	// Reconcile those representations and validate the resulting tree before
+	// any sessions are flushed, removed, or created.
+	if err := preserveTreeEndpoints(synchronizationSessions, synchronizationChanges); err != nil {
 		return nil, err
 	}
 

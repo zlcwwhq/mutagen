@@ -43,3 +43,32 @@ func TestCreationSpecificationIgnores(t *testing.T) {
 		}
 	}
 }
+
+// TestCreationSpecificationTree tests that creation specifications with
+// invalid workspace tree membership are rejected before session creation.
+func TestCreationSpecificationTree(t *testing.T) {
+	alpha, beta := t.TempDir(), t.TempDir()
+	for _, test := range []struct {
+		description string
+		tree        *synchronization.TreeMembership
+		expectValid bool
+	}{
+		{"no membership", nil, true},
+		{"valid membership", &synchronization.TreeMembership{Identifier: "project", Root: "a", Alpha: "a", Beta: "b"}, true},
+		{"missing child", &synchronization.TreeMembership{Identifier: "project", Root: "a", Alpha: "a"}, false},
+	} {
+		specification := &CreationSpecification{
+			Alpha:              &url.URL{Kind: url.Kind_Synchronization, Path: alpha},
+			Beta:               &url.URL{Kind: url.Kind_Synchronization, Path: beta},
+			Configuration:      &synchronization.Configuration{},
+			ConfigurationAlpha: &synchronization.Configuration{},
+			ConfigurationBeta:  &synchronization.Configuration{},
+			Tree:               test.tree,
+		}
+		if err := specification.ensureValid(); test.expectValid && err != nil {
+			t.Errorf("%s: valid specification rejected: %v", test.description, err)
+		} else if !test.expectValid && err == nil {
+			t.Errorf("%s: invalid specification accepted", test.description)
+		}
+	}
+}

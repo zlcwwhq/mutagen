@@ -1,7 +1,6 @@
 package project
 
-const (
-	// LabelKey is the label key that's applied to sessions orchestrated by the
-	// project, with the label value being the orchestration session identifier.
-	LabelKey = "io.mutagen.project"
-)
+import "github.com/mutagen-io/mutagen/pkg/selection"
+
+// LabelKey is the label key applied to sessions orchestrated by a project.
+const LabelKey = selection.ProjectLabelKey

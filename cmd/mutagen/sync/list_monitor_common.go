@@ -314,6 +314,15 @@ func printSession(state *synchronization.State, mode common.SessionDisplayMode) 
 			}
 		}
 
+		// Print workspace tree membership, if any.
+		if tree := state.Session.Tree; tree != nil {
+			fmt.Println("Workspace tree:")
+			fmt.Println("\tIdentifier:", tree.Identifier)
+			fmt.Println("\tRoot node:", tree.Root)
+			fmt.Println("\tParent node (alpha):", tree.Alpha)
+			fmt.Println("\tChild node (beta):", tree.Beta)
+		}
+
 		// Print the configuration header.
 		fmt.Println("Configuration:")
 

@@ -37,9 +37,40 @@ var terminationGracePeriod = TerminationGracePeriod
 // normalized synchronization root. If the command requests a prologue, then it
 // sources the workspace override or, if absent, the specified resolved prologue
 // (if non-empty). The alpha flag identifies the executing endpoint for the
-// command's environment. Serve owns and closes the connection and cancels the
+// command's environment. The node name sets MUTAGEN_REMOTE_NODE after
+// submitted environment overrides. Serve owns the connection and cancels the
 // command if the client disconnects.
-func Serve(ctx context.Context, connection io.ReadWriteCloser, root, prologue string, alpha bool) error {
+func Serve(ctx context.Context, connection io.ReadWriteCloser, root, prologue string, alpha bool, node string) error {
+	return serve(ctx, connection, func(ctx context.Context, request *Request, stdin io.Reader, stdout, stderr io.Writer, _ func(*CommandEvent) error) result {
+		if node != "" {
+			request.Environment = append(request.Environment, "MUTAGEN_REMOTE_NODE="+node)
+		}
+		return run(ctx, root, prologue, alpha, request, stdin, stdout, stderr)
+	})
+}
+
+// ServeForwarded serves a command whose lifecycle is managed by the daemon.
+// It preserves streaming and cancellation while allowing the handler to
+// synchronize multiple sessions before and after forwarding to an executor.
+func ServeForwarded(ctx context.Context, connection io.ReadWriteCloser, handler func(context.Context, *Request, io.Reader, io.Writer, io.Writer, func(*CommandEvent) error) (*CommandResult, error)) error {
+	return serve(ctx, connection, func(ctx context.Context, request *Request, stdin io.Reader, stdout, stderr io.Writer, event func(*CommandEvent) error) result {
+		response, err := handler(ctx, request, stdin, stdout, stderr, event)
+		if err != nil {
+			failure := failedResult(err)
+			if response != nil {
+				failure.ExitCode = response.ExitCode
+			}
+			return failure
+		}
+		if response == nil {
+			return failedResult(errors.New("forwarded command returned no result"))
+		}
+		return *response
+	})
+}
+
+// serve handles the command protocol independently of where execution occurs.
+func serve(ctx context.Context, connection io.ReadWriteCloser, handler func(context.Context, *Request, io.Reader, io.Writer, io.Writer, func(*CommandEvent) error) result) error {
 	// Report that the route has reached an executing endpoint, along with the
 	// protocol features that it supports.
 	if err := writeMessage(connection, &status{Features: executorFeatures}); err != nil {
@@ -75,7 +106,14 @@ func Serve(ctx context.Context, connection io.ReadWriteCloser, root, prologue st
 	if err := readMessage(control, &request); err != nil {
 		return fmt.Errorf("unable to receive command: %w", err)
 	}
-	response := run(ctx, root, prologue, alpha, &request, connectionReader{input}, connectionWriter{output}, connectionWriter{errorOutput})
+	event := func(event *CommandEvent) error {
+		bounded, err := boundCommandEvent(event)
+		if err != nil {
+			return err
+		}
+		return writeMessage(control, &result{Event: bounded})
+	}
+	response := handler(ctx, &request, connectionReader{input}, connectionWriter{output}, connectionWriter{errorOutput}, event)
 	input.Close()
 	output.CloseWrite()
 	errorOutput.CloseWrite()

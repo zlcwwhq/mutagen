@@ -263,6 +263,28 @@ func NewSessionSpecifications(
 		}
 	}
 
+	// Expand the workspace tree after validating the ordinary sessions. Refuse
+	// name collisions and extra synchronization edges touching its workspaces.
+	tree, err := treeSpecifications(configuration.Tree, defaultConfigurationSynchronization, projectIdentifier, paused)
+	if err != nil {
+		return nil, fmt.Errorf("invalid workspace tree: %w", err)
+	}
+	for _, edge := range tree {
+		for _, ordinary := range synchronizationSpecifications {
+			if edge.Name == ordinary.Name {
+				return nil, fmt.Errorf("synchronization name %s is reserved by the tree", edge.Name)
+			}
+			for _, a := range []*url.URL{edge.Alpha, edge.Beta} {
+				for _, b := range []*url.URL{ordinary.Alpha, ordinary.Beta} {
+					if synchronization.TreeEndpointsOverlap(a, b) {
+						return nil, fmt.Errorf("session %s overlaps a workspace tree node", ordinary.Name)
+					}
+				}
+			}
+		}
+	}
+	synchronizationSpecifications = append(synchronizationSpecifications, tree...)
+
 	// Use a deterministic creation order independent of YAML map iteration.
 	sort.Slice(forwardingSpecifications, func(i, j int) bool {
 		return forwardingSpecifications[i].Name < forwardingSpecifications[j].Name

@@ -71,7 +71,15 @@ type Session struct {
 	// Labels are the session labels. They are static.
 	Labels map[string]string `protobuf:"bytes,13,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Paused indicates whether or not the session is marked as paused.
-	Paused        bool `protobuf:"varint,10,opt,name=paused,proto3" json:"paused,omitempty"`
+	Paused bool `protobuf:"varint,10,opt,name=paused,proto3" json:"paused,omitempty"`
+	// NOTE: Fields 11, 12, 13, and 14 are used above. They are out of order for
+	// historical reasons.
+	// Tree identifies the session as an edge of a workspace tree, or is nil if
+	// the session doesn't belong to one. Membership determines command routing
+	// and authorization between nodes, so it's recorded with the session
+	// rather than in labels, which are selection metadata that users can set
+	// on any session. It is static.
+	Tree          *TreeMembership `protobuf:"bytes,15,opt,name=tree,proto3" json:"tree,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -204,11 +212,98 @@ func (x *Session) GetPaused() bool {
 	return false
 }
 
+func (x *Session) GetTree() *TreeMembership {
+	if x != nil {
+		return x.Tree
+	}
+	return nil
+}
+
+// TreeMembership identifies a session as the edge of a workspace tree that
+// joins a parent node, the session's alpha, to a child node, the session's
+// beta. Project orchestration records it for each edge it creates, so that the
+// daemon can reconstruct the tree from its sessions, including after a
+// restart, without access to the project's configuration file.
+type TreeMembership struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Identifier identifies the tree. It's the identifier of the project that
+	// declares the tree. It cannot be empty.
+	Identifier string `protobuf:"bytes,1,opt,name=identifier,proto3" json:"identifier,omitempty"`
+	// Root names the tree's structural root node. It cannot be empty.
+	Root string `protobuf:"bytes,2,opt,name=root,proto3" json:"root,omitempty"`
+	// Alpha names the parent node, whose workspace is the session's alpha. It
+	// cannot be empty.
+	Alpha string `protobuf:"bytes,3,opt,name=alpha,proto3" json:"alpha,omitempty"`
+	// Beta names the child node, whose workspace is the session's beta. It
+	// cannot be empty, and it can't name the root or the parent.
+	Beta          string `protobuf:"bytes,4,opt,name=beta,proto3" json:"beta,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TreeMembership) Reset() {
+	*x = TreeMembership{}
+	mi := &file_synchronization_session_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TreeMembership) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TreeMembership) ProtoMessage() {}
+
+func (x *TreeMembership) ProtoReflect() protoreflect.Message {
+	mi := &file_synchronization_session_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TreeMembership.ProtoReflect.Descriptor instead.
+func (*TreeMembership) Descriptor() ([]byte, []int) {
+	return file_synchronization_session_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *TreeMembership) GetIdentifier() string {
+	if x != nil {
+		return x.Identifier
+	}
+	return ""
+}
+
+func (x *TreeMembership) GetRoot() string {
+	if x != nil {
+		return x.Root
+	}
+	return ""
+}
+
+func (x *TreeMembership) GetAlpha() string {
+	if x != nil {
+		return x.Alpha
+	}
+	return ""
+}
+
+func (x *TreeMembership) GetBeta() string {
+	if x != nil {
+		return x.Beta
+	}
+	return ""
+}
+
 var File_synchronization_session_proto protoreflect.FileDescriptor
 
 const file_synchronization_session_proto_rawDesc = "" +
 	"\n" +
-	"\x1dsynchronization/session.proto\x12\x0fsynchronization\x1a\x1fgoogle/protobuf/timestamp.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/version.proto\x1a\rurl/url.proto\"\x80\x06\n" +
+	"\x1dsynchronization/session.proto\x12\x0fsynchronization\x1a\x1fgoogle/protobuf/timestamp.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/version.proto\x1a\rurl/url.proto\"\xb5\x06\n" +
 	"\aSession\x12\x1e\n" +
 	"\n" +
 	"identifier\x18\x01 \x01(\tR\n" +
@@ -226,10 +321,18 @@ const file_synchronization_session_proto_rawDesc = "" +
 	"\x04name\x18\x0e \x01(\tR\x04name\x12<\n" +
 	"\x06labels\x18\r \x03(\v2$.synchronization.Session.LabelsEntryR\x06labels\x12\x16\n" +
 	"\x06paused\x18\n" +
-	" \x01(\bR\x06paused\x1a9\n" +
+	" \x01(\bR\x06paused\x123\n" +
+	"\x04tree\x18\x0f \x01(\v2\x1f.synchronization.TreeMembershipR\x04tree\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"n\n" +
+	"\x0eTreeMembership\x12\x1e\n" +
+	"\n" +
+	"identifier\x18\x01 \x01(\tR\n" +
+	"identifier\x12\x12\n" +
+	"\x04root\x18\x02 \x01(\tR\x04root\x12\x14\n" +
+	"\x05alpha\x18\x03 \x01(\tR\x05alpha\x12\x12\n" +
+	"\x04beta\x18\x04 \x01(\tR\x04betaB3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
 
 var (
 	file_synchronization_session_proto_rawDescOnce sync.Once
@@ -243,29 +346,31 @@ func file_synchronization_session_proto_rawDescGZIP() []byte {
 	return file_synchronization_session_proto_rawDescData
 }
 
-var file_synchronization_session_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_synchronization_session_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_synchronization_session_proto_goTypes = []any{
 	(*Session)(nil),               // 0: synchronization.Session
-	nil,                           // 1: synchronization.Session.LabelsEntry
-	(Version)(0),                  // 2: synchronization.Version
-	(*timestamppb.Timestamp)(nil), // 3: google.protobuf.Timestamp
-	(*url.URL)(nil),               // 4: url.URL
-	(*Configuration)(nil),         // 5: synchronization.Configuration
+	(*TreeMembership)(nil),        // 1: synchronization.TreeMembership
+	nil,                           // 2: synchronization.Session.LabelsEntry
+	(Version)(0),                  // 3: synchronization.Version
+	(*timestamppb.Timestamp)(nil), // 4: google.protobuf.Timestamp
+	(*url.URL)(nil),               // 5: url.URL
+	(*Configuration)(nil),         // 6: synchronization.Configuration
 }
 var file_synchronization_session_proto_depIdxs = []int32{
-	2, // 0: synchronization.Session.version:type_name -> synchronization.Version
-	3, // 1: synchronization.Session.creationTime:type_name -> google.protobuf.Timestamp
-	4, // 2: synchronization.Session.alpha:type_name -> url.URL
-	4, // 3: synchronization.Session.beta:type_name -> url.URL
-	5, // 4: synchronization.Session.configuration:type_name -> synchronization.Configuration
-	5, // 5: synchronization.Session.configurationAlpha:type_name -> synchronization.Configuration
-	5, // 6: synchronization.Session.configurationBeta:type_name -> synchronization.Configuration
-	1, // 7: synchronization.Session.labels:type_name -> synchronization.Session.LabelsEntry
-	8, // [8:8] is the sub-list for method output_type
-	8, // [8:8] is the sub-list for method input_type
-	8, // [8:8] is the sub-list for extension type_name
-	8, // [8:8] is the sub-list for extension extendee
-	0, // [0:8] is the sub-list for field type_name
+	3, // 0: synchronization.Session.version:type_name -> synchronization.Version
+	4, // 1: synchronization.Session.creationTime:type_name -> google.protobuf.Timestamp
+	5, // 2: synchronization.Session.alpha:type_name -> url.URL
+	5, // 3: synchronization.Session.beta:type_name -> url.URL
+	6, // 4: synchronization.Session.configuration:type_name -> synchronization.Configuration
+	6, // 5: synchronization.Session.configurationAlpha:type_name -> synchronization.Configuration
+	6, // 6: synchronization.Session.configurationBeta:type_name -> synchronization.Configuration
+	2, // 7: synchronization.Session.labels:type_name -> synchronization.Session.LabelsEntry
+	1, // 8: synchronization.Session.tree:type_name -> synchronization.TreeMembership
+	9, // [9:9] is the sub-list for method output_type
+	9, // [9:9] is the sub-list for method input_type
+	9, // [9:9] is the sub-list for extension type_name
+	9, // [9:9] is the sub-list for extension extendee
+	0, // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_session_proto_init() }
@@ -281,7 +386,7 @@ func file_synchronization_session_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_synchronization_session_proto_rawDesc), len(file_synchronization_session_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -70,4 +70,29 @@ message Session {
     bool paused = 10;
     // NOTE: Fields 11, 12, 13, and 14 are used above. They are out of order for
     // historical reasons.
+    // Tree identifies the session as an edge of a workspace tree, or is nil if
+    // the session doesn't belong to one. Membership determines command routing
+    // and authorization between nodes, so it's recorded with the session
+    // rather than in labels, which are selection metadata that users can set
+    // on any session. It is static.
+    TreeMembership tree = 15;
+}
+
+// TreeMembership identifies a session as the edge of a workspace tree that
+// joins a parent node, the session's alpha, to a child node, the session's
+// beta. Project orchestration records it for each edge it creates, so that the
+// daemon can reconstruct the tree from its sessions, including after a
+// restart, without access to the project's configuration file.
+message TreeMembership {
+    // Identifier identifies the tree. It's the identifier of the project that
+    // declares the tree. It cannot be empty.
+    string identifier = 1;
+    // Root names the tree's structural root node. It cannot be empty.
+    string root = 2;
+    // Alpha names the parent node, whose workspace is the session's alpha. It
+    // cannot be empty.
+    string alpha = 3;
+    // Beta names the child node, whose workspace is the session's beta. It
+    // cannot be empty, and it can't name the root or the parent.
+    string beta = 4;
 }

@@ -39,7 +39,9 @@ Unchanged sessions retain their identifiers, synchronization history, scan
 caches, and paused state. Renaming a session removes the old session and
 creates a new one. Docker environment variables such as `DOCKER_HOST` are not
 compared: retained sessions keep the environment they were created with, while
-new and replaced sessions use the current environment.
+new and replaced pair sessions use the current environment. In a workspace
+tree, retained edges determine the endpoint of a shared node, including for
+new or replaced edges attached to it.
 
 Replaced synchronization sessions, like sessions created under a new name,
 start with fresh history and scan caches. Without a record of the last
@@ -100,14 +102,137 @@ Only the daemon's system needs an installation. The `mutagen-setup` agent skill
 (see below) automates this.
 
 
+## Workspace trees
+
+A project can declare one tree of directory workspaces, managed by one daemon:
+
+```yaml
+tree:
+  remote: true
+  sync:
+    mode: two-way-safe
+    ignore:
+      paths: ["/mutagen.yml.lock", ".venv/", "__pycache__/"]
+  nodes:
+    local:
+      endpoint: "."
+    server:
+      endpoint: "server:~/project"
+      parent: local
+    gpu:
+      endpoint: "gpu:~/project"
+      parent: server
+      remotePrologue: "~/.config/gpu-prologue.sh"
+```
+
+Apply it with `mutagen project apply --dry-run` and `mutagen project apply`.
+Each node identifies one system and directory. There must be at least two
+nodes, one root without a parent, and one parent for every other node, with no
+cycles. Names start with an ASCII letter, contain letters, digits, or dashes,
+end with a letter or digit, and have at most 63 characters; `defaults` is
+reserved. The tree expands into ordinary synchronization sessions named
+`tree-<child>`, which `mutagen project list` displays. Each session records
+its membership (tree, root, parent, and child node) as a dedicated field rather
+than in labels, so it survives daemon restarts and can't be set or changed
+with `mutagen sync create --label`; `mutagen sync list -l` shows it. Unchanged
+edges retain their history when applying configuration changes. When a node
+has retained edges, new or replaced edges reuse that node's retained endpoint,
+including its captured Docker environment, so all edges still identify the
+same workspace.
+
+Every edge uses `two-way-safe`. Settings under `tree.sync` extend global and
+project synchronization defaults, including ignores, and apply to every edge.
+The tree rejects other synchronization modes; set `tree.sync.mode` explicitly
+if defaults select another mode. Pair-specific `configurationAlpha` and
+`configurationBeta` defaults don't apply. Configure prologues on nodes:
+`remotePrologue` in global or project synchronization defaults doesn't apply
+to tree nodes. The
+root is structural and doesn't win conflicts. Distinct nodes must not use
+overlapping directories, and additional synchronization sessions must not
+overlap tree workspaces. Known overlaps are rejected; don't use different host
+aliases or remote symlink paths to give the same workspace multiple identities.
+
+`tree.remote: true` explicitly permits commands between **all** nodes in the
+tree. Its default is false, regardless of `sync.defaults.remote`. From inside
+any participating node's directory, select another node by name:
+
+```sh
+remote --nodes
+remote --nodes --json
+remote --node gpu pytest -x
+remote --node server --timeout 2m make test
+```
+
+For `local` to `gpu`, the daemon synchronizes `local ↔ server`, then
+`server ↔ gpu`, executes on `gpu`, and synchronizes those edges in reverse to
+bring changes back. Commands use the corresponding relative directory;
+`--cwd` overrides it. The daemon sends the command directly through its agent
+connection to the target, so parents aren't network jump hosts and every
+endpoint must be reachable from the daemon. `MUTAGEN_REMOTE_NODE` identifies
+the executing node, regardless of which incident edge carries execution. Use
+it in tree prologues instead of `MUTAGEN_REMOTE_ENDPOINT`, whose alpha/beta
+value depends on the edge.
+
+Node commands stop **before execution** if any path edge reports a conflict,
+scan/transition problem, or synchronization failure. If execution finishes but
+synchronization back fails, they return 125 and report the command's exit
+status and failed edge. Timeout and interruption retain their usual statuses.
+Tree commands started with `--detach` also require strict preflight on their
+adjacent edge; conflicts and synchronization failures prevent the job from
+starting, and `--no-flush` cannot bypass this check. Their later results arrive
+through background synchronization or `--wait`.
+Commands aren't retried automatically. Pausing or disconnecting a path endpoint,
+replacing a path edge, or introducing a problem that makes the path unsafe
+invalidates active routes. Changes to unrelated, valid branches do not cancel
+running commands unless they close the connection carrying the submission.
+Reconnection never redirects an invocation. An interrupted
+command may have written files without returning them, so inspect its outcome
+before retrying.
+
+`remote --nodes` lists every configured node, including paused or disconnected
+ones, marks the current node, and shows each target's path and connection
+availability. `--nodes --json` provides machine-readable output. Discovery
+neither synchronizes files nor executes commands; available doesn't imply
+conflict-free. With more than one other node, specify `--node` explicitly,
+even if only one destination is online.
+
+Foreground commands and scripts can reach any node. `remote --node gpu
+--conflicts` inspects the synchronization path and labels conflicts by the
+actual adjacent nodes holding their copies. Resolve from one of those nodes
+with `--node` selecting its peer. Jobs, file operations, conflict modifications,
+and `--flush` require an adjacent destination. Conflict listings with `--json`
+always use an `edges` array, including for an adjacent destination or an implicit
+pair; each entry names `alpha` and `beta`, identifies its traversal `source`
+and `target`, and contains their `listing`. The listing's local and remote
+changes refer to that entry's source and target, including intermediate nodes.
+Tree foreground commands and detached job starts always synchronize strictly
+and reject `--no-flush`.
+
+If the tree's sessions no longer form the configured tree, such as after an
+edge was terminated or a partial `mutagen project apply`, or another session
+overlaps a node, tree commands and path conflict listings fail with 125 until
+the tree is repaired, typically by applying the project again. `remote --nodes`
+still succeeds and reports the problem, and operations on an adjacent node
+(existing jobs, conflicts, `--diff`, `--pull`, `--flush`, and `--ignores`)
+keep working as long as that node's own edge is connected, which `--nodes
+--json` reports as `adjacent`. Starting a new detached job still requires the
+strict tree preflight.
+
+Other branches continue background synchronization without participating in this
+call's completion. Ordered path synchronization provides neither snapshots nor
+concurrent writer isolation and doesn't make the entire tree consistent at
+once. `remote --help nodes` describes target selection and operation limits.
+
+
 ## Remote commands
 
-The `remote` executable runs a command on the opposite endpoint of a
-synchronization session, in the directory corresponding to the current one:
-invoked inside alpha's root, it runs the command on beta, and invoked inside
-beta's root, it runs the command on alpha. Commands are routed through the
-Mutagen daemon over its own agent connections, so the endpoints don't need to
-reach each other and the daemon can run on a third system.
+The `remote` executable selects a destination **node**, a workspace on a
+system. A standalone synchronization pair is exposed as an implicit two-node
+graph named `alpha` and `beta`; a declared tree uses its configured names.
+`remote --nodes` discovers the graph and `remote --node NAME` selects a target.
+When there is exactly one other node, the name can be omitted. Commands run in
+the corresponding directory and use the daemon's agent connections, so the
+daemon can run on a third system and endpoints needn't reach each other.
 
 Remote commands are enabled per session with the `remote` configuration
 parameter, whose value names the endpoints that execute commands: `true`
@@ -143,48 +268,25 @@ symbolic link, or a hard link on Windows), normally at
 that path, or put that directory on `PATH`; links to it must also be named
 `remote`.
 
-`remote` uses the session whose root most specifically contains the current
-directory. Use `--session` (`-s`) to select a session by name or identifier
-instead, which also allows invocation outside its roots: commands submitted from
-outside the selected session's roots run at the root of its opposite endpoint,
-or in the directory specified by `--cwd`. If another session's root contains the
-current directory, such commands require `--cwd`, since they would otherwise run
-at the selected session's root rather than in a directory corresponding to the
-current one. An exported `MUTAGEN_REMOTE_SESSION` only selects among the
-sessions whose roots contain the current directory, such as to choose between
-them, and is ignored if none of them matches it; outside every session's
-root, it selects a session as `--session` does. Once `remote` has located the
-session, it uses that session for the rest of the invocation, rather than
-switching to another session if it disconnects in the meantime.
+The current directory identifies the most specific connected source workspace.
+Several incident edges of one node are one source. Independent pairs sharing
+the same root are ambiguous: declare them as one tree instead of relying on
+creation order. Earlier versions used the session created first; such setups
+now fail with `ambiguous source node` until they're declared as a tree, such
+as the shared directory as the root and each machine as its child. Outside
+every root, an explicit `--node` (or `--nodes`) is
+accepted only if one source workspace is unambiguous on this system. Commands
+then use the destination root, or `--cwd`, and skip its prologue. This also
+allows file operations on an implicit pair whose roots are single files.
 
-If several sessions' roots contain the current directory equally
-specifically, such as when one directory is synchronized to several machines,
-the session created first is used. `remote --sessions` lists the sessions
-connected for remote commands on the current system, separating those whose
-roots contain the current directory and marking the one used by default. Each
-entry shows `local root`, the execution host and configured root (`runs on`),
-and the mapped execution `cwd`. Home-relative paths use `~/` for the executing
-user's home and are not resolved during listing; old registrations with no
-execution metadata show `unknown`. Ignored directories and selections outside
-a root are annotated. When several sessions synchronize the current directory
-(their roots contain it, and they don't ignore it), `remote` names them in a
-warning, unless the session was selected with `--session` or a matching
-`MUTAGEN_REMOTE_SESSION`. Sessions are named by their names, or by their
-identifiers if they're unnamed or share their names, as `--session` accepts
-them.
+**`--session`, `-s`, `--sessions`, and `MUTAGEN_REMOTE_SESSION` are deprecated
+and rejected with status 125.** Unset the environment variable and use
+`--nodes` and `--node NAME`. They are not aliases. Sessions remain the daemon's
+internal synchronization edges, managed through `mutagen sync` and projects.
 
-Commands don't run in a directory that the session ignores, or inside one, since
-the session doesn't synchronize it, unless `--cwd` is given: `--cwd .` runs them
-in the corresponding directory anyway, such as in an ignored build directory
-that exists on both endpoints. `remote --ignores` lists the session's ignores.
-
-`remote` can't find sessions that are paused, disconnected, or that don't run
-commands submitted from the current endpoint. Inside the root of such a session
-that's nested in another session's root, the enclosing session is used instead:
-if it ignores the nested root, as it typically does, commands are refused, and
-otherwise they run in its copy of the directory. `--session` selecting the
-nested session makes them fail instead. `--flush` and `--diff` still use the
-enclosing session.
+Ignored directories require an explicit `--cwd`; their files still aren't
+synchronized. `remote --ignores` inspects the source's ignore rules. Each call
+pins its selected target and doesn't switch to another node after a failure.
 
 `--cwd` overrides the working directory (relative values are resolved against
 the corresponding directory, or against the opposite endpoint's root when
@@ -196,8 +298,9 @@ local home is missing on the executing side, the error suggests this spelling
 conditionally; it never rewrites the path. Otherwise, commands inherit the
 environment of the agent (or, on the daemon's system, of the daemon).
 
-Every command receives `MUTAGEN_REMOTE_ENDPOINT=alpha` or `beta`, identifying
-the endpoint where it executes. This value overrides inherited values and
+Every command receives `MUTAGEN_REMOTE_NODE`, the executing node name (also
+`alpha` or `beta` for an implicit pair). `MUTAGEN_REMOTE_ENDPOINT=alpha` or
+`beta` additionally identifies its role on the underlying synchronization edge. This value overrides inherited values and
 those submitted with `-e` or `--env-file`, including when prologues are skipped.
 Detached jobs also receive `MUTAGEN_REMOTE_JOB`, set to their ID.
 
@@ -260,7 +363,7 @@ configured default.
 
 The prologue applies to commands submitted from inside the session root,
 including those using `--cwd`, unless `--no-prologue` is specified; commands
-submitted from outside the root with `--session` don't use it. These rules apply
+submitted from outside the roots with explicit `--node` don't use it. These rules apply
 to both workspace overrides and configured prologues. It sees variables
 set with `-e` and `--env-file`, and the command is located (using the `PATH` it
 sets) only after it has been sourced, so `remote -e CONDA_ENV=test pytest` works
@@ -274,8 +377,8 @@ Options must precede the command, and arguments are passed without shell
 interpretation, so shell syntax requires an explicit shell or `--script`.
 Standard streams and the command or job's own exit status are preserved.
 Remote's own argument, input, or operation failures return 125; connection
-setup, lost connections, protocol failures, and an unreachable session return
-255. An invalid explicit session selection returns 125. Read the `remote:`
+setup, lost connections, protocol failures, and an unreachable node return
+255. An unknown node or a workspace tree problem returns 125. Read the `remote:`
 diagnostic before retrying a 125 failure. Commands may themselves return 125
 or 255, so exit status alone cannot always identify the source. Timeouts remain
 124, startup/working-directory/prologue failures 126, and missing commands 127;
@@ -286,7 +389,7 @@ connection failures, then operation failures. This changes scripts that used
 Commands can only be routed while the session is connected, and the daemon
 connects command channels in the background, so SSH authentication must work
 non-interactively. `remote --help` summarizes usage, and `remote --help
-<topic>` covers sessions, synchronization, scripts, detached jobs, environment
+<topic>` covers nodes, synchronization, scripts, detached jobs, environment
 setup, termination, and conflicts in detail.
 
 Programs may buffer output without a terminal. For immediate Python output,
@@ -306,7 +409,8 @@ The arguments after the file are the script's, even ones that look like
 options. A script read from standard input leaves its commands no input.
 Scripts are limited to 512 KiB and aren't supported on Windows endpoints.
 
-`remote` flushes the session (as `mutagen sync flush` does) before the command,
+For an implicit pair, `remote` flushes the session (as `mutagen sync flush`
+does) before the command,
 so that it sees local changes, and after it, so that its changes are present
 locally when `remote` exits. This works from either endpoint, since the daemon
 performs the flush. If flushing fails, then `remote` prints a warning and
@@ -318,15 +422,17 @@ costs a rescan of both roots, so use `--no-flush` only for commands that
 neither read nor write synchronized files. `--detach` flushes only before
 starting a job and `--wait` only after it ends, while `--jobs`, `--kill`,
 `--ignores`, and `--pull` don't flush. `--kill` accepts `--no-flush`, which
-has no effect.
+has no effect. Tree foreground commands and detached job starts instead require
+the strict preflight described above.
 
 Flushes that take over 3 seconds show their progress on standard error,
 following git's convention: on a terminal, as a line updated in place, and
 elsewhere only with `--progress`, as separate `remote:` lines printed when the
 phase changes and every 10 seconds, which suits commands run in the background
 or under a line-based monitor; `--progress=false` disables it. This applies to
-every flush, including those of `--wait`, `--diff`, and the conflict
-operations. A final line summarizes where the time went, such as
+every flush, including those of tree commands, `--wait`, `--diff`, and the
+conflict operations. Tree progress identifies the path edge being synchronized.
+A final line summarizes where the time went, such as
 `remote: synchronized in 44s: scanning 31s; staging on alpha (local) 12s, 1 file, 5.0 MiB`:
 scanning both roots (a flush rescans them in full), staging changed files on an
 endpoint (transferring their contents to it; the size is approximate),
@@ -432,7 +538,7 @@ synchronize: conflicts (paths modified on both endpoints, which aren't
 synchronized until resolved) and problems such as permission errors.
 `remote --diff` shows how the remote copies of conflicting files, or of the
 specified paths, differ from the local copies as a unified diff, and exits with
-status 1 if any differ. Single-file sessions are supported: use `--session`
+status 1 if any differ. Single-file pairs are supported: use explicit `--node`
 from outside the file root. When one endpoint has replaced a directory with a
 file, its former children are compared as missing entries. Large conflict
 reports may omit change details; warnings give the omitted counts, and explicit

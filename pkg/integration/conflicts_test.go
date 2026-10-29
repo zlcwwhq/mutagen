@@ -43,7 +43,7 @@ func createConflictSessionWithCommands(t *testing.T, commands synchronization.Re
 	ctx := context.Background()
 	id, err := synchronizationManager.Create(ctx, &url.URL{Path: roots[0]}, &url.URL{Protocol: netpipe.Protocol_Netpipe, Path: roots[1]},
 		&synchronization.Configuration{SynchronizationMode: mode, WatchMode: synchronization.WatchMode_WatchModeNoWatch, RemoteCommandMode: commands},
-		&synchronization.Configuration{}, &synchronization.Configuration{}, "", nil, false, "")
+		&synchronization.Configuration{}, &synchronization.Configuration{}, "", nil, nil, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,10 +111,16 @@ func (c *conflictCommands) fail(expected string, args ...string) {
 // list lists conflicts.
 func (c *conflictCommands) list() (listing conflictListing) {
 	c.t.Helper()
-	if err := json.Unmarshal([]byte(c.invoke("--conflicts", "--json")), &listing); err != nil {
+	var path struct {
+		Edges []struct{ Listing conflictListing }
+	}
+	if err := json.Unmarshal([]byte(c.invoke("--conflicts", "--json")), &path); err != nil {
 		c.t.Fatal(err)
 	}
-	return
+	if len(path.Edges) != 1 {
+		c.t.Fatalf("expected one conflict edge: %+v", path)
+	}
+	return path.Edges[0].Listing
 }
 
 // outcomes runs a conflict operation with JSON output, which must succeed,
@@ -439,7 +445,7 @@ func TestRemoteConflictLateRequests(t *testing.T) {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		connection, _, err := remote.Dial(ctx, alpha.directory, "", operation)
+		connection, _, err := (&remote.Selection{}).Dial(ctx, alpha.directory, operation)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1085,10 +1091,10 @@ func TestRemoteConflictFileRoot(t *testing.T) {
 	directory := t.TempDir()
 	alphaRoot, betaRoot := filepath.Join(directory, "alpha"), filepath.Join(directory, "beta")
 	writeFile(t, alphaRoot, "base\n")
-	sessionID := createRemoteDiffSession(t, alphaRoot, betaRoot)
+	createRemoteDiffSession(t, alphaRoot, betaRoot)
 	writeFile(t, alphaRoot, "local\n")
 	writeFile(t, betaRoot, "remote\n")
-	c := &conflictCommands{t: t, directory: directory, options: []string{"--session", sessionID}}
+	c := &conflictCommands{t: t, directory: directory, options: []string{"--node", "beta"}}
 	if listing := c.list(); len(listing.Conflicts) != 1 || listing.Conflicts[0].Path != alphaRoot || !listing.Conflicts[0].Files {
 		t.Fatalf("unexpected conflicts: %+v", listing.Conflicts)
 	}

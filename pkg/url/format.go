@@ -65,7 +65,7 @@ func (u *URL) formatDocker(environmentPrefix string) string {
 			return invalidDockerURLFormat
 		} else if u.Path[0] == '/' {
 			result += u.Path
-		} else if u.Path[0] == '~' || isWindowsPath(u.Path) {
+		} else if u.Path[0] == '~' || IsWindowsDrivePath(u.Path) {
 			result += fmt.Sprintf("/%s", u.Path)
 		} else {
 			return invalidDockerURLFormat

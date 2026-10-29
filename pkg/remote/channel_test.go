@@ -95,7 +95,11 @@ func TestDialSelection(t *testing.T) {
 	dial := func(directory, session string) (*Target, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		connection, target, err := Dial(ctx, directory, session, OperationExecute)
+		selection := &Selection{}
+		if session != "" {
+			selection.Target = &Target{SourceSession: session, SourceAlpha: session == "sync_outer"}
+		}
+		connection, target, err := selection.Dial(ctx, directory, OperationExecute)
 		if err == nil {
 			connection.Close()
 		}
@@ -116,7 +120,7 @@ func TestDialSelection(t *testing.T) {
 		t.Fatal("directory outside all roots accepted")
 	} else if _, err := dial(outer+"-sibling", ""); err == nil {
 		t.Fatal("sibling prefix matched")
-	} else if target, err := dial(outside, "outer-name"); err != nil || target.Session != "sync_outer" || target.Path != "" || target.Contained {
+	} else if target, err := dial(outside, "sync_outer"); err != nil || target.Session != "sync_outer" || target.Path != "" || target.Contained {
 		t.Fatalf("incorrect explicit selection by name: %+v, %v", target, err)
 	} else if target, err := dial(filepath.Join(inner, "x"), "sync_outer"); err != nil || target.Path != "inner/x" || !target.Contained {
 		t.Fatalf("incorrect explicit selection by identifier: %+v, %v", target, err)
@@ -139,40 +143,16 @@ func TestDialSelection(t *testing.T) {
 	}
 
 	// Among distinct sessions with the same root, the session created first is
-	// used, with ties broken by identifier, and the sessions are labeled for a
-	// warning, unless one is selected explicitly.
+	// used, with ties broken by identifier, unless one is selected explicitly.
 	registerTest(t, &Endpoint{Session: "sync_other", Root: outer, SessionCreated: time.Now()}, "other", &accepted, &lock)
-	if target, err := dial(filepath.Join(outer, "y"), ""); err != nil || target.Session != "sync_outer" ||
-		!reflect.DeepEqual(target.Overlapping, []string{"outer-name", "sync_other"}) {
+	if target, err := dial(filepath.Join(outer, "y"), ""); err != nil || target.Session != "sync_outer" {
 		t.Fatalf("incorrect selection among equally specific roots: %+v, %v", target, err)
-	} else if target, err := dial(filepath.Join(outer, "y"), "sync_other"); err != nil || target.Session != "sync_other" || target.Overlapping != nil {
+	} else if target, err := dial(filepath.Join(outer, "y"), "sync_other"); err != nil || target.Session != "sync_other" {
 		t.Fatalf("explicit selection not used: %+v, %v", target, err)
 	}
 	registerTest(t, &Endpoint{Session: "sync_another", Root: outer}, "another", &accepted, &lock)
-	if target, err := dial(filepath.Join(outer, "y"), ""); err != nil || target.Session != "sync_another" ||
-		!reflect.DeepEqual(target.Overlapping, []string{"sync_another", "outer-name", "sync_other"}) {
+	if target, err := dial(filepath.Join(outer, "y"), ""); err != nil || target.Session != "sync_another" {
 		t.Fatalf("tie not broken by identifier: %+v, %v", target, err)
-	}
-
-	// If both endpoints of a session are on this system, then selecting the
-	// session outside their roots is ambiguous regardless of root lengths,
-	// while invocation inside a root selects that endpoint.
-	short, long := filepath.Join(base, "a"), filepath.Join(base, "longer-beta")
-	mkdirs(t, short, long)
-	registerTest(t, &Endpoint{Session: "sync_both", Name: "both", Root: short, Alpha: true}, "both-alpha", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_both", Name: "both", Root: long}, "both-beta", &accepted, &lock)
-	if target, err := dial(outside, "both"); err == nil || !strings.Contains(err.Error(), "both endpoints") {
-		t.Fatalf("ambiguous endpoints accepted: %+v, %v", target, err)
-	} else if target, err := dial(short, "both"); err != nil || !target.Alpha {
-		t.Fatalf("incorrect alpha selection: %+v, %v", target, err)
-	} else if target, err := dial(long, "sync_both"); err != nil || target.Alpha {
-		t.Fatalf("incorrect beta selection: %+v, %v", target, err)
-	}
-
-	// Distinct sessions sharing a name are similarly ambiguous.
-	registerTest(t, &Endpoint{Session: "sync_named", Name: "both", Root: inner}, "named", &accepted, &lock)
-	if target, err := dial(outside, "both"); err == nil || !strings.Contains(err.Error(), "multiple sessions match") {
-		t.Fatalf("ambiguous sessions accepted: %+v, %v", target, err)
 	}
 
 	// Registrations of crashed processes are pruned.
@@ -195,8 +175,34 @@ func TestDialSelection(t *testing.T) {
 	data, _ := json.Marshal(&record{Version: "0.0.1", Session: "sync_old", Root: outside})
 	if err := os.WriteFile(filepath.Join(registry, "old"+recordExtension), data, 0600); err != nil {
 		t.Fatal(err)
-	} else if _, err := dial(outside, ""); err == nil || !strings.Contains(err.Error(), "0.0.1") {
+	} else if _, err := dial(outside, ""); err == nil ||
+		!strings.Contains(err.Error(), "registered by Mutagen 0.0.1, but this is Mutagen "+mutagen.Version) {
 		t.Fatal("version mismatch not explained:", err)
+	}
+}
+
+func TestDialIgnoresSessionVariable(t *testing.T) {
+	useTestRegistry(t)
+	base := resolveSymbolicLinks(t.TempDir())
+	first, outside := filepath.Join(base, "first"), filepath.Join(base, "outside")
+	mkdirs(t, first, outside)
+	var lock sync.Mutex
+	var accepted []string
+	registerTest(t, &Endpoint{Session: "sync_first", Name: "first", Root: first}, "first", &accepted, &lock)
+
+	// Session selectors are deprecated, so the environment variable that used
+	// to select a default session no longer redirects submissions from outside
+	// every root (the remote executable refuses to run while it's set).
+	t.Setenv(SessionVariable, "first")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if connection, target, err := (&Selection{}).Dial(ctx, outside, OperationExecute); err == nil {
+		connection.Close()
+		t.Fatalf("environment variable selected a session: %+v", target)
+	} else if connection, target, err := (&Selection{}).Dial(ctx, first, OperationExecute); err != nil || target.Session != "sync_first" {
+		t.Fatalf("containing session not selected: %+v, %v", target, err)
+	} else {
+		connection.Close()
 	}
 }
 
@@ -297,136 +303,6 @@ func TestDialRegistrationRefusals(t *testing.T) {
 	}
 }
 
-func TestDialSessionDefault(t *testing.T) {
-	registry := useTestRegistry(t)
-	base := resolveSymbolicLinks(t.TempDir())
-	outer, first, outside := filepath.Join(base, "outer"), filepath.Join(base, "first"), filepath.Join(base, "outside")
-	inner := filepath.Join(outer, "inner")
-	mkdirs(t, filepath.Join(inner, "x"), filepath.Join(outer, "y"), first, outside)
-	var lock sync.Mutex
-	var accepted []string
-	registerTest(t, &Endpoint{Session: "sync_outer", Name: "outer", Root: outer, Alpha: true}, "outer", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "inner", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_first", Name: "first", Root: first}, "first", &accepted, &lock)
-
-	// The default never redirects a submission from inside a session's root
-	// to a session that doesn't contain it, but it selects among the sessions
-	// that do, and outside every root it selects a session.
-	for _, test := range []struct {
-		directory, session, path string
-		contained                bool
-	}{
-		{filepath.Join(outer, "y"), "sync_outer", "y", true},
-		{filepath.Join(inner, "x"), "sync_inner", "x", true},
-		{outside, "sync_first", "", false},
-	} {
-		if target, err := dialTest(&Selection{Default: "first"}, test.directory); err != nil ||
-			target.Session != test.session || target.Path != test.path || target.Contained != test.contained {
-			t.Errorf("incorrect selection from %s with a default: %+v, %v", test.directory, target, err)
-		}
-	}
-	if target, err := dialTest(&Selection{Default: "outer"}, filepath.Join(inner, "x")); err != nil ||
-		target.Session != "sync_outer" || target.Path != "inner/x" {
-		t.Errorf("default didn't select among containing sessions: %+v, %v", target, err)
-	} else if _, err := dialTest(&Selection{Default: "missing"}, outside); err == nil ||
-		!strings.Contains(err.Error(), `MUTAGEN_REMOTE_SESSION="missing"`) {
-		t.Error("missing default session not explained:", err)
-	} else if target, err := dialTest(&Selection{Session: "first", Default: "outer"}, outside); err != nil || target.Session != "sync_first" {
-		t.Errorf("explicit session didn't take precedence over the default: %+v, %v", target, err)
-	}
-
-	// Dial uses the environment variable as the default.
-	t.Setenv(SessionVariable, "first")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for directory, expected := range map[string]string{outside: "sync_first", filepath.Join(outer, "y"): "sync_outer"} {
-		if connection, target, err := Dial(ctx, directory, "", OperationExecute); err != nil || target.Session != expected {
-			t.Errorf("environment variable applied incorrectly from %s: %+v, %v", directory, target, err)
-		} else {
-			connection.Close()
-		}
-	}
-
-	// A default matching one of several equally specific containing sessions
-	// selects it, while an unrelated default leaves the session created first
-	// in use, with a warning.
-	registerTest(t, &Endpoint{Session: "sync_other", Name: "other", Root: outer, SessionCreated: time.Now()}, "other", &accepted, &lock)
-	if target, err := dialTest(&Selection{Default: "first"}, filepath.Join(outer, "y")); err != nil || target.Session != "sync_outer" ||
-		!reflect.DeepEqual(target.Overlapping, []string{"outer", "other"}) {
-		t.Errorf("incorrect selection with an unrelated default: %+v, %v", target, err)
-	} else if target, err := dialTest(&Selection{Default: "other"}, filepath.Join(outer, "y")); err != nil || target.Session != "sync_other" ||
-		target.Overlapping != nil {
-		t.Errorf("default not used: %+v, %v", target, err)
-	}
-
-	// A root synchronized by another version of Mutagen isn't treated as being
-	// outside every root.
-	legacy := filepath.Join(base, "legacy")
-	mkdirs(t, filepath.Join(legacy, "sub"))
-	registerIncompatible(t, registry, "sync_legacy", legacy)
-	if target, err := dialTest(&Selection{Default: "first"}, filepath.Join(legacy, "sub")); err == nil ||
-		!strings.Contains(err.Error(), "0.0.1") {
-		t.Errorf("default selected outside a root synchronized by another version: %+v, %v", target, err)
-	}
-}
-
-func TestDialCorresponding(t *testing.T) {
-	useTestRegistry(t)
-	base := resolveSymbolicLinks(t.TempDir())
-	outer, first, outside := filepath.Join(base, "outer"), filepath.Join(base, "first"), filepath.Join(base, "outside")
-	inner := filepath.Join(outer, "inner")
-	mkdirs(t, filepath.Join(inner, "x"), filepath.Join(outer, "y"), first, outside)
-	var lock sync.Mutex
-	var accepted []string
-	registerTest(t, &Endpoint{Session: "sync_outer", Name: "outer", Root: outer, Alpha: true}, "outer", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "inner", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_first", Name: "first", Root: first}, "first", &accepted, &lock)
-
-	// A session selected explicitly from inside another session's root isn't
-	// used for operations corresponding to the directory, which would apply
-	// to its root instead.
-	if _, err := dialTest(&Selection{Session: "first", Corresponding: true}, filepath.Join(outer, "y")); err == nil ||
-		!strings.Contains(err.Error(), "is synchronized by session outer (sync_outer), not first (sync_first)") ||
-		!strings.Contains(err.Error(), "--cwd") {
-		t.Error("explicit session redirected a corresponding submission:", err)
-	} else if _, err := dialTest(&Selection{Session: "sync_first", Corresponding: true}, filepath.Join(inner, "x")); err == nil ||
-		!strings.Contains(err.Error(), "sessions inner (sync_inner), outer (sync_outer)") {
-		t.Error("nested containing sessions not described:", err)
-	} else if _, err := dialTest(&Selection{Session: "missing", Corresponding: true}, filepath.Join(outer, "y")); err == nil ||
-		!strings.Contains(err.Error(), `no connected session matching "missing"`) {
-		t.Error("missing session not reported:", err)
-	}
-
-	// Other operations, sessions that contain the directory, and selections
-	// outside every root are unaffected.
-	for _, test := range []struct {
-		selection       *Selection
-		directory, path string
-		session         string
-		contained       bool
-		description     string
-	}{
-		{&Selection{Session: "first"}, filepath.Join(outer, "y"), "", "sync_first", false, "non-corresponding operation"},
-		{&Selection{Session: "first", Corresponding: true}, outside, "", "sync_first", false, "outside every root"},
-		{&Selection{Session: "outer", Corresponding: true}, filepath.Join(inner, "x"), "inner/x", "sync_outer", true, "enclosing session"},
-	} {
-		if target, err := dialTest(test.selection, test.directory); err != nil || target.Session != test.session ||
-			target.Path != test.path || target.Contained != test.contained {
-			t.Errorf("incorrect selection (%s): %+v, %v", test.description, target, err)
-		}
-	}
-
-	// Registrations of crashed processes don't count as synchronizing the
-	// directory.
-	stale := filepath.Join(base, "stale")
-	mkdirs(t, stale)
-	registration := registerTest(t, &Endpoint{Session: "sync_stale", Root: stale}, "stale", &accepted, &lock)
-	registration.listener.(*registeredListener).Listener.Close()
-	if target, err := dialTest(&Selection{Session: "first", Corresponding: true}, stale); err != nil || target.Session != "sync_first" {
-		t.Errorf("stale registration prevented selection: %+v, %v", target, err)
-	}
-}
-
 func TestDialPinned(t *testing.T) {
 	useTestRegistry(t)
 	base := resolveSymbolicLinks(t.TempDir())
@@ -450,23 +326,36 @@ func TestDialPinned(t *testing.T) {
 	if fallback, err := dialTest(&Selection{}, directory); err != nil || fallback.Session != "sync_outer" {
 		t.Fatalf("unpinned selection didn't fall back: %+v, %v", fallback, err)
 	} else if _, err := dialTest(&Selection{Target: target}, directory); err == nil ||
-		!strings.Contains(err.Error(), "session inner (sync_inner) is no longer connected") {
+		!strings.Contains(err.Error(), "the beta endpoint of session inner (sync_inner) is no longer connected") {
 		t.Fatal("pinned selection fell back to another session:", err)
 	}
 
 	// A pinned selection follows the endpoint when it reconnects, and ignores
 	// other selection criteria.
 	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "reconnected", &accepted, &lock)
-	pinned := &Selection{Session: "outer", Default: "outer", Target: target}
+	pinned := &Selection{Workspace: true, Target: target}
 	if reconnected, err := dialTest(pinned, directory); err != nil || reconnected.Session != "sync_inner" || reconnected.Path != "x" {
 		t.Fatalf("pinned selection didn't follow the reconnected endpoint: %+v, %v", reconnected, err)
 	}
 
 	// Pinning distinguishes the endpoints of a session.
 	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: filepath.Join(base, "beta"), Alpha: true}, "alpha", &accepted, &lock)
-	if pinnedAlpha, err := dialTest(&Selection{Target: &Target{Session: "sync_inner", Alpha: true}}, directory); err != nil ||
+	if pinnedAlpha, err := dialTest(&Selection{Target: &Target{SourceSession: "sync_inner", SourceAlpha: true}}, directory); err != nil ||
 		!pinnedAlpha.Alpha || pinnedAlpha.Contained {
 		t.Fatalf("pinned selection reached the wrong endpoint: %+v, %v", pinnedAlpha, err)
+	}
+
+	// Only the source registration pins a selection, never the edge that the
+	// daemon selected, so a target without a source is refused.
+	if pinned, err := dialTest(&Selection{Target: &Target{SourceSession: "sync_inner", Session: "sync_outer", Alpha: true}}, directory); err != nil ||
+		pinned.Session != "sync_inner" || pinned.Alpha || pinned.SourceSession != "sync_inner" {
+		t.Fatalf("pinned selection followed the selected edge: %+v, %v", pinned, err)
+	} else if _, err := dialTest(&Selection{Target: &Target{Session: "sync_inner"}}, directory); err == nil ||
+		!strings.Contains(err.Error(), "doesn't identify a source registration") {
+		t.Fatal("target without a source registration pinned a selection:", err)
+	} else if _, err := dialTest(&Selection{Target: &Target{SourceSession: "sync_gone", SourceAlpha: true, Tree: true, SourceNode: "a", Session: "sync_inner"}}, directory); err == nil ||
+		!strings.Contains(err.Error(), "the alpha endpoint (node a) of session sync_gone is no longer connected") {
+		t.Fatal("disconnected source registration not described:", err)
 	}
 }
 
@@ -493,8 +382,7 @@ func TestDialExcluded(t *testing.T) {
 	<-registration.done
 	for _, selection := range []*Selection{
 		{Corresponding: true},
-		{Session: "outer", Corresponding: true},
-		{Default: "inner", Corresponding: true},
+		{Target: &Target{SourceSession: "sync_outer", SourceAlpha: true}, Corresponding: true},
 	} {
 		if _, err := dialTest(selection, directory); err == nil ||
 			!strings.Contains(err.Error(), "inner/x is inside inner, which session outer ignores") ||
@@ -513,127 +401,8 @@ func TestDialExcluded(t *testing.T) {
 		t.Errorf("non-corresponding operation refused: %+v, %v", target, err)
 	} else if target, err := dialTest(&Selection{Corresponding: true}, filepath.Join(outer, "y")); err != nil || target.Path != "y" {
 		t.Errorf("synchronized directory refused: %+v, %v", target, err)
-	} else if pinned, err := dialTest(&Selection{Target: target, Corresponding: true}, directory); err != nil || pinned.Path != "inner/x" {
-		t.Errorf("pinned selection refused: %+v, %v", pinned, err)
-	}
-}
-
-func TestDialOverlapping(t *testing.T) {
-	registry := useTestRegistry(t)
-	base := resolveSymbolicLinks(t.TempDir())
-	outer, first := filepath.Join(base, "outer"), filepath.Join(base, "first")
-	inner := filepath.Join(outer, "inner")
-	directory := filepath.Join(inner, "x")
-	mkdirs(t, directory, filepath.Join(outer, "y"), first)
-	var lock sync.Mutex
-	var accepted []string
-	registerTest(t, &Endpoint{Session: "sync_outer", Name: "outer", Root: outer, Alpha: true}, "outer", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "inner", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_first", Name: "first", Root: first}, "first", &accepted, &lock)
-
-	// Sessions that also synchronize the directory are described unless the
-	// session was selected, explicitly or by a matching default.
-	for _, test := range []struct {
-		selection   *Selection
-		directory   string
-		overlapping []string
-	}{
-		{&Selection{}, directory, []string{"inner", "outer"}},
-		{&Selection{Default: "first"}, directory, []string{"inner", "outer"}},
-		{&Selection{Default: "inner"}, directory, nil},
-		{&Selection{Session: "inner"}, directory, nil},
-		{&Selection{Session: "outer"}, directory, nil},
-		{&Selection{}, filepath.Join(outer, "y"), nil},
-		{&Selection{Default: "first"}, base, nil},
-		{&Selection{Target: &Target{Session: "sync_inner"}}, directory, nil},
-	} {
-		if target, err := dialTest(test.selection, test.directory); err != nil {
-			t.Errorf("selection failed (%+v from %s): %v", test.selection, test.directory, err)
-		} else if !reflect.DeepEqual(target.Overlapping, test.overlapping) {
-			t.Errorf("incorrect overlapping sessions (%+v from %s): %#v", test.selection, test.directory, target.Overlapping)
-		}
-	}
-
-	// Sessions whose ignores exclude the directory don't synchronize it, while
-	// sessions registered by other versions of Mutagen do. Equally specific
-	// sessions follow the order of preference.
-	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"inner"}}
-	registerTest(t, &Endpoint{Session: "sync_ignoring", Root: outer, Ignores: ignores}, "ignoring", &accepted, &lock)
-	registerIncompatible(t, registry, "sync_legacy", outer)
-	if target, err := dialTest(&Selection{}, directory); err != nil || !reflect.DeepEqual(target.Overlapping, []string{"inner", "sync_legacy", "outer"}) {
-		t.Errorf("incorrect overlapping sessions: %+v, %v", target, err)
-	}
-
-	// Sessions sharing a name are labeled by identifier.
-	registerTest(t, &Endpoint{Session: "sync_twin", Name: "outer", Root: first}, "twin", &accepted, &lock)
-	if target, err := dialTest(&Selection{}, directory); err != nil || !reflect.DeepEqual(target.Overlapping, []string{"inner", "sync_legacy", "sync_outer"}) {
-		t.Errorf("shared name not replaced by identifier: %+v, %v", target, err)
-	}
-}
-
-func TestSessions(t *testing.T) {
-	registry := useTestRegistry(t)
-	base := resolveSymbolicLinks(t.TempDir())
-	outer, first := filepath.Join(base, "outer"), filepath.Join(base, "first")
-	inner := filepath.Join(outer, "inner")
-	directory := filepath.Join(inner, "x")
-	mkdirs(t, directory, first)
-	var lock sync.Mutex
-	var accepted []string
-	sessions := func(selection *Selection, directory string) []Session {
-		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		result, err := selection.Sessions(ctx, directory)
-		if err != nil {
-			t.Fatal("unable to list sessions:", err)
-		}
-		return result
-	}
-	if listed := sessions(&Selection{}, directory); len(listed) != 0 {
-		t.Fatalf("sessions listed without registrations: %+v", listed)
-	}
-
-	// Containing sessions come first, most specific first and then in the order
-	// of preference, and the session that's used is marked. Replaced and dead
-	// registrations aren't listed.
-	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"inner"}}
-	registerTest(t, &Endpoint{Session: "sync_outer", Name: "outer", Root: outer, Alpha: true, Ignores: ignores}, "outer", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "inner", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "replacement", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_late", Name: "late", Root: inner, SessionCreated: time.Now()}, "late", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_first", Name: "first", Root: first}, "first", &accepted, &lock)
-	stale := registerTest(t, &Endpoint{Session: "sync_stale", Root: base}, "stale", &accepted, &lock)
-	stale.listener.(*registeredListener).Listener.Close()
-	registerIncompatible(t, registry, "sync_legacy", filepath.Join(base, "legacy"))
-	expected := []Session{
-		{Session: "sync_inner", Name: "inner", Label: "inner", Root: inner, Path: "x", Version: mutagen.Version, Contained: true, Selected: true},
-		{Session: "sync_late", Name: "late", Label: "late", Root: inner, Path: "x", Version: mutagen.Version, Contained: true},
-		{Session: "sync_outer", Name: "outer", Label: "outer", Alpha: true, Root: outer, Path: "inner/x", Version: mutagen.Version, Contained: true, Excluded: true},
-		{Session: "sync_first", Name: "first", Label: "first", Root: first, Version: mutagen.Version},
-		{Session: "sync_legacy", Label: "sync_legacy", Root: filepath.Join(base, "legacy"), Version: "0.0.1"},
-	}
-	if listed := sessions(&Selection{}, directory); !reflect.DeepEqual(listed, expected) {
-		t.Errorf("incorrect sessions:\n%+v\nexpected:\n%+v", listed, expected)
-	}
-
-	// The selection determines the session that's marked, and none is marked
-	// if it doesn't locate one.
-	selected := func(listed []Session) []string {
-		var result []string
-		for _, session := range listed {
-			if session.Selected {
-				result = append(result, session.Session)
-			}
-		}
-		return result
-	}
-	if marked := selected(sessions(&Selection{Default: "first"}, base)); !reflect.DeepEqual(marked, []string{"sync_first"}) {
-		t.Errorf("default selection not marked: %v", marked)
-	} else if marked := selected(sessions(&Selection{Default: "outer"}, directory)); !reflect.DeepEqual(marked, []string{"sync_outer"}) {
-		t.Errorf("default selection among containing sessions not marked: %v", marked)
-	} else if marked := selected(sessions(&Selection{}, base)); marked != nil {
-		t.Errorf("session marked outside every root: %v", marked)
+	} else if _, err := dialTest(&Selection{Target: target, Corresponding: true}, directory); err == nil {
+		t.Error("pinned selection bypassed the corresponding-directory check")
 	}
 }
 
@@ -772,9 +541,9 @@ func TestAgentChannel(t *testing.T) {
 	if !installed {
 		t.Fatal("remote executable not installed")
 	}
-	if sessions, err := (&Selection{}).Sessions(context.Background(), filepath.Join(root, "sub")); err != nil ||
-		len(sessions) != 1 || sessions[0].ExecutionHost != "opposite-host" || sessions[0].ExecutionRoot != opposite || sessions[0].Path != "sub" {
-		t.Fatalf("agent initialization lost execution metadata: %+v, %v", sessions, err)
+	if _, registered, _, err := relate(filepath.Join(root, "sub")); err != nil || len(registered) != 1 ||
+		registered[0].ExecutionHost != "opposite-host" || registered[0].ExecutionRoot != opposite || registered[0].path != "sub" {
+		t.Fatalf("agent initialization lost execution metadata: %+v, %v", registered, err)
 	}
 
 	// Commands opened by the daemon run in the endpoint's root.
@@ -797,12 +566,12 @@ func TestAgentChannel(t *testing.T) {
 			return
 		}
 		execution, server := net.Pipe()
-		go Serve(context.Background(), server, opposite, "", false)
+		go Serve(context.Background(), server, opposite, "", false, "")
 		Splice(submission, execution)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	connection, target, err := Dial(ctx, filepath.Join(root, "sub"), "", OperationExecute)
+	connection, target, err := (&Selection{}).Dial(ctx, filepath.Join(root, "sub"), OperationExecute)
 	if err != nil {
 		t.Fatal(err)
 	} else if directory := inspectDirectory(t, connection, target.Path); directory != filepath.Join(opposite, "sub") {
@@ -840,7 +609,7 @@ func TestAgentChannelWithoutExecution(t *testing.T) {
 	// Endpoints that don't submit commands don't register.
 	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, _, err := Dial(ctx, root, "", OperationExecute); err == nil {
+	if _, _, err := (&Selection{}).Dial(ctx, root, OperationExecute); err == nil {
 		t.Fatal("non-submitting endpoint registered")
 	}
 }
@@ -856,7 +625,7 @@ func TestAgentChannelInstallationFailure(t *testing.T) {
 	// Submission still works with a separately installed executable.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if connection, _, err := Dial(ctx, root, "", OperationExecute); err != nil {
+	if connection, _, err := (&Selection{}).Dial(ctx, root, OperationExecute); err != nil {
 		t.Fatal(err)
 	} else {
 		connection.Close()
@@ -1126,7 +895,7 @@ func TestLocalChannel(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	connection, target, err := Dial(ctx, filepath.Join(root, "sub"), "", OperationExecute)
+	connection, target, err := (&Selection{}).Dial(ctx, filepath.Join(root, "sub"), OperationExecute)
 	if err != nil {
 		t.Fatal(err)
 	} else if directory := inspectDirectory(t, connection, target.Path); directory != filepath.Join(root, "sub") {
@@ -1176,7 +945,7 @@ func TestFlush(t *testing.T) {
 		}
 	}()
 	flush := func(ctx context.Context, result outcome) (*Report, error) {
-		connection, _, err := Dial(ctx, root, "", OperationFlush)
+		connection, _, err := (&Selection{}).Dial(ctx, root, OperationFlush)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1207,7 +976,7 @@ func TestFlush(t *testing.T) {
 
 	// Cancellation abandons the wait.
 	ctx, cancel = context.WithCancel(context.Background())
-	connection, _, err := Dial(ctx, root, "", OperationFlush)
+	connection, _, err := (&Selection{}).Dial(ctx, root, OperationFlush)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1219,42 +988,6 @@ func TestFlush(t *testing.T) {
 	case outcomes <- outcome{}:
 	case <-time.After(5 * time.Second):
 		t.Fatal("abandoned flush not received")
-	}
-}
-
-func TestSessionsExecutionMetadata(t *testing.T) {
-	useTestRegistry(t)
-	base := resolveSymbolicLinks(t.TempDir())
-	alpha, beta := filepath.Join(base, "alpha"), filepath.Join(base, "beta")
-	mkdirs(t, filepath.Join(alpha, "sub", "dir"), filepath.Join(beta, "sub", "dir"))
-	var lock sync.Mutex
-	var accepted []string
-	registerTest(t, &Endpoint{Session: "sync_both", Root: alpha, Alpha: true, ExecutionHost: "beta-host", ExecutionRoot: beta}, "alpha", &accepted, &lock)
-	registerTest(t, &Endpoint{Session: "sync_both", Root: beta, ExecutionHost: "alpha-host", ExecutionRoot: alpha}, "beta", &accepted, &lock)
-	for _, test := range []struct {
-		root, opposite, host string
-	}{
-		{alpha, beta, "beta-host"},
-		{beta, alpha, "alpha-host"},
-	} {
-		directory := filepath.Join(test.root, "sub", "dir")
-		sessions, err := (&Selection{}).Sessions(context.Background(), directory)
-		if err != nil || len(sessions) != 2 {
-			t.Fatalf("unable to list endpoints: %+v, %v", sessions, err)
-		}
-		session := sessions[0]
-		target, err := dialTest(&Selection{}, directory)
-		if err != nil {
-			t.Fatal(err)
-		}
-		mapped, err := workingDirectory(test.opposite, &Request{Path: target.Path})
-		if err != nil || session.ExecutionHost != test.host || session.ExecutionRoot != test.opposite ||
-			session.Path != target.Path || filepath.Join(session.ExecutionRoot, filepath.FromSlash(session.Path)) != mapped {
-			t.Fatalf("listing and execution disagree: %+v, %+v, %q, %v", session, target, mapped, err)
-		}
-		if sessions[1].Path != "" || sessions[1].Contained {
-			t.Fatalf("outside-root mapping was not cleared: %+v", sessions[1])
-		}
 	}
 }
 
@@ -1274,10 +1007,6 @@ func TestExcludedSessionLabels(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "build/sub is inside build, which session "+label+" ignores") ||
 			!strings.Contains(err.Error(), "don't use --cwd") || !strings.Contains(err.Error(), "--cwd . runs in the other side's own copy") {
 			t.Fatal("incorrect exclusion diagnostic:", err)
-		}
-		sessions, listErr := (&Selection{}).Sessions(context.Background(), directory)
-		if listErr != nil || len(sessions) == 0 || sessions[0].Label != label {
-			t.Fatalf("error/listing labels disagree: %+v, %v", sessions, listErr)
 		}
 	}
 	check("project")
