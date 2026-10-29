@@ -399,7 +399,9 @@ sync:
 // file back to every workspace unless apply keeps flushing the sessions that
 // share workspaces until the deletion has reached all of them. Sessions are
 // flushed in name order, so the deletion is made at the end whose session is
-// flushed last. Watching is disabled, so only flushes synchronize changes.
+// flushed last, and in a cycle whose shortcut ignores the file, it has to take
+// the long way around. Watching is disabled, so only flushes synchronize
+// changes.
 func TestProjectApplyConvergesSharedSessions(t *testing.T) {
 	// Allow this test to run in parallel.
 	t.Parallel()
@@ -457,6 +459,32 @@ star:
 			},
 			deleted: "server",
 		},
+		{
+			// A cycle of five roots whose closing session, e, ignores the
+			// file. No session is more than two hops from another, so three
+			// rounds would suffice if every session carried the deletion,
+			// but the deletion on w1 has to traverse d, c, b, and a, which
+			// are flushed in the opposite order, so each round only carries
+			// it through one of them.
+			name:  "cycle",
+			roots: []string{"w1", "w2", "w3", "w4", "w5"},
+			configuration: func(roots map[string]string, settings string) string {
+				return fmt.Sprintf(`
+sync:
+  defaults:
+    watch: {mode: no-watch}
+    flushOnCreate: true
+%s
+  a: {alpha: '%s', beta: '%s'}
+  b: {alpha: '%s', beta: '%s'}
+  c: {alpha: '%s', beta: '%s'}
+  d: {alpha: '%s', beta: '%s'}
+  e: {alpha: '%s', beta: '%s', ignore: {paths: [file]}}
+`, settings, roots["w4"], roots["w5"], roots["w3"], roots["w4"], roots["w2"], roots["w3"],
+					roots["w1"], roots["w2"], roots["w5"], roots["w1"])
+			},
+			deleted: "w1",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			// Allow scenarios to run in parallel.
@@ -498,6 +526,7 @@ star:
 			// file in their histories.
 			fixture.apply(test.configuration(roots, ""))
 			flush()
+			_, initial := fixture.sessions()
 
 			// Delete the file without synchronizing the deletion, then
 			// replace every session by changing their ignores.
@@ -505,7 +534,7 @@ star:
 				t.Fatal("unable to delete file:", err)
 			}
 			output := fixture.apply(test.configuration(roots, "    ignore: {paths: [unused]}"))
-			if strings.Count(output, "Replace synchronization session") != len(test.roots)-1 ||
+			if strings.Count(output, "Replace synchronization session") != len(initial) ||
 				!strings.HasSuffix(output, "Unchanged sessions: 0\n") {
 				t.Fatalf("unexpected plan for replacement:\n%s", output)
 			}

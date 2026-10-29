@@ -66,7 +66,9 @@ workspace. Sessions share a workspace if their endpoints are equal or nested on
 the same configured host (aliases and remote symbolic links aren't recognized).
 A group of sessions connected this way is flushed in D+1 rounds, where D is the
 largest number of steps between two of them: two rounds for a star and k rounds
-for a chain of k sessions, while a session that shares no workspace is flushed
+for a chain of k sessions, or k rounds for k sessions whose workspaces form a
+cycle, since sessions that ignore a change or synchronize in one direction can
+force it the long way around. A session that shares no workspace is flushed
 once. If a flush fails, nothing is terminated or created: fix the session and
 apply again, or, if its unsynchronized changes don't matter, terminate it with
 `mutagen sync terminate` and apply again. A retained session can instead be

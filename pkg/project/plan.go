@@ -416,40 +416,63 @@ func sessionsShareWorkspaces(first, second *synchronization.Session) bool {
 // running session in a connected component that contains a session to be
 // terminated, including retained sessions, is flushed in D+1 rounds, where D
 // is the component's diameter: the largest distance between two of its
-// sessions, counted in hops between adjacent sessions.
+// sessions, counted in hops between adjacent sessions. If the workspaces of
+// the component's sessions form a cycle, then it's flushed in N rounds
+// instead, where N is the number of its sessions.
 //
-// Consider a change that is present in an endpoint of a session s before the
-// first round. s is flushed during the first round, after which both of its
-// endpoints hold the change. Suppose that every session k hops from s holds the
-// change on both endpoints after round k+1. A session t that is k+1 hops from s
-// is adjacent to a session k hops from s, which holds the change on both of its
-// endpoints, including the workspace that it shares with t, once round k+1 has
-// completed. The flush of t during round k+2 then carries the change to t's
-// other endpoint. By induction, since no session is more than D hops from s,
-// every session in the component holds the change on both endpoints after D+1
-// rounds, regardless of the order of the flushes within each round. The bound
-// is tight: a chain of k sessions has a diameter of k-1, and a change at one
-// end needs k rounds if each round flushes the sessions starting from the
-// other end. The edges of a star all share its center, so its diameter is 1
-// and two rounds suffice, while a session that shares no workspace with
-// another is flushed once. Flushes don't report whether they synchronized any
-// changes, so rounds can't stop early.
+// Consider a change that is present in a workspace before the first round and
+// that the sessions can carry to another workspace, i.e. along a route of
+// sessions s1, ..., sk, where s1 has the first workspace as an endpoint, each
+// subsequent session shares a workspace with its predecessor, and each session
+// carries the change from that workspace to its other endpoint. A session that
+// carries the change leaves it on both of its endpoints, so a route that
+// visits a session twice can continue directly after the first visit. The
+// shortest route therefore visits each session at most once, and k is at most
+// N. The flush of s1 during the first round carries the change. Suppose that
+// sj has carried it by the end of round j. The flush of the next session on
+// the route during round j+1 starts after round j has completed, when the
+// workspace that it shares with sj holds the change, so it carries the change
+// to its other endpoint. By induction, the change reaches the end of the route
+// within k rounds, regardless of the order of the flushes within each round.
 //
-// The argument assumes that each session carries the change between its
-// endpoints. A session might not, because the change is ignored, outside the
-// overlap of nested workspaces, or against a one-way mode. Where workspaces
-// form a tree, such as a chain or a star, there's no path around such a
-// session, so the change can't reach the sessions beyond it anyway, while the
-// distances to the others are unchanged. Where workspaces form a cycle, such a
-// session can force a path around the cycle that's longer than the diameter.
+// Sessions that don't carry the change, because they ignore it, cover only part
+// of a nested workspace, or only synchronize in the other direction, aren't
+// part of its route. They can, however, force a route that's longer than the
+// distance between its first and last sessions: in a cycle of five workspaces
+// connected by five sessions, no session is more than two hops from another,
+// but if one of the sessions ignores the change, then the change has to
+// traverse the other four.
+//
+// Where the workspaces form a tree, the diameter bounds the route. The
+// workspaces are the classes of the endpoints of the component's sessions,
+// where overlapping endpoints share a class, and each session connects the
+// classes of its endpoints. Since the sessions are connected, so are the
+// classes, which therefore form a tree if and only if there are N+1 of them. A
+// session whose endpoints overlap, or two sessions that connect the same
+// classes, thus count as cycles, and an endpoint that contains two disjoint
+// endpoints merges their classes, which can only make a tree look like a cycle,
+// never hide one. In a tree, a route can only return to a class through the
+// session by which it left, which brings the change back to where it was, so
+// the shortest route visits distinct classes v0, ..., vk, with si connecting
+// v(i-1) and vi. For 1 < i < k, removing si splits the tree into a part with
+// v(i-1) and s1 and a part with vi and sk, and since adjacent sessions share a
+// class, every path from s1 to sk in the session graph passes through si. The
+// distance between s1 and sk is therefore at least k-1, so k is at most D+1.
+//
+// The bound of D+1 is reached by a chain: a change at one end of a chain of N
+// sessions, whose diameter is N-1, needs N rounds if each round flushes the
+// sessions starting from the other end. The edges of a star all share its
+// center, and their workspaces form a tree, so two rounds suffice, while a
+// session that shares no workspace with another is flushed once. Flushes don't
+// report whether they synchronized any changes, so rounds can't stop early.
 //
 // Paused sessions are left out. They aren't flushed, since that would require
 // resuming them, which is why the plan notes those that will be terminated.
 // They don't carry changes while the plan is applied either, so paths through
-// them must not shorten distances. Skipping retained paused sessions is safe
-// because they keep their history: once resumed, they reconcile against it,
-// so a file that exists on only one of their endpoints is propagated as a
-// creation or deletion on that side rather than copied back.
+// them must neither shorten distances nor close cycles. Skipping retained
+// paused sessions is safe because they keep their history: once resumed, they
+// reconcile against it, so a file that exists on only one of their endpoints is
+// propagated as a creation or deletion on that side rather than copied back.
 func (p *Plan) flushRounds() [][]*synchronization.Session {
 	// Identify the running sessions that will be terminated.
 	terminated := make(map[*synchronization.Session]bool, len(p.synchronization))
@@ -506,9 +529,47 @@ func (p *Plan) flushRounds() [][]*synchronization.Session {
 		return reached, distances[reached[len(reached)-1]]
 	}
 
-	// Compute the number of rounds for each session from the diameter of its
-	// connected component, if the component contains a session that will be
-	// terminated. Sessions in other components aren't flushed.
+	// Define a function that reports whether the workspaces of a component's
+	// sessions form a cycle. It groups the endpoints of the sessions into
+	// classes of overlapping endpoints using a disjoint-set forest. The
+	// component is connected, so its workspaces form a tree if and only if it
+	// has one fewer session than classes, and otherwise they form a cycle.
+	cyclic := func(component []int) bool {
+		endpoints := make([]*url.URL, 0, 2*len(component))
+		for _, member := range component {
+			endpoints = append(endpoints, running[member].Alpha, running[member].Beta)
+		}
+		parents := make([]int, len(endpoints))
+		for e := range parents {
+			parents[e] = e
+		}
+		find := func(e int) int {
+			for parents[e] != e {
+				parents[e] = parents[parents[e]]
+				e = parents[e]
+			}
+			return e
+		}
+		classes := len(endpoints)
+		for e := range endpoints {
+			for f := e + 1; f < len(endpoints); f++ {
+				if endpoints[e] == nil || endpoints[f] == nil {
+					continue
+				} else if x, y := find(e), find(f); x != y &&
+					synchronization.WorkspaceEndpointsOverlap(endpoints[e], endpoints[f]) {
+					parents[x] = y
+					classes--
+				}
+			}
+		}
+		return len(component) >= classes
+	}
+
+	// Compute the number of rounds for the sessions in each connected
+	// component that contains a session that will be terminated: the
+	// component's diameter plus one if its workspaces form a tree, and
+	// otherwise the number of its sessions. Sessions in other components
+	// aren't flushed.
 	rounds := make([]int, len(running))
 	visited := make([]bool, len(running))
 	for i := range running {
@@ -516,19 +577,26 @@ func (p *Plan) flushRounds() [][]*synchronization.Session {
 			continue
 		}
 		component, _ := search(i)
-		var diameter int
 		var affected bool
 		for _, member := range component {
 			visited[member] = true
 			affected = affected || terminated[running[member]]
-			if _, eccentricity := search(member); eccentricity > diameter {
-				diameter = eccentricity
-			}
 		}
-		if affected {
+		if !affected {
+			continue
+		}
+		required := len(component)
+		if !cyclic(component) {
+			var diameter int
 			for _, member := range component {
-				rounds[member] = diameter + 1
+				if _, eccentricity := search(member); eccentricity > diameter {
+					diameter = eccentricity
+				}
 			}
+			required = diameter + 1
+		}
+		for _, member := range component {
+			rounds[member] = required
 		}
 	}
 

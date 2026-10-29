@@ -41,7 +41,8 @@ their workspaces, repeatedly, until changes have propagated across them, so
 that new sessions don't copy back files whose deletion hadn't reached every
 workspace. Sessions share a workspace if their endpoints are equal or nested on
 the same configured host. Connected sessions are flushed in D+1 rounds, where D
-is the largest number of steps between two of them (two rounds for a star),
+is the largest number of steps between two of them (two rounds for a star), or
+in as many rounds as there are sessions if their workspaces form a cycle,
 while a session that shares no workspace is flushed once. If a flush fails,
 nothing is terminated or created: fix the session and apply again, or terminate
 it with "mutagen sync terminate" and apply again if its unsynchronized changes
