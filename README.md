@@ -204,13 +204,16 @@ even if only one destination is online.
 
 Foreground commands and scripts can reach any node. `remote --node gpu
 --conflicts` inspects the synchronization path and labels conflicts by the
-actual adjacent nodes holding their copies. Resolve from one of those nodes
-with `--node` selecting its peer. Jobs, file operations, conflict modifications,
-and `--flush` require an adjacent destination. Conflict listings with `--json`
-always use an `edges` array, including for an adjacent destination or an implicit
-pair; each entry names `alpha` and `beta`, identifies its traversal `source`
-and `target`, and contains their `listing`. The listing's local and remote
-changes refer to that entry's source and target, including intermediate nodes.
+actual adjacent nodes holding their copies. Paths on the first edge are
+relative to the current directory, as for pairs, and those on later edges to
+their roots. Resolve from one of those nodes with `--node` selecting its peer,
+after listing its conflicts again there. Jobs, file operations, conflict
+modifications, and `--flush` require an adjacent destination. Conflict listings
+with `--json` always use an `edges` array, including for an adjacent
+destination or an implicit pair; each entry names `alpha` and `beta`,
+identifies its traversal `source` and `target`, and contains their `listing`.
+The listing's local and remote changes refer to that entry's source and
+target, including intermediate nodes.
 Tree foreground commands and detached job starts synchronize strictly unless
 given `--no-flush`.
 

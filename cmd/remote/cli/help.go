@@ -95,8 +95,10 @@ adjacent nodes require.
     use it only for commands that neither read nor write synchronized files
     (see --help sync). The tree must still be valid and the path connected.
   - --conflicts can inspect a multi-edge path. Each listing identifies the
-    actual adjacent nodes holding its copies, and paths are relative to those
-    roots. Resolve from one of that edge's endpoints using --node for its peer.
+    actual adjacent nodes holding its copies. Paths on the first edge are
+    relative to the current directory, as for pairs, and those on later edges
+    to their roots. Resolve from one of that edge's endpoints using --node for
+    its peer, after listing its conflicts again there.
     --conflicts --json always returns an edges array, even for one edge or an
     implicit pair; each entry has alpha, beta, source, target, and listing
     fields. Local and remote changes in that listing refer to its source
