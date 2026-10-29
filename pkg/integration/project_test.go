@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -387,5 +388,138 @@ sync:
 		if content := fixture.readContent(filepath.Join(root, "results")); content != "rename" {
 			t.Errorf("unsynchronized change was lost on %s after renaming: found %q", root, content)
 		}
+	}
+}
+
+// TestProjectApplyConvergesSharedSessions tests that replacing sessions that
+// share workspaces doesn't resurrect a deleted file. A flush only makes the
+// endpoints of its own session agree, so if a later flush brings a deletion
+// into a shared workspace, a session that was flushed before doesn't propagate
+// it. Since replacements start with fresh history, they would copy the stale
+// file back to every workspace unless apply keeps flushing the sessions that
+// share workspaces until the deletion has reached all of them. Sessions are
+// flushed in name order, so the deletion is made at the end whose session is
+// flushed last. Watching is disabled, so only flushes synchronize changes.
+func TestProjectApplyConvergesSharedSessions(t *testing.T) {
+	// Allow this test to run in parallel.
+	t.Parallel()
+
+	// Define the scenarios.
+	for _, test := range []struct {
+		// name is the scenario name.
+		name string
+		// roots are the synchronization roots, relative to the project
+		// directory.
+		roots []string
+		// configuration computes the project configuration from the absolute
+		// paths of the roots and additional synchronization settings, which
+		// replace every session when they change.
+		configuration func(roots map[string]string, settings string) string
+		// deleted is the root where the file is deleted.
+		deleted string
+	}{
+		{
+			// A chain of two pairs that share the middle root. The deletion
+			// on right reaches middle only when right is flushed, after left.
+			name:  "chain",
+			roots: []string{"left", "middle", "right"},
+			configuration: func(roots map[string]string, settings string) string {
+				return fmt.Sprintf(`
+sync:
+  defaults:
+    watch: {mode: no-watch}
+    flushOnCreate: true
+%s
+  left: {alpha: '%s', beta: '%s'}
+  right: {alpha: '%s', beta: '%s'}
+`, settings, roots["left"], roots["middle"], roots["middle"], roots["right"])
+			},
+			deleted: "right",
+		},
+		{
+			// A star whose edges are all replaced. The deletion on server
+			// reaches the center only when star-server is flushed, after
+			// star-gpu.
+			name:  "star",
+			roots: []string{"local", "server", "gpu"},
+			configuration: func(roots map[string]string, settings string) string {
+				return fmt.Sprintf(`
+star:
+  sync:
+    watch: {mode: no-watch}
+%s
+  center: local
+  nodes:
+    local: {endpoint: '%s'}
+    server: {endpoint: '%s'}
+    gpu: {endpoint: '%s'}
+`, settings, roots["local"], roots["server"], roots["gpu"])
+			},
+			deleted: "server",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Allow scenarios to run in parallel.
+			t.Parallel()
+
+			// Create the project and the synchronization roots, each with
+			// the same file, so that the initial sessions agree on it.
+			fixture := newProjectFixture(t)
+			roots := make(map[string]string, len(test.roots))
+			for _, root := range test.roots {
+				roots[root] = filepath.Join(fixture.directory, root)
+				if err := os.Mkdir(roots[root], 0700); err != nil {
+					t.Fatal("unable to create synchronization root:", err)
+				}
+				fixture.writeContent(filepath.Join(root, "file"), "content")
+			}
+
+			// Define a helper that flushes all of the project's sessions in
+			// name order.
+			flush := func() {
+				t.Helper()
+				_, sessions := fixture.sessions()
+				names := make([]string, 0, len(sessions))
+				for name := range sessions {
+					names = append(names, name)
+				}
+				sort.Strings(names)
+				var identifiers []string
+				for _, name := range names {
+					identifiers = append(identifiers, sessions[name].Identifier)
+					logSessionOnFailure(t, sessions[name].Identifier)
+				}
+				if err := (&managerSessionOperations{fixture.ctx}).FlushSynchronization(identifiers); err != nil {
+					t.Fatal("unable to flush sessions:", err)
+				}
+			}
+
+			// Create the sessions and synchronize them, which records the
+			// file in their histories.
+			fixture.apply(test.configuration(roots, ""))
+			flush()
+
+			// Delete the file without synchronizing the deletion, then
+			// replace every session by changing their ignores.
+			if err := os.Remove(filepath.Join(roots[test.deleted], "file")); err != nil {
+				t.Fatal("unable to delete file:", err)
+			}
+			output := fixture.apply(test.configuration(roots, "    ignore: {paths: [unused]}"))
+			if strings.Count(output, "Replace synchronization session") != len(test.roots)-1 ||
+				!strings.HasSuffix(output, "Unchanged sessions: 0\n") {
+				t.Fatalf("unexpected plan for replacement:\n%s", output)
+			}
+
+			// Synchronize the replacements, which start with fresh history,
+			// and verify that the deletion reached every root.
+			flush()
+			for _, root := range test.roots {
+				if _, err := os.Lstat(filepath.Join(roots[root], "file")); err == nil {
+					t.Errorf("deleted file was restored on %s", root)
+				} else if !os.IsNotExist(err) {
+					t.Errorf("unable to inspect file on %s: %v", root, err)
+				}
+			}
+		})
 	}
 }

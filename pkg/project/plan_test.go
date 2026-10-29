@@ -337,6 +337,12 @@ type testSessionOperations struct {
 	// failFlush specifies synchronization sessions, by identifier, whose flush
 	// fails.
 	failFlush map[string]bool
+	// failFlushAt specifies synchronization sessions, by identifier, whose
+	// flush fails only when it's requested for the specified time, counting
+	// from one.
+	failFlushAt map[string]int
+	// flushes counts the flush requests by identifier.
+	flushes map[string]int
 }
 
 func (o *testSessionOperations) TerminateForwarding(identifiers []string) error {
@@ -364,8 +370,12 @@ func (o *testSessionOperations) CreateSynchronization(specification *synchroniza
 
 func (o *testSessionOperations) FlushSynchronization(identifiers []string) error {
 	o.operations = append(o.operations, "flush synchronization "+strings.Join(identifiers, ","))
+	if o.flushes == nil {
+		o.flushes = make(map[string]int)
+	}
 	for _, identifier := range identifiers {
-		if o.failFlush[identifier] {
+		o.flushes[identifier]++
+		if o.failFlush[identifier] || o.failFlushAt[identifier] == o.flushes[identifier] {
 			return errTestFlush
 		}
 	}
@@ -373,11 +383,14 @@ func (o *testSessionOperations) FlushSynchronization(identifiers []string) error
 }
 
 // TestPlanApply verifies that running synchronization sessions that will be
-// terminated are flushed individually before any session is terminated, that
-// paused and unchanged sessions are never flushed, that obsolete sessions are
+// terminated, and that share no workspace with another session, are flushed
+// individually and once before any session is terminated, that paused and
+// unchanged sessions are never flushed if they share no workspace with a
+// running session that will be terminated, that obsolete sessions are
 // terminated before creation, that replacements retain paused state, and that
 // running sessions created by the plan are flushed after creation.
 func TestPlanApply(t *testing.T) {
+	t.Chdir(t.TempDir())
 	current := testSpecifications(t, `
 forward:
   defaults: {source: "tcp:127.0.0.1:8000", destination: "tcp:127.0.0.1:8001"}
@@ -385,12 +398,11 @@ forward:
   replace: {}
   remove: {}
 sync:
-  defaults: {alpha: ./alpha, beta: ./beta}
-  keep: {}
-  replace: {}
-  replace-paused: {}
-  remove: {}
-  remove-paused: {}
+  keep: {alpha: ./keep/alpha, beta: ./keep/beta}
+  replace: {alpha: ./replace/alpha, beta: ./replace/beta}
+  replace-paused: {alpha: ./replace-paused/alpha, beta: ./replace-paused/beta}
+  remove: {alpha: ./remove/alpha, beta: ./remove/beta}
+  remove-paused: {alpha: ./remove-paused/alpha, beta: ./remove-paused/beta}
 `)
 	desired := testSpecifications(t, `
 forward:
@@ -399,11 +411,11 @@ forward:
   replace: {destination: "tcp:127.0.0.1:8002"}
   add: {}
 sync:
-  defaults: {alpha: ./alpha, beta: ./beta, flushOnCreate: true}
-  keep: {}
-  replace: {beta: ./other}
-  replace-paused: {beta: ./other}
-  add: {}
+  defaults: {flushOnCreate: true}
+  keep: {alpha: ./keep/alpha, beta: ./keep/beta}
+  replace: {alpha: ./replace/alpha, beta: ./replace/other}
+  replace-paused: {alpha: ./replace-paused/alpha, beta: ./replace-paused/other}
+  add: {alpha: ./add/alpha, beta: ./add/beta}
 `)
 	forwardingStates, synchronizationStates := testSessionStates(current)
 	for _, state := range synchronizationStates {
@@ -505,6 +517,290 @@ sync:
 		if strings.Join(operations.operations, "\n") != strings.Join(test.operations, "\n") {
 			t.Errorf("unexpected operations:\n%s", strings.Join(operations.operations, "\n"))
 		}
+	}
+}
+
+// testApply computes a plan that reconciles the sessions created from a
+// current project configuration with a desired one and applies it using
+// operations. If prepare is non-nil, then it can modify the states of the
+// current synchronization sessions first. Relative paths are resolved against
+// the current directory.
+func testApply(t *testing.T, current, desired string, prepare func([]*synchronization.State), operations *testSessionOperations) error {
+	t.Helper()
+	_, states := testSessionStates(testSpecifications(t, current))
+	if prepare != nil {
+		prepare(states)
+	}
+	plan, err := NewPlan(testSpecifications(t, desired), nil, states)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan.Apply(operations)
+}
+
+// testPause returns a function that pauses the named sessions.
+func testPause(names ...string) func([]*synchronization.State) {
+	return func(states []*synchronization.State) {
+		for _, state := range states {
+			for _, name := range names {
+				if state.Session.Name == name {
+					state.Session.Paused = true
+				}
+			}
+		}
+	}
+}
+
+// testCheckOperations verifies the operations performed.
+func testCheckOperations(t *testing.T, operations *testSessionOperations, expected []string) {
+	t.Helper()
+	if strings.Join(operations.operations, "\n") != strings.Join(expected, "\n") {
+		t.Errorf("unexpected operations:\n%s", strings.Join(operations.operations, "\n"))
+	}
+}
+
+// TestPlanApplyConvergesStar verifies that replacing every edge of a star
+// flushes all of its running edges in two rounds before any session is
+// terminated, since they all share the center, and that paused edges aren't
+// flushed.
+func TestPlanApplyConvergesStar(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const star = `
+star:
+  center: local
+  sync: {ignore: {paths: [%s]}}
+  nodes:
+    local: {endpoint: ./local}
+    server: {endpoint: ./server}
+    gpu: {endpoint: ./gpu}
+    offline: {endpoint: ./offline}
+`
+	operations := &testSessionOperations{}
+	if err := testApply(t, fmt.Sprintf(star, "old"), fmt.Sprintf(star, "new"), testPause("star-offline"), operations); err != nil {
+		t.Fatal(err)
+	}
+	testCheckOperations(t, operations, []string{
+		"flush synchronization sync-star-gpu",
+		"flush synchronization sync-star-server",
+		"flush synchronization sync-star-gpu",
+		"flush synchronization sync-star-server",
+		"terminate synchronization sync-star-gpu,sync-star-offline,sync-star-server",
+		"create synchronization star-gpu paused=false",
+		"create synchronization star-offline paused=true",
+		"create synchronization star-server paused=false",
+	})
+}
+
+// TestPlanApplyConvergesChain verifies that replacing a chain of three
+// sessions, each sharing a workspace with the next, flushes them in three
+// rounds, and that the flush order is deterministic, i.e. independent of the
+// order of the sessions' states.
+func TestPlanApplyConvergesChain(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const chain = `
+sync:
+  defaults: {maxEntryCount: %d}
+  c: {alpha: ./w2, beta: ./w3}
+  a: {alpha: ./w0, beta: ./w1}
+  b: {alpha: ./w1, beta: ./w2}
+`
+	for _, prepare := range []func([]*synchronization.State){
+		nil,
+		func(states []*synchronization.State) {
+			for i, j := 0, len(states)-1; i < j; i, j = i+1, j-1 {
+				states[i], states[j] = states[j], states[i]
+			}
+		},
+		func(states []*synchronization.State) {
+			states[0], states[1] = states[1], states[0]
+		},
+	} {
+		operations := &testSessionOperations{}
+		if err := testApply(t, fmt.Sprintf(chain, 100), fmt.Sprintf(chain, 200), prepare, operations); err != nil {
+			t.Fatal(err)
+		}
+		testCheckOperations(t, operations, []string{
+			"flush synchronization sync-a",
+			"flush synchronization sync-b",
+			"flush synchronization sync-c",
+			"flush synchronization sync-a",
+			"flush synchronization sync-b",
+			"flush synchronization sync-c",
+			"flush synchronization sync-a",
+			"flush synchronization sync-b",
+			"flush synchronization sync-c",
+			"terminate synchronization sync-a,sync-b,sync-c",
+			"create synchronization a paused=false",
+			"create synchronization b paused=false",
+			"create synchronization c paused=false",
+		})
+	}
+}
+
+// TestPlanApplyIsolatedSession verifies that a replaced session that shares no
+// workspace with another session is flushed once, and that running retained
+// sessions that don't share its workspaces aren't flushed, even if they share
+// workspaces with each other.
+func TestPlanApplyIsolatedSession(t *testing.T) {
+	t.Chdir(t.TempDir())
+	operations := &testSessionOperations{}
+	if err := testApply(t, `
+sync:
+  replace: {alpha: ./a, beta: ./b}
+  keep-first: {alpha: ./c, beta: ./d}
+  keep-second: {alpha: ./d, beta: ./e}
+`, `
+sync:
+  replace: {alpha: ./a, beta: ./b, maxEntryCount: 100}
+  keep-first: {alpha: ./c, beta: ./d}
+  keep-second: {alpha: ./d, beta: ./e}
+`, nil, operations); err != nil {
+		t.Fatal(err)
+	}
+	testCheckOperations(t, operations, []string{
+		"flush synchronization sync-replace",
+		"terminate synchronization sync-replace",
+		"create synchronization replace paused=false",
+	})
+}
+
+// testRetainedCurrent and testRetainedDesired declare a replaced session that
+// shares a workspace with a retained session, whose endpoint is nested in it.
+const (
+	testRetainedCurrent = `
+sync:
+  keep: {alpha: ./w0, beta: ./w1/sub}
+  replace: {alpha: ./w1, beta: ./w2}
+`
+	testRetainedDesired = `
+sync:
+  keep: {alpha: ./w0, beta: ./w1/sub}
+  replace: {alpha: ./w1, beta: ./w2, maxEntryCount: 100}
+`
+)
+
+// TestPlanApplyConvergesRetainedSessions verifies that a running retained
+// session that shares a workspace with a replaced session, including through
+// nested endpoints, is flushed with it, but never terminated or created.
+func TestPlanApplyConvergesRetainedSessions(t *testing.T) {
+	t.Chdir(t.TempDir())
+	operations := &testSessionOperations{}
+	if err := testApply(t, testRetainedCurrent, testRetainedDesired, nil, operations); err != nil {
+		t.Fatal(err)
+	}
+	testCheckOperations(t, operations, []string{
+		"flush synchronization sync-keep",
+		"flush synchronization sync-replace",
+		"flush synchronization sync-keep",
+		"flush synchronization sync-replace",
+		"terminate synchronization sync-replace",
+		"create synchronization replace paused=false",
+	})
+}
+
+// TestPlanApplyPausedSessions verifies that paused sessions are neither
+// flushed, whether retained or replaced, nor shorten the paths between running
+// sessions: a chain of four running sessions needs four rounds, even though
+// paused sessions close it into a cycle, which would only need three.
+func TestPlanApplyPausedSessions(t *testing.T) {
+	t.Chdir(t.TempDir())
+	operations := &testSessionOperations{}
+	if err := testApply(t, `
+sync:
+  a: {alpha: ./w0, beta: ./w1}
+  b: {alpha: ./w1, beta: ./w2}
+  c: {alpha: ./w2, beta: ./w3}
+  d: {alpha: ./w3, beta: ./w4}
+  shortcut: {alpha: ./w4, beta: ./w0}
+  stale: {alpha: ./w4, beta: ./w0}
+`, `
+sync:
+  a: {alpha: ./w0, beta: ./w1}
+  b: {alpha: ./w1, beta: ./w2}
+  c: {alpha: ./w2, beta: ./w3}
+  d: {alpha: ./w3, beta: ./w4, maxEntryCount: 100}
+  shortcut: {alpha: ./w4, beta: ./w0}
+  stale: {alpha: ./w4, beta: ./w0, maxEntryCount: 100}
+`, testPause("shortcut", "stale"), operations); err != nil {
+		t.Fatal(err)
+	}
+	var expected []string
+	for range 4 {
+		for _, name := range []string{"a", "b", "c", "d"} {
+			expected = append(expected, "flush synchronization sync-"+name)
+		}
+	}
+	testCheckOperations(t, operations, append(expected,
+		"terminate synchronization sync-d,sync-stale",
+		"create synchronization d paused=false",
+		"create synchronization stale paused=true",
+	))
+
+	// A replaced session whose workspaces only paused sessions share is
+	// flushed once.
+	operations = &testSessionOperations{}
+	if err := testApply(t, testRetainedCurrent, testRetainedDesired, testPause("keep"), operations); err != nil {
+		t.Fatal(err)
+	}
+	testCheckOperations(t, operations, []string{
+		"flush synchronization sync-replace",
+		"terminate synchronization sync-replace",
+		"create synchronization replace paused=false",
+	})
+}
+
+// TestPlanApplyFlushFailureInLaterRound verifies that if a flush fails in a
+// later round, then no session is terminated or created, and that the error
+// identifies the session, whether it will be replaced or retained, wraps the
+// cause, and explains how to proceed.
+func TestPlanApplyFlushFailureInLaterRound(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, test := range []struct {
+		// failing is the identifier of the session whose second flush fails.
+		failing string
+		// operations are the expected operations.
+		operations []string
+		// message is the expected error message.
+		message string
+	}{
+		{
+			"sync-replace",
+			[]string{
+				"flush synchronization sync-keep",
+				"flush synchronization sync-replace",
+				"flush synchronization sync-keep",
+				"flush synchronization sync-replace",
+			},
+			`unable to flush synchronization session "replace" (sync-replace) before replacing it: flush failed; ` +
+				`replacing it now could overwrite its unsynchronized changes, so no sessions were terminated or ` +
+				`created: fix the session and apply again, or terminate it with "mutagen sync terminate sync-replace" ` +
+				`and apply again if its unsynchronized changes don't matter`,
+		},
+		{
+			"sync-keep",
+			[]string{
+				"flush synchronization sync-keep",
+				"flush synchronization sync-replace",
+				"flush synchronization sync-keep",
+			},
+			`unable to flush synchronization session "keep" (sync-keep), which shares workspaces with sessions that ` +
+				`will be replaced or removed: flush failed; replacing or removing them now could let sessions with ` +
+				`fresh history overwrite changes, or restore deleted files, that haven't propagated through it, so no ` +
+				`sessions were terminated or created: fix the session and apply again, or pause it with ` +
+				`"mutagen sync pause sync-keep" and apply again: it keeps its history, so it synchronizes its changes ` +
+				`once resumed`,
+		},
+	} {
+		operations := &testSessionOperations{failFlushAt: map[string]int{test.failing: 2}}
+		err := testApply(t, testRetainedCurrent, testRetainedDesired, nil, operations)
+		if err == nil {
+			t.Fatal("flush failure was not reported")
+		} else if err.Error() != test.message {
+			t.Error("unexpected flush failure message:", err)
+		} else if !errors.Is(err, errTestFlush) {
+			t.Error("flush failure does not wrap its cause")
+		}
+		testCheckOperations(t, operations, test.operations)
 	}
 }
 

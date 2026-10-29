@@ -56,17 +56,29 @@ synchronized state, they can't tell which endpoint changed a file:
 
 To protect changes that haven't been synchronized, `apply` flushes the running
 synchronization sessions that it replaces or removes before terminating any
-session. If a flush fails, nothing is terminated or created: fix the session and
+session, together with the running sessions that share their workspaces,
+including retained ones, repeatedly, until changes have propagated across them.
+A flush only makes its own session's endpoints agree, so a change that a later
+flush brings into a shared workspace, such as a star's center, takes another
+round to reach the other endpoints of sessions flushed before; otherwise, the
+new sessions would copy back files whose deletion hadn't reached every
+workspace. Sessions share a workspace if their endpoints are equal or nested on
+the same configured host (aliases and remote symbolic links aren't recognized).
+A group of sessions connected this way is flushed in D+1 rounds, where D is the
+largest number of steps between two of them: two rounds for a star and k rounds
+for a chain of k sessions, while a session that shares no workspace is flushed
+once. If a flush fails, nothing is terminated or created: fix the session and
 apply again, or, if its unsynchronized changes don't matter, terminate it with
-`mutagen sync terminate` and apply again. Changes that a flush leaves
-unsynchronized, such as those blocked by problems, aren't protected, and neither
-are changes made while `apply` runs, so stop processes that modify synchronized
-files before replacing or renaming their sessions. Paused sessions are neither
-flushed nor resumed, so changes made since a session was paused may be
-overwritten (`two-way-resolved`, `one-way-replica`) or become conflicts
-(`two-way-safe`, `one-way-safe`) once its replacement is resumed or a session
-created under a new name synchronizes them. The plan notes such sessions; resume
-them before applying to synchronize their changes first.
+`mutagen sync terminate` and apply again. A retained session can instead be
+paused with `mutagen sync pause`, since it keeps its history. Changes that a
+flush leaves unsynchronized, such as those blocked by problems, aren't
+protected, and neither are changes made while `apply` runs, so stop processes
+that modify synchronized files before replacing or renaming their sessions.
+Paused sessions are neither flushed nor resumed, so changes made since a session
+was paused may be overwritten (`two-way-resolved`, `one-way-replica`) or become
+conflicts (`two-way-safe`, `one-way-safe`) once its replacement is resumed or a
+session created under a new name synchronizes them. The plan notes such
+sessions; resume them before applying to synchronize their changes first.
 
 Use `-f path/to/project.yml` for another project file. Relative endpoint paths
 are resolved against its directory. Global configuration is included unless
@@ -234,6 +246,10 @@ contain it. To migrate a tree to a star:
 - Apply the project. `mutagen project apply` removes the former `tree-<node>`
   sessions, flushing running ones first, and creates `star-<node>` sessions,
   which start with fresh synchronization history.
+- The migration relies on `apply` flushing the tree's sessions together,
+  repeatedly, until changes such as deletions have reached every node (see
+  [Applying project configuration](#applying-project-configuration)). Paused
+  sessions aren't flushed, so resume paused `tree-<node>` sessions first.
 - Commands between two nodes other than the center no longer exist; run them
   from the center.
 - Star commands follow pair semantics: conflicts produce warnings instead of
