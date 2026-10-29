@@ -423,9 +423,10 @@ type Selection struct {
 	// Ignores), since the session doesn't synchronize the corresponding
 	// directory. The ignores are those of the edge that carries the operation,
 	// which, at a star's center, may only be known once the daemon resolves
-	// the destination, before the operation reads or writes any file. Such a directory is typically the root of a nested session
-	// that isn't connected for remote commands on this system, and through
-	// which the submission would otherwise have been made.
+	// the destination, before the operation reads or writes any file. Such a
+	// directory is typically the root of a nested session that isn't connected
+	// for remote commands on this system, and through which the submission
+	// would otherwise have been made.
 	Corresponding bool
 	// Target, if non-nil, restricts the selection to the local registration
 	// that its SourceSession and SourceAlpha identify, which was typically
