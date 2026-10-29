@@ -84,15 +84,16 @@ not conflict-free.
     session, and behaves as for a pair: commands, scripts, detached jobs,
     --flush, --no-flush, --pull, --diff, --ignores, and conflicts (see
     --help sync and --help conflicts). Conflicts produce warnings rather than
-    preventing commands.
+    preventing commands. Pausing, replacing, removing, or adding other nodes
+    doesn't affect an operation.
   - Each non-center node's mode configures its own edge. One-way modes flow
     from the center to the node, so the node's changes, including files that
     commands write there, don't reach the center.
   - If a star's edges disagree on the center's endpoint, such as after a
-    partial mutagen project apply, --nodes reports the star problem, and
+    partial mutagen project apply, --nodes reports the star problem, and new
     operations from the center fail with 125 until the project is applied
-    again. Other nodes keep using their own edges. A terminated edge only
-    removes its node.
+    again. Operations in progress and other nodes keep using their own
+    edges. A terminated edge only removes its node.
   - Execution uses the target's remotePrologue or workspace override.
     MUTAGEN_REMOTE_NODE identifies the target and overrides submitted values.
     Use it in shared scripts: the center is alpha on every edge.

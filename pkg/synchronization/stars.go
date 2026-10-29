@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/mutagen-io/mutagen/pkg/remote"
@@ -74,15 +73,13 @@ func (s *commandStars) membersLocked(identifier string) []*Session {
 	return members
 }
 
-// nodeRevision pins immutable session identities. Replacing, adding, or
-// removing an edge changes the revision.
-func nodeRevision(sessions []*Session) string {
-	ids := make([]string, len(sessions))
-	for i, session := range sessions {
-		ids[i] = session.Identifier
-	}
-	sort.Strings(ids)
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(ids, "\n"))))
+// edgeRevision pins the immutable identity of the edge that carries an
+// operation, identified by its session, so that the operation's later
+// submissions fail if that edge is replaced or removed, while changes to other
+// edges, such as adding, pausing, replacing, or removing other nodes, don't
+// affect them.
+func edgeRevision(session string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(session)))
 }
 
 // synchronizationModeName names a session's effective synchronization mode.
@@ -145,7 +142,7 @@ func (s *commandStars) nodes(source *commandRelay, index int) (*remote.NodeGraph
 // the source's relay is connected to it. The index lock must be held.
 func pairNodesLocked(source *commandRelay, index int) *remote.NodeGraph {
 	session := source.controller.session
-	graph := &remote.NodeGraph{Source: endpointName(index), Revision: nodeRevision([]*Session{session})}
+	graph := &remote.NodeGraph{Source: endpointName(index)}
 	for i, endpoint := range []*url.URL{session.Alpha, session.Beta} {
 		host, root := commandExecutionLocation(endpoint)
 		node := remote.Node{Name: endpointName(i), Host: host, Root: root, Path: []string{graph.Source}, Current: i == index, Available: i == index}
@@ -171,7 +168,7 @@ func (s *commandStars) starNodesLocked(source *commandRelay, index int) *remote.
 	members := s.membersLocked(session.Star.Identifier)
 	_, edges, problem := starTopology(members)
 	from := session.Star.node(index)
-	graph := &remote.NodeGraph{Source: from, Star: true, Revision: nodeRevision(members)}
+	graph := &remote.NodeGraph{Source: from, Star: true}
 	if problem != nil {
 		graph.Problem = problem.Error()
 	}
@@ -225,15 +222,15 @@ func (s *commandStars) starHasNode(identifier, name string) bool {
 // resolveSubmission selects the destination of an operation, which is always
 // the opposite endpoint of a single edge, along with the relay of that edge.
 // The source is identified by the submitting endpoint, never by client input.
-// A submission at a star's center is redirected to the selected node's edge;
-// all other submissions use their own edge.
+// A submission at a star's center normally enters through the selected node's
+// own edge (see remote.Selection.Workspace), and is otherwise redirected to
+// it; all other submissions use their own edge. A pinned revision only refers
+// to the selected edge, so that changes to other edges don't fail later
+// submissions of an operation.
 func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) (*commandRelay, int, *remote.ResolvedRoute, error) {
 	graph, err := r.stars.nodes(r, source)
 	if err != nil {
 		return nil, 0, nil, err
-	}
-	if header.Revision != "" && header.Revision != graph.Revision {
-		return nil, 0, nil, errNodeGraphChanged
 	}
 	name := header.Node
 	if name == "" {
@@ -253,6 +250,10 @@ func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) 
 			break
 		}
 	}
+	pinned := header.Revision != ""
+	if pinned && (selected == nil || selected.Current || edgeRevision(selected.Session) != header.Revision) {
+		return nil, 0, nil, errNodeGraphChanged
+	}
 	star := r.controller.session.Star
 	if selected == nil {
 		if star != nil && r.stars.starHasNode(star.Identifier, name) {
@@ -261,10 +262,20 @@ func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) 
 		return nil, 0, nil, fmt.Errorf("unknown node %q; use --nodes to list configured nodes", name)
 	} else if selected.Current {
 		return nil, 0, nil, errors.New("target is the current node; run the command locally")
-	} else if star != nil && source == 0 && graph.Problem != "" {
+	} else if star != nil && source == 0 && graph.Problem != "" && !pinned {
 		return nil, 0, nil, fmt.Errorf("operations from the center node %s are unavailable until the star is repaired, such as by applying the project again: %s", star.Center, graph.Problem)
-	} else if !selected.Available {
-		return nil, 0, nil, remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, selected.Reason))
+	}
+	// An operation that selected its edge before a star problem arose keeps
+	// using that edge, which the problem doesn't change, subject only to the
+	// edge's connection: other edges never affect it.
+	available, reason := selected.Available, selected.Reason
+	if !available && pinned && graph.Problem != "" {
+		r.stars.Lock()
+		available, reason = connectedLocked(r.stars.relays[selected.Session], 1), unavailableReason
+		r.stars.Unlock()
+	}
+	if !available {
+		return nil, 0, nil, remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, reason))
 	}
 	relay := r
 	if selected.Session != r.controller.session.Identifier {
@@ -284,7 +295,8 @@ func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) 
 	if configuration == nil {
 		configuration = relay.controller.session.Configuration
 	}
-	header.Node, header.Revision = name, graph.Revision
+	revision := edgeRevision(selected.Session)
+	header.Node, header.Revision = name, revision
 	return relay, target, &remote.ResolvedRoute{
 		Ignores:    EffectiveIgnores(configuration, relay.controller.session.Version),
 		Session:    selected.Session,
@@ -292,6 +304,6 @@ func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) 
 		SourceNode: graph.Source,
 		Node:       name,
 		Star:       graph.Star,
-		Revision:   graph.Revision,
+		Revision:   revision,
 	}, nil
 }

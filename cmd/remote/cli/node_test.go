@@ -12,7 +12,7 @@ import (
 
 // replyTestNodes adds discovery to the pair relays used by CLI tests.
 func replyTestNodes(connection io.ReadWriteCloser, session, alpha, beta string) {
-	remote.RespondWithNodes(connection, &remote.NodeGraph{Source: "alpha", Revision: session, Nodes: []remote.Node{
+	remote.RespondWithNodes(connection, &remote.NodeGraph{Source: "alpha", Nodes: []remote.Node{
 		{Name: "alpha", Root: alpha, Current: true, Available: true, Path: []string{"alpha"}},
 		{Name: "beta", Root: beta, Available: true, Mode: "two-way-safe", Path: []string{"alpha", "beta"}, Session: session, Alpha: true},
 	}}, nil)

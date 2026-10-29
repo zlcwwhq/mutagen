@@ -14,6 +14,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/mutagen-io/mutagen/cmd/remote/cli"
 	"github.com/mutagen-io/mutagen/pkg/integration/protocols/netpipe"
 	"github.com/mutagen-io/mutagen/pkg/project"
 	"github.com/mutagen-io/mutagen/pkg/remote"
@@ -123,34 +124,38 @@ func newStarFixture(t *testing.T, local ...bool) *starFixture {
 	return f
 }
 
+// available reports whether a node, identified by its workspace's directory,
+// reports the expected nodes as available, without changing the current
+// directory.
+func (f *starFixture) available(directory, from string, expected ...string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	connection, _, err := (&remote.Selection{Workspace: true}).Submit(ctx, directory, &remote.Submission{Operation: remote.OperationNodes})
+	if err != nil {
+		return false
+	}
+	graph, err := remote.ListNodes(ctx, connection)
+	if err != nil || graph.Source != from {
+		return false
+	}
+	for _, name := range expected {
+		found := false
+		for _, node := range graph.Nodes {
+			found = found || node.Name == name && node.Available
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 // ready waits until the center reports the connected nodes as available and
 // each connected node reports the center as available.
 func (f *starFixture) ready(t *testing.T) {
 	t.Helper()
-	available := func(from string, expected ...string) bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		connection, _, err := (&remote.Selection{Workspace: true}).Submit(ctx, f.roots[from], &remote.Submission{Operation: remote.OperationNodes})
-		if err != nil {
-			return false
-		}
-		graph, err := remote.ListNodes(ctx, connection)
-		if err != nil || graph.Source != from {
-			return false
-		}
-		for _, name := range expected {
-			found := false
-			for _, node := range graph.Nodes {
-				found = found || node.Name == name && node.Available
-			}
-			if !found {
-				return false
-			}
-		}
-		return true
-	}
 	deadline := time.Now().Add(15 * time.Second)
-	for !available("local", "server", "gpu") || !available("server", "local") || !available("gpu", "local") {
+	for !f.available(f.roots["local"], "local", "server", "gpu") || !f.available(f.roots["server"], "server", "local") || !f.available(f.roots["gpu"], "gpu", "local") {
 		if time.Now().After(deadline) {
 			t.Fatal("star command channels did not connect")
 		}
@@ -487,6 +492,118 @@ func TestStarApplyEquivalentCenter(t *testing.T) {
 	repeated.Print(&description)
 	if strings.TrimSpace(description.String()) != "Unchanged sessions: 4" {
 		t.Fatal("reapply changed the reconciled star:", description.String())
+	}
+}
+
+// TestStarIndependentEdges verifies that a running command on one node doesn't
+// depend on any other edge: it enters through its own edge at the center, even
+// if another edge registered the center more recently, and the edge alone is
+// pinned for its later submissions, so that pausing, terminating, or adding
+// other nodes while it runs doesn't affect it or its post-command flush.
+func TestStarIndependentEdges(t *testing.T) {
+	f := newStarFixture(t)
+	ctx := context.Background()
+	_, states, err := f.manager.List(ctx, &selection.Selection{Specifications: []string{f.sessions["star-server"]}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := states[0].Session
+	edge := func(node string) *selection.Selection {
+		return &selection.Selection{Specifications: []string{f.sessions["star-"+node]}}
+	}
+	t.Chdir(f.roots["local"])
+	for i, step := range []struct {
+		node, other string
+		terminate   bool
+	}{{"gpu", "server", false}, {"server", "gpu", true}} {
+		// Reconnect the other edge first, so that its registration of the
+		// center is the most recent, which a submission must not prefer.
+		if err := f.manager.Pause(ctx, edge(step.other), ""); err != nil {
+			t.Fatal(err)
+		} else if err := f.manager.Resume(ctx, edge(step.other), ""); err != nil {
+			t.Fatal(err)
+		}
+		f.ready(t)
+
+		// Start a command on the node that runs until it's released. The
+		// server's output is synchronized back, which its post-command flush
+		// must still do.
+		script := `: > ignored/started; while [ ! -e ignored/release ]; do sleep 0.05; done; printf done`
+		if step.node == "server" {
+			script += `; printf done > result`
+		}
+		type result struct {
+			code               int
+			output, diagnostic string
+		}
+		done := make(chan result, 1)
+		go func() {
+			var output, errorOutput strings.Builder
+			code := cli.Run([]string{"--node", step.node, "--timeout", "60", "sh", "-c", script}, strings.NewReader(""), &output, &errorOutput)
+			done <- result{code, output.String(), errorOutput.String()}
+		}()
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			if _, err := os.Stat(filepath.Join(f.roots[step.node], "ignored", "started")); err == nil {
+				break
+			}
+			select {
+			case r := <-done:
+				t.Fatalf("command on %s ended early: %d %q %s", step.node, r.code, r.output, r.diagnostic)
+			default:
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("command on %s didn't start", step.node)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// Pause or terminate the other node's edge, and add a node.
+		if step.terminate {
+			err = f.manager.Terminate(ctx, edge(step.other), "")
+		} else {
+			err = f.manager.Pause(ctx, edge(step.other), "")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		star := proto.Clone(template.Star).(*synchronization.StarMembership)
+		star.Node = fmt.Sprintf("extra%d", i)
+		extra := filepath.Join(f.base, star.Node)
+		if err := os.Mkdir(extra, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.manager.Create(ctx, template.Alpha, &url.URL{Kind: url.Kind_Synchronization, Path: extra},
+			template.Configuration, template.ConfigurationAlpha, template.ConfigurationBeta, "star-"+star.Node, template.Labels, star, false, ""); err != nil {
+			t.Fatal(err)
+		}
+		deadline = time.Now().Add(15 * time.Second)
+		for !f.available(f.roots["local"], "local", star.Node) {
+			if time.Now().After(deadline) {
+				t.Fatal("added node didn't connect")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// Release the command, which must complete and synchronize back.
+		if err := os.WriteFile(filepath.Join(f.roots[step.node], "ignored", "release"), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case r := <-done:
+			if r.code != 0 || r.output != "done" || r.diagnostic != "" {
+				t.Fatalf("command on %s affected by changes to other edges: %d %q %s", step.node, r.code, r.output, r.diagnostic)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("command on %s didn't complete", step.node)
+		}
+		if step.node == "server" {
+			if contents, err := os.ReadFile(filepath.Join(f.roots["local"], "result")); err != nil || string(contents) != "done" {
+				t.Fatalf("post-command flush didn't synchronize the result: %q %v", contents, err)
+			}
+		} else if err := f.manager.Resume(ctx, edge(step.other), ""); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

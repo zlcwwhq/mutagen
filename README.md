@@ -185,7 +185,9 @@ session, and follows the same rules as for a pair (see below): the edge is
 flushed before and after commands, conflicts produce warnings rather than
 preventing commands, and detached jobs, `--no-flush`, `--flush`, `--pull`,
 `--diff`, `--ignores`, and conflict resolution work as they do for pairs.
-Commands use the corresponding relative directory; `--cwd` overrides it.
+An operation depends only on its own edge: pausing, replacing, removing, or
+adding other nodes doesn't affect it. Commands use the corresponding relative
+directory; `--cwd` overrides it.
 `MUTAGEN_REMOTE_NODE` identifies the executing node; use it in prologues shared
 by several nodes instead of `MUTAGEN_REMOTE_ENDPOINT`, since the center is alpha
 on every edge and every other node is beta.
@@ -198,12 +200,13 @@ availability. `--nodes --json` provides machine-readable output. Discovery
 neither synchronizes files nor executes commands; available doesn't imply
 conflict-free. Terminating an edge only removes its node. If the star's sessions
 disagree on the center's endpoint, such as after a partial `mutagen project
-apply`, `remote --nodes` reports the star problem, and operations from the
-center fail with status 125 until the project is applied again, while other
-nodes keep using their own edges. `remote --conflicts --json` reports an
-`edges` array with a single entry, which names the edge's `alpha` and `beta`
-nodes and the listing's `source` and `target`, and contains the `listing`.
-`remote --help nodes` summarizes target selection.
+apply`, `remote --nodes` reports the star problem, and new operations from the
+center fail with status 125 until the project is applied again, while
+operations already in progress and other nodes keep using their own edges.
+`remote --conflicts --json` reports an `edges` array with a single entry,
+which names the edge's `alpha` and `beta` nodes and the listing's `source` and
+`target`, and contains the `listing`. `remote --help nodes` summarizes target
+selection.
 
 Earlier releases declared workspace trees under `tree:`, which is no longer
 accepted: `mutagen project start` and `apply` refuse project files that

@@ -451,14 +451,73 @@ func TestStarResolution(t *testing.T) {
 		t.Fatalf("single destination not selected: %+v %v", route, err)
 	}
 
-	// A selection pins the membership that it was based on.
+}
+
+// TestStarEdgeRevision verifies that a selection pins only the selected edge,
+// so that adding, pausing, replacing, or removing other nodes doesn't fail an
+// operation's later submissions, while replacing or removing the selected
+// edge does.
+func TestStarEdgeRevision(t *testing.T) {
+	gpu, server := starTestEdge("gpu"), starTestEdge("server")
+	stars, relays := starTestRegistry([]*Session{gpu, server}, "gpu", "server")
 	header := &remote.Submission{Operation: remote.OperationFlush, Node: "server", Resolve: true}
-	if _, _, route, err := relays["gpu"].resolveSubmission(0, header); err != nil || header.Revision == "" || header.Revision != route.Revision {
-		t.Fatalf("revision not pinned: %+v %v", header, err)
+	_, _, route, err := relays["server"].resolveSubmission(0, header)
+	if err != nil || header.Revision != edgeRevision("server") || route.Revision != header.Revision {
+		t.Fatalf("selected edge not pinned: %+v %+v %v", header, route, err)
 	}
+	pinned := func(through string) error {
+		_, _, _, err := relays[through].resolveSubmission(0, &remote.Submission{Operation: remote.OperationFlush, Node: "server", Resolve: true, Revision: header.Revision})
+		return err
+	}
+
+	// Changes to other edges don't affect the pinned edge.
+	stars.update(&controller{session: starTestEdge("extra")}, false)
+	if err := pinned("server"); err != nil {
+		t.Fatal("added node failed a pinned submission:", err)
+	}
+	gpuController := relays["gpu"].controller
+	stars.setRelay(gpuController, nil)
+	if err := pinned("server"); err != nil {
+		t.Fatal("paused node failed a pinned submission:", err)
+	}
+	replacement := starTestEdge("gpu")
+	replacement.Identifier = "gpu-replacement"
+	stars.update(gpuController, true)
+	stars.update(&controller{session: replacement}, false)
+	if err := pinned("server"); err != nil {
+		t.Fatal("replaced node failed a pinned submission:", err)
+	}
+	stars.update(&controller{session: replacement}, true)
+	if err := pinned("server"); err != nil {
+		t.Fatal("removed node failed a pinned submission:", err)
+	}
+
+	// Replacing or removing the selected edge fails pinned submissions, even
+	// those that enter through another edge at the center.
+	stars, relays = starTestRegistry([]*Session{gpu, server}, "gpu", "server")
 	header.Revision = "stale"
-	if _, _, _, err := relays["gpu"].resolveSubmission(0, header); !errors.Is(err, errNodeGraphChanged) {
+	if _, _, _, err := relays["server"].resolveSubmission(0, header); !errors.Is(err, errNodeGraphChanged) {
 		t.Fatal("stale revision accepted:", err)
+	}
+	replacement = starTestEdge("server")
+	replacement.Identifier = "server-replacement"
+	stars.update(relays["server"].controller, true)
+	stars.update(&controller{session: replacement}, false)
+	if err := pinned("gpu"); !errors.Is(err, errNodeGraphChanged) {
+		t.Fatal("replaced edge accepted under its old revision:", err)
+	}
+	stars.update(&controller{session: replacement}, true)
+	if err := pinned("gpu"); !errors.Is(err, errNodeGraphChanged) {
+		t.Fatal("removed edge accepted under its old revision:", err)
+	}
+
+	// A pair pins its own session.
+	pair := starTestEdge("pair")
+	pair.Star, pair.Labels = nil, nil
+	_, relays = starTestRegistry([]*Session{pair}, "pair")
+	header = &remote.Submission{Operation: remote.OperationFlush, Resolve: true}
+	if _, _, route, err := relays["pair"].resolveSubmission(1, header); err != nil || route.Revision != edgeRevision("pair") {
+		t.Fatalf("pair not pinned: %+v %v", route, err)
 	}
 }
 
@@ -473,6 +532,10 @@ func TestStarResolutionProblems(t *testing.T) {
 		t.Fatal("unavailable node not reported as a connection failure:", err)
 	}
 
+	pinned := &remote.Submission{Node: "gpu", Resolve: true}
+	if _, _, _, err := relays["gpu"].resolveSubmission(0, pinned); err != nil {
+		t.Fatal(err)
+	}
 	server.Alpha = &url.URL{Protocol: url.Protocol_SSH, Host: "center", Path: "~/elsewhere"}
 	graph, err := stars.nodes(relays["gpu"], 0)
 	if err != nil {
@@ -485,6 +548,16 @@ func TestStarResolutionProblems(t *testing.T) {
 	if _, _, _, err := relays["gpu"].resolveSubmission(0, &remote.Submission{Node: "gpu", Resolve: true}); err == nil ||
 		remote.ClassifyError(err) != remote.ErrorKindOperation || !strings.Contains(err.Error(), "until the star is repaired") {
 		t.Fatal("star problem didn't refuse an operation from the center:", err)
+	}
+
+	// An operation that selected its edge before the problem keeps using it,
+	// subject to its connection.
+	if relay, _, route, err := relays["gpu"].resolveSubmission(0, pinned); err != nil || relay != relays["gpu"] || route.Node != "gpu" {
+		t.Fatalf("star problem refused a pinned operation: %+v %v", route, err)
+	}
+	close(relays["gpu"].channels[1].(*starTestChannel).done)
+	if _, _, _, err := relays["gpu"].resolveSubmission(0, pinned); err == nil || remote.ClassifyError(err) != remote.ErrorKindConnection {
+		t.Fatal("disconnected pinned edge accepted:", err)
 	}
 	if graph, err := stars.nodes(relays["gpu"], 1); err != nil || graph.Problem == "" {
 		t.Fatalf("star problem not reported from a node: %+v %v", graph, err)
@@ -501,10 +574,11 @@ func TestStarResolutionProblems(t *testing.T) {
 }
 
 // TestStarRedirectTrackedBySelectedRelay verifies that a route redirected at
-// the center to another edge uses that edge's relay, which tracks it: stopping
-// the relay waits for the route, and once the relay stops admitting routes, a
-// redirect to it is refused as a connection failure rather than using its
-// state. The source registration, not the selected edge, pins the submission.
+// the center to another edge, which happens only when the submission enters
+// through another edge's registration, uses that edge's relay, which tracks
+// it: stopping the relay waits for the route, and once the relay stops
+// admitting routes, a redirect to it is refused as a connection failure rather
+// than using its state. An unresolved target keeps its source registration.
 func TestStarRedirectTrackedBySelectedRelay(t *testing.T) {
 	data, err := os.MkdirTemp("", "ms-")
 	if err != nil {

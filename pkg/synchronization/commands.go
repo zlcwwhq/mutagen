@@ -439,6 +439,15 @@ func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWrit
 		remote.Reject(submission, remote.ConnectionError(fmt.Errorf("unable to reach %s: %w", endpointName(target), err)))
 		return
 	}
+	// Close both streams once the route is cancelled, which terminates the
+	// command. Closing the relay's channels alone doesn't end a route that was
+	// redirected from another edge, whose submission stream belongs to that
+	// edge, while the execution stream waits for the command's output.
+	stop := context.AfterFunc(ctx, func() {
+		submission.Close()
+		execution.Close()
+	})
+	defer stop()
 	remote.Splice(submission, execution)
 }
 
