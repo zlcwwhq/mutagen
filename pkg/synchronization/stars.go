@@ -115,7 +115,29 @@ func connectedLocked(relay *commandRelay, index int) bool {
 }
 
 // unavailableReason explains why a node's edge can't carry operations.
-const unavailableReason = "node is paused, disconnected, or has commands disabled"
+const unavailableReason = "node is paused or disconnected"
+
+// executionDisabledReason explains why a node can't be the target of
+// operations whatever its connection: its session's remote command mode
+// doesn't let the node's endpoint execute commands (see executes).
+const executionDisabledReason = "command execution is disabled there by the session's remote setting"
+
+// executingEndpoints reports whether a session's alpha and beta endpoints
+// execute commands under its remote command mode.
+func executingEndpoints(session *Session) (bool, bool) {
+	mode := session.GetConfiguration().GetRemoteCommandMode()
+	if mode.IsDefault() {
+		mode = session.Version.DefaultRemoteCommandMode()
+	}
+	return mode.Executes()
+}
+
+// executes reports whether the endpoint of a session with the specified index
+// executes commands under its remote command mode.
+func executes(session *Session, index int) bool {
+	alpha, beta := executingEndpoints(session)
+	return index == 0 && alpha || index == 1 && beta
+}
 
 // centerUnavailableReason explains why a node can't be reached from a star's
 // center although its edge may run: the edge's command channel at the center,
@@ -124,13 +146,16 @@ const unavailableReason = "node is paused, disconnected, or has commands disable
 // it entered through another edge (see resolveSubmission).
 const centerUnavailableReason = "its edge isn't connected for remote commands at the center (it may be paused, terminated, or reconnecting), so retry once it reconnects"
 
-// starEdgeAvailableLocked reports whether a star's edge can carry operations
-// from the center, and otherwise explains why not. Both of the edge's command
-// channels must be connected: the channel at the center registers the center's
-// workspace, through which operations on the node are submitted, and the
-// channel at the node executes them. The index lock must be held.
-func starEdgeAvailableLocked(relay *commandRelay) (bool, string) {
-	if !connectedLocked(relay, 1) {
+// starEdgeAvailableLocked reports whether a star's edge, run by the specified
+// relay, if any, can carry operations from the center, and otherwise explains
+// why not. The node must execute commands, and both of the edge's command
+// channels must be connected: the channel at the center registers the
+// center's workspace, through which operations on the node are submitted, and
+// the channel at the node executes them. The index lock must be held.
+func starEdgeAvailableLocked(edge *Session, relay *commandRelay) (bool, string) {
+	if !executes(edge, 1) {
+		return false, executionDisabledReason
+	} else if !connectedLocked(relay, 1) {
 		return false, unavailableReason
 	} else if !connectedLocked(relay, 0) {
 		return false, centerUnavailableReason
@@ -160,8 +185,9 @@ func (s *commandStars) nodes(source *commandRelay, index int) (*remote.NodeGraph
 	return s.starNodesLocked(source, index), nil
 }
 
-// pairNodesLocked describes an implicit pair, whose peer is available while
-// the source's relay is connected to it. The index lock must be held.
+// pairNodesLocked describes an implicit pair, whose peer is available while it
+// executes commands and the source's relay is connected to it. The index lock
+// must be held.
 func pairNodesLocked(source *commandRelay, index int) *remote.NodeGraph {
 	session := source.controller.session
 	graph := &remote.NodeGraph{Source: endpointName(index)}
@@ -172,8 +198,10 @@ func pairNodesLocked(source *commandRelay, index int) *remote.NodeGraph {
 			node.Path = append(node.Path, node.Name)
 			node.Mode = synchronizationModeName(session)
 			node.Session, node.Alpha = session.Identifier, index == 0
-			if node.Available = connectedLocked(source, i); !node.Available {
-				node.Reason = "node is disconnected or command execution is disabled"
+			if !executes(session, i) {
+				node.Reason = executionDisabledReason
+			} else if node.Available = connectedLocked(source, i); !node.Available {
+				node.Reason = "node is disconnected"
 			}
 		}
 		graph.Nodes = append(graph.Nodes, node)
@@ -182,10 +210,12 @@ func pairNodesLocked(source *commandRelay, index int) *remote.NodeGraph {
 }
 
 // starNodesLocked describes a star from one of its nodes. The center lists
-// every node, each over its own edge, which is available while it's connected
-// at both ends (see starEdgeAvailableLocked), while any other node lists
-// itself and the center, over its own edge. A star problem makes every node
-// unavailable from the center, whose identity is then ambiguous.
+// every node, each over its own edge, which is available while the node
+// executes commands and the edge is connected at both ends (see
+// starEdgeAvailableLocked), while any other node lists itself and the center,
+// over its own edge, which is available while the center executes commands
+// and is connected. A star problem makes every node unavailable from the
+// center, whose identity is then ambiguous.
 func (s *commandStars) starNodesLocked(source *commandRelay, index int) *remote.NodeGraph {
 	session := source.controller.session
 	members := s.membersLocked(session.Star.Identifier)
@@ -205,7 +235,9 @@ func (s *commandStars) starNodesLocked(source *commandRelay, index int) *remote.
 				node.Path = append(node.Path, name)
 				node.Mode = synchronizationModeName(session)
 				node.Session = session.Identifier
-				if node.Available = connectedLocked(source, 0); !node.Available {
+				if !executes(session, 0) {
+					node.Reason = executionDisabledReason
+				} else if node.Available = connectedLocked(source, 0); !node.Available {
 					node.Reason = unavailableReason
 				}
 			}
@@ -222,7 +254,7 @@ func (s *commandStars) starNodesLocked(source *commandRelay, index int) *remote.
 		if problem != nil {
 			node.Reason = problem.Error()
 		} else {
-			node.Available, node.Reason = starEdgeAvailableLocked(s.relays[edge.Identifier])
+			node.Available, node.Reason = starEdgeAvailableLocked(edge, s.relays[edge.Identifier])
 		}
 		graph.Nodes = append(graph.Nodes, node)
 	}
@@ -300,10 +332,18 @@ func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) 
 	available, reason := selected.Available, selected.Reason
 	if !available && pinned && source == 0 && graph.Problem != "" {
 		r.stars.Lock()
-		available, reason = starEdgeAvailableLocked(r.stars.relays[selected.Session])
+		if edge := r.stars.controllers[selected.Session]; edge != nil {
+			available, reason = starEdgeAvailableLocked(edge.session, r.stars.relays[selected.Session])
+		}
 		r.stars.Unlock()
 	}
-	if !available {
+
+	// A node that doesn't execute commands is refused as an operation error,
+	// as its executor refuses commands, since retrying doesn't help, while
+	// other unavailable nodes are connection failures.
+	if !available && reason == executionDisabledReason {
+		return nil, fmt.Errorf("node %s is unavailable: %s", name, reason)
+	} else if !available {
 		return nil, remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, reason))
 	}
 

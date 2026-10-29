@@ -110,11 +110,7 @@ func endpointName(index int) string {
 // returns a function that stops routing and waits for all channels, routes,
 // and commands to terminate.
 func (c *controller) startCommandRelay(ctx context.Context) func() {
-	mode := c.session.Configuration.RemoteCommandMode
-	if mode.IsDefault() {
-		mode = c.session.Version.DefaultRemoteCommandMode()
-	}
-	alphaExecutes, betaExecutes := mode.Executes()
+	alphaExecutes, betaExecutes := executingEndpoints(c.session)
 	if !alphaExecutes && !betaExecutes {
 		return func() {}
 	}

@@ -57,7 +57,9 @@ workspace can reach, including paused or disconnected ones. It marks the
 current node and a star's center, and shows each node's configured host and
 root and the synchronization mode of the edge to it. This is read-only: it
 neither synchronizes files nor executes commands. Available means that the
-edge to the node is connected at both ends, not that it's conflict-free.
+node executes commands and the edge to it is connected at both ends, not that
+it's conflict-free. Operations on a node whose session's remote setting
+disables execution there fail with 125.
 
   - A project's star names its nodes. Its center is joined to every other
     node by its own synchronization pair, so the center reaches every node,

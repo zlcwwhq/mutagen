@@ -357,7 +357,7 @@ func TestStarNodes(t *testing.T) {
 		if node := starTestNode(t, graph, "server"); !node.Available || node.Mode != "two-way-safe" {
 			t.Fatalf("default mode misreported: %+v", node)
 		}
-		if node := starTestNode(t, graph, "offline"); node.Available || !strings.Contains(node.Reason, "paused, disconnected") {
+		if node := starTestNode(t, graph, "offline"); node.Available || !strings.Contains(node.Reason, "paused or disconnected") {
 			t.Fatalf("offline node misreported: %+v", node)
 		}
 	}
@@ -406,6 +406,70 @@ func TestStarNodes(t *testing.T) {
 		t.Fatalf("pair misreported: %+v", graph)
 	} else if node := starTestNode(t, graph, "alpha"); !node.Available || node.Center || node.Mode != "two-way-safe" || node.Session != "pair" || node.Alpha {
 		t.Fatalf("pair peer misreported: %+v", node)
+	}
+}
+
+// TestStarNodesExecution verifies that a connected node whose endpoint doesn't
+// execute commands under its session's remote command mode is unavailable,
+// with a reason that says so, in a star and in a pair, and that operations on
+// it are refused as operation errors.
+func TestStarNodesExecution(t *testing.T) {
+	disabled := func(node remote.Node) bool {
+		return !node.Available && node.Reason == executionDisabledReason
+	}
+	refused := func(err error) bool {
+		return err != nil && remote.ClassifyError(err) == remote.ErrorKindOperation && strings.Contains(err.Error(), executionDisabledReason)
+	}
+
+	// A star edge on which only the center executes commands.
+	gpu, server := starTestEdge("gpu"), starTestEdge("server")
+	gpu.Configuration.RemoteCommandMode = RemoteCommandMode_RemoteCommandModeAlpha
+	stars, relays := starTestRegistry([]*Session{gpu, server}, "gpu", "server")
+	graph, err := stars.nodes(relays["server"], 0)
+	if err != nil {
+		t.Fatal(err)
+	} else if node := starTestNode(t, graph, "gpu"); !disabled(node) {
+		t.Fatalf("non-executing node misreported from the center: %+v", node)
+	} else if node := starTestNode(t, graph, "server"); !node.Available {
+		t.Fatalf("other node affected: %+v", node)
+	}
+	for _, through := range []string{"gpu", "server"} {
+		if _, err := relays[through].resolveSubmission(0, &remote.Submission{Node: "gpu", Resolve: true}); !refused(err) {
+			t.Fatalf("operation on a non-executing node through %s not refused: %v", through, err)
+		}
+	}
+	if graph, err := stars.nodes(relays["gpu"], 1); err != nil {
+		t.Fatal(err)
+	} else if node := starTestNode(t, graph, "center"); !node.Available {
+		t.Fatalf("executing center misreported: %+v", node)
+	}
+
+	// A star edge on which only the node executes commands.
+	gpu.Configuration.RemoteCommandMode = RemoteCommandMode_RemoteCommandModeBeta
+	if graph, err := stars.nodes(relays["gpu"], 1); err != nil {
+		t.Fatal(err)
+	} else if node := starTestNode(t, graph, "center"); !disabled(node) {
+		t.Fatalf("non-executing center misreported from a node: %+v", node)
+	} else if _, err := relays["gpu"].resolveSubmission(1, &remote.Submission{Resolve: true}); !refused(err) {
+		t.Fatal("operation on a non-executing center not refused:", err)
+	}
+
+	// A pair on which only alpha executes commands.
+	pair := starTestEdge("pair")
+	pair.Star, pair.Labels = nil, nil
+	pair.Configuration.RemoteCommandMode = RemoteCommandMode_RemoteCommandModeAlpha
+	stars, relays = starTestRegistry([]*Session{pair}, "pair")
+	if graph, err := stars.nodes(relays["pair"], 0); err != nil {
+		t.Fatal(err)
+	} else if node := starTestNode(t, graph, "beta"); !disabled(node) {
+		t.Fatalf("non-executing pair peer misreported: %+v", node)
+	} else if _, err := relays["pair"].resolveSubmission(0, &remote.Submission{Resolve: true}); !refused(err) {
+		t.Fatal("operation on a non-executing pair peer not refused:", err)
+	}
+	if graph, err := stars.nodes(relays["pair"], 1); err != nil {
+		t.Fatal(err)
+	} else if node := starTestNode(t, graph, "alpha"); !node.Available {
+		t.Fatalf("executing pair peer misreported: %+v", node)
 	}
 }
 

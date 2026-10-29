@@ -25,7 +25,7 @@ func TestNodeListing(t *testing.T) {
 	graph := &remote.NodeGraph{Source: "local", Star: true, Nodes: []remote.Node{
 		{Name: "gpu", Available: true, Host: "host", Root: "~/project", Mode: "one-way-safe", Path: []string{"local", "gpu"}, Session: "private-handle", Alpha: true},
 		{Name: "local", Center: true, Host: "laptop", Root: "/work", Current: true, Available: true, Path: []string{"local"}},
-		{Name: "offline", Host: "offline", Root: "project", Mode: "two-way-safe", Reason: "node is paused, disconnected, or has commands disabled", Path: []string{"local", "offline"}},
+		{Name: "offline", Host: "offline", Root: "project", Mode: "two-way-safe", Reason: "node is paused or disconnected", Path: []string{"local", "offline"}},
 	}}
 	var output strings.Builder
 	if err := printNodes(graph, true, &output); err != nil {
@@ -69,7 +69,7 @@ func TestNodeListing(t *testing.T) {
 		"Current node: local\n",
 		"  gpu: available; host:~/project; one-way-safe\n",
 		"  local: center; current; laptop:/work\n",
-		"  offline: unavailable: node is paused, disconnected, or has commands disabled; offline:~/project; two-way-safe\n",
+		"  offline: unavailable: node is paused or disconnected; offline:~/project; two-way-safe\n",
 		"report conflicts unless given --no-flush",
 	} {
 		if !strings.Contains(output.String(), expected) {
