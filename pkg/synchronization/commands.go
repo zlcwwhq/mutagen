@@ -57,20 +57,18 @@ var errFlushTerminated = remote.ConnectionError(errors.New("synchronization stop
 // doesn't support conflict resolution.
 var errResolutionUnsupported = errors.New("conflict resolution requires the two-way-safe or one-way-safe synchronization mode")
 
-// errRelayStopping indicates that a submission was redirected to an edge whose
-// relay stopped admitting routes, since its synchronization loop is stopping.
-var errRelayStopping = remote.ConnectionError(errors.New("selected edge stopped synchronizing"))
-
 // commandRelay routes commands submitted on each endpoint's system to the
 // opposite endpoint. Routes always pass through the daemon, so neither endpoint
 // needs connectivity to the other, regardless of where the daemon runs. It also
 // performs flushes requested by submissions.
 type commandRelay struct {
-	// Tree routing shares the daemon's membership registry and pins this
-	// particular synchronization loop for the duration of each invocation.
-	trees      *commandTrees
+	// stars is the daemon's index of sessions and relays, which describes the
+	// nodes that a submission can reach (see resolveSubmission).
+	stars *commandStars
+	// controller is the session's controller.
 	controller *controller
-	ctx        context.Context
+	// ctx is cancelled when the relay stops.
+	ctx context.Context
 	// logger is the relay logger.
 	logger *logging.Logger
 	// flushRequests is the synchronization loop's flush request channel.
@@ -92,41 +90,12 @@ type commandRelay struct {
 	channelsLock sync.Mutex
 	// channels holds the connected alpha and beta channels (or nil).
 	channels [2]remote.Channel
-	// routesLock serializes admission to routes with refuseRoutes, so that no
-	// admission adds to routes concurrently with or after waiting for them.
-	routesLock sync.Mutex
-	// stopping indicates that the relay no longer admits routes. It's guarded
-	// by routesLock.
-	stopping bool
-	// routes tracks the accept loops and routes admitted by admit. A route is
-	// tracked by every relay whose state it uses: the relay that accepted it
-	// and, if it was redirected to another edge, that edge's relay too, so that
-	// once a relay stops, no route uses its state.
+	// routes tracks the accept loops and the routes that they accept, each of
+	// which only uses this relay's state, since operations never cross another
+	// edge than the one through which they were submitted. Accept loops are
+	// added by the channel maintainers, which stop before routes are waited
+	// for, and routes by their accept loops while those are tracked.
 	routes sync.WaitGroup
-}
-
-// admit registers a route or accept loop that uses the relay's state, such as
-// its flush requests, channels, and controller callbacks, so that stopping the
-// relay waits for it. It returns false, admitting nothing, once the relay stops
-// admitting routes (see refuseRoutes). Each admission must be balanced by a
-// call to routes.Done once the route no longer uses the relay's state.
-func (r *commandRelay) admit() bool {
-	r.routesLock.Lock()
-	defer r.routesLock.Unlock()
-	if r.stopping {
-		return false
-	}
-	r.routes.Add(1)
-	return true
-}
-
-// refuseRoutes stops admitting routes. Once it returns, routes can only
-// decrease, so that it's safe to wait for them. Stopping a relay never runs
-// within one of its routes, so the wait never includes the caller itself.
-func (r *commandRelay) refuseRoutes() {
-	r.routesLock.Lock()
-	r.stopping = true
-	r.routesLock.Unlock()
 }
 
 // endpointName returns the name of an endpoint by relay index.
@@ -141,11 +110,7 @@ func endpointName(index int) string {
 // returns a function that stops routing and waits for all channels, routes,
 // and commands to terminate.
 func (c *controller) startCommandRelay(ctx context.Context) func() {
-	mode := c.session.Configuration.RemoteCommandMode
-	if mode.IsDefault() {
-		mode = c.session.Version.DefaultRemoteCommandMode()
-	}
-	alphaExecutes, betaExecutes := mode.Executes()
+	alphaExecutes, betaExecutes := executingEndpoints(c.session)
 	if !alphaExecutes && !betaExecutes {
 		return func() {}
 	}
@@ -195,20 +160,20 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 	// merged configurations specify the same ones.
 	ignores := EffectiveIgnores(c.mergedAlphaConfiguration, c.session.Version)
 	ctx, cancel := context.WithCancel(ctx)
-	relay.trees, relay.controller, relay.ctx = c.trees, c, ctx
-	c.trees.setRelay(c, relay)
+	relay.stars, relay.controller, relay.ctx = c.stars, c, ctx
+	c.stars.setRelay(c, relay)
 	var maintainers sync.WaitGroup
 	urls := [2]*urlpkg.URL{c.session.Alpha, c.session.Beta}
 	for index, url := range urls {
 		executionHost, executionRoot := commandExecutionLocation(urls[1-index])
-		// Tree endpoints are named by their nodes, and the endpoints of other
-		// sessions form an implicit pair graph of alpha and beta.
+		// Star endpoints are named by their nodes, and the endpoints of other
+		// sessions form an implicit pair of nodes named alpha and beta.
 		names := []string{"alpha", "beta"}
-		if c.session.Tree != nil {
-			names = []string{c.session.Tree.Alpha, c.session.Tree.Beta}
+		if c.session.Star != nil {
+			names = []string{c.session.Star.Center, c.session.Star.Node}
 		}
 		endpoint := &remote.Endpoint{
-			Tree:           c.session.GetTree().GetIdentifier(),
+			Star:           c.session.GetStar().GetIdentifier(),
 			Node:           names[index],
 			PeerNode:       names[1-index],
 			Session:        c.session.Identifier,
@@ -230,13 +195,11 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		}()
 	}
 	return func() {
-		// Refuse new routes, including those that other edges' relays redirect
-		// to this one, before cancelling the admitted ones, which observe the
-		// cancellation through the relay's context. The relay's channels close
-		// before the wait, which ends routes spliced to them.
-		relay.refuseRoutes()
+		// Routes observe the cancellation through the relay's context. The
+		// relay's channels close before the wait, which ends routes spliced to
+		// them.
 		cancel()
-		c.trees.setRelay(c, nil)
+		c.stars.setRelay(c, nil)
 		maintainers.Wait()
 		relay.routes.Wait()
 	}
@@ -274,9 +237,8 @@ func (r *commandRelay) maintain(ctx context.Context, index int, url *urlpkg.URL,
 			r.channelsLock.Lock()
 			r.channels[index] = channel
 			r.channelsLock.Unlock()
-			// A relay that stopped admitting routes is also being cancelled,
-			// so it doesn't need to accept submissions.
-			if endpoint.Submit && r.admit() {
+			if endpoint.Submit {
+				r.routes.Add(1)
 				go func() {
 					defer r.routes.Done()
 					r.accept(ctx, index, channel)
@@ -301,18 +263,14 @@ func (r *commandRelay) maintain(ctx context.Context, index int, url *urlpkg.URL,
 }
 
 // accept routes commands submitted through a channel to the opposite endpoint
-// until the channel closes or the relay stops admitting routes. A submission
-// that arrives once the relay is stopping is closed before the handshake,
-// which its submitter reports as a connection failure.
+// until the channel closes.
 func (r *commandRelay) accept(ctx context.Context, index int, channel remote.Channel) {
 	for {
 		submission, err := channel.Accept()
 		if err != nil {
 			return
-		} else if !r.admit() {
-			submission.Close()
-			return
 		}
+		r.routes.Add(1)
 		go func() {
 			defer r.routes.Done()
 			r.route(ctx, submission, 1-index)
@@ -321,8 +279,9 @@ func (r *commandRelay) accept(ctx context.Context, index int, channel remote.Cha
 }
 
 // route handles a submission by performing a flush or by connecting it to the
-// executor of the specified endpoint. The caller must have admitted the route
-// on the relay (see admit).
+// executor of the specified endpoint, which is always the opposite endpoint of
+// this relay's session: a submission that selects a node on another edge is
+// refused (see resolveSubmission).
 func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser, target int) {
 	header, err := remote.ReceiveSubmission(ctx, submission)
 	if err != nil {
@@ -330,43 +289,21 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		return
 	}
 	if header.Resolve || header.Node != "" {
-		selected, selectedTarget, route, err := r.resolveSubmission(1-target, header)
+		route, err := r.resolveSubmission(1-target, header)
 		if err != nil {
 			remote.Reject(submission, err)
 			return
-		}
-		// A route redirected to another edge uses that edge's state, so its
-		// relay tracks the route as well, and refuses it once stopping. The
-		// route is then tracked by both relays, and stopping either cancels
-		// it: this relay's context is the parent of ctx, and the selected
-		// relay's context cancels it below. Neither relay's stop waits for
-		// the other, so neither waits for itself. Admission precedes the
-		// route response, so that a refusal is the response.
-		if selected != r {
-			if !selected.admit() {
-				remote.Reject(submission, errRelayStopping)
-				return
-			}
-			defer selected.routes.Done()
-		}
-		if header.Resolve {
+		} else if header.Resolve {
 			if err := remote.RespondWithRoute(submission, route); err != nil {
 				submission.Close()
 				return
 			}
 		}
-		// The source connection and the selected edge must both remain alive.
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		stop := context.AfterFunc(selected.ctx, cancel)
-		defer stop()
-		selected.routeResolved(ctx, submission, selectedTarget, header)
-		return
 	}
 	r.routeResolved(ctx, submission, target, header)
 }
 
-// routeResolved executes an operation after its source and destination are fixed.
+// routeResolved executes an operation after its destination is resolved.
 func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWriteCloser, target int, header *remote.Submission) {
 	var err error
 	operation := header.Operation
@@ -375,18 +312,10 @@ func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWrit
 		return
 	}
 	if operation == remote.OperationNodes {
-		graph, err := r.trees.nodes(r, 1-target)
+		graph, err := r.stars.nodes(r, 1-target)
 		remote.RespondWithNodes(submission, graph, err)
 		return
-	} else if operation == remote.OperationNodeConflicts {
-		r.serveNodeConflicts(ctx, submission, 1-target, header)
-		return
-	}
-	if operation == remote.OperationTreeExecute {
-		r.serveTree(ctx, submission, 1-target, header)
-		return
-	}
-	if operation == remote.OperationConflicts {
+	} else if operation == remote.OperationConflicts {
 		r.logger.Debug("Forcing synchronization cycle for conflict listing")
 		stop := context.AfterFunc(ctx, func() { submission.Close() })
 		defer stop()

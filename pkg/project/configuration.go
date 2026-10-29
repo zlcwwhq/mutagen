@@ -1,6 +1,8 @@
 package project
 
 import (
+	"go.yaml.in/yaml/v4"
+
 	"github.com/mutagen-io/mutagen/pkg/api/models/forwarding"
 	"github.com/mutagen-io/mutagen/pkg/api/models/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/encoding"
@@ -95,8 +97,13 @@ type SynchronizationConfiguration struct {
 
 // Configuration is the orchestration configuration object type.
 type Configuration struct {
-	// Tree declares a directory workspace tree, expanded into pair sessions.
-	Tree *TreeConfiguration `yaml:"tree"`
+	// Star declares a star of directory workspaces, expanded into pair
+	// sessions.
+	Star *StarConfiguration `yaml:"star"`
+	// Tree is only decoded to detect project files that declare a workspace
+	// tree, which stars replaced, so that starting or applying them explains
+	// the migration rather than reporting an unknown field.
+	Tree yaml.Node `yaml:"tree"`
 	// BeforeCreate are setup commands to be run before session creation.
 	BeforeCreate []string `yaml:"beforeCreate"`
 	// AfterCreate are setup commands to be run after session creation.

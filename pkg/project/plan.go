@@ -211,9 +211,9 @@ func forwardingSessionMatches(session *forwarding.Session, specification *forwar
 
 // synchronizationSessionMatches checks the session's declarative configuration.
 func synchronizationSessionMatches(session *synchronization.Session, specification *synchronizationsvc.CreationSpecification) bool {
-	// Tree membership changes command authorization and routing even when an
-	// edge's filesystem locations are unchanged.
-	if !proto.Equal(session.Tree, specification.Tree) {
+	// Star membership changes command routing even when an edge's filesystem
+	// locations are unchanged.
+	if !proto.Equal(session.Star, specification.Star) {
 		return false
 	}
 	return endpointMatches(session.Alpha, specification.Alpha) &&
@@ -244,6 +244,10 @@ type Plan struct {
 	forwarding []*sessionChange[*forwarding.Session, *forwardingsvc.CreationSpecification]
 	// synchronization contains synchronization session changes sorted by name.
 	synchronization []*sessionChange[*synchronization.Session, *synchronizationsvc.CreationSpecification]
+	// synchronizationSessions contains the project's existing synchronization
+	// sessions, including those that will be retained, which may share
+	// workspaces with those that will be terminated.
+	synchronizationSessions []*synchronization.Session
 	// flushOnCreate records flush-on-creation behavior by synchronization
 	// session name.
 	flushOnCreate map[string]bool
@@ -287,21 +291,22 @@ func NewPlan(
 		return nil, err
 	}
 
-	// A retained tree node keeps its execution identity across every incident
-	// edge, including new and replaced edges. The initial matching pass uses
-	// declarative locations, while runtime tree membership compares exact URLs.
-	// Reconcile those representations and validate the resulting tree before
-	// any sessions are flushed, removed, or created.
-	if err := preserveTreeEndpoints(synchronizationSessions, synchronizationChanges); err != nil {
+	// A star's retained edges keep the center's identity for new and replaced
+	// edges. The initial matching pass uses declarative locations, while the
+	// daemon compares the center's exact URLs across edges. Reconcile those
+	// representations and validate the resulting stars before any sessions
+	// are flushed, removed, or created.
+	if err := preserveStarCenters(synchronizationSessions, synchronizationChanges); err != nil {
 		return nil, err
 	}
 
 	// Success.
 	return &Plan{
-		forwarding:      forwardingChanges,
-		synchronization: synchronizationChanges,
-		flushOnCreate:   specifications.FlushOnCreate,
-		unchanged:       forwardingUnchanged + synchronizationUnchanged,
+		forwarding:              forwardingChanges,
+		synchronization:         synchronizationChanges,
+		synchronizationSessions: synchronizationSessions,
+		flushOnCreate:           specifications.FlushOnCreate,
+		unchanged:               forwardingUnchanged + synchronizationUnchanged,
 	}, nil
 }
 
@@ -380,45 +385,227 @@ func currentIdentifiers[S projectSession, P projectSpecification](changes []*ses
 	return identifiers
 }
 
-// Apply applies the plan. Running synchronization sessions that will be
-// terminated are flushed first, because their replacements, as well as any
-// sessions created under other names for the same files, start with fresh
-// history and could otherwise overwrite (or turn into conflicts) the changes
-// that the terminated sessions haven't synchronized yet. If a flush fails, then
-// no session is terminated or created. Paused sessions are terminated without
-// being flushed, since that would require resuming them, which is why the plan
-// notes them. Removed and replaced sessions are then terminated before any
-// creation so that forwarding listeners and synchronization roots are released,
-// including when endpoints move between names. Operations are never performed
-// with an empty set of sessions, and unchanged sessions are never paused,
-// resumed, flushed, or terminated. Changes are not transactional: if an
-// operation fails, completed changes remain in place.
-func (p *Plan) Apply(operations SessionOperations) error {
-	// Flush running synchronization sessions that will be terminated. Once a
-	// flush completes, the endpoints agree on all content that the session can
-	// synchronize, so the lack of history in a session that takes over its
-	// files doesn't matter. Removed sessions are flushed as well, since a
-	// session created under another name (by this plan or a later one) may
-	// synchronize the same files, which can't be reliably detected by
-	// comparing endpoint URLs. Sessions are flushed individually so that a
-	// failure can identify the session.
+// sessionsShareWorkspaces reports whether any endpoint of one synchronization
+// session overlaps any endpoint of another, i.e. whether they are equal or
+// nested on the same configured system (see
+// synchronization.WorkspaceEndpointsOverlap).
+func sessionsShareWorkspaces(first, second *synchronization.Session) bool {
+	for _, a := range []*url.URL{first.Alpha, first.Beta} {
+		for _, b := range []*url.URL{second.Alpha, second.Beta} {
+			if a != nil && b != nil && synchronization.WorkspaceEndpointsOverlap(a, b) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// flushRounds returns the flushes that must complete before any
+// synchronization session is terminated, as rounds of running sessions, sorted
+// by name and then identifier. Each round must be performed after the previous
+// one has completed.
+//
+// Once a session is flushed, its endpoints agree on the content that it
+// synchronizes, as of the flush's scans. That suffices for a session that
+// shares no workspace with another session, but not for sessions that do: a
+// change that a later flush brings into a shared workspace isn't propagated by
+// a session that was flushed before. Sessions that take over files start with
+// fresh history, so a file that then exists on only one side is copied to the
+// other, which undoes deletions. Running sessions are therefore adjacent if
+// any of their endpoints overlap (see sessionsShareWorkspaces), and every
+// running session in a connected component that contains a session to be
+// terminated, including retained sessions, is flushed in D+1 rounds, where D
+// is the component's diameter: the largest distance between two of its
+// sessions, counted in hops between adjacent sessions.
+//
+// Consider a change that is present in an endpoint of a session s before the
+// first round. s is flushed during the first round, after which both of its
+// endpoints hold the change. Suppose that every session k hops from s holds the
+// change on both endpoints after round k+1. A session t that is k+1 hops from s
+// is adjacent to a session k hops from s, which holds the change on both of its
+// endpoints, including the workspace that it shares with t, once round k+1 has
+// completed. The flush of t during round k+2 then carries the change to t's
+// other endpoint. By induction, since no session is more than D hops from s,
+// every session in the component holds the change on both endpoints after D+1
+// rounds, regardless of the order of the flushes within each round. The bound
+// is tight: a chain of k sessions has a diameter of k-1, and a change at one
+// end needs k rounds if each round flushes the sessions starting from the
+// other end. The edges of a star all share its center, so its diameter is 1
+// and two rounds suffice, while a session that shares no workspace with
+// another is flushed once. Flushes don't report whether they synchronized any
+// changes, so rounds can't stop early.
+//
+// The argument assumes that each session carries the change between its
+// endpoints. A session might not, because the change is ignored, outside the
+// overlap of nested workspaces, or against a one-way mode. Where workspaces
+// form a tree, such as a chain or a star, there's no path around such a
+// session, so the change can't reach the sessions beyond it anyway, while the
+// distances to the others are unchanged. Where workspaces form a cycle, such a
+// session can force a path around the cycle that's longer than the diameter.
+//
+// Paused sessions are left out. They aren't flushed, since that would require
+// resuming them, which is why the plan notes those that will be terminated.
+// They don't carry changes while the plan is applied either, so paths through
+// them must not shorten distances. Skipping retained paused sessions is safe
+// because they keep their history: once resumed, they reconcile against it,
+// so a file that exists on only one of their endpoints is propagated as a
+// creation or deletion on that side rather than copied back.
+func (p *Plan) flushRounds() [][]*synchronization.Session {
+	// Identify the running sessions that will be terminated.
+	terminated := make(map[*synchronization.Session]bool, len(p.synchronization))
 	for _, change := range p.synchronization {
-		if change.current == nil || change.current.Paused {
+		if change.current != nil && !change.current.Paused {
+			terminated[change.current] = true
+		}
+	}
+	if len(terminated) == 0 {
+		return nil
+	}
+
+	// Collect the running sessions in a deterministic order.
+	var running []*synchronization.Session
+	for _, session := range p.synchronizationSessions {
+		if !session.Paused {
+			running = append(running, session)
+		}
+	}
+	sort.Slice(running, func(i, j int) bool {
+		if running[i].Name != running[j].Name {
+			return running[i].Name < running[j].Name
+		}
+		return running[i].Identifier < running[j].Identifier
+	})
+
+	// Connect running sessions that share workspaces.
+	neighbors := make([][]int, len(running))
+	for i := range running {
+		for j := i + 1; j < len(running); j++ {
+			if sessionsShareWorkspaces(running[i], running[j]) {
+				neighbors[i] = append(neighbors[i], j)
+				neighbors[j] = append(neighbors[j], i)
+			}
+		}
+	}
+
+	// Define a breadth-first search that returns the sessions reachable from a
+	// session, which form its connected component, and the largest distance
+	// to any of them. Sessions are reached in order of distance, so the last
+	// one is the farthest.
+	search := func(source int) ([]int, int) {
+		distances := map[int]int{source: 0}
+		reached := []int{source}
+		for next := 0; next < len(reached); next++ {
+			session := reached[next]
+			for _, neighbor := range neighbors[session] {
+				if _, ok := distances[neighbor]; !ok {
+					distances[neighbor] = distances[session] + 1
+					reached = append(reached, neighbor)
+				}
+			}
+		}
+		return reached, distances[reached[len(reached)-1]]
+	}
+
+	// Compute the number of rounds for each session from the diameter of its
+	// connected component, if the component contains a session that will be
+	// terminated. Sessions in other components aren't flushed.
+	rounds := make([]int, len(running))
+	visited := make([]bool, len(running))
+	for i := range running {
+		if visited[i] {
 			continue
 		}
-		if err := operations.FlushSynchronization([]string{change.current.Identifier}); err != nil {
-			action := "replacing"
-			risk := "replacing it now could overwrite its unsynchronized changes"
-			if change.specification == nil {
-				action = "removing"
-				risk = "removing it now could let a new session for the same files overwrite its unsynchronized changes"
+		component, _ := search(i)
+		var diameter int
+		var affected bool
+		for _, member := range component {
+			visited[member] = true
+			affected = affected || terminated[running[member]]
+			if _, eccentricity := search(member); eccentricity > diameter {
+				diameter = eccentricity
 			}
-			return fmt.Errorf(
-				"unable to flush synchronization session %q (%s) before %s it: %w; %s, so no sessions were terminated or created: "+
-					"fix the session and apply again, or terminate it with \"mutagen sync terminate %s\" and apply again "+
-					"if its unsynchronized changes don't matter",
-				change.current.Name, change.current.Identifier, action, err, risk, change.current.Identifier,
-			)
+		}
+		if affected {
+			for _, member := range component {
+				rounds[member] = diameter + 1
+			}
+		}
+	}
+
+	// Assemble the rounds.
+	var result [][]*synchronization.Session
+	for round := 0; ; round++ {
+		var sessions []*synchronization.Session
+		for i, session := range running {
+			if rounds[i] > round {
+				sessions = append(sessions, session)
+			}
+		}
+		if len(sessions) == 0 {
+			return result
+		}
+		result = append(result, sessions)
+	}
+}
+
+// Apply applies the plan. Running synchronization sessions that will be
+// terminated are flushed first, together with the running sessions that share
+// their workspaces, repeatedly, until changes have propagated across them (see
+// flushRounds). Their replacements, as well as any sessions created under
+// other names for the same files, start with fresh history and could otherwise
+// overwrite (or turn into conflicts) changes that haven't been synchronized
+// yet, or copy back files whose deletion hasn't reached every workspace. If a
+// flush fails, then no session is terminated or created. Paused sessions are
+// terminated without being flushed, since that would require resuming them,
+// which is why the plan notes them. Removed and replaced sessions are then
+// terminated before any creation so that forwarding listeners and
+// synchronization roots are released, including when endpoints move between
+// names. Operations are never performed with an empty set of sessions.
+// Unchanged sessions are never paused, resumed, or terminated, and they're
+// only flushed if they share workspaces with running sessions that will be
+// terminated. Changes are not transactional: if an operation fails, completed
+// changes remain in place.
+func (p *Plan) Apply(operations SessionOperations) error {
+	// Flush running synchronization sessions that will be terminated, together
+	// with the running sessions that share their workspaces. Removed sessions
+	// are flushed as well, since a session created under another name (by this
+	// plan or a later one) may synchronize the same files, which can't be
+	// reliably detected by comparing endpoint URLs. Sessions are flushed
+	// individually so that a failure can identify the session.
+	changes := make(map[*synchronization.Session]*sessionChange[*synchronization.Session, *synchronizationsvc.CreationSpecification])
+	for _, change := range p.synchronization {
+		if change.current != nil {
+			changes[change.current] = change
+		}
+	}
+	for _, round := range p.flushRounds() {
+		for _, session := range round {
+			if err := operations.FlushSynchronization([]string{session.Identifier}); err != nil {
+				change := changes[session]
+				if change == nil {
+					return fmt.Errorf(
+						"unable to flush synchronization session %q (%s), which shares workspaces with sessions that will be "+
+							"replaced or removed: %w; replacing or removing them now could let sessions with fresh history "+
+							"overwrite changes, or restore deleted files, that haven't propagated through it, so no sessions "+
+							"were terminated or created: fix the session and apply again, or pause it with "+
+							"\"mutagen sync pause %s\" and apply again: it keeps its history, so it synchronizes its changes "+
+							"once resumed",
+						session.Name, session.Identifier, err, session.Identifier,
+					)
+				}
+				action := "replacing"
+				risk := "replacing it now could overwrite its unsynchronized changes"
+				if change.specification == nil {
+					action = "removing"
+					risk = "removing it now could let a new session for the same files overwrite its unsynchronized changes"
+				}
+				return fmt.Errorf(
+					"unable to flush synchronization session %q (%s) before %s it: %w; %s, so no sessions were terminated or created: "+
+						"fix the session and apply again, or terminate it with \"mutagen sync terminate %s\" and apply again "+
+						"if its unsynchronized changes don't matter",
+					session.Name, session.Identifier, action, err, risk, session.Identifier,
+				)
+			}
 		}
 	}
 

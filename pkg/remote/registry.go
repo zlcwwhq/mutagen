@@ -61,8 +61,9 @@ var ambiguousRefusals = slices.Contains([]string{"darwin", "ios", "freebsd", "ne
 // record is the on-disk description of a registered endpoint, or of the scope
 // of a synchronization endpoint (see RegisterScope).
 type record struct {
-	// Tree and Node identify a workspace tree submission endpoint.
-	Tree     string `json:",omitempty"`
+	// Star, Node, and PeerNode identify a star workspace's submission
+	// endpoint (see Endpoint).
+	Star     string `json:",omitempty"`
 	Node     string `json:",omitempty"`
 	PeerNode string `json:",omitempty"`
 	// Version is the Mutagen version of the registering process.
@@ -203,7 +204,7 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 	}
 	prune(context.Background(), directory)
 	return registerIn(directory, &record{
-		Tree:           endpoint.Tree,
+		Star:           endpoint.Star,
 		Node:           endpoint.Node,
 		PeerNode:       endpoint.PeerNode,
 		Session:        endpoint.Session,
@@ -346,21 +347,26 @@ func RegisterScope(session string, alpha bool, root string, ignores *Ignores) (i
 // Target describes the endpoint from which a command is submitted.
 type Target struct {
 	// SourceSession and SourceAlpha identify the local registration through
-	// which the command is submitted, and they alone pin later submissions
-	// (see Selection.Target), so targets built by hand must set them. They
-	// never change when the daemon selects another edge of the same node.
+	// which the command is submitted, and they pin later submissions (see
+	// Selection.Target), so targets built by hand must set them. The daemon
+	// only accepts an operation that crosses the edge through which it was
+	// submitted, so once resolved, they identify the selected edge (see
+	// Session), which, at a star's center, where every edge registers, is the
+	// selected node's own.
 	SourceSession string
 	SourceAlpha   bool
-	// Tree identifies a declared workspace tree at the submitting registration.
-	Tree bool
-	// Resolved marks a destination selected by the daemon. Revision pins it.
+	// Star identifies a declared star workspace at the submitting registration.
+	Star bool
+	// Resolved marks a destination selected by the daemon. Revision pins it:
+	// it identifies the selected edge, so that changes to other edges don't
+	// affect later submissions.
 	Resolved bool
 	Revision string
 	// SourceNode and Node identify the submitting and selected workspaces.
 	SourceNode string
 	Node       string
-	// Session identifies the selected adjacent edge for checkout ownership.
-	// SourceSession, not this field, pins subsequent local submissions.
+	// Session identifies the selected edge, such as for checkout ownership.
+	// Once resolved, it's SourceSession (see SourceSession).
 	Session string
 	// Name is the name of the source session (see SourceSession), if any.
 	Name string
@@ -394,9 +400,11 @@ type Selection struct {
 	// Workspace selects the source workspace by node rather than by session:
 	// the most specific live workspace containing the directory, which may be
 	// registered by several endpoints only if they identify the same node of
-	// the same tree, as incident edges do (see locateWorkspace). Neither
-	// creation order nor session names choose among distinct workspaces. It's
-	// ignored if Target is non-nil.
+	// the same star, as the edges at its center do (see locateWorkspace). Neither
+	// creation order nor session names choose among distinct workspaces. Among
+	// the registrations of one star node, the one whose peer is Node is used,
+	// if any, since the daemon only accepts operations that cross the edge
+	// through which they were submitted. It's ignored if Target is non-nil.
 	Workspace bool
 	// WorkspaceOutside allows a workspace selection from a directory outside
 	// all live workspaces, such as for an explicit node selection, in which
@@ -412,18 +420,24 @@ type Selection struct {
 	// working directory is specified explicitly. Dial refuses a submission whose
 	// ignores exclude the directory or a parent of it inside the root (see
 	// Ignores), since the session doesn't synchronize the corresponding
-	// directory. Such a directory is typically the root of a nested session
-	// that isn't connected for remote commands on this system, and through
-	// which the submission would otherwise have been made.
+	// directory. The ignores are the registration's, whose edge is the only
+	// one that the daemon lets the operation cross. At a star node, unless the
+	// registration's peer is Node, the daemon may refuse the submission
+	// instead, such as when the selected node's edge isn't connected at the
+	// center, so the ignores are only checked once it accepts the route,
+	// before the operation reads or writes any file. Such a directory is
+	// typically the root of a nested session that isn't connected for remote
+	// commands on this system, and through which the submission would
+	// otherwise have been made.
 	Corresponding bool
 	// Target, if non-nil, restricts the selection to the local registration
 	// that its SourceSession and SourceAlpha identify, which was typically
 	// located by a previous submission, so that related submissions can't
 	// reach different sessions as sessions connect and disconnect in between.
-	// Its Session and Alpha, which may identify another edge selected by the
-	// daemon, don't affect the registration. Dial then fails if that
-	// registration is no longer live, rather than selecting another, and
-	// Workspace is ignored; Corresponding still validates the first submission.
+	// Dial then fails if that registration is no longer live, rather than
+	// selecting another, even another registration of the same star node,
+	// and Workspace is ignored; Corresponding still validates the first
+	// submission.
 	Target *Target
 }
 
@@ -759,18 +773,8 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 	}
 	connection, c := endpoint.connection, endpoint.candidate
 
-	// Refuse operations corresponding to a directory that the session doesn't
-	// synchronize (see Selection.Corresponding), or that it might not, since
-	// running them anyway could run them in an outdated or missing directory.
-	if s.Corresponding && c.contained {
-		if excluded := c.Ignores.ExcludedInAnyForm(c.path, true); excluded != "" {
-			connection.Close()
-			return nil, nil, excludedError(c, labeler(slices.Concat(compatible, incompatible))(c), excluded)
-		}
-	}
-
 	// Resolve destinations on the operation connection. Pinned targets retain
-	// both the original source registration and the selected destination.
+	// the selected destination and the revision of its edge.
 	submitted := *header
 	header = &submitted
 	if s.Resolve || s.Target != nil && s.Target.Resolved {
@@ -785,6 +789,31 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 			header.Revision = s.Target.Revision
 		}
 	}
+
+	// Refuse operations corresponding to a directory that the session doesn't
+	// synchronize (see Selection.Corresponding), or that it might not, since
+	// running them anyway could run them in an outdated or missing directory.
+	// The rules are the registration's, since the daemon only lets operations
+	// cross the registration's own edge. At a star node, unless the
+	// registration's peer is the requested node, the daemon may refuse the
+	// submission instead, such as when the selected node's edge isn't
+	// connected at the center, or when the node is unknown, which explains the
+	// failure, whereas the registration's rules would be irrelevant. They're
+	// then only applied once the daemon accepts the route, before the
+	// operation reads or writes any file.
+	var excluded string
+	if s.Corresponding && c.contained {
+		excluded = c.Ignores.ExcludedInAnyForm(c.path, true)
+	}
+	refuse := func() error {
+		connection.Close()
+		return excludedError(c, labeler(slices.Concat(compatible, incompatible))(c), excluded)
+	}
+	deferred := header.Resolve && c.Star != "" && c.PeerNode != header.Node
+	if excluded != "" && !deferred {
+		return nil, nil, refuse()
+	}
+
 	// Perform the version handshake and submit the operation.
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
 	err = mutagen.ClientVersionHandshake(connection)
@@ -809,10 +838,13 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 		}
 		target.Session, target.Alpha = route.Session, route.Alpha
 		target.Node, target.SourceNode = route.Node, route.SourceNode
-		target.Tree, target.Resolved, target.Revision = route.Tree, true, route.Revision
+		target.Star, target.Resolved, target.Revision = route.Star, true, route.Revision
 		if route.Ignores != nil {
 			target.Ignores = route.Ignores
 		}
+	}
+	if excluded != "" {
+		return nil, nil, refuse()
 	}
 	return connection, target, nil
 }
@@ -836,7 +868,7 @@ func (c *candidate) target() *Target {
 		}
 	}
 	return &Target{
-		SourceSession: c.Session, SourceAlpha: c.Alpha, Tree: c.Tree != "",
+		SourceSession: c.Session, SourceAlpha: c.Alpha, Star: c.Star != "",
 		SourceNode: source,
 		Node:       peer,
 		Session:    c.Session,
@@ -941,14 +973,132 @@ func Synchronizing(ctx context.Context, path string, directory bool) ([]string, 
 	return result, nil
 }
 
+// locateWorkspace selects the source workspace for a workspace selection (see
+// Selection.Workspace), given the registrations related to the submission
+// directory that are compatible with this version of Mutagen and those that
+// aren't. The most specific live workspace containing the directory is used,
+// or, if outside is true and no live workspace contains it, the only live
+// workspace on this system. Several live registrations are only accepted when
+// they identify the same node of the same star, as the endpoints of a star's
+// edges at its center do; anything else is reported as ambiguous rather than
+// resolved by creation order. Among those, the registration whose peer is the
+// requested destination node is used, if any, since the daemon only accepts
+// operations that cross the edge through which they were submitted, so that
+// they don't depend on any other edge. Any of them serves discovery or an
+// omitted node, which the daemon only accepts with a single destination. If
+// the requested node's registration isn't live, such as while its edge
+// reconnects, another is used anyway, so that the daemon reports why the node
+// can't be used: it refuses the submission as unavailable, unless the node is
+// unknown, can't be reached from this node, or the star has a problem.
+//
+// Registrations whose processes no longer listen are pruned and otherwise
+// ignored, exactly as if they had been removed cleanly, as the registrations
+// of paused or reconnecting sessions are. A more specific workspace that isn't
+// connected therefore can't be told apart from one that doesn't exist, and an
+// enclosing workspace is used instead. For operations corresponding to the
+// directory, the enclosing workspace's ignores, which typically exclude a
+// nested workspace's root, then refuse the submission (see
+// Selection.Corresponding).
+//
+// Live registrations by other versions of Mutagen can't be used, but they
+// aren't masked either: if one contains the directory at least as specifically
+// as the selected workspace, or no compatible workspace is found, the version
+// mismatch is reported (see mismatchedVersions), since the submission was
+// probably meant for it.
+func locateWorkspace(ctx context.Context, compatible, incompatible []*candidate, outside bool, node string) (*liveEndpoint, error) {
+	// Determine the live registrations by other versions of Mutagen whose roots
+	// contain the directory, most specific first, pruning dead ones, so that a
+	// stale record can't block selection.
+	others, err := synchronizingSessions(ctx, incompatible)
+	if err != nil {
+		return nil, err
+	}
+
+	// Connect to the most specific live workspaces containing the directory,
+	// or, if permitted and none does, to all live workspaces. Dead
+	// registrations are pruned as tiers are probed, and the next tier is used
+	// if a tier has no live registrations (see locate).
+	live, err := locate(ctx, filter(compatible, func(c *candidate) bool {
+		return c.contained || outside
+	}))
+	if err != nil {
+		return nil, err
+	} else if len(live) == 0 {
+		subject := "the workspaces containing this directory are"
+		if len(others) == 0 && outside {
+			subject = "the workspaces on this system are"
+			if others, err = liveSessions(ctx, filter(incompatible, excluding)); err != nil {
+				return nil, err
+			}
+		}
+		if len(others) > 0 {
+			return nil, mismatchedVersions(subject, others)
+		}
+		return nil, ConnectionError(errors.New("no connected node contains the current directory; run from a workspace root or its subdirectory"))
+	}
+	chosen := live[0]
+
+	// Refuse to mask a live workspace registered by another version of Mutagen
+	// that contains the directory at least as specifically. Since the other
+	// registrations are ordered most specific first, the first one determines
+	// whether they're all equally specific.
+	var masking []*candidate
+	for _, c := range others {
+		if c.depth >= chosen.candidate.depth {
+			masking = append(masking, c)
+		}
+	}
+	if len(masking) > 0 {
+		closeEndpoints(live)
+		subject := "a more specific workspace containing this directory is"
+		if !chosen.candidate.contained {
+			subject = "a workspace containing this directory is"
+		} else if masking[0].depth == chosen.candidate.depth {
+			subject = "another workspace with the same root is"
+		}
+		return nil, mismatchedVersions(subject, masking)
+	}
+
+	// Several live registrations must identify the same node: a star's edges
+	// share its center's root, while distinct pairs or stars sharing a root
+	// are ambiguous.
+	for _, endpoint := range live[1:] {
+		first, other := chosen.candidate, endpoint.candidate
+		same := first.Star != "" && first.Star == other.Star && first.Node == other.Node
+		if first.Star == "" && other.Star == "" {
+			same = first.Session == other.Session && first.Alpha == other.Alpha
+		}
+		if !same {
+			closeEndpoints(live)
+			return nil, errors.New("ambiguous source node; declare the workspaces sharing this root as one star, or run from an unambiguous workspace")
+		}
+	}
+	if node != "" && chosen.candidate.Star != "" {
+		for _, endpoint := range live {
+			if endpoint.candidate.PeerNode == node {
+				chosen = endpoint
+				break
+			}
+		}
+	}
+	for _, endpoint := range live {
+		if endpoint.connection != chosen.connection {
+			endpoint.connection.Close()
+		}
+	}
+	return &chosen, nil
+}
+
 // locate connects to the endpoint through which to submit an operation from the
 // specified directory, given the registrations related to it that are
 // compatible with this version of Mutagen and those that aren't.
 func (s *Selection) locate(ctx context.Context, directory string, compatible, incompatible []*candidate) (*liveEndpoint, error) {
 	// A pinned selection only considers the source registration that it
 	// identifies, which may have reconnected in the meantime, and fails rather
-	// than falling back to another endpoint. The daemon-selected edge (Session
-	// and Alpha) never chooses the registration, even if the source is unset.
+	// than falling back to another endpoint, including another registration
+	// of the same star node, since the daemon only accepts operations through
+	// the edge that they cross. The daemon-selected edge (Session and Alpha)
+	// never chooses the registration, even if the source is unset.
 	if s.Target != nil {
 		source := s.Target.SourceSession
 		if source == "" {
@@ -965,7 +1115,7 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 			if s.Target.SourceAlpha {
 				endpoint = "alpha endpoint"
 			}
-			if s.Target.Tree && s.Target.SourceNode != "" {
+			if s.Target.Star && s.Target.SourceNode != "" {
 				endpoint = fmt.Sprintf("%s (node %s)", endpoint, s.Target.SourceNode)
 			}
 			return nil, ConnectionError(fmt.Errorf("the %s of session %s is no longer connected for remote commands on this system (it may have been paused or terminated, or be reconnecting)",
@@ -976,7 +1126,7 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 
 	// A workspace selection is resolved by node (see locateWorkspace).
 	if s.Workspace {
-		return locateWorkspace(ctx, compatible, incompatible, s.WorkspaceOutside)
+		return locateWorkspace(ctx, compatible, incompatible, s.WorkspaceOutside, s.Node)
 	}
 
 	// Otherwise, the most specific containing root is used, and among equally

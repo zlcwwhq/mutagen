@@ -74,5 +74,5 @@ func (s *Session) EnsureValid() error {
 		}
 	}
 
-	return validateTreeMembership(s)
+	return validateStarMembership(s)
 }

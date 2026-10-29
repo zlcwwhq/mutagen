@@ -18,9 +18,10 @@ import (
 )
 
 // pull copies paths that the session ignores from the opposite endpoint,
-// reporting the outcome for each path.
+// reporting the outcome for each path. The daemon resolves the destination,
+// which may refuse it, before anything is read or written.
 func pull(router *router, paths []string) error {
-	target, err := router.locate()
+	target, err := router.resolve()
 	if err != nil {
 		return err
 	}

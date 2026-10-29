@@ -40,11 +40,12 @@ follow the code and update this file.
   `pkg/remote` contains its protocol, registry, agent executor channel,
   and the executor's detached jobs and scripts;
   `pkg/synchronization/commands.go` relays commands in the daemon.
-  Project workspace trees are declared in `pkg/project/tree.go`, expanded into
-  pair sessions, and routed by `pkg/synchronization/tree_commands.go` for
-  `remote --node` with strict synchronization along the selected path.
-  `pkg/synchronization/nodes.go` provides read-only node discovery and path
-  conflict inspection; `node_routes.go` resolves operation targets in the daemon.
+  Project star workspaces are declared in `pkg/project/star.go` and
+  expanded into one pair session per node, joining it to the star's
+  center. `pkg/synchronization/star.go` validates star membership,
+  topology, and overlaps for both project apply and the daemon, and
+  `pkg/synchronization/stars.go` provides node discovery and resolves
+  `remote --node` targets, center to node or node to center only.
   `remote` exposes nodes; session selectors are deprecated.
 - `cmd/mutagen-sidecar` is the sidecar entry point. It is built
   separately from the main `scripts/build.go` flow.

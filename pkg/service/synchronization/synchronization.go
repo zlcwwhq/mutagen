@@ -66,11 +66,11 @@ func (s *CreationSpecification) ensureValid() error {
 		}
 	}
 
-	// Verify that tree membership is valid, if specified. The daemon also
-	// checks that the configuration is suitable for a tree.
-	if s.Tree != nil {
-		if err := s.Tree.EnsureValid(); err != nil {
-			return fmt.Errorf("invalid tree membership: %w", err)
+	// Verify that star membership is valid, if specified. The daemon also
+	// checks that the star belongs to the session's project.
+	if s.Star != nil {
+		if err := s.Star.EnsureValid(); err != nil {
+			return fmt.Errorf("invalid star membership: %w", err)
 		}
 	}
 

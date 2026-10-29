@@ -48,9 +48,9 @@ type CreationSpecification struct {
 	Labels map[string]string `protobuf:"bytes,7,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Paused indicates whether or not to create the session pre-paused.
 	Paused bool `protobuf:"varint,8,opt,name=paused,proto3" json:"paused,omitempty"`
-	// Tree identifies the session as an edge of a workspace tree, if non-nil.
-	// Only project orchestration sets it (see synchronization.Session.Tree).
-	Tree          *synchronization.TreeMembership `protobuf:"bytes,9,opt,name=tree,proto3" json:"tree,omitempty"`
+	// Star identifies the session as an edge of a star workspace, if non-nil.
+	// Only project orchestration sets it (see synchronization.Session.Star).
+	Star          *synchronization.StarMembership `protobuf:"bytes,10,opt,name=star,proto3" json:"star,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -141,9 +141,9 @@ func (x *CreationSpecification) GetPaused() bool {
 	return false
 }
 
-func (x *CreationSpecification) GetTree() *synchronization.TreeMembership {
+func (x *CreationSpecification) GetStar() *synchronization.StarMembership {
 	if x != nil {
-		return x.Tree
+		return x.Star
 	}
 	return nil
 }
@@ -833,7 +833,7 @@ var File_service_synchronization_synchronization_proto protoreflect.FileDescript
 
 const file_service_synchronization_synchronization_proto_rawDesc = "" +
 	"\n" +
-	"-service/synchronization/synchronization.proto\x12\x0fsynchronization\x1a\x19selection/selection.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/session.proto\x1a\x1bsynchronization/state.proto\x1a\rurl/url.proto\"\xa1\x04\n" +
+	"-service/synchronization/synchronization.proto\x12\x0fsynchronization\x1a\x19selection/selection.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/session.proto\x1a\x1bsynchronization/state.proto\x1a\rurl/url.proto\"\xad\x04\n" +
 	"\x15CreationSpecification\x12\x1e\n" +
 	"\x05alpha\x18\x01 \x01(\v2\b.url.URLR\x05alpha\x12\x1c\n" +
 	"\x04beta\x18\x02 \x01(\v2\b.url.URLR\x04beta\x12D\n" +
@@ -843,10 +843,12 @@ const file_service_synchronization_synchronization_proto_rawDesc = "" +
 	"\x04name\x18\x06 \x01(\tR\x04name\x12J\n" +
 	"\x06labels\x18\a \x03(\v22.synchronization.CreationSpecification.LabelsEntryR\x06labels\x12\x16\n" +
 	"\x06paused\x18\b \x01(\bR\x06paused\x123\n" +
-	"\x04tree\x18\t \x01(\v2\x1f.synchronization.TreeMembershipR\x04tree\x1a9\n" +
+	"\x04star\x18\n" +
+	" \x01(\v2\x1f.synchronization.StarMembershipR\x04star\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"y\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\t\x10\n" +
+	"R\x04tree\"y\n" +
 	"\rCreateRequest\x12\x1a\n" +
 	"\bprompter\x18\x01 \x01(\tR\bprompter\x12L\n" +
 	"\rspecification\x18\x02 \x01(\v2&.synchronization.CreationSpecificationR\rspecification\"*\n" +
@@ -922,7 +924,7 @@ var file_service_synchronization_synchronization_proto_goTypes = []any{
 	nil,                                    // 15: synchronization.CreationSpecification.LabelsEntry
 	(*url.URL)(nil),                        // 16: url.URL
 	(*synchronization.Configuration)(nil),  // 17: synchronization.Configuration
-	(*synchronization.TreeMembership)(nil), // 18: synchronization.TreeMembership
+	(*synchronization.StarMembership)(nil), // 18: synchronization.StarMembership
 	(*selection.Selection)(nil),            // 19: selection.Selection
 	(*synchronization.State)(nil),          // 20: synchronization.State
 }
@@ -933,7 +935,7 @@ var file_service_synchronization_synchronization_proto_depIdxs = []int32{
 	17, // 3: synchronization.CreationSpecification.configurationAlpha:type_name -> synchronization.Configuration
 	17, // 4: synchronization.CreationSpecification.configurationBeta:type_name -> synchronization.Configuration
 	15, // 5: synchronization.CreationSpecification.labels:type_name -> synchronization.CreationSpecification.LabelsEntry
-	18, // 6: synchronization.CreationSpecification.tree:type_name -> synchronization.TreeMembership
+	18, // 6: synchronization.CreationSpecification.star:type_name -> synchronization.StarMembership
 	0,  // 7: synchronization.CreateRequest.specification:type_name -> synchronization.CreationSpecification
 	19, // 8: synchronization.ListRequest.selection:type_name -> selection.Selection
 	20, // 9: synchronization.ListResponse.sessionStates:type_name -> synchronization.State

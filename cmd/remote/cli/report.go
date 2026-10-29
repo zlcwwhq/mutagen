@@ -86,8 +86,6 @@ func escapes(relative string) bool {
 // reporter prints synchronization reports as warnings from the submitting
 // endpoint's perspective, omitting lines that it has already printed.
 type reporter struct {
-	// Node names replace local/remote labels for tree edge reports.
-	localNode, remoteNode string
 	// output is the warning output.
 	output io.Writer
 	// locator maps paths for display.
@@ -100,11 +98,7 @@ type reporter struct {
 
 // newReporter creates a reporter for the target of a submission.
 func newReporter(output io.Writer, target *remote.Target) *reporter {
-	reporter := &reporter{output: output, locator: newLocator(target), alpha: target.Alpha, printed: make(map[string]bool)}
-	if target.Tree {
-		reporter.localNode, reporter.remoteNode = target.SourceNode, target.Node
-	}
-	return reporter
+	return &reporter{output: output, locator: newLocator(target), alpha: target.Alpha, printed: make(map[string]bool)}
 }
 
 // print prints a report.
@@ -130,12 +124,6 @@ func (r *reporter) print(report *remote.Report) {
 		side := "remote"
 		if problem.Alpha == r.alpha {
 			side = "local"
-		}
-		if r.localNode != "" {
-			side = r.remoteNode
-			if problem.Alpha == r.alpha {
-				side = r.localNode
-			}
 		}
 		problems = append(problems, fmt.Sprintf("%s (%s): %s",
 			r.locator.display(problem.Path), side, terminal.NeutralizeControlCharacters(problem.Error)))
@@ -177,15 +165,10 @@ func (r *reporter) sides(conflict remote.Conflict) ([]remote.Change, []remote.Ch
 func (r *reporter) describeConflict(conflict remote.Conflict) string {
 	local, opposite := r.sides(conflict)
 	var changes []string
-	localName, remoteName := "locally", "remotely"
-	if r.localNode != "" {
-		localName = "on node " + terminal.NeutralizeControlCharacters(r.localNode)
-		remoteName = "on node " + terminal.NeutralizeControlCharacters(r.remoteNode)
-	}
 	for _, side := range []struct {
 		changes []remote.Change
 		name    string
-	}{{local, localName}, {opposite, remoteName}} {
+	}{{local, "locally"}, {opposite, "remotely"}} {
 		for _, change := range side.changes {
 			description := describeChange(change)
 			if change.Path != conflict.Root {

@@ -33,8 +33,9 @@ const (
 
 // controller manages and executes a single session.
 type controller struct {
-	// trees indexes this controller's tree membership and active command relay.
-	trees *commandTrees
+	// stars indexes this controller's session and active command relay for
+	// node discovery and destination selection.
+	stars *commandStars
 	// logger is the controller logger.
 	logger *logging.Logger
 	// sessionPath is the path to the serialized session.
@@ -104,20 +105,20 @@ func newSession(
 	ctx context.Context,
 	logger *logging.Logger,
 	tracker *state.Tracker,
-	trees *commandTrees,
+	stars *commandStars,
 	identifier string,
 	alpha, beta *url.URL,
 	configuration, configurationAlpha, configurationBeta *Configuration,
 	name string,
 	labels map[string]string,
-	tree *TreeMembership,
+	star *StarMembership,
 	paused bool,
 	prompter string,
 ) (*controller, error) {
-	// Validate tree membership, which authorizes commands between nodes,
-	// before connecting or writing any state, including for requests made
-	// directly through the Go API.
-	if err := validateTreeMembership(&Session{Labels: labels, Configuration: configuration, Tree: tree}); err != nil {
+	// Validate star membership, which determines command routing between
+	// nodes, before connecting or writing any state, including for requests
+	// made directly through the Go API.
+	if err := validateStarMembership(&Session{Labels: labels, Star: star}); err != nil {
 		return nil, err
 	}
 	// Update status.
@@ -200,7 +201,7 @@ func newSession(
 		Name:                 name,
 		Labels:               labels,
 		Paused:               paused,
-		Tree:                 tree,
+		Star:                 star,
 	}
 	archive := &core.Archive{}
 
@@ -225,7 +226,7 @@ func newSession(
 
 	// Create the controller.
 	controller := &controller{
-		trees:                    trees,
+		stars:                    stars,
 		logger:                   logger,
 		sessionPath:              sessionPath,
 		archivePath:              archivePath,
@@ -240,7 +241,7 @@ func newSession(
 		},
 	}
 
-	trees.update(controller, false)
+	stars.update(controller, false)
 
 	// If the session isn't being created paused, then start a synchronization
 	// loop and mark the endpoints as handed off to that loop so that we don't
@@ -261,7 +262,7 @@ func newSession(
 }
 
 // loadSession loads an existing session and creates a corresponding controller.
-func loadSession(logger *logging.Logger, tracker *state.Tracker, trees *commandTrees, identifier string) (*controller, error) {
+func loadSession(logger *logging.Logger, tracker *state.Tracker, stars *commandStars, identifier string) (*controller, error) {
 	// Compute session and archive paths.
 	sessionPath, err := pathForSession(identifier)
 	if err != nil {
@@ -292,7 +293,7 @@ func loadSession(logger *logging.Logger, tracker *state.Tracker, trees *commandT
 
 	// Create the controller.
 	controller := &controller{
-		trees:       trees,
+		stars:       stars,
 		logger:      logger,
 		sessionPath: sessionPath,
 		archivePath: archivePath,
@@ -313,7 +314,7 @@ func loadSession(logger *logging.Logger, tracker *state.Tracker, trees *commandT
 		},
 	}
 
-	trees.update(controller, false)
+	stars.update(controller, false)
 
 	// If the session isn't marked as paused, start a synchronization loop.
 	if !session.Paused {
@@ -1133,8 +1134,8 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		// Extract contents.
 		αContent := αSnapshot.Content
 		βContent := βSnapshot.Content
-		if c.session.GetTree().GetIdentifier() != "" && ((αContent != nil && αContent.Kind != core.EntryKind_Directory) || (βContent != nil && βContent.Kind != core.EntryKind_Directory)) {
-			return errors.New("workspace tree nodes must be directories")
+		if c.session.Star != nil && ((αContent != nil && αContent.Kind != core.EntryKind_Directory) || (βContent != nil && βContent.Kind != core.EntryKind_Directory)) {
+			return errors.New("star nodes must be directories")
 		}
 		if c.logger.Level() >= logging.LevelTrace {
 			c.logger.Tracef("Ancestor contains %d entries, alpha contains %d entries, beta contains %d entries",

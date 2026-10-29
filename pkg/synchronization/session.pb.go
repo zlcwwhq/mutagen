@@ -72,14 +72,12 @@ type Session struct {
 	Labels map[string]string `protobuf:"bytes,13,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Paused indicates whether or not the session is marked as paused.
 	Paused bool `protobuf:"varint,10,opt,name=paused,proto3" json:"paused,omitempty"`
-	// NOTE: Fields 11, 12, 13, and 14 are used above. They are out of order for
-	// historical reasons.
-	// Tree identifies the session as an edge of a workspace tree, or is nil if
-	// the session doesn't belong to one. Membership determines command routing
-	// and authorization between nodes, so it's recorded with the session
-	// rather than in labels, which are selection metadata that users can set
-	// on any session. It is static.
-	Tree          *TreeMembership `protobuf:"bytes,15,opt,name=tree,proto3" json:"tree,omitempty"`
+	// Star identifies the session as the edge of a star workspace that joins
+	// its center node to another node, or is nil if the session doesn't belong
+	// to one. Membership determines command routing between nodes, so it's
+	// recorded with the session rather than in labels, which are selection
+	// metadata that users can set on any session. It is static.
+	Star          *StarMembership `protobuf:"bytes,16,opt,name=star,proto3" json:"star,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -212,49 +210,48 @@ func (x *Session) GetPaused() bool {
 	return false
 }
 
-func (x *Session) GetTree() *TreeMembership {
+func (x *Session) GetStar() *StarMembership {
 	if x != nil {
-		return x.Tree
+		return x.Star
 	}
 	return nil
 }
 
-// TreeMembership identifies a session as the edge of a workspace tree that
-// joins a parent node, the session's alpha, to a child node, the session's
-// beta. Project orchestration records it for each edge it creates, so that the
-// daemon can reconstruct the tree from its sessions, including after a
-// restart, without access to the project's configuration file.
-type TreeMembership struct {
+// StarMembership identifies a session as the edge of a star workspace that
+// joins the star's center node, the session's alpha, to one of its other
+// nodes, the session's beta. Project orchestration records it for each edge
+// that it creates, so that the daemon can reconstruct the star from its
+// sessions, including after a restart, without access to the project's
+// configuration file.
+type StarMembership struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Identifier identifies the tree. It's the identifier of the project that
-	// declares the tree. It cannot be empty.
+	// Identifier identifies the star. It's the identifier of the project that
+	// declares the star. It cannot be empty.
 	Identifier string `protobuf:"bytes,1,opt,name=identifier,proto3" json:"identifier,omitempty"`
-	// Root names the tree's structural root node. It cannot be empty.
-	Root string `protobuf:"bytes,2,opt,name=root,proto3" json:"root,omitempty"`
-	// Alpha names the parent node, whose workspace is the session's alpha. It
-	// cannot be empty.
-	Alpha string `protobuf:"bytes,3,opt,name=alpha,proto3" json:"alpha,omitempty"`
-	// Beta names the child node, whose workspace is the session's beta. It
-	// cannot be empty, and it can't name the root or the parent.
-	Beta          string `protobuf:"bytes,4,opt,name=beta,proto3" json:"beta,omitempty"`
+	// Center names the star's center node, whose workspace is the session's
+	// alpha. It cannot be empty.
+	Center string `protobuf:"bytes,2,opt,name=center,proto3" json:"center,omitempty"`
+	// Node names the node whose workspace is the session's beta. It cannot be
+	// empty, and it can't name the center.
+	Node          string `protobuf:"bytes,3,opt,name=node,proto3" json:"node,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *TreeMembership) Reset() {
-	*x = TreeMembership{}
+func (x *StarMembership) Reset() {
+	*x = StarMembership{}
 	mi := &file_synchronization_session_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *TreeMembership) String() string {
+func (x *StarMembership) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*TreeMembership) ProtoMessage() {}
+func (*StarMembership) ProtoMessage() {}
 
-func (x *TreeMembership) ProtoReflect() protoreflect.Message {
+func (x *StarMembership) ProtoReflect() protoreflect.Message {
 	mi := &file_synchronization_session_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -266,35 +263,28 @@ func (x *TreeMembership) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use TreeMembership.ProtoReflect.Descriptor instead.
-func (*TreeMembership) Descriptor() ([]byte, []int) {
+// Deprecated: Use StarMembership.ProtoReflect.Descriptor instead.
+func (*StarMembership) Descriptor() ([]byte, []int) {
 	return file_synchronization_session_proto_rawDescGZIP(), []int{1}
 }
 
-func (x *TreeMembership) GetIdentifier() string {
+func (x *StarMembership) GetIdentifier() string {
 	if x != nil {
 		return x.Identifier
 	}
 	return ""
 }
 
-func (x *TreeMembership) GetRoot() string {
+func (x *StarMembership) GetCenter() string {
 	if x != nil {
-		return x.Root
+		return x.Center
 	}
 	return ""
 }
 
-func (x *TreeMembership) GetAlpha() string {
+func (x *StarMembership) GetNode() string {
 	if x != nil {
-		return x.Alpha
-	}
-	return ""
-}
-
-func (x *TreeMembership) GetBeta() string {
-	if x != nil {
-		return x.Beta
+		return x.Node
 	}
 	return ""
 }
@@ -303,7 +293,7 @@ var File_synchronization_session_proto protoreflect.FileDescriptor
 
 const file_synchronization_session_proto_rawDesc = "" +
 	"\n" +
-	"\x1dsynchronization/session.proto\x12\x0fsynchronization\x1a\x1fgoogle/protobuf/timestamp.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/version.proto\x1a\rurl/url.proto\"\xb5\x06\n" +
+	"\x1dsynchronization/session.proto\x12\x0fsynchronization\x1a\x1fgoogle/protobuf/timestamp.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/version.proto\x1a\rurl/url.proto\"\xc1\x06\n" +
 	"\aSession\x12\x1e\n" +
 	"\n" +
 	"identifier\x18\x01 \x01(\tR\n" +
@@ -322,17 +312,16 @@ const file_synchronization_session_proto_rawDesc = "" +
 	"\x06labels\x18\r \x03(\v2$.synchronization.Session.LabelsEntryR\x06labels\x12\x16\n" +
 	"\x06paused\x18\n" +
 	" \x01(\bR\x06paused\x123\n" +
-	"\x04tree\x18\x0f \x01(\v2\x1f.synchronization.TreeMembershipR\x04tree\x1a9\n" +
+	"\x04star\x18\x10 \x01(\v2\x1f.synchronization.StarMembershipR\x04star\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"n\n" +
-	"\x0eTreeMembership\x12\x1e\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x0f\x10\x10R\x04tree\"\\\n" +
+	"\x0eStarMembership\x12\x1e\n" +
 	"\n" +
 	"identifier\x18\x01 \x01(\tR\n" +
-	"identifier\x12\x12\n" +
-	"\x04root\x18\x02 \x01(\tR\x04root\x12\x14\n" +
-	"\x05alpha\x18\x03 \x01(\tR\x05alpha\x12\x12\n" +
-	"\x04beta\x18\x04 \x01(\tR\x04betaB3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
+	"identifier\x12\x16\n" +
+	"\x06center\x18\x02 \x01(\tR\x06center\x12\x12\n" +
+	"\x04node\x18\x03 \x01(\tR\x04nodeB3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
 
 var (
 	file_synchronization_session_proto_rawDescOnce sync.Once
@@ -349,7 +338,7 @@ func file_synchronization_session_proto_rawDescGZIP() []byte {
 var file_synchronization_session_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_synchronization_session_proto_goTypes = []any{
 	(*Session)(nil),               // 0: synchronization.Session
-	(*TreeMembership)(nil),        // 1: synchronization.TreeMembership
+	(*StarMembership)(nil),        // 1: synchronization.StarMembership
 	nil,                           // 2: synchronization.Session.LabelsEntry
 	(Version)(0),                  // 3: synchronization.Version
 	(*timestamppb.Timestamp)(nil), // 4: google.protobuf.Timestamp
@@ -365,7 +354,7 @@ var file_synchronization_session_proto_depIdxs = []int32{
 	6, // 5: synchronization.Session.configurationAlpha:type_name -> synchronization.Configuration
 	6, // 6: synchronization.Session.configurationBeta:type_name -> synchronization.Configuration
 	2, // 7: synchronization.Session.labels:type_name -> synchronization.Session.LabelsEntry
-	1, // 8: synchronization.Session.tree:type_name -> synchronization.TreeMembership
+	1, // 8: synchronization.Session.star:type_name -> synchronization.StarMembership
 	9, // [9:9] is the sub-list for method output_type
 	9, // [9:9] is the sub-list for method input_type
 	9, // [9:9] is the sub-list for extension type_name

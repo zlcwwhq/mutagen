@@ -70,13 +70,36 @@ func (w *checkedWriter) Write(data []byte) (int, error) {
 	return count, err
 }
 
+// lockedWriter serializes writes to an output that several goroutines write.
+type lockedWriter struct {
+	// lock serializes writes.
+	lock sync.Mutex
+	// writer is the underlying output.
+	writer io.Writer
+}
+
+func (w *lockedWriter) Write(data []byte) (int, error) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	return w.writer.Write(data)
+}
+
+// Fd preserves terminal detection (see terminalWidth) when the underlying
+// output exposes a file descriptor.
+func (w *lockedWriter) Fd() uintptr {
+	if file, ok := w.writer.(interface{ Fd() uintptr }); ok {
+		return file.Fd()
+	}
+	return ^uintptr(0)
+}
+
 // options are the parsed command line options.
 type options struct {
-	// node selects an execution node in the current workspace tree.
+	// node selects the destination node.
 	node string
-	// nodes requests a read-only node graph listing.
+	// nodes requests a read-only listing of the nodes that can be reached.
 	nodes bool
-	// target is the resolved adjacent route, kept internal to node selection.
+	// target is the resolved route, kept internal to node selection.
 	target *remote.Target
 	conflictOptions
 	// Deprecated selectors are parsed solely to report migration errors.
@@ -186,7 +209,7 @@ func parse(arguments []string) (*options, error) {
 	// Names in backquotes are used as value placeholders in usage information.
 	flags.StringVarP(&result.deprecatedSession, "session", "s", "", "Deprecated; use --node")
 	flags.StringVar(&result.node, "node", "", "Select destination node `NAME`")
-	flags.BoolVar(&result.nodes, "nodes", false, "List nodes, paths, and connection availability")
+	flags.BoolVar(&result.nodes, "nodes", false, "List reachable nodes and their availability")
 	flags.StringVarP(&result.directory, "cwd", "C", "", "Override execution directory with `DIR`")
 	flags.StringArrayVarP(&result.environment, "env", "e", nil, "Set or forward `NAME[=VALUE]` (repeatable)")
 	flags.StringArrayVar(&result.environmentFiles, "env-file", nil, "Read NAME=VALUE from `FILE` (repeatable)")
@@ -368,8 +391,13 @@ func (o *options) command() bool {
 // exit code.
 func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Remote stderr, progress refreshes, and daemon reports may arrive on
-	// different goroutines. Cancellation diagnostics use this writer too.
-	stderr = &commandErrorOutput{writer: stderr}
+	// different goroutines. Cancellation diagnostics use this writer too: a
+	// command's stderr may still be forwarded when cancellation ends
+	// remote.Execute, and the diagnostic that follows must wait for it.
+	// Standard output needs no lock: Run only writes it itself after the
+	// operations that forward output to it have completed, and never after
+	// cancellation ends one of them.
+	stderr = &lockedWriter{writer: stderr}
 	fail := func(err error) int {
 		fmt.Fprintln(stderr, "remote:", err)
 		return errorExitCode(err)
@@ -482,24 +510,11 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 	}
 	router := &router{ctx: ctx, directory: directory, selection: options.selection(request != nil && options.directory == ""), stderr: stderr, progress: options.progress}
-	if request != nil {
-		// Registrations already identify whether the source belongs to a tree.
-		// This local lookup needs no daemon graph query or remote round trip.
-		selection, source, err := options.locateSource(ctx, directory, options.directory == "")
-		if err != nil {
-			return fail(err)
-		}
-		router.selection = selection
-		if source.Tree {
-			return runNode(ctx, directory, options, request, selection, stdin, stdout, stderr, interrupted)
-		}
-	}
 	if (options.ignores || options.discard) && options.node != "" {
-		connection, target, err := router.submit(&remote.Submission{Operation: remote.OperationResolve})
+		target, err := router.resolve()
 		if err != nil {
 			return fail(err)
 		}
-		connection.Close()
 		options.target = target
 	}
 
@@ -509,7 +524,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	output := &checkedWriter{Writer: stdout}
 	switch {
 	case options.conflicts:
-		activity, err = "listing path conflicts", printPathConflicts(ctx, directory, options, output, stderr)
+		activity, err = "listing conflicts", printConflicts(ctx, directory, options, output, stderr)
 	case options.active():
 		activity, err = "resolving conflicts", runConflicts(ctx, directory, options, output, stderr)
 	case options.jobs:
@@ -587,8 +602,28 @@ func (r *router) submit(header *remote.Submission) (net.Conn, *remote.Target, er
 	return connection, target, err
 }
 
+// resolve has the daemon select the destination, as it does for every
+// submission, without performing an operation, and pins later submissions to
+// it, as dial does, unless an earlier submission already resolved it. The
+// daemon then refuses unknown or unavailable nodes, multi-hop selections, an
+// omitted node with several destinations, and star problems, exactly as it
+// does for commands, before the caller reads or writes anything.
+func (r *router) resolve() (*remote.Target, error) {
+	if target := r.selection.Target; target != nil && target.Resolved {
+		return target, nil
+	}
+	connection, target, err := r.submit(&remote.Submission{Operation: remote.OperationResolve})
+	if err != nil {
+		return nil, err
+	}
+	connection.Close()
+	return target, nil
+}
+
 // locate locates the session's endpoint without submitting an operation,
-// pinning later submissions to it, as dial does.
+// pinning later submissions to it, as dial does. Since the daemon doesn't
+// resolve the destination, it only serves the inspection of local rules, such
+// as by --ignores without --node; operations on a destination use resolve.
 func (r *router) locate() (*remote.Target, error) {
 	if r.selection.Target != nil {
 		return r.selection.Target, nil

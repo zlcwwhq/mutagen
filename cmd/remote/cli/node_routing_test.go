@@ -93,10 +93,9 @@ func TestCommandRoutingDoesNotDiscoverNodes(t *testing.T) {
 	}
 }
 
-// Tree commands refuse an ignored submission directory before submitting
-// anything, with the same guidance as pair commands, rather than relying on
-// the daemon's per-edge check.
-func TestTreeCommandRefusesIgnoredDirectory(t *testing.T) {
+// Star commands refuse an ignored submission directory before submitting
+// anything, with the same guidance as pair commands.
+func TestStarCommandRefusesIgnoredDirectory(t *testing.T) {
 	data, err := os.MkdirTemp("", "mr-")
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +108,7 @@ func TestTreeCommandRefusesIgnoredDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	source, err := remote.NewLocalChannel(nil, &remote.Endpoint{
-		Session: "sync_tree", Tree: "project", Root: root, Alpha: true, Submit: true, Node: "alpha", PeerNode: "beta",
+		Session: "sync_star", Star: "project", Root: root, Alpha: true, Submit: true, Node: "center", PeerNode: "gpu",
 		Ignores: &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"ignored"}},
 	})
 	if err != nil {
@@ -139,8 +138,8 @@ func TestTreeCommandRefusesIgnoredDirectory(t *testing.T) {
 	t.Cleanup(func() { source.Close(); handlers.Wait() })
 	t.Chdir(directory)
 	var output, diagnostic bytes.Buffer
-	if code := Run([]string{"--node", "beta", "true"}, strings.NewReader(""), &output, &diagnostic); code != failureExitCode ||
-		!strings.Contains(diagnostic.String(), "ignored/sub is inside ignored, which session sync_tree ignores") ||
+	if code := Run([]string{"--node", "gpu", "true"}, strings.NewReader(""), &output, &diagnostic); code != failureExitCode ||
+		!strings.Contains(diagnostic.String(), "ignored/sub is inside ignored, which session sync_star ignores") ||
 		!strings.Contains(diagnostic.String(), "--cwd . runs in the other side's own copy") {
 		t.Fatalf("ignored directory not refused locally: %d %s", code, diagnostic.String())
 	}
@@ -148,42 +147,5 @@ func TestTreeCommandRefusesIgnoredDirectory(t *testing.T) {
 	defer lock.Unlock()
 	if len(submitted) != 0 {
 		t.Fatalf("refused command was submitted: %v", submitted)
-	}
-}
-
-// Tree reports use the regular reporter independently of progress settings,
-// retain node identities on intermediate edges, and neutralize filenames.
-func TestTreeCommandReportsWithoutProgress(t *testing.T) {
-	var output bytes.Buffer
-	target := &remote.Target{Tree: true, SourceNode: "a", Node: "c", Root: "/project", Contained: true}
-	events := newCommandEvents(context.Background(), &output, &progressOutput{}, target)
-	report := &remote.Report{Resolution: true, Conflicts: []remote.Conflict{{Root: "unsafe\x1b[31m", Alpha: []remote.Change{{Path: "unsafe\x1b[31m", Old: "file", New: "file"}}, Beta: []remote.Change{{Path: "unsafe\x1b[31m", Old: "file", New: "file"}}}}}
-	event := &remote.CommandEvent{Alpha: "b", Beta: "c", Phase: "before command", Done: true, Report: report}
-	events.receive(event)
-	first := output.String()
-	events.receive(event)
-	events.finish()
-	if output.String() != first {
-		t.Fatal("duplicate edge report was printed twice")
-	}
-	if strings.Contains(first, "\x1b") || !strings.Contains(first, "on node b") || !strings.Contains(first, "on node c") || strings.Contains(first, "locally") {
-		t.Fatalf("unsafe or incorrectly identified report: %q", first)
-	}
-	if first == "" {
-		t.Fatal("disabled progress suppressed synchronization report")
-	}
-}
-
-// A distant edge has no merge workspace on this machine, but its own source
-// can hold an unfinished checkout after the conflict disappears.
-func TestPathConflictTextRetainsIntermediateState(t *testing.T) {
-	var output, diagnostic bytes.Buffer
-	target := &remote.Target{Tree: true, SourceNode: "b", Node: "c", Alpha: true, Contained: true}
-	listing := &remote.Listing{Problems: []remote.Problem{{Alpha: true, Path: "unreadable", Error: "permission denied"}}, Checkouts: []remote.Checkout{{Alpha: true, Path: "pending-file"}}}
-	if err := renderConflicts(context.Background(), t.TempDir(), &options{}, &output, &diagnostic, listing, target, false); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(output.String(), "No conflicts") || !strings.Contains(output.String(), "node b") || !strings.Contains(output.String(), "pending-file") || !strings.Contains(diagnostic.String(), "permission denied") || !strings.Contains(diagnostic.String(), "unreadable") {
-		t.Fatalf("intermediate state hidden: stdout=%q stderr=%q", output.String(), diagnostic.String())
 	}
 }

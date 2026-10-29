@@ -39,7 +39,7 @@ func (s *Server) Create(ctx context.Context, request *CreateRequest) (*CreateRes
 		request.Specification.ConfigurationBeta,
 		request.Specification.Name,
 		request.Specification.Labels,
-		request.Specification.Tree,
+		request.Specification.Star,
 		request.Specification.Paused,
 		request.Prompter,
 	)

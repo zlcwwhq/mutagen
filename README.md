@@ -39,9 +39,9 @@ Unchanged sessions retain their identifiers, synchronization history, scan
 caches, and paused state. Renaming a session removes the old session and
 creates a new one. Docker environment variables such as `DOCKER_HOST` are not
 compared: retained sessions keep the environment they were created with, while
-new and replaced pair sessions use the current environment. In a workspace
-tree, retained edges determine the endpoint of a shared node, including for
-new or replaced edges attached to it.
+new and replaced pair sessions use the current environment. In a star,
+retained edges determine the center's endpoint, including for new or replaced
+edges.
 
 Replaced synchronization sessions, like sessions created under a new name,
 start with fresh history and scan caches. Without a record of the last
@@ -56,17 +56,29 @@ synchronized state, they can't tell which endpoint changed a file:
 
 To protect changes that haven't been synchronized, `apply` flushes the running
 synchronization sessions that it replaces or removes before terminating any
-session. If a flush fails, nothing is terminated or created: fix the session and
+session, together with the running sessions that share their workspaces,
+including retained ones, repeatedly, until changes have propagated across them.
+A flush only makes its own session's endpoints agree, so a change that a later
+flush brings into a shared workspace, such as a star's center, takes another
+round to reach the other endpoints of sessions flushed before; otherwise, the
+new sessions would copy back files whose deletion hadn't reached every
+workspace. Sessions share a workspace if their endpoints are equal or nested on
+the same configured host (aliases and remote symbolic links aren't recognized).
+A group of sessions connected this way is flushed in D+1 rounds, where D is the
+largest number of steps between two of them: two rounds for a star and k rounds
+for a chain of k sessions, while a session that shares no workspace is flushed
+once. If a flush fails, nothing is terminated or created: fix the session and
 apply again, or, if its unsynchronized changes don't matter, terminate it with
-`mutagen sync terminate` and apply again. Changes that a flush leaves
-unsynchronized, such as those blocked by problems, aren't protected, and neither
-are changes made while `apply` runs, so stop processes that modify synchronized
-files before replacing or renaming their sessions. Paused sessions are neither
-flushed nor resumed, so changes made since a session was paused may be
-overwritten (`two-way-resolved`, `one-way-replica`) or become conflicts
-(`two-way-safe`, `one-way-safe`) once its replacement is resumed or a session
-created under a new name synchronizes them. The plan notes such sessions; resume
-them before applying to synchronize their changes first.
+`mutagen sync terminate` and apply again. A retained session can instead be
+paused with `mutagen sync pause`, since it keeps its history. Changes that a
+flush leaves unsynchronized, such as those blocked by problems, aren't
+protected, and neither are changes made while `apply` runs, so stop processes
+that modify synchronized files before replacing or renaming their sessions.
+Paused sessions are neither flushed nor resumed, so changes made since a session
+was paused may be overwritten (`two-way-resolved`, `one-way-replica`) or become
+conflicts (`two-way-safe`, `one-way-safe`) once its replacement is resumed or a
+session created under a new name synchronizes them. The plan notes such
+sessions; resume them before applying to synchronize their changes first.
 
 Use `-f path/to/project.yml` for another project file. Relative endpoint paths
 are resolved against its directory. Global configuration is included unless
@@ -102,144 +114,155 @@ Only the daemon's system needs an installation. The `mutagen-setup` agent skill
 (see below) automates this.
 
 
-## Workspace trees
+## Star workspaces
 
-A project can declare one tree of directory workspaces, managed by one daemon:
+A project can declare one star of directory workspaces, managed by one daemon:
+a center node joined to every other node by its own synchronization session.
 
 ```yaml
-tree:
+star:
   remote: true
   sync:
-    mode: two-way-safe
     ignore:
       paths: ["/mutagen.yml.lock", ".venv/", "__pycache__/"]
+  center: local
   nodes:
     local:
       endpoint: "."
     server:
       endpoint: "server:~/project"
-      parent: local
     gpu:
       endpoint: "gpu:~/project"
-      parent: server
+      mode: one-way-safe
       remotePrologue: "~/.config/gpu-prologue.sh"
 ```
 
 Apply it with `mutagen project apply --dry-run` and `mutagen project apply`.
-Each node identifies one system and directory. There must be at least two
-nodes, one root without a parent, and one parent for every other node, with no
-cycles. Names start with an ASCII letter, contain letters, digits, or dashes,
-end with a letter or digit, and have at most 63 characters; `defaults` is
-reserved. The tree expands into ordinary synchronization sessions named
-`tree-<child>`, which `mutagen project list` displays. Each session records
-its membership (tree, root, parent, and child node) as a dedicated field rather
-than in labels, so it survives daemon restarts and can't be set or changed
-with `mutagen sync create --label`; `mutagen sync list -l` shows it. Unchanged
-edges retain their history when applying configuration changes. When a node
-has retained edges, new or replaced edges reuse that node's retained endpoint,
-including its captured Docker environment, so all edges still identify the
-same workspace.
+Each node identifies one system and directory. `center` is required and names
+one of the nodes, and there must be at least one other node. Names start with
+an ASCII letter, contain letters, digits, or dashes, end with a letter or digit,
+and have at most 63 characters; `defaults` is reserved. The star expands into
+one ordinary synchronization session for each node other than the center, named
+`star-<node>`, whose alpha is the center and whose beta is the node; `mutagen
+project list` displays them. Each session records its membership (star, center,
+and node) as a dedicated field rather than in labels, so it survives daemon
+restarts and can't be set or changed with `mutagen sync create --label`;
+`mutagen sync list -l` shows it. Unchanged edges retain their history when
+applying configuration changes. New or replaced edges reuse the center's
+endpoint from the star's retained edges, including its captured Docker
+environment, so that all edges still identify the same center.
 
-Every edge uses `two-way-safe`. Settings under `tree.sync` extend global and
-project synchronization defaults, including ignores, and apply to every edge.
-The tree rejects other synchronization modes; set `tree.sync.mode` explicitly
-if defaults select another mode. Pair-specific `configurationAlpha` and
-`configurationBeta` defaults don't apply. Configure prologues on nodes:
-`remotePrologue` in global or project synchronization defaults doesn't apply
-to tree nodes. The
-root is structural and doesn't win conflicts. Distinct nodes must not use
-overlapping directories, and additional synchronization sessions must not
-overlap tree workspaces. Known overlaps are rejected; don't use different host
-aliases or remote symlink paths to give the same workspace multiple identities.
+Any node can be the center, with any type of endpoint, but only the center
+reaches every node, so put it where you usually work, such as on the system
+where your agents run. Mutagen relays every session's data through the daemon,
+so every endpoint must be reachable from the daemon, and endpoints needn't reach
+each other. When the center isn't on the daemon's system, the daemon relays its
+edges as it relays a pair whose endpoints are both remote. Either way, each
+command crosses a single edge, without intermediate copies.
 
-`tree.remote: true` explicitly permits commands between **all** nodes in the
-tree. Its default is false, regardless of `sync.defaults.remote`. From inside
-any participating node's directory, select another node by name:
+Settings under `star.sync` extend global and project synchronization defaults,
+including ignores, and apply to every edge. A node's `mode` sets the
+synchronization mode of its own edge (`two-way-safe`, `two-way-resolved`,
+`one-way-safe`, or `one-way-replica`), taking precedence over `star.sync.mode`
+and the defaults; edges use `two-way-safe` if nothing selects a mode. The
+center is alpha on every edge, so it wins conflicts in `two-way-resolved` mode,
+and one-way modes flow from the center to the node: changes made on such a node,
+including files that commands write there, don't reach the center. `mode` can't
+be set on the center. Pair-specific `configurationAlpha` and `configurationBeta`
+defaults don't apply. Configure prologues on nodes, including the center:
+`remotePrologue` in global or project synchronization defaults doesn't apply to
+star nodes.
+
+The nodes of a star must not overlap one another, including the center: the
+daemon refuses star edges whose nodes would overlap, and `mutagen project start`
+and `apply` refuse such declarations. They also refuse sessions declared in the
+same project file that overlap star workspaces. Sessions created outside the
+project aren't checked, and overlapping them behaves like overlapping pairs:
+the most specific workspace containing a directory is the source for `remote`,
+workspaces with the same root are ambiguous, and changes propagate through both
+sessions. Detection compares configured hosts and paths and can't see through
+host aliases or remote symbolic links, so don't use them to give one workspace
+multiple identities.
+
+`star.remote: true` explicitly permits commands between the center and every
+other node. Its default is false, regardless of `sync.defaults.remote`. Select
+a node by name:
 
 ```sh
 remote --nodes
 remote --nodes --json
-remote --node gpu pytest -x
-remote --node server --timeout 2m make test
+remote --node gpu pytest -x                    # from the center
+remote --node server --timeout 2m make test    # from the center
+remote make test                               # from server/gpu: on the center
 ```
 
-For `local` to `gpu`, the daemon synchronizes `local ↔ server`, then
-`server ↔ gpu`, executes on `gpu`, and synchronizes those edges in reverse to
-bring changes back. Commands use the corresponding relative directory;
-`--cwd` overrides it. The daemon sends the command directly through its agent
-connection to the target, so parents aren't network jump hosts and every
-endpoint must be reachable from the daemon. `MUTAGEN_REMOTE_NODE` identifies
-the executing node, regardless of which incident edge carries execution. Use
-it in tree prologues instead of `MUTAGEN_REMOTE_ENDPOINT`, whose alpha/beta
-value depends on the edge.
+From the center, `--node` selects any node, and can only be omitted if the star
+has a single other node. From any other node, the center is the only
+destination, so `--node` can be omitted. Selecting another node there fails
+with status 125: stars have no multi-hop routes, so run the command from the
+center. Every command crosses exactly one edge, which is an ordinary pair
+session, and follows the same rules as for a pair (see below): the edge is
+flushed before and after commands, conflicts produce warnings rather than
+preventing commands, and detached jobs, `--no-flush`, `--flush`, `--pull`,
+`--diff`, `--ignores`, and conflict resolution work as they do for pairs.
+An operation depends only on its own edge: pausing, replacing, removing, or
+adding other nodes doesn't affect it, and no operation uses another edge. As
+for a pair, the edge must be connected for commands at both of its ends: while
+it isn't connected at the center, such as while it reconnects, the node is
+unavailable, and operations on it from the center fail with status 255, so
+retry once it reconnects. Commands use the corresponding relative directory;
+`--cwd` overrides it.
+`MUTAGEN_REMOTE_NODE` identifies the executing node; use it in prologues shared
+by several nodes instead of `MUTAGEN_REMOTE_ENDPOINT`, since the center is alpha
+on every edge and every other node is beta.
 
-Node commands stop **before execution** if any path edge reports a conflict,
-scan/transition problem, or synchronization failure. If execution finishes but
-synchronization back fails, they return 125 and report the command's exit
-status and failed edge. Timeout and interruption retain their usual statuses.
-Tree commands started with `--detach` also require strict preflight on their
-adjacent edge; conflicts and synchronization failures prevent the job from
-starting. Their later results arrive through background synchronization or
-`--wait`. `--no-flush` skips both path synchronizations and their checks, so
-commands that neither read nor write synchronized files, such as `nvidia-smi`,
-run even while a path edge has conflicts. Such a call neither synchronizes nor
-waits for synchronization: background synchronization continues as
-configured, but conflicts, paused or disconnected edges, or disabled watching
-can keep its changes from propagating. The tree must still be valid and the
-path connected.
-Commands aren't retried automatically. Pausing or disconnecting a path endpoint,
-replacing a path edge, or introducing a problem that makes the path unsafe
-invalidates active routes. Changes to unrelated, valid branches do not cancel
-running commands unless they close the connection carrying the submission.
-Reconnection never redirects an invocation. An interrupted
-command may have written files without returning them, so inspect its outcome
-before retrying.
-
-`remote --nodes` lists every configured node, including paused or disconnected
-ones, marks the current node, and shows each target's path and connection
-availability. `--nodes --json` provides machine-readable output. Discovery
+`remote --nodes` lists the nodes that the current node can reach: from the
+center, every node, including paused or disconnected ones, and from another
+node, itself and the center. It marks the current node and the center, and shows
+each node's host and root, the mode of the edge to it, and its connection
+availability: a node is available while it executes commands, as the remote
+setting of the edge to it permits, and that edge is connected for commands at
+both ends. Operations on a node that doesn't execute commands fail with status
+125. `--nodes --json` provides machine-readable output. Discovery
 neither synchronizes files nor executes commands; available doesn't imply
-conflict-free. With more than one other node, specify `--node` explicitly,
-even if only one destination is online.
+conflict-free. Terminating an edge only removes its node. The daemon refuses
+star edges that disagree with the star's existing edges on the center or its
+endpoint, or whose node already has an edge. If the sessions that it loads
+disagree on the center's endpoint anyway, `remote --nodes` reports the star
+problem, and new operations from the center fail with status 125 until the star
+is repaired, such as by terminating the edge that disagrees and applying the
+project again, while operations already in progress and other nodes keep using
+their own edges. `remote --conflicts --json` reports an `edges` array with a
+single entry, which names the edge's `alpha` and `beta` nodes and the listing's
+`source` and `target`, and contains the `listing`. `remote --help nodes`
+summarizes target selection.
 
-Foreground commands and scripts can reach any node. `remote --node gpu
---conflicts` inspects the synchronization path and labels conflicts by the
-actual adjacent nodes holding their copies. Paths on the first edge are
-relative to the current directory, as for pairs, and those on later edges to
-their roots. Resolve from one of those nodes with `--node` selecting its peer,
-after listing its conflicts again there. Jobs, file operations, conflict
-modifications, and `--flush` require an adjacent destination. Conflict listings
-with `--json` always use an `edges` array, including for an adjacent
-destination or an implicit pair; each entry names `alpha` and `beta`,
-identifies its traversal `source` and `target`, and contains their `listing`.
-The listing's local and remote changes refer to that entry's source and
-target, including intermediate nodes.
-Tree foreground commands and detached job starts synchronize strictly unless
-given `--no-flush`.
+Earlier releases declared workspace trees under `tree:`, which is no longer
+accepted: `mutagen project start` and `apply` refuse project files that
+contain it. To migrate a tree to a star:
 
-If the tree's sessions no longer form the configured tree, such as after an
-edge was terminated or a partial `mutagen project apply`, or another session
-overlaps a node, tree commands and path conflict listings fail with 125 until
-the tree is repaired, typically by applying the project again. `remote --nodes`
-still succeeds and reports the problem, and operations on an adjacent node
-(existing jobs, conflicts, `--diff`, `--pull`, `--flush`, and `--ignores`)
-keep working as long as that node's own edge is connected, which `--nodes
---json` reports as `adjacent`. Starting a new detached job still requires a
-valid tree, even with `--no-flush`.
-
-Other branches continue background synchronization without participating in this
-call's completion. Ordered path synchronization provides neither snapshots nor
-concurrent writer isolation and doesn't make the entire tree consistent at
-once. `remote --help nodes` describes target selection and operation limits.
+- Replace `tree:` with `star:`, remove each node's `parent`, and name a node,
+  such as the former root, with `center:`.
+- Apply the project. `mutagen project apply` removes the former `tree-<node>`
+  sessions, flushing running ones first, and creates `star-<node>` sessions,
+  which start with fresh synchronization history.
+- The migration relies on `apply` flushing the tree's sessions together,
+  repeatedly, until changes such as deletions have reached every node (see
+  [Applying project configuration](#applying-project-configuration)). Paused
+  sessions aren't flushed, so resume paused `tree-<node>` sessions first.
+- Commands between two nodes other than the center no longer exist; run them
+  from the center.
+- Star commands follow pair semantics: conflicts produce warnings instead of
+  preventing commands, and no command synchronizes several edges.
 
 
 ## Remote commands
 
 The `remote` executable selects a destination **node**, a workspace on a
-system. A standalone synchronization pair is exposed as an implicit two-node
-graph named `alpha` and `beta`; a declared tree uses its configured names.
-`remote --nodes` discovers the graph and `remote --node NAME` selects a target.
-When there is exactly one other node, the name can be omitted. Commands run in
+system. A standalone synchronization pair is exposed as two nodes named `alpha`
+and `beta`; a declared star uses its configured names. `remote --nodes` lists
+the nodes that can be reached, and `remote --node NAME` selects a target. When
+there is exactly one other node, the name can be omitted. Commands run in
 the corresponding directory and use the daemon's agent connections, so the
 daemon can run on a third system and endpoints needn't reach each other.
 
@@ -278,11 +301,11 @@ that path, or put that directory on `PATH`; links to it must also be named
 `remote`.
 
 The current directory identifies the most specific connected source workspace.
-Several incident edges of one node are one source. Independent pairs sharing
-the same root are ambiguous: declare them as one tree instead of relying on
+The edges of a star are one source at its center. Independent pairs sharing
+the same root are ambiguous: declare them as one star instead of relying on
 creation order. Earlier versions used the session created first; such setups
-now fail with `ambiguous source node` until they're declared as a tree, such
-as the shared directory as the root and each machine as its child. Outside
+now fail with `ambiguous source node` until they're declared as a star, such
+as with the shared directory as the center and each machine as a node. Outside
 every root, an explicit `--node` (or `--nodes`) is
 accepted only if one source workspace is unambiguous on this system. Commands
 then use the destination root, or `--cwd`, and skip its prologue. This also
@@ -387,7 +410,8 @@ interpretation, so shell syntax requires an explicit shell or `--script`.
 Standard streams and the command or job's own exit status are preserved.
 Remote's own argument, input, or operation failures return 125; connection
 setup, lost connections, protocol failures, and an unreachable node return
-255. An unknown node or a workspace tree problem returns 125. Read the `remote:`
+255. An unknown node, a node that only a star's center reaches, or a star
+problem returns 125. Read the `remote:`
 diagnostic before retrying a 125 failure. Commands may themselves return 125
 or 255, so exit status alone cannot always identify the source. Timeouts remain
 124, startup/working-directory/prologue failures 126, and missing commands 127;
@@ -418,30 +442,28 @@ The arguments after the file are the script's, even ones that look like
 options. A script read from standard input leaves its commands no input.
 Scripts are limited to 512 KiB and aren't supported on Windows endpoints.
 
-For an implicit pair, `remote` flushes the session (as `mutagen sync flush`
-does) before the command,
-so that it sees local changes, and after it, so that its changes are present
-locally when `remote` exits. This works from either endpoint, since the daemon
-performs the flush. If flushing fails, then `remote` prints a warning and
-continues with the command's exit status; `--no-flush` skips both flushes, and
-`remote --flush` only flushes. `--timeout` takes seconds, or a duration with a
+`remote` flushes the session that the command crosses, such as a star's edge,
+as `mutagen sync flush` does: before the command, so that it sees local
+changes, and after it, so that its changes are present locally when `remote`
+exits. This works from either endpoint, since the daemon performs the flush.
+If flushing fails, then `remote` prints a warning and continues with the
+command's exit status; `--no-flush` skips both flushes, and `remote --flush`
+only flushes. `--timeout` takes seconds, or a duration with a
 unit such as `10m`, and includes the time spent flushing. Skipping the flush
 before a command can silently run outdated code, while an unneeded flush only
 costs a rescan of both roots, so use `--no-flush` only for commands that
 neither read nor write synchronized files. `--detach` flushes only before
 starting a job and `--wait` only after it ends, while `--jobs`, `--kill`,
 `--ignores`, and `--pull` don't flush. `--kill` accepts `--no-flush`, which
-has no effect. Tree foreground commands and detached job starts instead
-synchronize their paths strictly, as described above, and `--no-flush` skips
-that as well.
+has no effect.
 
 Flushes that take over 3 seconds show their progress on standard error,
 following git's convention: on a terminal, as a line updated in place, and
 elsewhere only with `--progress`, as separate `remote:` lines printed when the
 phase changes and every 10 seconds, which suits commands run in the background
 or under a line-based monitor; `--progress=false` disables it. This applies to
-every flush, including those of tree commands, `--wait`, `--diff`, and the
-conflict operations. Tree progress identifies the path edge being synchronized.
+every flush, including those of `--wait`, `--diff`, and the conflict
+operations.
 A final line summarizes where the time went, such as
 `remote: synchronized in 44s: scanning 31s; staging on alpha (local) 12s, 1 file, 5.0 MiB`:
 scanning both roots (a flush rescans them in full), staging changed files on an
@@ -521,10 +543,12 @@ Content that commands write to ignored paths exists only on the executing
 endpoint. `remote --ignores <path>...` shows whether the session ignores each
 path. Missing local paths are marked `not present locally`, with conditional
 results for a file or directory; access errors are reported separately.
-`remote --pull <path>...` copies ignored files, directories, and
-symbolic links from the opposite endpoint, replacing local files that differ
-but never deleting local content. It refuses paths that the session (or
-another session) synchronizes, and directories with synchronized content
+`remote --pull <path>...` copies ignored files, directories, and symbolic links
+from the target node, replacing local files that differ but never deleting
+local content. The target is selected as for commands before anything is
+copied, so a pull that names an unknown or unreachable node, or omits a node
+where several are reachable, copies nothing. It refuses paths that the session
+(or another session) synchronizes, and directories with synchronized content
 beneath them. Other sessions are recognized whether or not they run remote
 commands, but only while their endpoints on this system are connected and run
 by this version of Mutagen or a later one: `--pull` can't tell whether paused

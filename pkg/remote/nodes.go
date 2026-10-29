@@ -7,54 +7,48 @@ import (
 	"io"
 )
 
-// Node describes a workspace in the source's graph. Reachability is only a
-// connection snapshot: command preflight still checks synchronization results.
+// Node describes a workspace that the source can reach, or the source itself.
+// Availability is only a connection snapshot: commands still synchronize and
+// report conflicts as for any pair.
 type Node struct {
-	// Name and Parent are scoped to this workspace graph.
-	Name   string
-	Parent string `json:",omitempty"`
+	// Name is scoped to the star or implicit pair.
+	Name string
+	// Center identifies a star's center node, which reaches every other node,
+	// while the other nodes reach only the center.
+	Center bool `json:",omitempty"`
 	// Host and Root are configured display values, without credentials.
 	Host string
 	Root string
-	// Path includes both the source and destination names.
+	// Path includes the source and, for a destination, the destination name.
+	// Every destination is reached over a single edge.
 	Path []string
-	// Current identifies the submitting workspace. Available describes only
-	// connections: in a declared tree, it means that a strict tree command can
-	// be routed along Path, and in an implicit pair, that the peer is
-	// connected. Reason explains why a node isn't available.
+	// Mode is the synchronization mode of the edge to a destination.
+	Mode string `json:",omitempty"`
+	// Current identifies the submitting workspace. Available indicates that
+	// the edge to a destination runs and is connected for commands. Reason
+	// explains why a destination isn't available.
 	Current   bool
 	Available bool
 	Reason    string `json:",omitempty"`
-	// Adjacent indicates that the node is directly adjacent to the source over
-	// an edge whose synchronization loop runs and whose command channels are
-	// both connected. Operations that only use that edge, such as job control
-	// and conflict resolution, require it rather than Available. New commands,
-	// including detached starts, additionally require strict tree preflight.
-	// It equals Available for an implicit pair's peer.
-	Adjacent bool `json:",omitempty"`
-	// Session and Alpha are daemon-only indexes for adjacent edges. They are
-	// never serialized or used by clients to select a submission registration.
+	// Session and Alpha are daemon-only indexes of a destination's edge and
+	// the source's role on it. They are never serialized or used by clients
+	// to select a submission registration.
 	Session string `json:"-"`
 	Alpha   bool   `json:"-"`
 }
 
-// NodeGraph describes the configured nodes, including disconnected members.
-// Tree distinguishes an explicitly declared tree from an implicit pair.
+// NodeGraph describes the nodes that a source can reach, including
+// disconnected ones. Star distinguishes a declared star from an implicit pair.
 type NodeGraph struct {
 	// Source is the submitting node's name.
 	Source string
-	// Tree marks a declared tree, whose foreground execution uses strict sync.
-	Tree bool
-	// Revision pins immutable graph membership for subsequent operations.
-	Revision string
-	// Problem describes why a declared tree's persisted membership can't be
-	// used for strict tree commands, such as an edge missing from the tree,
-	// inconsistent edge configurations, or another session overlapping a node.
-	// Every strict tree command is then refused, but the graph still lists the
-	// nodes known from the tree's edges, as far as they can be reconstructed,
-	// and adjacent nodes over connected edges remain usable (see Adjacent).
+	// Star marks a declared star workspace.
+	Star bool
+	// Problem describes why a star's persisted edges are inconsistent, such
+	// as edges that disagree on the center's endpoint. Operations from the
+	// center are then refused, while other nodes keep using their own edges.
 	Problem string `json:",omitempty"`
-	// Nodes includes offline members, in deterministic name order.
+	// Nodes includes offline nodes, in deterministic name order.
 	Nodes []Node
 }
 
@@ -93,16 +87,18 @@ func ListNodes(ctx context.Context, connection io.ReadWriteCloser) (*NodeGraph, 
 }
 
 // ResolvedRoute acknowledges destination selection on an operation connection.
-// Session and Alpha describe the actual adjacent edge solely for checkout
-// ownership and conflict direction; they never select a local registration.
+// Session and Alpha describe the selected edge for checkout ownership and
+// conflict direction. It's always the edge whose registration the submission
+// entered through, since the daemon refuses submissions that would cross
+// another edge. Revision pins the selected edge for later submissions.
 type ResolvedRoute struct {
-	// Ignores belong to the selected edge, even in a degraded tree.
+	// Ignores belong to the selected edge.
 	Ignores    *Ignores `json:",omitempty"`
 	Session    string
 	Alpha      bool
 	SourceNode string
 	Node       string
-	Tree       bool
+	Star       bool
 	Revision   string
 }
 

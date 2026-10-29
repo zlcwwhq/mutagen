@@ -291,18 +291,11 @@ const (
 	// OperationRelease requests that the daemon remove a checkout held by the
 	// submitting endpoint (see ReleaseCheckout).
 	OperationRelease
-	// OperationTreeExecute runs a foreground command on a named tree node,
-	// synchronizing its path strictly before and after execution unless the
-	// submission sets NoFlush. A distinct operation prevents older daemons
-	// from silently executing on a pair peer.
-	OperationTreeExecute
 	// OperationNodes queries the submitting workspace's node graph without
 	// synchronizing files or executing a command.
 	OperationNodes
-	// OperationNodeConflicts lists every actual edge on the route to Node in
-	// order, using the same bounded stream for adjacent and distant targets.
-	OperationNodeConflicts
-	// OperationResolve validates an adjacent target without other side effects.
+	// OperationResolve selects a destination (see Submission.Resolve) without
+	// other side effects.
 	OperationResolve
 )
 
@@ -311,38 +304,17 @@ const (
 // ReceiveSubmission). Hops between them forward it unchanged, along with the
 // rest of the route's data.
 type Submission struct {
-	// Adjacent is daemon-local routing metadata, never trusted from the wire.
-	Adjacent bool `json:"-"`
 	// Operation is the requested operation.
 	Operation Operation
 	// Resolve requests a routing acknowledgement before the operation response.
 	// The acknowledgement shares this connection; no discovery round trip is needed.
 	Resolve bool `json:",omitempty"`
-	// Command distinguishes command starts, including those of detached jobs,
-	// from file and job-control operations. For a tree source, it selects
-	// strict routing, in which the daemon synchronizes the path to the target
-	// node before (and, in the foreground, after) the command, and refuses the
-	// command if it can't (see OperationTreeExecute), unless NoFlush skips
-	// that synchronization. Strict routing is a policy that the submitting
-	// client declares, not a security boundary: the remote executable always
-	// sets Command for commands, but a submission that omits it takes the
-	// lenient adjacent path, which runs whatever it requests without that
-	// synchronization. Any submitter can already run arbitrary commands on an
-	// adjacent node, and the daemon deliberately doesn't parse requests to
-	// classify them, since other operations, such as conflict resolution's
-	// file transfers, are submitted as OperationExecute.
-	Command bool `json:",omitempty"`
-	// Detached marks a command start that requires an adjacent destination.
-	Detached bool `json:",omitempty"`
-	// NoFlush declares that the client skips synchronization around a command.
-	// The daemon then skips a tree command's strict path synchronization and
-	// its conflict checks, but still routes it only through a valid tree.
-	NoFlush bool `json:",omitempty"`
 	// Node selects the destination for every operation. The daemon identifies
 	// the source from the submitting endpoint, never from client input.
 	Node string `json:",omitempty"`
-	// Revision pins the membership returned by a node query. A topology change
-	// between discovery and a subsequent operation is an error.
+	// Revision pins the edge selected by an operation's first submission (see
+	// ResolvedRoute) for its later submissions, which fail if that edge was
+	// replaced or removed in the meantime. Other edges don't affect it.
 	Revision string `json:",omitempty"`
 	// Progress requests progress messages (see ReportProgress) while the
 	// daemon waits for the synchronization cycle of an OperationFlush or
@@ -414,8 +386,6 @@ type progressMessage struct {
 
 // result distinguishes command exit status from execution infrastructure errors.
 type result struct {
-	// Event is a synchronization update preceding the final execution result.
-	Event *CommandEvent `json:",omitempty"`
 	// ExitCode is the command exit code.
 	ExitCode int
 	// Error is the execution infrastructure error, if any.

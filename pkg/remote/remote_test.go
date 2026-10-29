@@ -597,7 +597,7 @@ func TestReceiveSubmission(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	for _, operation := range []Operation{OperationExecute, OperationFlush, OperationConflicts, OperationClaim, OperationRelease, OperationTreeExecute, OperationNodes, OperationNodeConflicts, OperationResolve} {
+	for _, operation := range []Operation{OperationExecute, OperationFlush, OperationConflicts, OperationClaim, OperationRelease, OperationNodes, OperationResolve} {
 		for _, progress := range []bool{false, true} {
 			sent := &Submission{Operation: operation, Progress: progress}
 			if received, err := receive(ctx, sent); err != nil || *received != *sent {

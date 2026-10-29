@@ -44,18 +44,22 @@ func TestCreationSpecificationIgnores(t *testing.T) {
 	}
 }
 
-// TestCreationSpecificationTree tests that creation specifications with
-// invalid workspace tree membership are rejected before session creation.
-func TestCreationSpecificationTree(t *testing.T) {
+// TestCreationSpecificationStar tests that creation specifications with
+// invalid star membership are rejected before session creation.
+func TestCreationSpecificationStar(t *testing.T) {
 	alpha, beta := t.TempDir(), t.TempDir()
 	for _, test := range []struct {
 		description string
-		tree        *synchronization.TreeMembership
+		star        *synchronization.StarMembership
 		expectValid bool
 	}{
 		{"no membership", nil, true},
-		{"valid membership", &synchronization.TreeMembership{Identifier: "project", Root: "a", Alpha: "a", Beta: "b"}, true},
-		{"missing child", &synchronization.TreeMembership{Identifier: "project", Root: "a", Alpha: "a"}, false},
+		{"valid membership", &synchronization.StarMembership{Identifier: "project", Center: "local", Node: "gpu"}, true},
+		{"missing node", &synchronization.StarMembership{Identifier: "project", Center: "local"}, false},
+		{"missing center", &synchronization.StarMembership{Identifier: "project", Node: "gpu"}, false},
+		{"node is center", &synchronization.StarMembership{Identifier: "project", Center: "gpu", Node: "gpu"}, false},
+		{"missing identifier", &synchronization.StarMembership{Center: "local", Node: "gpu"}, false},
+		{"invalid node name", &synchronization.StarMembership{Identifier: "project", Center: "local", Node: "-gpu"}, false},
 	} {
 		specification := &CreationSpecification{
 			Alpha:              &url.URL{Kind: url.Kind_Synchronization, Path: alpha},
@@ -63,7 +67,7 @@ func TestCreationSpecificationTree(t *testing.T) {
 			Configuration:      &synchronization.Configuration{},
 			ConfigurationAlpha: &synchronization.Configuration{},
 			ConfigurationBeta:  &synchronization.Configuration{},
-			Tree:               test.tree,
+			Star:               test.star,
 		}
 		if err := specification.ensureValid(); test.expectValid && err != nil {
 			t.Errorf("%s: valid specification rejected: %v", test.description, err)

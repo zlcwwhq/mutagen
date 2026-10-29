@@ -27,8 +27,8 @@ type Session struct {
 	Name string `json:"name,omitempty"`
 	// Label are the session labels.
 	Labels map[string]string `json:"labels,omitempty"`
-	// Tree identifies the session as an edge of a workspace tree, if it is one.
-	Tree *TreeMembership `json:"tree,omitempty"`
+	// Star identifies the session as an edge of a star workspace, if it is one.
+	Star *StarMembership `json:"star,omitempty"`
 	// Paused indicates whether or not the session is paused.
 	Paused bool `json:"paused"`
 	// Status is the session status.
@@ -38,18 +38,18 @@ type Session struct {
 	*SessionState
 }
 
-// TreeMembership identifies a session as the edge of a workspace tree that
-// joins a parent node, the session's alpha, to a child node, its beta.
-type TreeMembership struct {
-	// Identifier identifies the tree, which is the identifier of the project
+// StarMembership identifies a session as the edge of a star workspace that
+// joins the star's center node, the session's alpha, to another node, its
+// beta.
+type StarMembership struct {
+	// Identifier identifies the star, which is the identifier of the project
 	// that declares it.
 	Identifier string `json:"identifier"`
-	// Root names the tree's structural root node.
-	Root string `json:"root"`
-	// Parent names the node whose workspace is the session's alpha.
-	Parent string `json:"parent"`
-	// Child names the node whose workspace is the session's beta.
-	Child string `json:"child"`
+	// Center names the star's center node, whose workspace is the session's
+	// alpha.
+	Center string `json:"center"`
+	// Node names the node whose workspace is the session's beta.
+	Node string `json:"node"`
 }
 
 // SessionState encodes fields relevant to unpaused sessions.
@@ -83,12 +83,11 @@ func (s *Session) loadFromInternal(state *synchronization.State) {
 	)
 	s.Name = state.Session.Name
 	s.Labels = state.Session.Labels
-	if tree := state.Session.Tree; tree != nil {
-		s.Tree = &TreeMembership{
-			Identifier: tree.Identifier,
-			Root:       tree.Root,
-			Parent:     tree.Alpha,
-			Child:      tree.Beta,
+	if star := state.Session.Star; star != nil {
+		s.Star = &StarMembership{
+			Identifier: star.Identifier,
+			Center:     star.Center,
+			Node:       star.Node,
 		}
 	}
 	s.Paused = state.Session.Paused

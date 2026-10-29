@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -992,20 +993,39 @@ func printConflicts(ctx context.Context, directory string, o *options, output, e
 	listing, target, err := listConflicts(ctx, directory, o, errorOutput)
 	if err != nil {
 		return err
+	} else if !o.json {
+		return renderConflicts(ctx, directory, o, output, errorOutput, listing, target)
 	}
-	return renderConflicts(ctx, directory, o, output, errorOutput, listing, target, true)
+	var rendered bytes.Buffer
+	if err := renderConflicts(ctx, directory, o, &rendered, errorOutput, listing, target); err != nil {
+		return err
+	}
+	alpha, beta := target.SourceNode, target.Node
+	if !target.Alpha {
+		alpha, beta = beta, alpha
+	}
+	return json.NewEncoder(output).Encode(struct {
+		Edges []conflictEdge `json:"edges"`
+	}{[]conflictEdge{{alpha, beta, target.SourceNode, target.Node, json.RawMessage(rendered.Bytes())}}})
 }
 
-// renderConflicts shares the public listing schema across adjacent and distant
-// edges. Only the first edge can have workspaces on the submitting system.
-func renderConflicts(ctx context.Context, directory string, o *options, output, errorOutput io.Writer, listing *remote.Listing, target *remote.Target, local bool) error {
+// conflictEdge labels a conflict listing in JSON by the nodes of the edge that
+// the listing belongs to, alpha and beta, and by the source and target of the
+// listing, whose local and remote changes it describes. Every listing has a
+// single edge, which is kept in an array for compatibility.
+type conflictEdge struct {
+	Alpha   string          `json:"alpha"`
+	Beta    string          `json:"beta"`
+	Source  string          `json:"source"`
+	Target  string          `json:"target"`
+	Listing json.RawMessage `json:"listing"`
+}
+
+// renderConflicts prints a conflict listing (see printConflicts).
+func renderConflicts(ctx context.Context, directory string, o *options, output, errorOutput io.Writer, listing *remote.Listing, target *remote.Target) error {
 	l := newLocator(target)
-	workspaces := make(map[string]*workspace)
-	checkouts := listing.Checkouts
-	if local {
-		workspaces = sessionWorkspaces(target)
-		checkouts = releaseAbandoned(ctx, directory, target, checkouts, workspaces)
-	}
+	workspaces := sessionWorkspaces(target)
+	checkouts := releaseAbandoned(ctx, directory, target, listing.Checkouts, workspaces)
 	holders := make(map[string]bool)
 	for _, checkout := range checkouts {
 		holders[checkout.Path] = checkout.Alpha
@@ -1052,7 +1072,7 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 		delete(workspaces, conflict.Path)
 		delete(holders, conflict.Path)
 	}
-	var pending, elsewhere, remoteSourcePending []string
+	var pending, elsewhere []string
 	for path := range workspaces {
 		pending = append(pending, path)
 	}
@@ -1060,19 +1080,15 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 	for path, alpha := range holders {
 		if alpha != target.Alpha {
 			elsewhere = append(elsewhere, path)
-		} else if !local {
-			remoteSourcePending = append(remoteSourcePending, path)
 		}
 	}
 	slices.Sort(elsewhere)
-	slices.Sort(remoteSourcePending)
 	if !o.json {
 		reports.print(&remote.Report{Problems: listing.Problems})
 	}
 	if o.json {
-		// Every path edge retains scan/transition problems and checkout owners,
-		// including pending checkouts on intermediate nodes with no local merge
-		// workspace. Omit opaque checkout tokens from the public JSON.
+		// Retain scan/transition problems and checkout owners, but omit opaque
+		// checkout tokens from the public JSON.
 		type checkoutOwner struct{ Path, Node string }
 		listed := struct {
 			Conflicts     []listedConflict
@@ -1100,7 +1116,7 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 			listed.RemotePending[p] = l.local(path)
 		}
 		return json.NewEncoder(output).Encode(&listed)
-	} else if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 && len(remoteSourcePending) == 0 && len(listing.Problems) == 0 {
+	} else if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 && len(listing.Problems) == 0 {
 		_, err := fmt.Fprintln(output, "No conflicts.")
 		return err
 	}
@@ -1127,7 +1143,7 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 	}
 	// Workspaces whose conflicts are no longer listed are listed with their
 	// locations, since they may hold the only copy of one side's changes.
-	var unfinished, unapplied, remotely, atSource []string
+	var unfinished, unapplied, remotely []string
 	for _, path := range pending {
 		w := workspaces[path]
 		line := fmt.Sprintf("%s (workspace: %s)", l.display(path), w.directory)
@@ -1140,9 +1156,6 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 	for _, path := range elsewhere {
 		remotely = append(remotely, l.display(path))
 	}
-	for _, path := range remoteSourcePending {
-		atSource = append(atSource, l.display(path))
-	}
 	for _, section := range []struct {
 		heading string
 		lines   []string
@@ -1151,7 +1164,6 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 		{fmt.Sprintf("Checked out, but no longer listed as conflicts, with nothing applied (resolved some other way, or ended by a change after checkout, which may have left one side's changes only in the workspace; compare the current file with the workspace's local and remote files before discarding, since discarded workspaces are deleted after %d days):",
 			int(backupRetention.Hours()/24)), unapplied},
 		{"Checked out through the opposite endpoint, but no longer listed as conflicts (possibly unfinished; leave them unchanged until applied or discarded there):", remotely},
-		{fmt.Sprintf("Checked out on node %s, but no longer listed as conflicts (possibly unfinished; inspect and apply or discard the workspace there):", terminal.NeutralizeControlCharacters(target.SourceNode)), atSource},
 	} {
 		if len(section.lines) == 0 {
 			continue
@@ -1932,11 +1944,10 @@ func releaseAt(ctx context.Context, local string, selected *remote.Target, w *wo
 	selection := &remote.Selection{Workspace: true, Resolve: true, Target: selected}
 	if selected == nil && w != nil {
 		// A saved workspace identifies the local endpoint of the edge that owns
-		// its checkout, which is the registration to pin, whether the daemon
-		// selected that edge for another source registration of the same node
-		// or the workspace predates node-based routing, in which case the edge
-		// was the source registration itself. The target isn't resolved, so
-		// the release goes over that edge to its opposite endpoint directly.
+		// its checkout, which is the registration to pin, since operations
+		// only cross the edge through which they're submitted. The target
+		// isn't resolved, so the release goes over that edge to its opposite
+		// endpoint directly, even at a star's center with several nodes.
 		selection = &remote.Selection{Target: &remote.Target{
 			SourceSession: w.Session, SourceAlpha: w.Alpha,
 			Session: w.Session, Alpha: w.Alpha,

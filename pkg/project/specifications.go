@@ -263,27 +263,35 @@ func NewSessionSpecifications(
 		}
 	}
 
-	// Expand the workspace tree after validating the ordinary sessions. Refuse
-	// name collisions and extra synchronization edges touching its workspaces.
-	tree, err := treeSpecifications(configuration.Tree, defaultConfigurationSynchronization, projectIdentifier, paused)
-	if err != nil {
-		return nil, fmt.Errorf("invalid workspace tree: %w", err)
+	// Expand the star after validating the ordinary sessions. Refuse name
+	// collisions and other synchronization sessions overlapping its
+	// workspaces.
+	if configuration.Tree.Kind != 0 {
+		return nil, errTreeRemoved
 	}
-	for _, edge := range tree {
-		for _, ordinary := range synchronizationSpecifications {
-			if edge.Name == ordinary.Name {
-				return nil, fmt.Errorf("synchronization name %s is reserved by the tree", edge.Name)
-			}
-			for _, a := range []*url.URL{edge.Alpha, edge.Beta} {
-				for _, b := range []*url.URL{ordinary.Alpha, ordinary.Beta} {
-					if synchronization.TreeEndpointsOverlap(a, b) {
-						return nil, fmt.Errorf("session %s overlaps a workspace tree node", ordinary.Name)
-					}
+	star, err := starSpecifications(configuration.Star, defaultConfigurationSynchronization, projectIdentifier, paused)
+	if err != nil {
+		return nil, fmt.Errorf("invalid star: %w", err)
+	}
+	if len(star) > 0 {
+		var ordinary []*synchronization.Session
+		for _, specification := range synchronizationSpecifications {
+			for _, edge := range star {
+				if edge.Name == specification.Name {
+					return nil, fmt.Errorf("synchronization session name %s is reserved by the star", edge.Name)
 				}
 			}
+			ordinary = append(ordinary, specificationSession(specification))
+		}
+		edges := make([]*synchronization.Session, len(star))
+		for i, edge := range star {
+			edges[i] = specificationSession(edge)
+		}
+		if err := synchronization.ValidateStar(edges, ordinary); err != nil {
+			return nil, fmt.Errorf("invalid star: %w", err)
 		}
 	}
-	synchronizationSpecifications = append(synchronizationSpecifications, tree...)
+	synchronizationSpecifications = append(synchronizationSpecifications, star...)
 
 	// Use a deterministic creation order independent of YAML map iteration.
 	sort.Slice(forwardingSpecifications, func(i, j int) bool {
