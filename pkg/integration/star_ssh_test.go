@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/agent"
+	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/project"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/selection"
@@ -56,15 +57,34 @@ func TestStarFakeSSH(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake SSH commands require a POSIX shell")
 	}
-	if path, err := agent.ExecutableForPlatform(runtime.GOOS, runtime.GOARCH, ""); err != nil {
-		t.Skip("agent bundle unavailable (perform a local build first):", err)
+
+	// The fake remote system is this one, whose platform the agent installer
+	// probes with uname (see pkg/agent/probe.go), so the bundle must contain
+	// the agent for the host's platform, which isn't the test's when it's
+	// built for another architecture, such as 386 on amd64.
+	platform, err := exec.Command("go", "env", "GOHOSTOS", "GOHOSTARCH").Output()
+	if err != nil {
+		t.Skip("unable to determine the host platform with go env:", err)
+	}
+	host := strings.Fields(string(platform))
+	if len(host) != 2 {
+		t.Fatalf("unexpected host platform: %q", platform)
+	}
+	if path, err := agent.ExecutableForPlatform(host[0], host[1], ""); err != nil {
+		t.Skipf("agent bundle has no agent for the host platform %s/%s (perform a local build for it first): %v", host[0], host[1], err)
 	} else {
 		os.Remove(path)
 	}
 
 	// Create the fake remote system and the center's workspace in a short
-	// directory, which keeps socket paths within Unix limits.
-	base, err := os.MkdirTemp("", "mss-")
+	// directory, which keeps the registries' socket paths within Unix limits:
+	// sun_path holds 104 bytes on macOS, including the terminating NUL. The
+	// temporary directory there is long (/var/folders/xx/<28 characters>/T,
+	// which resolves to /private/var/...), so use /tmp, which resolves to
+	// /private/tmp. The base is then at most 27 bytes long, and the longest
+	// socket path, a scope registration of a development agent in the fake
+	// home directory, is at most 27 + 54 = 81 bytes long.
+	base, err := os.MkdirTemp("/tmp", "mss-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +97,13 @@ func TestStarFakeSSH(t *testing.T) {
 		t.Fatal(err)
 	}
 	tools, home, local, data := filepath.Join(base, "tools"), filepath.Join(base, "home"), filepath.Join(base, "local"), filepath.Join(base, "data")
+	for _, directory := range []string{filepath.Join(home, filesystem.MutagenDataDirectoryDevelopmentName), data} {
+		for _, registry := range []string{"remote", "remote-scopes"} {
+			if socket := filepath.Join(directory, registry, strings.Repeat("0", 16)+".sock"); len(socket) > 103 {
+				t.Fatalf("registration socket paths would exceed Unix limits: %s", socket)
+			}
+		}
+	}
 	for _, directory := range []string{tools, home, local} {
 		if err := os.Mkdir(directory, 0700); err != nil {
 			t.Fatal(err)
