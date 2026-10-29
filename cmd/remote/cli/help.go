@@ -221,8 +221,9 @@ and foreground commands also synchronize back, unless --no-flush skips both
     This overrides inherited values and those passed with -e or --env-file,
     even with --no-prologue or when submitting from outside the root.
     Detached jobs also receive MUTAGEN_REMOTE_JOB, set to their ID.
-    Tree endpoints also set MUTAGEN_REMOTE_NODE to their stable node name;
-    use it in tree scripts, since alpha/beta roles depend on the incident edge.
+    MUTAGEN_REMOTE_NODE is set likewise to the stable node name (alpha or
+    beta for an ordinary pair); use it in tree scripts, since alpha/beta roles
+    depend on the incident edge.
 
 No terminal is allocated. Programs may buffer output or disable colors:
   remote -e PYTHONUNBUFFERED=1 python train.py
