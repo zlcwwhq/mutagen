@@ -250,7 +250,15 @@ func TestWorkspaceTreeConflicts(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatal("command ran despite preflight conflict")
 	}
-	code, output, diagnostic := runRemote(t, f.roots["a"], "--node", "c", "--conflicts")
+	// --no-flush skips the path's synchronizations along with their checks.
+	code, output, diagnostic := runRemote(t, f.roots["a"], "--node", "c", "--no-flush", "sh", "-c", `cat sub/input && touch "$1"`, "sh", marker)
+	if code != 0 || output != "c" || strings.Contains(diagnostic, "b <-> c") {
+		t.Fatalf("unsynchronized command not run on the conflicted target: %d %q %s", code, output, diagnostic)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("unsynchronized command didn't run:", err)
+	}
+	code, output, diagnostic = runRemote(t, f.roots["a"], "--node", "c", "--conflicts")
 	if code != 0 || !strings.Contains(output, "Edge b <-> c:") || !strings.Contains(output, "sub/input") || strings.Contains(output, "--session") {
 		t.Fatalf("path conflicts not labeled by their actual nodes: %d %q %s", code, output, diagnostic)
 	}

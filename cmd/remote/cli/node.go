@@ -40,11 +40,12 @@ func (o *options) locateSource(ctx context.Context, directory string, correspond
 //
 // The submission declares Command, which makes the daemon own both
 // synchronization phases: a failed preflight stops the command, and a failed
-// return synchronization can't look successful. This is a contract with the
-// remote executable rather than a security boundary, since a client that
-// omits Command takes the lenient adjacent path (see remote.Submission.Command)
-// and could run a command on an adjacent node without that synchronization
-// anyway.
+// return synchronization can't look successful. --no-flush skips both phases,
+// along with their conflict checks, as it skips both flushes for a pair (see
+// remote.Submission.NoFlush). This is a contract with the remote executable
+// rather than a security boundary, since a client that omits Command takes the
+// lenient adjacent path (see remote.Submission.Command) and could run a
+// command on an adjacent node without that synchronization anyway.
 func runNode(ctx context.Context, directory string, options *options, request *remote.Request, selection *remote.Selection, stdin io.Reader, stdout, stderr io.Writer, interrupted func(string) (int, bool)) int {
 	progress := newProgressOutput(stderr, options.progress)
 	connection, target, err := selection.Submit(ctx, directory, &remote.Submission{
@@ -63,7 +64,11 @@ func runNode(ctx context.Context, directory string, options *options, request *r
 			code, err = remote.ExecuteWithEvents(ctx, connection, request, stdin, stdout, stderr, events.receive)
 		}
 	}
-	if status, ok := interrupted("running the tree command and synchronizing its path"); ok {
+	activity := "running the tree command and synchronizing its path"
+	if options.noFlush {
+		activity = "running the tree command"
+	}
+	if status, ok := interrupted(activity); ok {
 		return status
 	} else if err != nil {
 		printCommandError(stderr, err, request.Directory)

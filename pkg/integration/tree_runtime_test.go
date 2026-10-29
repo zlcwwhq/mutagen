@@ -44,6 +44,18 @@ func TestWorkspaceTreeDetachedPreflight(t *testing.T) {
 	if len(events) == 0 || events[len(events)-1].Report.Empty() || !events[len(events)-1].Done {
 		t.Fatal("strict refusal did not carry its structured report")
 	}
+	// --no-flush starts the job without the preflight, as it does for a pair.
+	code, output, diagnostic := runRemote(t, f.roots["a"], "--node", "b", "--detach", "--no-flush", "sh", "-c", "printf ran > ignored/job")
+	id := strings.TrimSpace(output)
+	if code != 0 || id == "" {
+		t.Fatalf("unsynchronized job not started: %d %q %s", code, output, diagnostic)
+	}
+	if code, _, diagnostic := runRemote(t, f.roots["a"], "--node", "b", "--wait", id, "--no-flush"); code != 0 {
+		t.Fatalf("unsynchronized job failed: %d %s", code, diagnostic)
+	}
+	if result, err := os.ReadFile(filepath.Join(f.roots["b"], "ignored", "job")); err != nil || string(result) != "ran" {
+		t.Fatalf("unsynchronized job didn't run: %q %v", result, err)
+	}
 }
 
 // TestWorkspaceTreeDetachedResult preserves job metadata across daemon

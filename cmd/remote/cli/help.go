@@ -82,12 +82,16 @@ adjacent nodes require.
     synchronizing in the background and needn't finish for this call.
   - Tree command preflight stops on any conflict, scan/transition problem,
     or synchronization failure. Failure to sync back returns 125 and reports
-    the command's exit status. --no-flush is unavailable for these commands.
-    --detach also requires strict preflight on its adjacent edge and rejects
-    --no-flush; a failed preflight never starts the job. Its later results
-    arrive through background synchronization or --wait.
+    the command's exit status. --detach also requires strict preflight on
+    its adjacent edge; a failed preflight never starts the job. Its later
+    results arrive through background synchronization or --wait.
     Timeout and interruption retain their normal statuses. Neither failures
     nor reconnects automatically retry commands or change their target.
+  - --no-flush skips both path synchronizations and their checks, so the
+    command runs even if path edges have conflicts, and its changes return
+    through background synchronization. As for pairs, use it only for
+    commands that neither read nor write synchronized files (see --help
+    sync). The tree must still be valid and the path connected.
   - --conflicts can inspect a multi-edge path. Each listing identifies the
     actual adjacent nodes holding its copies, and paths are relative to those
     roots. Resolve from one of that edge's endpoints using --node for its peer.
@@ -104,7 +108,7 @@ adjacent nodes require.
     --nodes still shows the problem and the nodes known from existing edges.
     Operations on an adjacent node (existing jobs, conflicts, diff/pull,
     --flush, --ignores) only need its edge to be connected. New detached jobs
-    still require strict preflight.
+    still require a valid tree, even with --no-flush.
   - Target selection pins the source and destination. Lost path or submission
     connections, replaced path edges, and new problems that make the path
     unsafe invalidate a running tree command. Changes to unrelated, valid
@@ -123,9 +127,9 @@ between all nodes; prologues come only from each node's remotePrologue, never
 from synchronization defaults. A tree root has no precedence when resolving
 conflicts.
 `},
-	{"sync", "synchronization, ignored paths, --pull, and --diff", `Tree foreground commands and detached job starts require strict preflight;
-foreground commands also synchronize back (see --help nodes).
-For an implicit pair and other adjacent operations:
+	{"sync", "synchronization, ignored paths, --pull, and --diff", `Tree foreground commands and detached job starts require strict preflight,
+and foreground commands also synchronize back, unless --no-flush skips both
+(see --help nodes). For an implicit pair and other adjacent operations:
 
   - The session is synchronized before and after the command. Failure to
     synchronize only produces a warning. Keep these synchronizations: without
