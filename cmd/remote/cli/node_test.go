@@ -70,6 +70,7 @@ func TestNodeListing(t *testing.T) {
 		"  gpu: available; host:~/project; one-way-safe\n",
 		"  local: center; current; laptop:/work\n",
 		"  offline: unavailable: node is paused or disconnected; offline:~/project; two-way-safe\n",
+		"Available means that a node executes commands and the edge to it is connected at both ends, not that it's in sync;",
 		"report conflicts unless given --no-flush",
 	} {
 		if !strings.Contains(output.String(), expected) {

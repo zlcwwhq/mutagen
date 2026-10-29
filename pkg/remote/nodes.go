@@ -8,8 +8,9 @@ import (
 )
 
 // Node describes a workspace that the source can reach, or the source itself.
-// Availability is only a connection snapshot: commands still synchronize and
-// report conflicts as for any pair.
+// Availability is only a snapshot of whether a destination executes commands
+// and the edge to it is connected: commands still synchronize and report
+// conflicts as for any pair.
 type Node struct {
 	// Name is scoped to the star or implicit pair.
 	Name string
@@ -24,9 +25,10 @@ type Node struct {
 	Path []string
 	// Mode is the synchronization mode of the edge to a destination.
 	Mode string `json:",omitempty"`
-	// Current identifies the submitting workspace. Available indicates that
-	// the edge to a destination runs and is connected for commands. Reason
-	// explains why a destination isn't available.
+	// Current identifies the submitting workspace. Available indicates that a
+	// destination executes commands, as its edge's remote setting permits,
+	// and that the edge runs and is connected for commands at both ends.
+	// Reason explains why a destination isn't available.
 	Current   bool
 	Available bool
 	Reason    string `json:",omitempty"`

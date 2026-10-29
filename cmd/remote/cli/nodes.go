@@ -87,6 +87,6 @@ func printNodes(graph *remote.NodeGraph, asJSON bool, writer io.Writer) error {
 	if graph.Problem != "" {
 		fmt.Fprintln(output, "Operations from the center fail until the star is repaired, such as by applying the project again.")
 	}
-	fmt.Fprintln(output, "Availability describes connections only; commands still synchronize and report conflicts unless given --no-flush.")
+	fmt.Fprintln(output, "Available means that a node executes commands and the edge to it is connected at both ends, not that it's in sync; commands still synchronize and report conflicts unless given --no-flush.")
 	return output.err
 }
