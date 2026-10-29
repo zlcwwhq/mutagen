@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -195,6 +197,25 @@ func listStar(t *testing.T, directory string) (starListing, string) {
 	return listing, output
 }
 
+// suggestedCommandPattern matches the remote command lines that remote
+// suggests for job operations, such as remote --node gpu --wait ID, capturing
+// their options.
+var suggestedCommandPattern = regexp.MustCompile(`\bremote((?: --node \S+)? --(?:wait|kill) \S+)`)
+
+// suggestedCommand returns the arguments of the remote command line that a
+// diagnostic suggests for a job operation, such as --wait, so that it can be
+// run as printed.
+func suggestedCommand(t *testing.T, diagnostic, operation string) []string {
+	t.Helper()
+	for _, match := range suggestedCommandPattern.FindAllStringSubmatch(diagnostic, -1) {
+		if arguments := strings.Fields(match[1]); slices.Contains(arguments, operation) {
+			return arguments
+		}
+	}
+	t.Fatalf("no suggested %s command: %s", operation, diagnostic)
+	return nil
+}
+
 func TestStarCommands(t *testing.T) {
 	f := newStarFixture(t)
 
@@ -247,14 +268,23 @@ func TestStarCommands(t *testing.T) {
 		t.Fatalf("paused node not refused: %d %s", code, diagnostic)
 	}
 
-	// Detached jobs use the edge as for a pair.
+	// Detached jobs use the edge as for a pair. The center has several other
+	// nodes, so the commands that remote suggests for a job keep the selected
+	// node, without which they would fail, and work as printed.
 	code, output, diagnostic = runRemote(t, f.roots["local"], "--node", "server", "--detach", "sh", "-c", `printf job > job-output`)
 	if code != 0 {
 		t.Fatalf("detached job not started: %d %s", code, diagnostic)
 	}
 	job := strings.TrimSpace(output)
-	if code, _, diagnostic = runRemote(t, f.roots["local"], "--node", "server", "--wait", job); code != 0 {
-		t.Fatalf("detached job wait failed: %d %s", code, diagnostic)
+	wait := suggestedCommand(t, diagnostic, "--wait")
+	if strings.Join(wait, " ") != "--node server --wait "+job || strings.Join(suggestedCommand(t, diagnostic, "--kill"), " ") != "--node server --kill "+job {
+		t.Fatalf("suggested commands didn't keep the node: %s", diagnostic)
+	}
+	if code, _, diagnostic = runRemote(t, f.roots["local"], "--wait", job); code != 125 || !strings.Contains(diagnostic, "multiple destination nodes") {
+		t.Fatalf("wait without the node not refused: %d %s", code, diagnostic)
+	}
+	if code, _, diagnostic = runRemote(t, f.roots["local"], wait...); code != 0 {
+		t.Fatalf("suggested wait failed: %d %s", code, diagnostic)
 	}
 	if contents, err := os.ReadFile(filepath.Join(f.roots["local"], "job-output")); err != nil || string(contents) != "job" {
 		t.Fatalf("job output didn't return after waiting: %q %v", contents, err)
@@ -265,6 +295,22 @@ func TestStarCommands(t *testing.T) {
 	}
 	if code, output, _ = runRemote(t, f.roots["local"], "--node", "gpu", "--jobs"); code != 0 || strings.Contains(output, job) {
 		t.Fatalf("job listed on another node: %d %q", code, output)
+	}
+
+	// The commands that remote suggests once a wait times out keep the node
+	// too, and terminate the job as printed.
+	code, output, diagnostic = runRemote(t, f.roots["local"], "--node", "gpu", "--detach", "sh", "-c", `while :; do sleep 0.1; done`)
+	if code != 0 {
+		t.Fatalf("long-running job not started: %d %s", code, diagnostic)
+	}
+	job = strings.TrimSpace(output)
+	code, _, diagnostic = runRemote(t, f.roots["local"], "--node", "gpu", "--wait", job, "--no-flush", "--timeout", "1")
+	kill := suggestedCommand(t, diagnostic, "--kill")
+	if code != 124 || strings.Join(suggestedCommand(t, diagnostic, "--wait"), " ") != "--node gpu --wait "+job || strings.Join(kill, " ") != "--node gpu --kill "+job {
+		t.Fatalf("timed out wait didn't keep the node: %d %s", code, diagnostic)
+	}
+	if code, _, diagnostic = runRemote(t, f.roots["local"], kill...); code != 0 || !strings.Contains(diagnostic, "terminated job "+job) {
+		t.Fatalf("suggested kill failed: %d %s", code, diagnostic)
 	}
 
 	// --no-flush skips synchronization as for a pair.

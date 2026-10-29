@@ -126,7 +126,7 @@ func TestPullParents(t *testing.T) {
 	locator := newLocator(target)
 	prepare := func(relative string) (string, error) {
 		t.Helper()
-		resolvedRoot, landing, err := prepareParents(context.Background(), target, locator, relative)
+		resolvedRoot, landing, err := prepareParents(context.Background(), target, locator, relative, "remote --node gpu")
 		if err == nil {
 			if expected, resolveErr := filepath.EvalSymlinks(root); resolveErr != nil || resolvedRoot != expected {
 				t.Fatalf("incorrect resolved root for %s: %s", relative, resolvedRoot)
@@ -145,7 +145,7 @@ func TestPullParents(t *testing.T) {
 		t.Fatal("incorrect landing:", landing)
 	} else if _, err := prepare("src/train.log"); err != nil {
 		t.Fatal("existing parent rejected:", err)
-	} else if _, err := prepare("missing/train.log"); err == nil || !strings.Contains(err.Error(), "synchronizes it") {
+	} else if _, err := prepare("missing/train.log"); err == nil || !strings.HasSuffix(err.Error(), "synchronizes it, so remote doesn't create it; remote --node gpu --flush synchronizes it") {
 		t.Fatal("synchronized parent created:", err)
 	} else if _, err := prepare("file/train.log"); err == nil || !strings.Contains(err.Error(), "isn't a directory") {
 		t.Fatal("file accepted as a parent:", err)
@@ -215,11 +215,21 @@ func TestPullChecks(t *testing.T) {
 		{literal, "data", false, ""},
 		{literal, "data/other", false, ""},
 	} {
-		if err := checkIgnored(test.ignores, test.path, test.directory); test.refusal == "" && err != nil {
+		if err := checkIgnored(test.ignores, test.path, test.directory, "remote"); test.refusal == "" && err != nil {
 			t.Errorf("%q (directory: %t) refused: %v", test.path, test.directory, err)
 		} else if test.refusal != "" && (err == nil || !strings.Contains(err.Error(), test.refusal)) {
 			t.Errorf("%q (directory: %t) not refused correctly: %v", test.path, test.directory, err)
 		}
+	}
+
+	// Refusals suggest commands that keep the node that selected the
+	// destination.
+	if err := checkIgnored(literal, "train.py", false, "remote --node gpu"); err == nil ||
+		!strings.HasSuffix(err.Error(), "; remote --node gpu --flush synchronizes it, and remote --node gpu --ignores shows what the session ignores") {
+		t.Errorf("refusal didn't keep the node: %v", err)
+	} else if err := checkIgnored(literal, composed, false, "remote --node gpu"); err == nil ||
+		!strings.HasSuffix(err.Error(), "; remote --node gpu --ignores shows what the session ignores") {
+		t.Errorf("partial refusal didn't keep the node: %v", err)
 	}
 
 	// Paths are checked where writes to them land, given the root, both with

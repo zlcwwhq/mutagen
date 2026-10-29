@@ -108,7 +108,7 @@ func TestPrintJobs(t *testing.T) {
 		{ID: "91aa0b3c", State: remote.JobLost, Started: started, Log: "/l", Arguments: []string{"sleep", "60"}},
 	}
 	var output strings.Builder
-	if err := printJobs(&output, locator, "beta", jobs, 2); err != nil {
+	if err := printJobs(&output, locator, "beta", "remote", jobs, 2); err != nil {
 		t.Fatal(err)
 	}
 	expected := "" +
@@ -123,12 +123,13 @@ func TestPrintJobs(t *testing.T) {
 
 	// Jobs that left processes running are followed by a line that lists them,
 	// or, where they can't be listed, notes that their groups may still have
-	// processes, and the listing ends with how to deal with them. The table
+	// processes, and the listing ends with how to deal with them, keeping the
+	// node that selected the destination in the suggested commands. The table
 	// stays aligned.
 	jobs[1].Group, jobs[1].Leftovers = 4242, []remote.JobProcess{{PID: 4250, Command: "python worker.py"}, {PID: 4251, Command: "bad\nname"}}
 	jobs[2].Group, jobs[2].GroupMayRemain = 5151, true
 	output.Reset()
-	if err := printJobs(&output, locator, "beta", jobs, 0); err != nil {
+	if err := printJobs(&output, locator, "gpu", "remote --node gpu", jobs, 0); err != nil {
 		t.Fatal(err)
 	}
 	expected = "" +
@@ -138,14 +139,14 @@ func TestPrintJobs(t *testing.T) {
 		"  left running: 4250 python worker.py; 4251 bad\\nname\n" +
 		"91aa0b3c  lost      -        2026-10-22 14:03:11  /l                                         sleep 60\n" +
 		"  process group 5151 may still have processes\n" +
-		"(Processes that jobs left running aren't part of them, so remote --kill doesn't terminate them; remote -- kill PID... does.)\n" +
-		"(remote -- ps -A -o pid,pgid,args lists processes with their groups.)\n"
+		"(Processes that jobs left running aren't part of them, so remote --kill doesn't terminate them; remote --node gpu -- kill PID... does.)\n" +
+		"(remote --node gpu -- ps -A -o pid,pgid,args lists processes with their groups.)\n"
 	if output.String() != expected {
 		t.Fatalf("incorrect listing with leftovers:\n%s\nexpected:\n%s", output.String(), expected)
 	}
 
 	output.Reset()
-	if err := printJobs(&output, locator, "alpha", nil, 1); err != nil {
+	if err := printJobs(&output, locator, "alpha", "remote", nil, 1); err != nil {
 		t.Fatal(err)
 	} else if output.String() != "No jobs were started at this node's root on alpha.\n(1 job started at another root on alpha isn't shown.)\n" {
 		t.Fatalf("incorrect empty listing: %q", output.String())
@@ -165,16 +166,17 @@ func TestLeftoverReports(t *testing.T) {
 		t.Errorf("incorrect leftovers: %q", described)
 	}
 	expected = "remote: warning: job b2c4d6e8 left processes running: " + expected + "; remote -- kill 4250 4251 4252 4253 4254 4255 4256 terminates them\n"
-	if report := describeLeftoverReport(job.ID, job, false); report != expected {
+	if report := describeLeftoverReport("remote", job.ID, job, false); report != expected {
 		t.Errorf("incorrect leftover warning: %q", report)
 	}
 
 	// Killing a job that has ended reports its leftovers, which remote --kill
-	// doesn't terminate.
+	// doesn't terminate, with a command that keeps the node that selected the
+	// destination.
 	job.Leftovers, job.OmittedLeftovers = job.Leftovers[:1], 0
 	expected = "remote: job b2c4d6e8 had already exited with status 0\n" +
-		"remote: job b2c4d6e8 left processes running, which remote --kill doesn't terminate: 4250 worker; remote -- kill 4250 terminates them\n"
-	if report, err := describeKill(job.ID, job); err != nil || report != expected {
+		"remote: job b2c4d6e8 left processes running, which remote --kill doesn't terminate: 4250 worker; remote --node gpu -- kill 4250 terminates them\n"
+	if report, err := describeKill("remote --node gpu", job.ID, job); err != nil || report != expected {
 		t.Errorf("incorrect kill report: %q, %v", report, err)
 	}
 
@@ -182,29 +184,29 @@ func TestLeftoverReports(t *testing.T) {
 	// it may still have processes.
 	job.Leftovers, job.GroupMayRemain = nil, true
 	expected = "remote: warning: process group 4242 of job b2c4d6e8 may still have processes that the job left running; remote -- ps -A -o pid,pgid,args lists processes with their groups\n"
-	if report := describeLeftoverReport(job.ID, job, false); report != expected {
+	if report := describeLeftoverReport("remote", job.ID, job, false); report != expected {
 		t.Errorf("incorrect group warning: %q", report)
 	}
 	expected = "remote: job b2c4d6e8 had already exited with status 0\n" +
-		"remote: process group 4242 of job b2c4d6e8 may still have processes that the job left running, which remote --kill doesn't terminate; remote -- ps -A -o pid,pgid,args lists processes with their groups\n"
-	if report, err := describeKill(job.ID, job); err != nil || report != expected {
+		"remote: process group 4242 of job b2c4d6e8 may still have processes that the job left running, which remote --kill doesn't terminate; remote --node gpu -- ps -A -o pid,pgid,args lists processes with their groups\n"
+	if report, err := describeKill("remote --node gpu", job.ID, job); err != nil || report != expected {
 		t.Errorf("incorrect kill report for a group: %q, %v", report, err)
 	}
 
 	// Nothing is reported for jobs without leftovers, but executing endpoints
 	// that predate their reporting, which don't report groups, can't tell.
 	job.GroupMayRemain = false
-	if report := describeLeftoverReport(job.ID, job, false); report != "" {
+	if report := describeLeftoverReport("remote", job.ID, job, false); report != "" {
 		t.Errorf("incorrect report without leftovers: %q", report)
-	} else if report, err := describeKill(job.ID, job); err != nil || report != "remote: job b2c4d6e8 had already exited with status 0\n" {
+	} else if report, err := describeKill("remote", job.ID, job); err != nil || report != "remote: job b2c4d6e8 had already exited with status 0\n" {
 		t.Errorf("incorrect kill report without leftovers: %q, %v", report, err)
 	}
 	job.Group = 0
-	if report, err := describeKill(job.ID, job); err != nil || report != "remote: job b2c4d6e8 had already exited with status 0; processes that it left running aren't terminated\n" {
+	if report, err := describeKill("remote", job.ID, job); err != nil || report != "remote: job b2c4d6e8 had already exited with status 0; processes that it left running aren't terminated\n" {
 		t.Errorf("incorrect kill report from an older endpoint: %q, %v", report, err)
 	}
 	job.State = remote.JobRunning
-	if _, err := describeKill(job.ID, job); err == nil {
+	if _, err := describeKill("remote", job.ID, job); err == nil {
 		t.Error("running job reported as killed")
 	}
 }

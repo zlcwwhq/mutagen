@@ -213,7 +213,9 @@ for a pair, the edge must be connected for commands at both of its ends: while
 it isn't connected at the center, such as while it reconnects, the node is
 unavailable, and operations on it from the center fail with status 255, so
 retry once it reconnects. Commands use the corresponding relative directory;
-`--cwd` overrides it.
+`--cwd` overrides it. Repeat `--node` for later operations on the same node,
+such as `--wait` and `--kill` for a detached job; the commands that `remote`
+suggests, such as when it starts a job, include it.
 `MUTAGEN_REMOTE_NODE` identifies the executing node; use it in prologues shared
 by several nodes instead of `MUTAGEN_REMOTE_ENDPOINT`, since the center is alpha
 on every edge and every other node is beta.

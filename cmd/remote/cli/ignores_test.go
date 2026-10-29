@@ -35,6 +35,18 @@ func TestPrintIgnores(t *testing.T) {
 		t.Fatalf("listing failed: %d, %v", code, err)
 	} else if !strings.HasPrefix(output.String(), "Node gpu ignores (Mutagen syntax):\n  results/\n  *.log\n  VCS directories") {
 		t.Fatalf("incorrect listing: %q", output.String())
+	} else if !strings.Contains(output.String(), "; remote --ignores <path> checks a path, and remote --pull <path> copies") {
+		t.Fatalf("listing didn't suggest commands: %q", output.String())
+	}
+
+	// The suggested commands keep the node that selected the destination.
+	output.Reset()
+	router := pinnedRouter(target, &errorOutput)
+	router.node = "gpu"
+	if _, err := printIgnores(router, nil, &output); err != nil {
+		t.Fatal("listing failed:", err)
+	} else if !strings.Contains(output.String(), "; remote --node gpu --ignores <path> checks a path, and remote --node gpu --pull <path> copies") {
+		t.Fatalf("suggested commands didn't keep the node: %q", output.String())
 	}
 
 	// Paths are checked as the kind of entry that they are locally, or as both

@@ -57,7 +57,7 @@ func TestLocator(t *testing.T) {
 func TestReporter(t *testing.T) {
 	// Reports are described from the submitting endpoint's perspective.
 	var output strings.Builder
-	reports := newReporter(&output, &remote.Target{Root: t.TempDir(), Alpha: true, Path: "sub", Contained: true})
+	reports := newReporter(&output, &remote.Target{Root: t.TempDir(), Alpha: true, Path: "sub", Contained: true}, "remote")
 	conflict := remote.Conflict{
 		Root:  "sub/out",
 		Alpha: []remote.Change{{Path: "sub/out", Old: "directory"}},
@@ -105,12 +105,13 @@ func TestReporter(t *testing.T) {
 
 	// Beta's perspective is the reverse, and the paths of conflicting changes
 	// are listed once each. Sessions that don't support resolution don't
-	// refer to it.
+	// refer to it. Suggested commands keep the node that selected the
+	// destination.
 	output.Reset()
-	newReporter(&output, &remote.Target{Root: t.TempDir(), Alpha: false}).print(&remote.Report{Conflicts: []remote.Conflict{conflict}})
+	newReporter(&output, &remote.Target{Root: t.TempDir(), Alpha: false}, "remote --node gpu").print(&remote.Report{Conflicts: []remote.Conflict{conflict}})
 	if !strings.Contains(output.String(), "deleted directory remotely") {
 		t.Fatal("beta perspective not applied:", output.String())
-	} else if !strings.Contains(output.String(), "one side's copy is deleted (see remote --diff):") {
+	} else if !strings.Contains(output.String(), "one side's copy is deleted (see remote --node gpu --diff):") {
 		t.Fatal("resolution referenced without support:", output.String())
 	} else if paths := conflictPaths(report); strings.Join(paths, ",") != "sub/out,sub/out/log,sub/out/new,sub/out/run,sub/a" {
 		t.Fatal("incorrect conflict paths:", paths)
@@ -125,8 +126,8 @@ func TestTruncatedConflict(t *testing.T) {
 	}
 	report := &remote.Report{Conflicts: []remote.Conflict{conflict}}
 	var output strings.Builder
-	newReporter(&output, &remote.Target{Root: t.TempDir(), Contained: true}).print(report)
-	if !strings.Contains(output.String(), "42 more changes") || !strings.Contains(output.String(), "specify paths with remote --diff") {
+	newReporter(&output, &remote.Target{Root: t.TempDir(), Contained: true}, "remote --node gpu").print(report)
+	if !strings.Contains(output.String(), "42 more changes") || !strings.Contains(output.String(), "specify paths with remote --node gpu --diff") {
 		t.Fatal("omissions weren't explained:", output.String())
 	} else if paths := conflictPaths(report); strings.Join(paths, ",") != "d,d/file" {
 		t.Fatal("truncated conflict root wasn't compared:", paths)
@@ -144,7 +145,7 @@ func TestConflictRootSummary(t *testing.T) {
 		ExcludedChanges: 42,
 	}
 	for _, alpha := range []bool{true, false} {
-		reports := newReporter(nil, &remote.Target{Root: t.TempDir(), Alpha: alpha, Contained: true, Path: "sub"})
+		reports := newReporter(nil, &remote.Target{Root: t.TempDir(), Alpha: alpha, Contained: true, Path: "sub"}, "remote")
 		summary := reports.describeConflict(conflict.Changes())
 		side := "locally"
 		if !alpha {
@@ -174,7 +175,7 @@ func TestListedConflictChangesLimited(t *testing.T) {
 	} else if len(root.AlphaChanges) != 12 || root.ExcludedChanges != 3 {
 		t.Fatal("listing modified:", root)
 	}
-	reports := newReporter(nil, &remote.Target{Root: t.TempDir(), Alpha: true, Contained: true})
+	reports := newReporter(nil, &remote.Target{Root: t.TempDir(), Alpha: true, Contained: true}, "remote")
 	if summary := reports.describeConflict(limited); !strings.HasPrefix(summary, "out: deleted directory locally") ||
 		!strings.Contains(summary, "...and 10 more changes") || strings.Contains(summary, "out/5") {
 		t.Fatalf("incorrect summary: %q", summary)

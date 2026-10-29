@@ -100,7 +100,8 @@ func TestWaitJobTailTimeout(t *testing.T) {
 	// To receive the tail in time, remote stops waiting shortly before the
 	// timeout, which other waits, including those that follow the log, which
 	// has been printed already, don't need to do. A zero tail prints nothing.
-	report := fmt.Sprintf("remote: timed out after 1s while waiting for the job\nremote: job %[1]s is still running; remote --wait %[1]s resumes waiting, and remote --kill %[1]s terminates it\n", job.ID)
+	// The suggested commands keep the node that selected the destination.
+	report := fmt.Sprintf("remote: timed out after 1s while waiting for the job\nremote: job %[1]s is still running; remote --node beta --wait %[1]s resumes waiting, and remote --node beta --kill %[1]s terminates it\n", job.ID)
 	for _, test := range []struct {
 		options []string
 		output  string
@@ -390,9 +391,14 @@ func TestDetachIgnoredLogWarning(t *testing.T) {
 		id := strings.TrimSpace(output.String())
 
 		// Every job with an ignored log is warned about, along with the wait
-		// that prints the log's end.
-		warning := "remote: warning: the session ignores results, so the log isn't synchronized; read it with remote cat or remote --wait " + id + " --tail <lines>, or copy it with remote --pull\n"
-		if test.warned && !strings.Contains(errors.String(), warning) || !test.warned && strings.Contains(errors.String(), "warning") {
+		// that prints the log's end. The suggested commands, including those
+		// that wait for and terminate the job, keep the node that selected the
+		// destination.
+		started := "; remote --node beta --wait " + id + " waits for it, and remote --node beta --kill " + id + " terminates it\n"
+		warning := "remote: warning: the session ignores results, so the log isn't synchronized; read it with remote --node beta cat or remote --node beta --wait " + id + " --tail <lines>, or copy it with remote --node beta --pull\n"
+		if !strings.Contains(errors.String(), started) {
+			t.Fatalf("incorrect start report for %s: %q", test.log, errors.String())
+		} else if test.warned && !strings.Contains(errors.String(), warning) || !test.warned && strings.Contains(errors.String(), "warning") {
 			t.Fatalf("incorrect warning for %s: %q", test.log, errors.String())
 		}
 		output.Reset()
