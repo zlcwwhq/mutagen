@@ -498,9 +498,10 @@ func (r *treeRoute) synchronize(ctx context.Context, step treeStep, phase string
 // starting one does not wait for it or synchronize back before it finishes.
 // noFlush skips both path synchronizations, along with their checks for
 // conflicts and other unsynchronized content, as --no-flush skips both flushes
-// of a pair command: the command's changes then return through background
-// synchronization. The route itself is still pinned and checked, so the target
-// remains the selected node of a valid tree.
+// of a pair command. The invocation then neither synchronizes nor waits for
+// synchronization: background synchronization continues as configured, with
+// no guarantee that the command's changes propagate. The route itself is still
+// pinned and checked, so the target remains the selected node of a valid tree.
 func (r *treeRoute) run(ctx context.Context, request *remote.Request, stdin io.Reader, stdout, stderr io.Writer, noFlush, progress bool, event func(*remote.CommandEvent) error) (*remote.CommandResult, error) {
 	if err := r.check(ctx); err != nil {
 		return nil, err

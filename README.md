@@ -182,9 +182,11 @@ adjacent edge; conflicts and synchronization failures prevent the job from
 starting. Their later results arrive through background synchronization or
 `--wait`. `--no-flush` skips both path synchronizations and their checks, so
 commands that neither read nor write synchronized files, such as `nvidia-smi`,
-run even while a path edge has conflicts; their changes return through
-background synchronization. The tree must still be valid and the path
-connected.
+run even while a path edge has conflicts. Such a call neither synchronizes nor
+waits for synchronization: background synchronization continues as
+configured, but conflicts, paused or disconnected edges, or disabled watching
+can keep its changes from propagating. The tree must still be valid and the
+path connected.
 Commands aren't retried automatically. Pausing or disconnecting a path endpoint,
 replacing a path edge, or introducing a problem that makes the path unsafe
 invalidates active routes. Changes to unrelated, valid branches do not cancel

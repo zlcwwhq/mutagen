@@ -88,10 +88,12 @@ adjacent nodes require.
     Timeout and interruption retain their normal statuses. Neither failures
     nor reconnects automatically retry commands or change their target.
   - --no-flush skips both path synchronizations and their checks, so the
-    command runs even if path edges have conflicts, and its changes return
-    through background synchronization. As for pairs, use it only for
-    commands that neither read nor write synchronized files (see --help
-    sync). The tree must still be valid and the path connected.
+    command runs even if path edges have conflicts. It neither synchronizes
+    nor waits for synchronization; background synchronization continues as
+    configured, but conflicts, paused or disconnected edges, or disabled
+    watching can keep the command's changes from propagating. As for pairs,
+    use it only for commands that neither read nor write synchronized files
+    (see --help sync). The tree must still be valid and the path connected.
   - --conflicts can inspect a multi-edge path. Each listing identifies the
     actual adjacent nodes holding its copies, and paths are relative to those
     roots. Resolve from one of that edge's endpoints using --node for its peer.

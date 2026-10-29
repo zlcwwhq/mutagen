@@ -84,6 +84,40 @@ func TestWorkspaceTreeDetachedResult(t *testing.T) {
 	}
 }
 
+// TestWorkspaceTreeNoFlushSkipsSynchronization verifies that --no-flush runs a
+// command without synchronizing the path at all. Every strict synchronization
+// reports its completion as an event, even when there's nothing to transfer.
+func TestWorkspaceTreeNoFlushSkipsSynchronization(t *testing.T) {
+	f := newTreeFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, noFlush := range []bool{false, true} {
+		connection, _, err := (&remote.Selection{Workspace: true}).Submit(ctx, f.roots["a"], &remote.Submission{
+			Operation: remote.OperationTreeExecute, Command: true, NoFlush: noFlush, Node: "c", Progress: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var output bytes.Buffer
+		var events []*remote.CommandEvent
+		code, err := remote.ExecuteWithEvents(ctx, connection, &remote.Request{Arguments: []string{"sh", "-c", `printf '%s' "$MUTAGEN_REMOTE_NODE"`}}, strings.NewReader(""), &output, io.Discard,
+			func(event *remote.CommandEvent) { events = append(events, event) })
+		if code != 0 || err != nil || output.String() != "c" {
+			t.Fatalf("command failed (no flush: %t): %d %q %v", noFlush, code, output.String(), err)
+		}
+		completions := 0
+		for _, event := range events {
+			if event.Done {
+				completions++
+			}
+		}
+		// Two edges, each synchronized before and after the command.
+		if noFlush && len(events) != 0 || !noFlush && completions != 4 {
+			t.Fatalf("unexpected path synchronization (no flush: %t): %d events, %d completions", noFlush, len(events), completions)
+		}
+	}
+}
+
 // TestWorkspaceTreeEventsKeepCommandStderr verifies that progress uses control
 // metadata rather than polluting the remote command's stderr stream.
 func TestWorkspaceTreeEventsKeepCommandStderr(t *testing.T) {
