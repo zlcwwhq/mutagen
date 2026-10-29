@@ -148,6 +148,11 @@ func TestPullBatchFailurePriority(t *testing.T) {
 				if err == nil && header.Operation == remote.OperationNodes {
 					replyTestNodes(connection, "sync_mixed", root, root)
 					return
+				} else if err == nil && header.Operation == remote.OperationResolve {
+					// Pulls resolve their destination before any request.
+					replyTestRoute(connection, header, "sync_mixed")
+					connection.Close()
+					return
 				}
 				if interruptNext.Swap(false) {
 					// Receiving a submission proves Run installed its signal

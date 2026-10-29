@@ -511,11 +511,10 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	router := &router{ctx: ctx, directory: directory, selection: options.selection(request != nil && options.directory == ""), stderr: stderr, progress: options.progress}
 	if (options.ignores || options.discard) && options.node != "" {
-		connection, target, err := router.submit(&remote.Submission{Operation: remote.OperationResolve})
+		target, err := router.resolve()
 		if err != nil {
 			return fail(err)
 		}
-		connection.Close()
 		options.target = target
 	}
 
@@ -603,8 +602,28 @@ func (r *router) submit(header *remote.Submission) (net.Conn, *remote.Target, er
 	return connection, target, err
 }
 
+// resolve has the daemon select the destination, as it does for every
+// submission, without performing an operation, and pins later submissions to
+// it, as dial does, unless an earlier submission already resolved it. The
+// daemon then refuses unknown or unavailable nodes, multi-hop selections, an
+// omitted node with several destinations, and star problems, exactly as it
+// does for commands, before the caller reads or writes anything.
+func (r *router) resolve() (*remote.Target, error) {
+	if target := r.selection.Target; target != nil && target.Resolved {
+		return target, nil
+	}
+	connection, target, err := r.submit(&remote.Submission{Operation: remote.OperationResolve})
+	if err != nil {
+		return nil, err
+	}
+	connection.Close()
+	return target, nil
+}
+
 // locate locates the session's endpoint without submitting an operation,
-// pinning later submissions to it, as dial does.
+// pinning later submissions to it, as dial does. Since the daemon doesn't
+// resolve the destination, it only serves the inspection of local rules, such
+// as by --ignores without --node; operations on a destination use resolve.
 func (r *router) locate() (*remote.Target, error) {
 	if r.selection.Target != nil {
 		return r.selection.Target, nil

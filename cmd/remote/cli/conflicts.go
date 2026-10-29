@@ -1944,11 +1944,10 @@ func releaseAt(ctx context.Context, local string, selected *remote.Target, w *wo
 	selection := &remote.Selection{Workspace: true, Resolve: true, Target: selected}
 	if selected == nil && w != nil {
 		// A saved workspace identifies the local endpoint of the edge that owns
-		// its checkout, which is the registration to pin, whether the daemon
-		// selected that edge for another source registration of the same node
-		// or the workspace predates node-based routing, in which case the edge
-		// was the source registration itself. The target isn't resolved, so
-		// the release goes over that edge to its opposite endpoint directly.
+		// its checkout, which is the registration to pin, since operations
+		// only cross the edge through which they're submitted. The target
+		// isn't resolved, so the release goes over that edge to its opposite
+		// endpoint directly, even at a star's center with several nodes.
 		selection = &remote.Selection{Target: &remote.Target{
 			SourceSession: w.Session, SourceAlpha: w.Alpha,
 			Session: w.Session, Alpha: w.Alpha,

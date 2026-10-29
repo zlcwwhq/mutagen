@@ -525,10 +525,12 @@ Content that commands write to ignored paths exists only on the executing
 endpoint. `remote --ignores <path>...` shows whether the session ignores each
 path. Missing local paths are marked `not present locally`, with conditional
 results for a file or directory; access errors are reported separately.
-`remote --pull <path>...` copies ignored files, directories, and
-symbolic links from the opposite endpoint, replacing local files that differ
-but never deleting local content. It refuses paths that the session (or
-another session) synchronizes, and directories with synchronized content
+`remote --pull <path>...` copies ignored files, directories, and symbolic links
+from the target node, replacing local files that differ but never deleting
+local content. The target is selected as for commands before anything is
+copied, so a pull that names an unknown or unreachable node, or omits a node
+where several are reachable, copies nothing. It refuses paths that the session
+(or another session) synchronizes, and directories with synchronized content
 beneath them. Other sessions are recognized whether or not they run remote
 commands, but only while their endpoints on this system are connected and run
 by this version of Mutagen or a later one: `--pull` can't tell whether paused

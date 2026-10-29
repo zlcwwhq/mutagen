@@ -966,8 +966,19 @@ func TestRemotePullIgnored(t *testing.T) {
 		t.Fatalf("incorrect ignore listing: %d, %q", code, output)
 	}
 
+	// The daemon resolves the destination first, so a pull from an unknown
+	// node fails without pulling anything.
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "--node", "bogus", "results", "train.log"); code != 125 || !strings.Contains(errorOutput, "unknown node") {
+		t.Fatalf("pull from an unknown node not refused: %d, %q", code, errorOutput)
+	}
+	for _, path := range []string{"results", "train.log"} {
+		if _, err := os.Lstat(filepath.Join(alphaRoot, path)); !os.IsNotExist(err) {
+			t.Fatalf("refused pull wrote %s: %v", path, err)
+		}
+	}
+
 	// Ignored paths are pulled.
-	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "results", "train.log"); code != 0 ||
+	if code, _, errorOutput := runRemote(t, alphaRoot, "--pull", "--node", "beta", "results", "train.log"); code != 0 ||
 		errorOutput != "remote: pulled results (1 added, 0 replaced, 0 unchanged)\nremote: pulled train.log (1 added, 0 replaced, 0 unchanged)\n" {
 		t.Fatalf("incorrect pull result: %d, %q", code, errorOutput)
 	}

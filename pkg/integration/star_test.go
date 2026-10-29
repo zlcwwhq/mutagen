@@ -607,6 +607,56 @@ func TestStarIndependentEdges(t *testing.T) {
 	}
 }
 
+// TestStarPull verifies that pulls resolve their source node through the daemon
+// before reading or writing anything, as commands do: the center must select
+// one of several nodes and pulls from the selected one, while another node
+// can only pull from the center.
+func TestStarPull(t *testing.T) {
+	f := newStarFixture(t)
+	for _, node := range []string{"server", "gpu"} {
+		if err := os.WriteFile(filepath.Join(f.roots[node], "ignored", "data"), []byte(node), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(node string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(f.roots[node], "ignored", "data"))
+		if os.IsNotExist(err) {
+			return ""
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+
+	// The center must select a node.
+	code, _, diagnostic := runRemote(t, f.roots["local"], "--pull", "ignored/data")
+	if code != 125 || !strings.Contains(diagnostic, "multiple destination nodes") {
+		t.Fatalf("pull without a node not refused at the center: %d %s", code, diagnostic)
+	} else if contents := read("local"); contents != "" {
+		t.Fatalf("refused pull wrote %q", contents)
+	}
+
+	// The center pulls from the selected node.
+	code, _, diagnostic = runRemote(t, f.roots["local"], "--pull", "--node", "gpu", "ignored/data")
+	if code != 0 || read("local") != "gpu" {
+		t.Fatalf("pull from the selected node failed: %d %q %s", code, read("local"), diagnostic)
+	}
+
+	// Another node can't pull from a node other than the center, which would
+	// now provide the gpu's content.
+	code, _, diagnostic = runRemote(t, f.roots["server"], "--pull", "--node", "gpu", "ignored/data")
+	if code != 125 || !strings.Contains(diagnostic, "no multi-hop") {
+		t.Fatalf("multi-hop pull not refused: %d %s", code, diagnostic)
+	} else if contents := read("server"); contents != "server" {
+		t.Fatalf("refused pull replaced the node's content with %q", contents)
+	}
+	code, _, diagnostic = runRemote(t, f.roots["server"], "--pull", "ignored/data")
+	if code != 0 || read("server") != "gpu" {
+		t.Fatalf("pull from the center failed: %d %q %s", code, read("server"), diagnostic)
+	}
+}
+
 // TestStarCenterChannelDisconnected verifies that while one edge's command
 // channel at the center is disconnected, with the node's own channel and the
 // other edges still connected, the node is unavailable from the center, and an

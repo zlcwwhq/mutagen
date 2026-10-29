@@ -152,9 +152,10 @@ between a star's center and one of its nodes:
     are marked not present locally, with conditional file/directory results;
     either candidate being ignored gives status 1. Access failures are errors.
     remote --pull <path>... copies ignored files, directories, and links from the
-    opposite endpoint, replacing local files that differ but never deleting
-    local content. It refuses the root, paths that the session synchronizes,
-    which synchronization updates instead, and directories with synchronized
+    target node, which is selected as for commands before anything is copied,
+    replacing local files that differ but never deleting local content. It
+    refuses the root, paths that the session synchronizes, which
+    synchronization updates instead, and directories with synchronized
     content beneath them. Both options count a path as ignored only if the
     session ignores it in every Unicode normalization form, and, if symbolic
     links among its local parents lead elsewhere in the root, only if the
