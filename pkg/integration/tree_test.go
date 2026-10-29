@@ -39,7 +39,19 @@ func newTreeFixture(t *testing.T, local ...bool) *treeFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("MUTAGEN_DATA_DIRECTORY", filepath.Join(base, "state"))
+	// Keep the data directory out of t.TempDir: the test name and nested
+	// directory it adds, combined with macOS's long temporary root, would push
+	// the command registry's socket paths past Unix socket path limits.
+	data, err := os.MkdirTemp("", "mt-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(data); err != nil {
+			t.Error("unable to remove data directory:", err)
+		}
+	})
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
 	t.Chdir(base)
 	f := &treeFixture{roots: make(map[string]string), sessions: make(map[string]string)}
 	for _, node := range []string{"a", "b", "c", "d"} {
