@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
@@ -50,6 +52,61 @@ func TestCommandLocalIOExitCode(t *testing.T) {
 		if code := Run(arguments, strings.NewReader(""), failedCommandIO{}, io.Discard); code != failureExitCode {
 			t.Fatalf("%v output failure returned %d, expected 125", arguments, code)
 		}
+	}
+}
+
+// slowErrorOutput is a standard error writer that isn't safe for concurrent
+// use, like bytes.Buffer. Its first write of the command's standard error
+// lasts until after the command's timeout, so that remote's timeout diagnostic
+// is written while it's in progress unless remote serializes its writes.
+// Overlapping writes are recorded, and are also data races on buffer.
+type slowErrorOutput struct {
+	// marker identifies the command's standard error.
+	marker string
+	// until is when the slow write returns.
+	until time.Time
+	// buffer receives the output.
+	buffer bytes.Buffer
+	// slowed indicates that the slow write happened. It's only accessed by
+	// writes, which must not overlap.
+	slowed bool
+	// active counts the writes in progress.
+	active atomic.Int32
+	// overlapped indicates that writes overlapped.
+	overlapped atomic.Bool
+}
+
+func (w *slowErrorOutput) Write(data []byte) (int, error) {
+	if w.active.Add(1) > 1 {
+		w.overlapped.Store(true)
+	}
+	defer w.active.Add(-1)
+	if !w.slowed && strings.Contains(string(data), w.marker) {
+		w.slowed = true
+		time.Sleep(time.Until(w.until))
+	}
+	return w.buffer.Write(data)
+}
+
+// TestTimeoutDiagnosticSerialized verifies that the timeout diagnostic waits
+// for the command's standard error, which may still be written when the
+// timeout ends the command, rather than writing to the same output
+// concurrently.
+func TestTimeoutDiagnosticSerialized(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	alpha, _ := setupPullSessions(t, map[string]string{"file": "x"}, map[string]string{"file": "x"})
+	t.Chdir(alpha)
+	const timeout = time.Second
+	output := &slowErrorOutput{marker: "from-remote", until: time.Now().Add(timeout + time.Second)}
+	code := Run([]string{"--no-flush", "--timeout", timeout.String(), "sh", "-c", "printf from-remote >&2; exec sleep 30"}, strings.NewReader(""), io.Discard, output)
+	if code != timeoutExitCode {
+		t.Fatalf("timeout returned %d: %s", code, output.buffer.String())
+	} else if output.overlapped.Load() {
+		t.Fatal("timeout diagnostic written concurrently with the command's standard error")
+	} else if diagnostic := output.buffer.String(); diagnostic != "from-remote"+"remote: timed out after 1s while running the command\n" {
+		t.Fatalf("unexpected standard error: %q", diagnostic)
 	}
 }
 

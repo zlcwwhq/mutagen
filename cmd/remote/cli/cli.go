@@ -70,6 +70,29 @@ func (w *checkedWriter) Write(data []byte) (int, error) {
 	return count, err
 }
 
+// lockedWriter serializes writes to an output that several goroutines write.
+type lockedWriter struct {
+	// lock serializes writes.
+	lock sync.Mutex
+	// writer is the underlying output.
+	writer io.Writer
+}
+
+func (w *lockedWriter) Write(data []byte) (int, error) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	return w.writer.Write(data)
+}
+
+// Fd preserves terminal detection (see terminalWidth) when the underlying
+// output exposes a file descriptor.
+func (w *lockedWriter) Fd() uintptr {
+	if file, ok := w.writer.(interface{ Fd() uintptr }); ok {
+		return file.Fd()
+	}
+	return ^uintptr(0)
+}
+
 // options are the parsed command line options.
 type options struct {
 	// node selects the destination node.
@@ -367,6 +390,14 @@ func (o *options) command() bool {
 // Run executes the command line (excluding the executable name) and returns the
 // exit code.
 func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// Remote stderr, progress refreshes, and daemon reports may arrive on
+	// different goroutines. Cancellation diagnostics use this writer too: a
+	// command's stderr may still be forwarded when cancellation ends
+	// remote.Execute, and the diagnostic that follows must wait for it.
+	// Standard output needs no lock: Run only writes it itself after the
+	// operations that forward output to it have completed, and never after
+	// cancellation ends one of them.
+	stderr = &lockedWriter{writer: stderr}
 	fail := func(err error) int {
 		fmt.Fprintln(stderr, "remote:", err)
 		return errorExitCode(err)
