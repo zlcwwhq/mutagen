@@ -68,7 +68,9 @@ func (c *Cache) Equal(other *Cache) bool {
 			panic("nil modification time in cache")
 		}
 
-		// Verify equivalence
+		// Verify equivalence. Racy isn't compared, since it reflects when a
+		// digest was computed relative to the file's modification, rather than
+		// the cached content.
 		equivalent := otherEntry.Mode == entry.Mode &&
 			otherEntry.ModificationTime.Seconds == entry.ModificationTime.Seconds &&
 			otherEntry.ModificationTime.Nanos == entry.ModificationTime.Nanos &&

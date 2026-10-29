@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // testingContentManager generates and removes test content on disk using
@@ -92,6 +94,7 @@ func (g *testingContentManager) generate() (string, error) {
 		root,
 		[]*Change{creation},
 		nil,
+		newTestingHasher(),
 		SymbolicLinkMode_SymbolicLinkModePOSIXRaw,
 		0600,
 		0700,
@@ -114,6 +117,30 @@ func (g *testingContentManager) generate() (string, error) {
 		if err := g.tweak(root); err != nil {
 			return "", fmt.Errorf("unable to tweak content root: %w", err)
 		}
+	}
+
+	// Backdate the generated files, including any that the tweak operation
+	// created, so that they appear to have been modified well before any scan
+	// of them. Otherwise, their digests would be racy (see CacheEntry.Racy),
+	// and every scan would hash them again, which would make it impossible to
+	// test cache reuse. Tests still modify files at the current time between
+	// scans, which scans detect as modifications. Content that doesn't exist
+	// (such as an absent root) or that the tweak operation made inaccessible
+	// has nothing to backdate.
+	modificationTime := time.Now().Add(-time.Hour)
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
+			return err
+		} else if entry.Type().IsRegular() {
+			return os.Chtimes(path, modificationTime, modificationTime)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("unable to backdate content: %w", err)
 	}
 
 	// Success.

@@ -38,7 +38,15 @@ type CacheEntry struct {
 	// On Windows it is currently 0.
 	FileID uint64 `protobuf:"varint,4,opt,name=fileID,proto3" json:"fileID,omitempty"`
 	// Digest is the cached digest for file entries.
-	Digest        []byte `protobuf:"bytes,9,opt,name=digest,proto3" json:"digest,omitempty"`
+	Digest []byte `protobuf:"bytes,9,opt,name=digest,proto3" json:"digest,omitempty"`
+	// Racy indicates that the digest was computed so soon after the file's
+	// last modification that a subsequent modification may have left the
+	// file's metadata unchanged, since modification times have limited
+	// granularity. A racy digest can thus be outdated even if the metadata
+	// above still matches the file. Scans don't reuse racy digests, and
+	// transitions verify a file's contents before relying on a racy digest.
+	// This is equivalent to Git's treatment of "racily clean" index entries.
+	Racy          bool `protobuf:"varint,10,opt,name=racy,proto3" json:"racy,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -108,6 +116,13 @@ func (x *CacheEntry) GetDigest() []byte {
 	return nil
 }
 
+func (x *CacheEntry) GetRacy() bool {
+	if x != nil {
+		return x.Racy
+	}
+	return false
+}
+
 // Cache provides a store for file metadata and digets to allow for efficient
 // rescans.
 type Cache struct {
@@ -159,14 +174,16 @@ var File_synchronization_core_cache_proto protoreflect.FileDescriptor
 
 const file_synchronization_core_cache_proto_rawDesc = "" +
 	"\n" +
-	" synchronization/core/cache.proto\x12\x04core\x1a\x1fgoogle/protobuf/timestamp.proto\"\xac\x01\n" +
+	" synchronization/core/cache.proto\x12\x04core\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc0\x01\n" +
 	"\n" +
 	"CacheEntry\x12\x12\n" +
 	"\x04mode\x18\x01 \x01(\rR\x04mode\x12F\n" +
 	"\x10modificationTime\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x10modificationTime\x12\x12\n" +
 	"\x04size\x18\x03 \x01(\x04R\x04size\x12\x16\n" +
 	"\x06fileID\x18\x04 \x01(\x04R\x06fileID\x12\x16\n" +
-	"\x06digest\x18\t \x01(\fR\x06digest\"\x89\x01\n" +
+	"\x06digest\x18\t \x01(\fR\x06digest\x12\x12\n" +
+	"\x04racy\x18\n" +
+	" \x01(\bR\x04racy\"\x89\x01\n" +
 	"\x05Cache\x122\n" +
 	"\aentries\x18\x01 \x03(\v2\x18.core.Cache.EntriesEntryR\aentries\x1aL\n" +
 	"\fEntriesEntry\x12\x10\n" +

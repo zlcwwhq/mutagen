@@ -28,6 +28,15 @@ message CacheEntry {
 
     // Digest is the cached digest for file entries.
     bytes digest = 9;
+
+    // Racy indicates that the digest was computed so soon after the file's
+    // last modification that a subsequent modification may have left the
+    // file's metadata unchanged, since modification times have limited
+    // granularity. A racy digest can thus be outdated even if the metadata
+    // above still matches the file. Scans don't reuse racy digests, and
+    // transitions verify a file's contents before relying on a racy digest.
+    // This is equivalent to Git's treatment of "racily clean" index entries.
+    bool racy = 10;
 }
 
 // Cache provides a store for file metadata and digets to allow for efficient

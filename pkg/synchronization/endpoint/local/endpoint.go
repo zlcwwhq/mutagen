@@ -201,6 +201,10 @@ type endpoint struct {
 	// stager will only be used in at most one of Stage or Transition methods at
 	// any given time.
 	stager stager
+	// transitionHasher is the hasher used by transitions to verify the
+	// contents of files whose cached digests are racy. It's separate from
+	// hasher, which background scans use without coordinating with Transition.
+	transitionHasher hash.Hash
 }
 
 // NewEndpoint creates a new local endpoint instance using the specified session
@@ -481,6 +485,7 @@ func NewEndpoint(
 			maximumStagingFileSize,
 			hasherFactory,
 		),
+		transitionHasher: hasherFactory(),
 	}
 
 	// Start the cache saving Goroutine.
@@ -1291,6 +1296,7 @@ func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) (
 		e.root,
 		transitions,
 		e.lastReturnedScanCache,
+		e.transitionHasher,
 		e.symbolicLinkMode,
 		e.defaultFileMode,
 		e.defaultDirectoryMode,

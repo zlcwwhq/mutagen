@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
@@ -47,6 +48,19 @@ const (
 	// doubling on insert without always allocating a huge cache. Its value is
 	// somewhat arbitrary.
 	defaultInitialCacheCapacity = 1024
+
+	// racyWindow is the period before the start of a scan within which a
+	// file's modification time makes its digest racy (see CacheEntry.Racy).
+	// A file can be modified again after its digest is computed without its
+	// modification time changing, provided that the modification falls within
+	// the same timestamp granule as the previous one. Such a granule can be as
+	// coarse as two seconds (on FAT filesystems), and the clock that stamps
+	// modification times can lag the wall clock (e.g. Linux's coarse clock
+	// lags by up to one tick). The window covers both, with some margin for
+	// minor clock differences. Files modified within the window are hashed
+	// again by the next scan that examines them, which only costs a second
+	// hash of recently modified files.
+	racyWindow = 3 * time.Second
 )
 
 // ErrScanCancelled indicates that the scan was cancelled.
@@ -107,6 +121,9 @@ type scanner struct {
 	hasher hash.Hash
 	// cache is the existing cache to use for fast digest lookups.
 	cache *Cache
+	// racyThreshold is the modification time at or after which digests
+	// computed by the scan are racy (see racyWindow).
+	racyThreshold time.Time
 	// ignorer is the ignorer identifying ignored paths.
 	ignorer ignore.Ignorer
 	// ignoreCache is the cache of ignored path behavior.
@@ -170,13 +187,20 @@ func (s *scanner) file(
 	// don't affect content, but we do check for full mode equivalence when
 	// assessing cache entry reusability since permission changes need to be
 	// detected during transition operations (where the cache is also used).
-	cacheContentMatch := cacheHit &&
+	//
+	// A racy digest isn't reused at all, since the file may have been modified
+	// after the digest was computed without any change to this metadata (see
+	// CacheEntry.Racy), so it's recomputed, and the new entry records whether
+	// the new digest is racy in turn. A reusable entry must not become racy,
+	// which only happens if the clock moves backward.
+	cacheContentMatch := cacheHit && !cached.Racy &&
 		(metadata.Mode&filesystem.ModeTypeMask) == (filesystem.Mode(cached.Mode)&filesystem.ModeTypeMask) &&
 		metadata.ModificationTime.Equal(cached.ModificationTime.AsTime()) &&
 		metadata.Size == cached.Size &&
 		metadata.FileID == cached.FileID
 	cacheEntryReusable := cacheContentMatch &&
-		metadata.Mode == filesystem.Mode(cached.Mode)
+		metadata.Mode == filesystem.Mode(cached.Mode) &&
+		metadata.ModificationTime.Before(s.racyThreshold)
 
 	// Compute the digest, either by pulling it from the cache or computing it
 	// from the on-disk contents.
@@ -241,13 +265,16 @@ func (s *scanner) file(
 			}, nil
 		}
 
-		// Create the new cache entry.
+		// Create the new cache entry. The metadata may have been updated when
+		// the file was opened for hashing, which is what the digest is racy
+		// relative to.
 		s.newCache.Entries[path] = &CacheEntry{
 			Mode:             uint32(metadata.Mode),
 			ModificationTime: modificationTime,
 			Size:             metadata.Size,
 			FileID:           metadata.FileID,
 			Digest:           digest,
+			Racy:             !metadata.ModificationTime.Before(s.racyThreshold),
 		}
 	}
 
@@ -767,6 +794,10 @@ func Scan(
 		return nil, nil, nil, errors.New("raw POSIX symbolic links not supported on Windows")
 	}
 
+	// Determine the threshold for racy digests before examining any file, so
+	// that it precedes the computation of every digest (see racyWindow).
+	racyThreshold := time.Now().Add(-racyWindow)
+
 	// Open the root and defer its closure. We explicitly disallow symbolic
 	// links at the root path, though intermediate symbolic links are fine.
 	rootObject, metadata, err := filesystem.Open(root, false)
@@ -964,6 +995,7 @@ func Scan(
 		dirtyPaths:             dirtyPaths,
 		hasher:                 hasher,
 		cache:                  cache,
+		racyThreshold:          racyThreshold,
 		ignorer:                ignorer,
 		ignoreCache:            ignoreCache,
 		symbolicLinkMode:       symbolicLinkMode,
