@@ -179,8 +179,14 @@ synchronization back fails, they return 125 and report the command's exit
 status and failed edge. Timeout and interruption retain their usual statuses.
 Tree commands started with `--detach` also require strict preflight on their
 adjacent edge; conflicts and synchronization failures prevent the job from
-starting, and `--no-flush` cannot bypass this check. Their later results arrive
-through background synchronization or `--wait`.
+starting. Their later results arrive through background synchronization or
+`--wait`. `--no-flush` skips both path synchronizations and their checks, so
+commands that neither read nor write synchronized files, such as `nvidia-smi`,
+run even while a path edge has conflicts. Such a call neither synchronizes nor
+waits for synchronization: background synchronization continues as
+configured, but conflicts, paused or disconnected edges, or disabled watching
+can keep its changes from propagating. The tree must still be valid and the
+path connected.
 Commands aren't retried automatically. Pausing or disconnecting a path endpoint,
 replacing a path edge, or introducing a problem that makes the path unsafe
 invalidates active routes. Changes to unrelated, valid branches do not cancel
@@ -198,15 +204,18 @@ even if only one destination is online.
 
 Foreground commands and scripts can reach any node. `remote --node gpu
 --conflicts` inspects the synchronization path and labels conflicts by the
-actual adjacent nodes holding their copies. Resolve from one of those nodes
-with `--node` selecting its peer. Jobs, file operations, conflict modifications,
-and `--flush` require an adjacent destination. Conflict listings with `--json`
-always use an `edges` array, including for an adjacent destination or an implicit
-pair; each entry names `alpha` and `beta`, identifies its traversal `source`
-and `target`, and contains their `listing`. The listing's local and remote
-changes refer to that entry's source and target, including intermediate nodes.
-Tree foreground commands and detached job starts always synchronize strictly
-and reject `--no-flush`.
+actual adjacent nodes holding their copies. Paths on the first edge are
+relative to the current directory, as for pairs, and those on later edges to
+their roots. Resolve from one of those nodes with `--node` selecting its peer,
+after listing its conflicts again there. Jobs, file operations, conflict
+modifications, and `--flush` require an adjacent destination. Conflict listings
+with `--json` always use an `edges` array, including for an adjacent
+destination or an implicit pair; each entry names `alpha` and `beta`,
+identifies its traversal `source` and `target`, and contains their `listing`.
+The listing's local and remote changes refer to that entry's source and
+target, including intermediate nodes.
+Tree foreground commands and detached job starts synchronize strictly unless
+given `--no-flush`.
 
 If the tree's sessions no longer form the configured tree, such as after an
 edge was terminated or a partial `mutagen project apply`, or another session
@@ -215,8 +224,8 @@ the tree is repaired, typically by applying the project again. `remote --nodes`
 still succeeds and reports the problem, and operations on an adjacent node
 (existing jobs, conflicts, `--diff`, `--pull`, `--flush`, and `--ignores`)
 keep working as long as that node's own edge is connected, which `--nodes
---json` reports as `adjacent`. Starting a new detached job still requires the
-strict tree preflight.
+--json` reports as `adjacent`. Starting a new detached job still requires a
+valid tree, even with `--no-flush`.
 
 Other branches continue background synchronization without participating in this
 call's completion. Ordered path synchronization provides neither snapshots nor
@@ -422,8 +431,9 @@ costs a rescan of both roots, so use `--no-flush` only for commands that
 neither read nor write synchronized files. `--detach` flushes only before
 starting a job and `--wait` only after it ends, while `--jobs`, `--kill`,
 `--ignores`, and `--pull` don't flush. `--kill` accepts `--no-flush`, which
-has no effect. Tree foreground commands and detached job starts instead require
-the strict preflight described above.
+has no effect. Tree foreground commands and detached job starts instead
+synchronize their paths strictly, as described above, and `--no-flush` skips
+that as well.
 
 Flushes that take over 3 seconds show their progress on standard error,
 following git's convention: on a terminal, as a line updated in place, and

@@ -496,7 +496,13 @@ func (r *treeRoute) synchronize(ctx context.Context, step treeStep, phase string
 // run performs strict path synchronization around a foreground command, or
 // before starting an adjacent detached job. Jobs retain their normal lifecycle:
 // starting one does not wait for it or synchronize back before it finishes.
-func (r *treeRoute) run(ctx context.Context, request *remote.Request, stdin io.Reader, stdout, stderr io.Writer, progress bool, event func(*remote.CommandEvent) error) (*remote.CommandResult, error) {
+// noFlush skips both path synchronizations, along with their checks for
+// conflicts and other unsynchronized content, as --no-flush skips both flushes
+// of a pair command. The invocation then neither synchronizes nor waits for
+// synchronization: background synchronization continues as configured, with
+// no guarantee that the command's changes propagate. The route itself is still
+// pinned and checked, so the target remains the selected node of a valid tree.
+func (r *treeRoute) run(ctx context.Context, request *remote.Request, stdin io.Reader, stdout, stderr io.Writer, noFlush, progress bool, event func(*remote.CommandEvent) error) (*remote.CommandResult, error) {
 	if err := r.check(ctx); err != nil {
 		return nil, err
 	}
@@ -536,7 +542,11 @@ func (r *treeRoute) run(ctx context.Context, request *remote.Request, stdin io.R
 			return nil, fmt.Errorf("submission directory is ignored by edge %s <-> %s: %s", step.session.Tree.Alpha, step.session.Tree.Beta, excluded)
 		}
 	}
-	for _, step := range r.steps {
+	synchronized := r.steps
+	if noFlush {
+		synchronized = nil
+	}
+	for _, step := range synchronized {
 		if err := r.synchronize(ctx, step, "before command", progress, event); err != nil {
 			return nil, fmt.Errorf("command not started: %w", err)
 		}
@@ -553,6 +563,9 @@ func (r *treeRoute) run(ctx context.Context, request *remote.Request, stdin io.R
 	}
 	response, executionError := remote.ForwardCommand(ctx, connection, request, stdin, stdout, stderr)
 	if ctx.Err() != nil || errors.Is(executionError, remote.ErrConnectionLost) {
+		if noFlush {
+			return nil, remote.ConnectionError(errors.New("tree route was interrupted; the command may have run; it was not retried"))
+		}
 		return nil, remote.ConnectionError(errors.New("tree route was interrupted; the command may have run and its changes were not synchronized back; it was not retried"))
 	}
 	if request.Job != nil {
@@ -561,8 +574,8 @@ func (r *treeRoute) run(ctx context.Context, request *remote.Request, stdin io.R
 	if response != nil && executionError == nil {
 		executionError = response.ExecutionError()
 	}
-	for i := len(r.steps) - 1; i >= 0; i-- {
-		if err := r.synchronize(ctx, r.steps[i], "after command", progress, event); err != nil {
+	for i := len(synchronized) - 1; i >= 0; i-- {
+		if err := r.synchronize(ctx, synchronized[i], "after command", progress, event); err != nil {
 			outcome := "command execution failed"
 			if response != nil {
 				outcome = fmt.Sprintf("command exited with status %d", response.ExitCode)
@@ -596,6 +609,6 @@ func (r *commandRelay) serveTree(ctx context.Context, submission io.ReadWriteClo
 		return
 	}
 	remote.ServeForwarded(ctx, submission, func(ctx context.Context, request *remote.Request, stdin io.Reader, stdout, stderr io.Writer, event func(*remote.CommandEvent) error) (*remote.CommandResult, error) {
-		return route.run(ctx, request, stdin, stdout, stderr, header.Progress, event)
+		return route.run(ctx, request, stdin, stdout, stderr, header.NoFlush, header.Progress, event)
 	})
 }

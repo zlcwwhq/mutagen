@@ -65,9 +65,12 @@ func checkAdjacentOperations(t *testing.T, f *treeFixture, problem, job string) 
 			t.Fatalf("adjacent operation %v failed: %d %q %s", arguments, code, output, diagnostic)
 		}
 	}
-	code, output, diagnostic = runRemote(t, from, "--node", "b", "--detach", "true")
-	if code != 125 || !strings.Contains(diagnostic, problem) {
-		t.Fatalf("detached command bypassed tree preflight: %d %q %s", code, output, diagnostic)
+	// --no-flush skips synchronization, never the tree's validation.
+	for _, arguments := range [][]string{{"--detach", "true"}, {"--detach", "--no-flush", "true"}} {
+		code, output, diagnostic = runRemote(t, from, append([]string{"--node", "b"}, arguments...)...)
+		if code != 125 || !strings.Contains(diagnostic, problem) {
+			t.Fatalf("detached command %v bypassed tree preflight: %d %q %s", arguments, code, output, diagnostic)
+		}
 	}
 	if code, output, diagnostic := runRemote(t, from, "--node", "b", "--jobs"); code != 0 || !strings.Contains(output, job) {
 		t.Fatalf("detached job not listed: %d %q %s", code, output, diagnostic)
@@ -82,15 +85,19 @@ func checkAdjacentOperations(t *testing.T, f *treeFixture, problem, job string) 
 	// Strict tree commands are refused before anything runs, for adjacent
 	// and distant targets alike, and say why.
 	marker := filepath.Join(f.roots["b"], "ignored", "not-run")
-	code, _, diagnostic = runRemote(t, from, "--node", "b", "touch", marker)
-	if code != 125 || !strings.Contains(diagnostic, "tree commands are unavailable") || !strings.Contains(diagnostic, problem) {
-		t.Fatalf("strict command not refused: %d %s", code, diagnostic)
-	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatal("refused tree command ran")
-	}
-	if code, _, diagnostic = runRemote(t, from, "--node", "a", "true"); code != 125 || !strings.Contains(diagnostic, problem) {
-		t.Fatalf("distant strict command not refused: %d %s", code, diagnostic)
+	for _, options := range [][]string{nil, {"--no-flush"}} {
+		arguments := append(append([]string{"--node", "b"}, options...), "touch", marker)
+		code, _, diagnostic = runRemote(t, from, arguments...)
+		if code != 125 || !strings.Contains(diagnostic, "tree commands are unavailable") || !strings.Contains(diagnostic, problem) {
+			t.Fatalf("strict command %v not refused: %d %s", options, code, diagnostic)
+		}
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Fatalf("refused tree command %v ran", options)
+		}
+		arguments = append(append([]string{"--node", "a"}, options...), "true")
+		if code, _, diagnostic = runRemote(t, from, arguments...); code != 125 || !strings.Contains(diagnostic, problem) {
+			t.Fatalf("distant strict command %v not refused: %d %s", options, code, diagnostic)
+		}
 	}
 	if code, _, diagnostic = runRemote(t, from, "--node", "a", "--jobs"); code != 125 || !strings.Contains(diagnostic, "adjacent node") {
 		t.Fatalf("distant adjacent operation not refused: %d %s", code, diagnostic)

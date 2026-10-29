@@ -67,9 +67,6 @@ func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) 
 		if !selected.Available {
 			return nil, 0, nil, remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, selected.Reason))
 		}
-		if strict && header.NoFlush {
-			return nil, 0, nil, errors.New("--no-flush is unavailable for tree commands, which require strict synchronization")
-		}
 		if strict && !header.Detached || pathConflicts {
 			if strict {
 				header.Operation = remote.OperationTreeExecute

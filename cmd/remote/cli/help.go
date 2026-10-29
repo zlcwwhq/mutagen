@@ -82,15 +82,23 @@ adjacent nodes require.
     synchronizing in the background and needn't finish for this call.
   - Tree command preflight stops on any conflict, scan/transition problem,
     or synchronization failure. Failure to sync back returns 125 and reports
-    the command's exit status. --no-flush is unavailable for these commands.
-    --detach also requires strict preflight on its adjacent edge and rejects
-    --no-flush; a failed preflight never starts the job. Its later results
-    arrive through background synchronization or --wait.
+    the command's exit status. --detach also requires strict preflight on
+    its adjacent edge; a failed preflight never starts the job. Its later
+    results arrive through background synchronization or --wait.
     Timeout and interruption retain their normal statuses. Neither failures
     nor reconnects automatically retry commands or change their target.
+  - --no-flush skips both path synchronizations and their checks, so the
+    command runs even if path edges have conflicts. It neither synchronizes
+    nor waits for synchronization; background synchronization continues as
+    configured, but conflicts, paused or disconnected edges, or disabled
+    watching can keep the command's changes from propagating. As for pairs,
+    use it only for commands that neither read nor write synchronized files
+    (see --help sync). The tree must still be valid and the path connected.
   - --conflicts can inspect a multi-edge path. Each listing identifies the
-    actual adjacent nodes holding its copies, and paths are relative to those
-    roots. Resolve from one of that edge's endpoints using --node for its peer.
+    actual adjacent nodes holding its copies. Paths on the first edge are
+    relative to the current directory, as for pairs, and those on later edges
+    to their roots. Resolve from one of that edge's endpoints using --node for
+    its peer, after listing its conflicts again there.
     --conflicts --json always returns an edges array, even for one edge or an
     implicit pair; each entry has alpha, beta, source, target, and listing
     fields. Local and remote changes in that listing refer to its source
@@ -104,7 +112,7 @@ adjacent nodes require.
     --nodes still shows the problem and the nodes known from existing edges.
     Operations on an adjacent node (existing jobs, conflicts, diff/pull,
     --flush, --ignores) only need its edge to be connected. New detached jobs
-    still require strict preflight.
+    still require a valid tree, even with --no-flush.
   - Target selection pins the source and destination. Lost path or submission
     connections, replaced path edges, and new problems that make the path
     unsafe invalidate a running tree command. Changes to unrelated, valid
@@ -123,9 +131,9 @@ between all nodes; prologues come only from each node's remotePrologue, never
 from synchronization defaults. A tree root has no precedence when resolving
 conflicts.
 `},
-	{"sync", "synchronization, ignored paths, --pull, and --diff", `Tree foreground commands and detached job starts require strict preflight;
-foreground commands also synchronize back (see --help nodes).
-For an implicit pair and other adjacent operations:
+	{"sync", "synchronization, ignored paths, --pull, and --diff", `Tree foreground commands and detached job starts require strict preflight,
+and foreground commands also synchronize back, unless --no-flush skips both
+(see --help nodes). For an implicit pair and other adjacent operations:
 
   - The session is synchronized before and after the command. Failure to
     synchronize only produces a warning. Keep these synchronizations: without
@@ -215,8 +223,9 @@ For an implicit pair and other adjacent operations:
     This overrides inherited values and those passed with -e or --env-file,
     even with --no-prologue or when submitting from outside the root.
     Detached jobs also receive MUTAGEN_REMOTE_JOB, set to their ID.
-    Tree endpoints also set MUTAGEN_REMOTE_NODE to their stable node name;
-    use it in tree scripts, since alpha/beta roles depend on the incident edge.
+    MUTAGEN_REMOTE_NODE is set likewise to the stable node name (alpha or
+    beta for an ordinary pair); use it in tree scripts, since alpha/beta roles
+    depend on the incident edge.
 
 No terminal is allocated. Programs may buffer output or disable colors:
   remote -e PYTHONUNBUFFERED=1 python train.py
