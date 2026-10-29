@@ -89,10 +89,13 @@ not conflict-free.
   - Each non-center node's mode configures its own edge. One-way modes flow
     from the center to the node, so the node's changes, including files that
     commands write there, don't reach the center.
-  - If a star's edges disagree on the center's endpoint, such as after a
-    partial mutagen project apply, --nodes reports the star problem, and new
-    operations from the center fail with 125 until the project is applied
-    again. Operations in progress and other nodes keep using their own
+  - The daemon refuses star edges whose nodes overlap, including the center,
+    that disagree with the star's other edges on the center or its endpoint,
+    or whose node already has an edge. Sessions outside the star aren't
+    checked; overlapping them behaves like overlapping pairs. If loaded edges
+    disagree on the center's endpoint anyway, --nodes reports the star
+    problem, and new operations from the center fail with 125 until the star
+    is repaired. Operations in progress and other nodes keep using their own
     edges. A terminated edge only removes its node.
   - Execution uses the target's remotePrologue or workspace override.
     MUTAGEN_REMOTE_NODE identifies the target and overrides submitted values.

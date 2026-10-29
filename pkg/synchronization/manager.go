@@ -37,6 +37,9 @@ type Manager struct {
 	// stars provides node discovery and destination selection across this
 	// manager's sessions.
 	stars *commandStars
+	// starCreations validates new star edges against the existing edges of
+	// their stars, including concurrent creations.
+	starCreations starCreations
 	// logger is the underlying logger.
 	logger *logging.Logger
 	// tracker tracks changes to session states.
@@ -208,7 +211,9 @@ func (m *Manager) Shutdown() {
 }
 
 // Create tells the manager to create a new session. If star is non-nil, then
-// the session is an edge of a star workspace (see Session.Star).
+// the session is an edge of a star workspace (see Session.Star), which must be
+// consistent with the star's existing edges, and its nodes must not overlap
+// (see validateStarEdge). Other sessions may overlap star workspaces.
 func (m *Manager) Create(
 	ctx context.Context,
 	alpha, beta *url.URL,
@@ -223,6 +228,26 @@ func (m *Manager) Create(
 	id, err := identifier.New(identifier.PrefixSynchronization)
 	if err != nil {
 		return "", fmt.Errorf("unable to generate identifier for session: %w", err)
+	}
+
+	// Validate a star edge together with the existing edges of its star before
+	// connecting to endpoints or writing any state, and keep it reserved until
+	// it's registered, so that concurrent creations validate against it (see
+	// starCreations). The session registers itself in the star index before
+	// newSession returns.
+	if star != nil {
+		release, err := m.starCreations.reserve(m.stars, &Session{
+			Identifier: id,
+			Name:       name,
+			Alpha:      alpha,
+			Beta:       beta,
+			Labels:     labels,
+			Star:       star,
+		})
+		if err != nil {
+			return "", err
+		}
+		defer release()
 	}
 
 	// Attempt to create a session.

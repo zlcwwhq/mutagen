@@ -607,10 +607,11 @@ func TestStarIndependentEdges(t *testing.T) {
 	}
 }
 
-// TestStarProblem verifies that edges disagreeing on the center's endpoint are
-// reported by --nodes and refuse operations from the center with 125, while
-// other nodes keep using their own edges, and that a terminated edge only
-// removes its node.
+// TestStarProblem verifies that the daemon refuses to create an edge that
+// disagrees on the center's endpoint, and that persisted edges disagreeing on
+// it are reported by --nodes and refuse operations from the center with 125,
+// while other nodes keep using their own edges, and that a terminated edge
+// only removes its node.
 func TestStarProblem(t *testing.T) {
 	f := newStarFixture(t, true)
 	other := filepath.Join(f.base, "other-center")
@@ -622,12 +623,26 @@ func TestStarProblem(t *testing.T) {
 	template := states[0].Session
 	star := proto.Clone(template.Star).(*synchronization.StarMembership)
 	star.Node = "extra"
-	id, err := f.manager.Create(context.Background(),
-		&url.URL{Kind: url.Kind_Synchronization, Path: other}, &url.URL{Kind: url.Kind_Synchronization, Path: extra},
-		template.Configuration, template.ConfigurationAlpha, template.ConfigurationBeta, "star-extra", template.Labels, star, false, "")
+	create := func(alpha *url.URL, paused bool) (string, error) {
+		return f.manager.Create(context.Background(),
+			alpha, &url.URL{Kind: url.Kind_Synchronization, Path: extra},
+			template.Configuration, template.ConfigurationAlpha, template.ConfigurationBeta, "star-extra", template.Labels, star, paused, "")
+	}
+	if _, err := create(&url.URL{Kind: url.Kind_Synchronization, Path: other}, false); err == nil ||
+		!strings.Contains(err.Error(), "alpha differs from the endpoint of center node local") {
+		t.Fatal("edge disagreeing on the center accepted:", err)
+	}
+
+	// Persisted edges can still disagree, such as when edited: move the
+	// center of a consistent paused edge while the daemon is stopped.
+	id, err := create(proto.Clone(template.Alpha).(*url.URL), true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.manager = restartWithSavedSession(t, f.manager, id, func(session *synchronization.Session) {
+		session.Alpha.Path = other
+	})
+	waitForStarCenter(t, f.roots["server"])
 	listing, output := listStar(t, f.roots["local"])
 	if !strings.Contains(listing.Problem, "disagree on the endpoint of center node local") {
 		t.Fatalf("star problem not reported: %s", output)

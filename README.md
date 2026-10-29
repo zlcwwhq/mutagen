@@ -159,10 +159,18 @@ including files that commands write there, don't reach the center. `mode` can't
 be set on the center. Pair-specific `configurationAlpha` and `configurationBeta`
 defaults don't apply. Configure prologues on nodes, including the center:
 `remotePrologue` in global or project synchronization defaults doesn't apply to
-star nodes. Distinct nodes must not use overlapping directories, and additional
-synchronization sessions must not overlap star workspaces. Known overlaps are
-rejected; don't use different host aliases or remote symlink paths to give the
-same workspace multiple identities.
+star nodes.
+
+The nodes of a star must not overlap one another, including the center: the
+daemon refuses star edges whose nodes would overlap, and `mutagen project start`
+and `apply` refuse such declarations. They also refuse sessions declared in the
+same project file that overlap star workspaces. Sessions created outside the
+project aren't checked, and overlapping them behaves like overlapping pairs:
+the most specific workspace containing a directory is the source for `remote`,
+workspaces with the same root are ambiguous, and changes propagate through both
+sessions. Detection compares configured hosts and paths and can't see through
+host aliases or remote symbolic links, so don't use them to give one workspace
+multiple identities.
 
 `star.remote: true` explicitly permits commands between the center and every
 other node. Its default is false, regardless of `sync.defaults.remote`. Select
@@ -198,15 +206,17 @@ node, itself and the center. It marks the current node and the center, and
 shows each node's host and root, the mode of the edge to it, and its connection
 availability. `--nodes --json` provides machine-readable output. Discovery
 neither synchronizes files nor executes commands; available doesn't imply
-conflict-free. Terminating an edge only removes its node. If the star's sessions
-disagree on the center's endpoint, such as after a partial `mutagen project
-apply`, `remote --nodes` reports the star problem, and new operations from the
-center fail with status 125 until the project is applied again, while
-operations already in progress and other nodes keep using their own edges.
-`remote --conflicts --json` reports an `edges` array with a single entry,
-which names the edge's `alpha` and `beta` nodes and the listing's `source` and
-`target`, and contains the `listing`. `remote --help nodes` summarizes target
-selection.
+conflict-free. Terminating an edge only removes its node. The daemon refuses
+star edges that disagree with the star's existing edges on the center or its
+endpoint, or whose node already has an edge. If the sessions that it loads
+disagree on the center's endpoint anyway, `remote --nodes` reports the star
+problem, and new operations from the center fail with status 125 until the star
+is repaired, such as by terminating the edge that disagrees and applying the
+project again, while operations already in progress and other nodes keep using
+their own edges. `remote --conflicts --json` reports an `edges` array with a
+single entry, which names the edge's `alpha` and `beta` nodes and the listing's
+`source` and `target`, and contains the `listing`. `remote --help nodes`
+summarizes target selection.
 
 Earlier releases declared workspace trees under `tree:`, which is no longer
 accepted: `mutagen project start` and `apply` refuse project files that
