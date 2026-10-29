@@ -57,7 +57,11 @@ func TestNodeListingWithTreeProblem(t *testing.T) {
 	if err := printNodes(graph, false, &output); err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"Tree problem: " + problem, "b: adjacent operations only (tree problem)", "a: unavailable: tree problem", "no path over existing edges", "e: unavailable: edge c <-> e"} {
+	// --no-flush skips synchronization and conflict checks, never the repair.
+	for _, expected := range []string{
+		"Tree problem: " + problem, "b: adjacent operations only (tree problem)", "a: unavailable: tree problem", "no path over existing edges", "e: unavailable: edge c <-> e",
+		"require a repaired tree, even with --no-flush", "check for conflicts unless given --no-flush",
+	} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("listing omitted %q: %s", expected, output.String())
 		}

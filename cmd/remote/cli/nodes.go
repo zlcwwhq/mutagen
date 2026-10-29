@@ -81,10 +81,10 @@ func printNodes(graph *remote.NodeGraph, asJSON bool, writer io.Writer) error {
 		fmt.Fprintf(output, "  %s: %s; %s:%s; %s\n", clean(node.Name), clean(status), clean(node.Host), clean(executionDirectory(node.Root, "")), clean(path))
 	}
 	if graph.Problem != "" {
-		fmt.Fprintln(output, "New commands, including detached jobs, require a repaired tree and strict preflight.")
+		fmt.Fprintln(output, "New commands, including detached jobs, require a repaired tree, even with --no-flush.")
 		fmt.Fprintln(output, "Existing job control, conflicts, and other adjacent operations still work over connected edges.")
 	}
-	fmt.Fprintln(output, "Availability describes connections only; commands still check synchronization and conflicts.")
+	fmt.Fprintln(output, "Availability describes connections only; commands still synchronize and check for conflicts unless given --no-flush.")
 	return output.err
 }
 
