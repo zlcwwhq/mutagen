@@ -418,6 +418,14 @@ func printSession(state *synchronization.State, mode common.SessionDisplayMode) 
 		}
 		fmt.Println("\tIgnore VCS mode:", ignoreVCSModeDescription)
 
+		// Compute and print the Git mode.
+		gitModeDescription := configuration.GitMode.Description()
+		if configuration.GitMode.IsDefault() {
+			defaultGitMode := state.Session.Version.DefaultGitMode()
+			gitModeDescription += fmt.Sprintf(" (%s)", defaultGitMode.Description())
+		}
+		fmt.Println("\tGit mode:", gitModeDescription)
+
 		// Compute and print permissions mode.
 		permissionsModeDescription := configuration.PermissionsMode.Description()
 		if configuration.PermissionsMode.IsDefault() {

@@ -5,6 +5,7 @@ package synchronization;
 option go_package = "github.com/mutagen-io/mutagen/pkg/synchronization";
 
 import "filesystem/behavior/probe_mode.proto";
+import "synchronization/git_mode.proto";
 import "synchronization/remote_command_mode.proto";
 import "synchronization/scan_mode.proto";
 import "synchronization/stage_mode.proto";
@@ -105,7 +106,14 @@ message Configuration {
     // synchronization.
     ignore.IgnoreVCSMode ignoreVCSMode = 33;
 
-    // Fields 35-60 are reserved for future ignore configuration parameters.
+    // GitMode specifies whether or not synchronization honors the conventions
+    // of Git working trees: .gitignore files are applied, .git entries are
+    // never synchronized, and submodules are compared by commit. Enabling it
+    // implies VCS ignoring. It can't be combined with an explicit VCS ignore
+    // mode of "propagate".
+    GitMode gitMode = 35;
+
+    // Fields 36-60 are reserved for future ignore configuration parameters.
 
 
     // Permissions configuration parameters (fields 61-80).

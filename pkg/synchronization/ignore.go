@@ -1,6 +1,7 @@
 package synchronization
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/mutagen-io/mutagen/pkg/remote"
@@ -9,10 +10,23 @@ import (
 	mutagenignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/mutagen"
 )
 
+// GitModeEnabled indicates whether or not a final (i.e. fully merged) session
+// configuration enables Git mode, using the session version to resolve any
+// default behavior. Git mode can't be endpoint-specific, so either endpoint's
+// merged configuration yields the same result.
+func GitModeEnabled(configuration *Configuration, version Version) bool {
+	gitMode := configuration.GitMode
+	if gitMode.IsDefault() {
+		gitMode = version.DefaultGitMode()
+	}
+	return gitMode == GitMode_GitModeEnabled
+}
+
 // effectiveIgnores computes the ignore syntax, the combined ignore list, and
 // whether VCS directories are ignored, as specified by a final (i.e. fully
 // merged) session configuration, using the session version to resolve any
-// default behavior.
+// default behavior. Git mode never synchronizes Git's own entries, so it
+// implies VCS ignoring.
 func effectiveIgnores(configuration *Configuration, version Version) (ignore.Syntax, []string, bool) {
 	// Compute the effective ignore syntax.
 	ignoreSyntax := configuration.IgnoreSyntax
@@ -30,7 +44,10 @@ func effectiveIgnores(configuration *Configuration, version Version) (ignore.Syn
 	if ignoreVCSMode.IsDefault() {
 		ignoreVCSMode = version.DefaultIgnoreVCSMode()
 	}
-	return ignoreSyntax, ignores, ignoreVCSMode == ignore.IgnoreVCSMode_IgnoreVCSModeIgnore
+	ignoreVCS := ignoreVCSMode == ignore.IgnoreVCSMode_IgnoreVCSModeIgnore
+
+	// Git mode implies VCS ignoring.
+	return ignoreSyntax, ignores, ignoreVCS || GitModeEnabled(configuration, version)
 }
 
 // EffectiveIgnores returns the effective ignores specified by a final (i.e.
@@ -48,8 +65,20 @@ func EffectiveIgnores(configuration *Configuration, version Version) *remote.Ign
 // behavior. The configuration must already be valid. Ignores can't be validated
 // by Configuration.EnsureValid because the ignore syntax may be specified by a
 // different configuration that's merged on top, so this function is used both
-// by endpoints and to validate ignores when session creation is requested.
+// by endpoints and to validate ignores when session creation is requested. It
+// also rejects Git mode combined with an explicit request to propagate VCS
+// directories, which Git mode contradicts by never synchronizing Git's own
+// entries. This can't be checked by Configuration.EnsureValid for the same
+// reason as ignores: either mode may be specified by a different configuration
+// that's merged on top. A VCS ignore mode that merely defaults to propagating
+// them isn't a conflict, because nothing was requested.
 func NewIgnorer(configuration *Configuration, version Version) (ignore.Ignorer, error) {
+	// Verify that Git mode doesn't contradict an explicit VCS ignore mode.
+	if GitModeEnabled(configuration, version) &&
+		configuration.IgnoreVCSMode == ignore.IgnoreVCSMode_IgnoreVCSModePropagate {
+		return nil, errors.New("Git mode never synchronizes VCS directories and can't be combined with propagating them")
+	}
+
 	// Compute the effective ignores and create the ignorer.
 	ignoreSyntax, ignores, ignoreVCS := effectiveIgnores(configuration, version)
 	var ignorer ignore.Ignorer

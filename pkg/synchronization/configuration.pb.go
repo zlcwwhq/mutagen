@@ -74,6 +74,12 @@ type Configuration struct {
 	// IgnoreVCSMode specifies the VCS ignore mode that should be used in
 	// synchronization.
 	IgnoreVCSMode ignore.IgnoreVCSMode `protobuf:"varint,33,opt,name=ignoreVCSMode,proto3,enum=ignore.IgnoreVCSMode" json:"ignoreVCSMode,omitempty"`
+	// GitMode specifies whether or not synchronization honors the conventions
+	// of Git working trees: .gitignore files are applied, .git entries are
+	// never synchronized, and submodules are compared by commit. Enabling it
+	// implies VCS ignoring. It can't be combined with an explicit VCS ignore
+	// mode of "propagate".
+	GitMode GitMode `protobuf:"varint,35,opt,name=gitMode,proto3,enum=synchronization.GitMode" json:"gitMode,omitempty"`
 	// PermissionsMode species the manner in which permissions should be
 	// propagated between endpoints.
 	PermissionsMode core.PermissionsMode `protobuf:"varint,61,opt,name=permissionsMode,proto3,enum=core.PermissionsMode" json:"permissionsMode,omitempty"`
@@ -236,6 +242,13 @@ func (x *Configuration) GetIgnoreVCSMode() ignore.IgnoreVCSMode {
 	return ignore.IgnoreVCSMode(0)
 }
 
+func (x *Configuration) GetGitMode() GitMode {
+	if x != nil {
+		return x.GitMode
+	}
+	return GitMode_GitModeDefault
+}
+
 func (x *Configuration) GetPermissionsMode() core.PermissionsMode {
 	if x != nil {
 		return x.PermissionsMode
@@ -296,7 +309,7 @@ var File_synchronization_configuration_proto protoreflect.FileDescriptor
 
 const file_synchronization_configuration_proto_rawDesc = "" +
 	"\n" +
-	"#synchronization/configuration.proto\x12\x0fsynchronization\x1a$filesystem/behavior/probe_mode.proto\x1a)synchronization/remote_command_mode.proto\x1a\x1fsynchronization/scan_mode.proto\x1a synchronization/stage_mode.proto\x1a synchronization/watch_mode.proto\x1a+synchronization/compression/algorithm.proto\x1a\x1fsynchronization/core/mode.proto\x1a+synchronization/core/permissions_mode.proto\x1a-synchronization/core/symbolic_link_mode.proto\x1a(synchronization/core/ignore/syntax.proto\x1a1synchronization/core/ignore/ignore_vcs_mode.proto\x1a'synchronization/hashing/algorithm.proto\"\xb8\t\n" +
+	"#synchronization/configuration.proto\x12\x0fsynchronization\x1a$filesystem/behavior/probe_mode.proto\x1a\x1esynchronization/git_mode.proto\x1a)synchronization/remote_command_mode.proto\x1a\x1fsynchronization/scan_mode.proto\x1a synchronization/stage_mode.proto\x1a synchronization/watch_mode.proto\x1a+synchronization/compression/algorithm.proto\x1a\x1fsynchronization/core/mode.proto\x1a+synchronization/core/permissions_mode.proto\x1a-synchronization/core/symbolic_link_mode.proto\x1a(synchronization/core/ignore/syntax.proto\x1a1synchronization/core/ignore/ignore_vcs_mode.proto\x1a'synchronization/hashing/algorithm.proto\"\xec\t\n" +
 	"\rConfiguration\x12K\n" +
 	"\x13synchronizationMode\x18\v \x01(\x0e2\x19.core.SynchronizationModeR\x13synchronizationMode\x12>\n" +
 	"\x10hashingAlgorithm\x18\x11 \x01(\x0e2\x12.hashing.AlgorithmR\x10hashingAlgorithm\x12,\n" +
@@ -311,7 +324,8 @@ const file_synchronization_configuration_proto_rawDesc = "" +
 	"\fignoreSyntax\x18\" \x01(\x0e2\x0e.ignore.SyntaxR\fignoreSyntax\x12&\n" +
 	"\x0edefaultIgnores\x18\x1f \x03(\tR\x0edefaultIgnores\x12\x18\n" +
 	"\aignores\x18  \x03(\tR\aignores\x12;\n" +
-	"\rignoreVCSMode\x18! \x01(\x0e2\x15.ignore.IgnoreVCSModeR\rignoreVCSMode\x12?\n" +
+	"\rignoreVCSMode\x18! \x01(\x0e2\x15.ignore.IgnoreVCSModeR\rignoreVCSMode\x122\n" +
+	"\agitMode\x18# \x01(\x0e2\x18.synchronization.GitModeR\agitMode\x12?\n" +
 	"\x0fpermissionsMode\x18= \x01(\x0e2\x15.core.PermissionsModeR\x0fpermissionsMode\x12(\n" +
 	"\x0fdefaultFileMode\x18? \x01(\rR\x0fdefaultFileMode\x122\n" +
 	"\x14defaultDirectoryMode\x18@ \x01(\rR\x14defaultDirectoryMode\x12\"\n" +
@@ -345,9 +359,10 @@ var file_synchronization_configuration_proto_goTypes = []any{
 	(WatchMode)(0),                // 7: synchronization.WatchMode
 	(ignore.Syntax)(0),            // 8: ignore.Syntax
 	(ignore.IgnoreVCSMode)(0),     // 9: ignore.IgnoreVCSMode
-	(core.PermissionsMode)(0),     // 10: core.PermissionsMode
-	(compression.Algorithm)(0),    // 11: compression.Algorithm
-	(RemoteCommandMode)(0),        // 12: synchronization.RemoteCommandMode
+	(GitMode)(0),                  // 10: synchronization.GitMode
+	(core.PermissionsMode)(0),     // 11: core.PermissionsMode
+	(compression.Algorithm)(0),    // 12: compression.Algorithm
+	(RemoteCommandMode)(0),        // 13: synchronization.RemoteCommandMode
 }
 var file_synchronization_configuration_proto_depIdxs = []int32{
 	1,  // 0: synchronization.Configuration.synchronizationMode:type_name -> core.SynchronizationMode
@@ -359,14 +374,15 @@ var file_synchronization_configuration_proto_depIdxs = []int32{
 	7,  // 6: synchronization.Configuration.watchMode:type_name -> synchronization.WatchMode
 	8,  // 7: synchronization.Configuration.ignoreSyntax:type_name -> ignore.Syntax
 	9,  // 8: synchronization.Configuration.ignoreVCSMode:type_name -> ignore.IgnoreVCSMode
-	10, // 9: synchronization.Configuration.permissionsMode:type_name -> core.PermissionsMode
-	11, // 10: synchronization.Configuration.compressionAlgorithm:type_name -> compression.Algorithm
-	12, // 11: synchronization.Configuration.remoteCommandMode:type_name -> synchronization.RemoteCommandMode
-	12, // [12:12] is the sub-list for method output_type
-	12, // [12:12] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	10, // 9: synchronization.Configuration.gitMode:type_name -> synchronization.GitMode
+	11, // 10: synchronization.Configuration.permissionsMode:type_name -> core.PermissionsMode
+	12, // 11: synchronization.Configuration.compressionAlgorithm:type_name -> compression.Algorithm
+	13, // 12: synchronization.Configuration.remoteCommandMode:type_name -> synchronization.RemoteCommandMode
+	13, // [13:13] is the sub-list for method output_type
+	13, // [13:13] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_configuration_proto_init() }
@@ -374,6 +390,7 @@ func file_synchronization_configuration_proto_init() {
 	if File_synchronization_configuration_proto != nil {
 		return
 	}
+	file_synchronization_git_mode_proto_init()
 	file_synchronization_remote_command_mode_proto_init()
 	file_synchronization_scan_mode_proto_init()
 	file_synchronization_stage_mode_proto_init()
