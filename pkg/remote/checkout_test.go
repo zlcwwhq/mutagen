@@ -109,7 +109,7 @@ func TestListingIncludesCheckouts(t *testing.T) {
 	defer cancel()
 	sent := &Listing{
 		Conflicts: []ConflictRoot{{Path: "file", Files: true}},
-		Problems:  []Problem{{Path: "problem", Error: "unreadable"}},
+		Problems:  []Problem{{Path: "problem", Error: "unreadable"}, {Path: "warning", Error: "ignored", Warning: true}},
 		Checkouts: []Checkout{{Path: "file", Alpha: true, Token: "token"}, {Path: "unfinished", Token: "other"}},
 	}
 	client, server := net.Pipe()

@@ -18,6 +18,13 @@ func (s *Snapshot) EnsureValid() error {
 		return fmt.Errorf("invalid snapshot content: %w", err)
 	}
 
+	// Ensure that warnings are valid.
+	for _, warning := range s.Warnings {
+		if err := warning.EnsureValid(); err != nil {
+			return fmt.Errorf("invalid snapshot warning: %w", err)
+		}
+	}
+
 	// All values of behavioral metadata fields are valid.
 
 	// While there are some validations that we could perform on the statistical
@@ -33,8 +40,28 @@ func (s *Snapshot) EnsureValid() error {
 }
 
 // Equal performs an equivalence comparison between this snapshot and another.
+// It doesn't compare warnings, which don't describe the snapshot's content and
+// which aren't necessarily computed for every snapshot. In particular, a change
+// in warnings doesn't constitute a modification to be synchronized.
 func (s *Snapshot) Equal(other *Snapshot) bool {
 	return s.Content.Equal(other.Content, true) &&
 		s.PreservesExecutability == other.PreservesExecutability &&
 		s.DecomposesUnicode == other.DecomposesUnicode
+}
+
+// WithWarnings returns a shallow copy of the snapshot with the specified
+// warnings in place of any that it has. Snapshots are immutable and may be
+// shared (e.g. as the baseline for a subsequent scan), so this is the way to
+// attach warnings to one.
+func (s *Snapshot) WithWarnings(warnings []*Problem) *Snapshot {
+	return &Snapshot{
+		Content:                s.Content,
+		PreservesExecutability: s.PreservesExecutability,
+		DecomposesUnicode:      s.DecomposesUnicode,
+		Directories:            s.Directories,
+		Files:                  s.Files,
+		SymbolicLinks:          s.SymbolicLinks,
+		TotalFileSize:          s.TotalFileSize,
+		Warnings:               warnings,
+	}
 }

@@ -5,6 +5,7 @@ package core;
 option go_package = "github.com/mutagen-io/mutagen/pkg/synchronization/core";
 
 import "synchronization/core/entry.proto";
+import "synchronization/core/problem.proto";
 
 // Snapshot bundles a filesystem content snapshot with associated metadata.
 // Snapshot objects should be considered immutable and must not be modified.
@@ -30,4 +31,10 @@ message Snapshot {
     // TotalFileSize is the total size of all synchronizable files referenced by
     // the snapshot.
     uint64 totalFileSize = 7;
+    // Warnings are problems with the endpoint's content that the scan itself
+    // doesn't represent, such as content that a Git repository tracks but that
+    // isn't synchronized. They're informational: they don't affect
+    // synchronization, and they aren't part of the snapshot's identity, so they
+    // don't participate in snapshot equality.
+    repeated Problem warnings = 8;
 }

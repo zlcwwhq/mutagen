@@ -654,8 +654,14 @@ func TestEntryProblems(t *testing.T) {
 
 	// Process test cases.
 	for i, test := range tests {
-		if problems := test.entry.Problems(); !testingProblemListsEqual(problems, test.expected) {
+		problems := test.entry.Problems()
+		if !testingProblemListsEqual(problems, test.expected) {
 			t.Errorf("test index %d: entry problems do not match expected", i)
+		}
+		for _, problem := range problems {
+			if problem.Warning {
+				t.Errorf("test index %d: entry problem indicated as warning", i)
+			}
 		}
 	}
 }
