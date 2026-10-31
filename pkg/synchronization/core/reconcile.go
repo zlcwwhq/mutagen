@@ -151,6 +151,28 @@ func (r *reconciler) reconcile(path string, ancestor, alpha, beta *Entry) {
 	// Seventh, we know that at least one of the sides represents non-nil
 	// synchronizable content at this path.
 
+	// An empty directory opposite a submodule isn't a conflict, because cloning
+	// a repository without --recurse-submodules leaves an empty directory at the
+	// submodule's path, and that mustn't conflict with the other side's checkout
+	// of the submodule. Instead, the empty side receives the submodule, whatever
+	// the ancestor contains, which means that running git submodule deinit on
+	// one side gets undone. In one-way modes, content never propagates from beta
+	// to alpha, so an empty directory on alpha and a submodule on beta are left
+	// alone, without a change or a conflict, rather than having the mode's
+	// mirroring delete the submodule on beta or report a conflict about it.
+	alphaIsEmptyDirectory := alpha != nil && alpha.Kind == EntryKind_Directory && len(alpha.Contents) == 0
+	betaIsEmptyDirectory := beta != nil && beta.Kind == EntryKind_Directory && len(beta.Contents) == 0
+	if betaIsEmptyDirectory && alpha != nil && alpha.Kind == EntryKind_GitLink {
+		r.betaChanges = append(r.betaChanges, &Change{Path: path, Old: beta, New: alpha})
+		return
+	} else if alphaIsEmptyDirectory && beta != nil && beta.Kind == EntryKind_GitLink {
+		if r.mode == SynchronizationMode_SynchronizationModeTwoWaySafe ||
+			r.mode == SynchronizationMode_SynchronizationModeTwoWayResolved {
+			r.alphaChanges = append(r.alphaChanges, &Change{Path: path, Old: alpha, New: beta})
+		}
+		return
+	}
+
 	// Beyond this point, disagreement handling and conflict resolution depends
 	// on the synchronization mode being used. When reasoning about the behavior
 	// of these functions, it's important to take into account all of the

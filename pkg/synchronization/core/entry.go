@@ -14,7 +14,8 @@ import (
 func (k EntryKind) synchronizable() bool {
 	return k == EntryKind_Directory ||
 		k == EntryKind_File ||
-		k == EntryKind_SymbolicLink
+		k == EntryKind_SymbolicLink ||
+		k == EntryKind_GitLink
 }
 
 // MarshalText implements encoding.TextMarshaler.MarshalText.
@@ -27,6 +28,8 @@ func (k EntryKind) MarshalText() ([]byte, error) {
 		result = "file"
 	case EntryKind_SymbolicLink:
 		result = "symlink"
+	case EntryKind_GitLink:
+		result = "gitlink"
 	case EntryKind_Untracked:
 		result = "untracked"
 	case EntryKind_Problematic:
@@ -52,6 +55,8 @@ func (k *EntryKind) UnmarshalText(textBytes []byte) error {
 		*k = EntryKind_File
 	case "symlink":
 		*k = EntryKind_SymbolicLink
+	case "gitlink":
+		*k = EntryKind_GitLink
 	case "untracked":
 		*k = EntryKind_Untracked
 	case "problematic":
@@ -85,6 +90,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("non-empty symbolic link target detected for directory")
 		} else if e.Problem != "" {
 			return errors.New("non-empty problem detected for directory")
+		} else if e.Url != "" {
+			return errors.New("non-empty URL detected for directory")
 		}
 
 		// Validate contents. Nil entries are not considered valid for contents.
@@ -109,6 +116,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("non-empty symbolic link target detected for file")
 		} else if e.Problem != "" {
 			return errors.New("non-empty problem detected for file")
+		} else if e.Url != "" {
+			return errors.New("non-empty URL detected for file")
 		}
 
 		// Ensure that the digest is non-empty.
@@ -125,12 +134,34 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("executable symbolic link detected")
 		} else if e.Problem != "" {
 			return errors.New("non-empty problem detected for symbolic link")
+		} else if e.Url != "" {
+			return errors.New("non-empty URL detected for symbolic link")
 		}
 
 		// Ensure that the target is non-empty. We avoid any further validation
 		// because there's none that we can reasonably perform.
 		if e.Target == "" {
 			return errors.New("symbolic link with empty target detected")
+		}
+	} else if e.Kind == EntryKind_GitLink {
+		// Ensure that no invalid fields are set.
+		if e.Contents != nil {
+			return errors.New("non-nil submodule content map detected")
+		} else if e.Executable {
+			return errors.New("executable submodule detected")
+		} else if e.Target != "" {
+			return errors.New("non-empty symbolic link target detected for submodule")
+		} else if e.Problem != "" {
+			return errors.New("non-empty problem detected for submodule")
+		}
+
+		// Ensure that the commit and the URL are non-empty. We avoid any further
+		// validation because the commit's length depends on the repository's
+		// hash algorithm and the URL's format is up to the version control tool.
+		if len(e.Digest) == 0 {
+			return errors.New("submodule with empty commit detected")
+		} else if e.Url == "" {
+			return errors.New("submodule with empty URL detected")
 		}
 	} else if e.Kind == EntryKind_Untracked {
 		// Verify that unsynchronizable content is allowed.
@@ -149,6 +180,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("non-empty symbolic link target detected for untracked content")
 		} else if e.Problem != "" {
 			return errors.New("non-empty problem detected for untracked content")
+		} else if e.Url != "" {
+			return errors.New("non-empty URL detected for untracked content")
 		}
 	} else if e.Kind == EntryKind_Problematic {
 		// Verify that unsynchronizable content is allowed.
@@ -165,6 +198,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("executable problematic content detected")
 		} else if e.Target != "" {
 			return errors.New("non-empty symbolic link target detected for problematic content")
+		} else if e.Url != "" {
+			return errors.New("non-empty URL detected for problematic content")
 		}
 
 		// Ensure that the problem is non-empty.
@@ -186,6 +221,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("non-empty symbolic link target detected for phantom directory")
 		} else if e.Problem != "" {
 			return errors.New("non-empty problem detected for phantom directory")
+		} else if e.Url != "" {
+			return errors.New("non-empty URL detected for phantom directory")
 		}
 
 		// Validate contents. Nil entries are not considered valid for contents.
@@ -309,7 +346,9 @@ func (e *Entry) Equal(other *Entry, deep bool) bool {
 		return false
 	}
 
-	// Compare all properties except for problem messages.
+	// Compare all properties except for problem messages and URLs. Only the
+	// commit (stored in the digest) identifies a submodule, because two
+	// endpoints may reach the same repository through different URLs.
 	propertiesEquivalent := e.Kind == other.Kind &&
 		e.Executable == other.Executable &&
 		bytes.Equal(e.Digest, other.Digest) &&
@@ -397,6 +436,7 @@ func (e *Entry) Copy(behavior EntryCopyBehavior) *Entry {
 		Digest:     e.Digest,
 		Target:     e.Target,
 		Problem:    e.Problem,
+		Url:        e.Url,
 	}
 
 	// If a slim copy was requested, then we're done.
@@ -472,6 +512,7 @@ func (e *Entry) synchronizable() *Entry {
 		Executable: e.Executable,
 		Digest:     e.Digest,
 		Target:     e.Target,
+		Url:        e.Url,
 	}
 
 	// Copy the entry contents. Some may not be synchronizable, in which case we

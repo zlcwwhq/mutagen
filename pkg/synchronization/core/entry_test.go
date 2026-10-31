@@ -2,6 +2,8 @@ package core
 
 import (
 	"testing"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // TestEntryKindSynchronizable tests EntryKind.synchronizable.
@@ -14,6 +16,7 @@ func TestEntryKindSynchronizable(t *testing.T) {
 		{EntryKind_Directory, true},
 		{EntryKind_File, true},
 		{EntryKind_SymbolicLink, true},
+		{EntryKind_GitLink, true},
 		{EntryKind_Untracked, false},
 		{EntryKind_Problematic, false},
 		{EntryKind_PhantomDirectory, false},
@@ -43,6 +46,7 @@ func TestEntryKindUnmarshal(t *testing.T) {
 		{"directory", EntryKind_Directory, false},
 		{"file", EntryKind_File, false},
 		{"symlink", EntryKind_SymbolicLink, false},
+		{"gitlink", EntryKind_GitLink, false},
 		{"untracked", EntryKind_Untracked, false},
 		{"problematic", EntryKind_Problematic, false},
 		{"phantom-directory", EntryKind_PhantomDirectory, false},
@@ -64,6 +68,23 @@ func TestEntryKindUnmarshal(t *testing.T) {
 				testCase.expected,
 			)
 		}
+	}
+}
+
+// TestEntryKindGitLinkTextRoundTrip tests that the textual form of a
+// submodule's entry kind round trips.
+func TestEntryKindGitLinkTextRoundTrip(t *testing.T) {
+	text, err := EntryKind_GitLink.MarshalText()
+	if err != nil {
+		t.Fatal("unable to marshal entry kind:", err)
+	} else if string(text) != "gitlink" {
+		t.Error("marshaled entry kind does not match expected:", string(text))
+	}
+	var kind EntryKind
+	if err := kind.UnmarshalText(text); err != nil {
+		t.Fatal("unable to unmarshal entry kind:", err)
+	} else if kind != EntryKind_GitLink {
+		t.Error("unmarshaled entry kind does not match expected:", kind)
 	}
 }
 
@@ -108,6 +129,10 @@ var entryEnsureValidTestCases = []struct {
 	{tDSA, true, true},
 	{tDM, false, true},
 	{tDM, true, true},
+	{tG1, false, true},
+	{tG1, true, true},
+	{tDG, false, true},
+	{tDG, true, true},
 
 	// Test unsynchronizable content.
 	{tU, false, true},
@@ -200,6 +225,34 @@ var entryEnsureValidTestCases = []struct {
 	{tIPPE, true, false},
 	{tII, false, false},
 	{tII, true, false},
+	{tIGCE, false, false},
+	{tIGCE, true, false},
+	{tIGC, false, false},
+	{tIGC, true, false},
+	{tIGE, false, false},
+	{tIGE, true, false},
+	{tIGT, false, false},
+	{tIGT, true, false},
+	{tIGP, false, false},
+	{tIGP, true, false},
+	{tIGDN, false, false},
+	{tIGDN, true, false},
+	{tIGDE, false, false},
+	{tIGDE, true, false},
+	{tIGUE, false, false},
+	{tIGUE, true, false},
+	{tIDU, false, false},
+	{tIDU, true, false},
+	{tIFU, false, false},
+	{tIFU, true, false},
+	{tISU, false, false},
+	{tISU, true, false},
+	{tIUU, false, false},
+	{tIUU, true, false},
+	{tIPU, false, false},
+	{tIPU, true, false},
+	{tIPDU, false, false},
+	{tIPDU, true, false},
 }
 
 // TestEntryEnsureValid tests Entry.EnsureValid.
@@ -245,6 +298,8 @@ func TestEntryWalk(t *testing.T) {
 		{"", tN, false, []testEntryWalkVisit{{"", tN}}},
 		{"", tF1, false, []testEntryWalkVisit{{"", tF1}}},
 		{"", tSR, false, []testEntryWalkVisit{{"", tSR}}},
+		{"", tG1, false, []testEntryWalkVisit{{"", tG1}}},
+		{"", tDGO, false, []testEntryWalkVisit{{"", tD0}, {"submodule", tG1}}},
 		{"", tD0, false, []testEntryWalkVisit{{"", tD0}}},
 		{"", tD1, false, []testEntryWalkVisit{{"", tD0}, {"file", tF1}}},
 		{"", tD1, true, []testEntryWalkVisit{{"file", tF1}, {"", tD0}}},
@@ -308,6 +363,8 @@ func TestEntryCount(t *testing.T) {
 		{tP1, 0},
 		{tDU, 1},
 		{tDP1, 1},
+		{tG1, 1},
+		{tDG, 3},
 	}
 
 	// Process test cases.
@@ -361,6 +418,18 @@ func TestEntryEqual(t *testing.T) {
 		{tDP1, tDP1, true, true},
 		{tPD0, tPD0, false, true},
 		{tPD0, tPD0, true, true},
+		{tG1, tG1, false, true},
+		{tG1, tG1, true, true},
+		{tG1, tG1U, false, true},
+		{tG1, tG1U, true, true},
+		{nested("submodule", tG1), nested("submodule", tG1U), true, true},
+		{tG1, tG2, false, false},
+		{tG1, tG2, true, false},
+		{nested("submodule", tG1), nested("submodule", tG2), true, false},
+		{tG1, tF1, false, false},
+		{tG1, tF1, true, false},
+		{tG1, tD0, false, false},
+		{tG1, tD0, true, false},
 	}
 
 	// Process test cases.
@@ -429,6 +498,16 @@ func TestEntryCopy(t *testing.T) {
 		{tD1, EntryCopyBehaviorShallow, tD1},
 		{tD1, EntryCopyBehaviorSlim, tD0},
 
+		{tG1, EntryCopyBehaviorDeep, tG1},
+		{tG1, EntryCopyBehaviorDeepPreservingLeaves, tG1},
+		{tG1, EntryCopyBehaviorShallow, tG1},
+		{tG1, EntryCopyBehaviorSlim, tG1},
+
+		{tDG, EntryCopyBehaviorDeep, tDG},
+		{tDG, EntryCopyBehaviorDeepPreservingLeaves, tDG},
+		{tDG, EntryCopyBehaviorShallow, tDG},
+		{tDG, EntryCopyBehaviorSlim, tD0},
+
 		{tU, EntryCopyBehaviorDeep, tU},
 		{tU, EntryCopyBehaviorDeepPreservingLeaves, tU},
 		{tU, EntryCopyBehaviorShallow, tU},
@@ -450,6 +529,81 @@ func TestEntryCopy(t *testing.T) {
 	}
 }
 
+// TestEntryURLPreservation tests that every operation that derives entries
+// preserves a submodule's URL. This has to be tested explicitly, because
+// Entry.Equal doesn't compare URLs and thus wouldn't notice its loss.
+func TestEntryURLPreservation(t *testing.T) {
+	// Ensure that a copy of tDG's submodule has the expected URL.
+	check := func(description string, directory *Entry) {
+		t.Helper()
+		if submodule := directory.GetContents()["submodule"]; submodule == nil {
+			t.Errorf("%s: submodule missing", description)
+		} else if submodule.Url != tG1.Url {
+			t.Errorf("%s: URL does not match expected: %q", description, submodule.Url)
+		}
+	}
+
+	// Test all copy behaviors, both on the submodule itself and on its parent
+	// (except for slim copies, which exclude a directory's contents).
+	for _, behavior := range []EntryCopyBehavior{
+		EntryCopyBehaviorDeep,
+		EntryCopyBehaviorDeepPreservingLeaves,
+		EntryCopyBehaviorShallow,
+		EntryCopyBehaviorSlim,
+	} {
+		if result := tG1.Copy(behavior); result.Url != tG1.Url {
+			t.Errorf("copy behavior %d: URL does not match expected: %q", behavior, result.Url)
+		}
+		if behavior != EntryCopyBehaviorSlim {
+			check("directory copy", tDG.Copy(behavior))
+		}
+	}
+
+	// Test synchronizability filtering, both on the submodule itself and on a
+	// parent directory that requires filtering of its contents.
+	if result := tG1.synchronizable(); result.Url != tG1.Url {
+		t.Errorf("synchronizability filtering: URL does not match expected: %q", result.Url)
+	}
+	check("synchronizability filtering", (&Entry{Contents: map[string]*Entry{
+		"submodule": tG1,
+		"untracked": tU,
+	}}).synchronizable())
+
+	// Test executability propagation, which performs a deep copy of its target.
+	check("executability propagation", PropagateExecutability(nil, tDG, tDG))
+
+	// Test application of changes, including a root replacement among others.
+	result, err := Apply(tD0, []*Change{{Path: "submodule", New: tG1}})
+	if err != nil {
+		t.Fatal("unable to apply change:", err)
+	}
+	check("application", result)
+	result, err = Apply(tD1, []*Change{{Path: "file"}, {New: tDG}, {Path: "other", New: tF1}})
+	if err != nil {
+		t.Fatal("unable to apply changes:", err)
+	}
+	check("application with root replacement", result)
+
+	// Test phantom directory reification.
+	alpha, beta, _, _ := ReifyPhantomDirectories(nil, tDG, tDG)
+	check("alpha reification", alpha)
+	check("beta reification", beta)
+
+	// Test serialization, which is how entries reach the ancestor and endpoints.
+	data, err := proto.Marshal(tDG)
+	if err != nil {
+		t.Fatal("unable to marshal entry:", err)
+	}
+	decoded := &Entry{}
+	if err := proto.Unmarshal(data, decoded); err != nil {
+		t.Fatal("unable to unmarshal entry:", err)
+	}
+	check("serialization", decoded)
+	if !decoded.Equal(tDG, true) {
+		t.Error("serialized entry does not match original")
+	}
+}
+
 // TestEntrySynchronizable tests Entry.synchronizable.
 func TestEntrySynchronizable(t *testing.T) {
 	// Define test cases.
@@ -466,6 +620,8 @@ func TestEntrySynchronizable(t *testing.T) {
 		{tP1, tN},
 		{tDU, tD0},
 		{tDP1, tD0},
+		{tG1, tG1},
+		{tDG, tDG},
 	}
 
 	// Process test cases.
@@ -492,6 +648,8 @@ func TestEntryProblems(t *testing.T) {
 		{tP1, []*Problem{{Error: tP1.Problem}}},
 		{tDU, nil},
 		{tDP1, []*Problem{{Path: "problematic", Error: tP1.Problem}}},
+		{tG1, nil},
+		{tDG, nil},
 	}
 
 	// Process test cases.

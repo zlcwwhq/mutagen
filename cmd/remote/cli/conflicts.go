@@ -1122,7 +1122,9 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 	}
 	for c, conflict := range conflicts {
 		line := reports.describeConflict(limitChanges(listing.Conflicts[c].Changes(), listedChanges))
-		if !conflict.Resolvable {
+		if listing.Conflicts[c].Submodule {
+			line += " (remote can't resolve it, since it involves a submodule: check out the same commit on both sides, or delete it on one side)"
+		} else if !conflict.Resolvable {
 			line += " (remote can't resolve it, since it involves a directory, the synchronization root, or content that can't be synchronized or read)"
 		} else if !conflict.Files {
 			line += fmt.Sprintf(" (not two files, so it can only be resolved with --take %s)", strings.Join(conflict.Take, " or --take "))

@@ -181,6 +181,64 @@ func TestDiscardAppliedWorkspace(t *testing.T) {
 	}
 }
 
+func TestSubmoduleConflict(t *testing.T) {
+	// Listings explain how to resolve a submodule conflict, which remote can't,
+	// without giving that advice for other conflicts that remote can't resolve,
+	// and checkouts refuse it before claiming it or downloading anything, which
+	// would fail here without a daemon.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	root := t.TempDir()
+	target := &remote.Target{SourceSession: "session", SourceAlpha: true, Session: "session", Alpha: true, Root: root, Contained: true}
+	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{
+		{
+			Path:         "directory",
+			AlphaChanges: []remote.Change{{Path: "directory", New: "directory"}},
+			BetaChanges:  []remote.Change{{Path: "directory", New: "file"}},
+		},
+		{
+			Path:         "submodule",
+			Submodule:    true,
+			AlphaChanges: []remote.Change{{Path: "submodule", Old: "submodule at 1111111", New: "submodule at 2222222"}},
+			BetaChanges:  []remote.Change{{Path: "submodule", Old: "submodule at 1111111", New: "submodule at 3333333"}},
+		},
+	}}
+	var output, errorOutput strings.Builder
+	if err := renderConflicts(ctx, root, &options{}, &output, &errorOutput, listing, target); err != nil {
+		t.Fatal("unable to list conflicts:", err)
+	}
+	const advice = "check out the same commit on both sides, or delete it on one side"
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("unexpected listing: %q", output.String())
+	} else if !strings.HasPrefix(lines[0], "directory: ") || !strings.Contains(lines[0], "it involves a directory") || strings.Contains(lines[0], advice) {
+		t.Errorf("incorrect directory conflict line: %q", lines[0])
+	} else if !strings.Contains(lines[1], "changed submodule at 1111111 to submodule at 2222222 locally") ||
+		!strings.Contains(lines[1], "changed submodule at 1111111 to submodule at 3333333 remotely") ||
+		!strings.Contains(lines[1], advice) || strings.Contains(lines[1], "--take") {
+		t.Errorf("incorrect submodule conflict line: %q", lines[1])
+	}
+
+	// Attempts to check out the conflict or to take a copy of it are refused.
+	local := filepath.Join(root, "submodule")
+	if _, err := checkout(ctx, root, &options{}, listing, target, local); err == nil || !strings.Contains(err.Error(), "isn't a conflict that remote can resolve") {
+		t.Error("checkout not refused:", err)
+	}
+	_, unlock, err := apply(ctx, root, &options{conflictOptions: conflictOptions{apply: true, take: sideLocal}}, local, nil,
+		func() (*remote.Listing, *remote.Target, error) {
+			return listing, target, nil
+		})
+	if unlock != nil {
+		unlock()
+	}
+	if err == nil || !strings.Contains(err.Error(), "isn't a conflict that remote can resolve") {
+		t.Error("take not refused:", err)
+	}
+	if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+		t.Error("refusal left a workspace:", err)
+	}
+}
+
 func TestConflictOptions(t *testing.T) {
 	for _, args := range [][]string{
 		{"--conflicts", "--json"},

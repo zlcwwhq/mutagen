@@ -812,6 +812,266 @@ func TestTransition(t *testing.T) {
 	}
 }
 
+// TestTransitionGitLink tests that Transition refuses to remove submodules,
+// even as part of a directory or a replacement, and that it leaves existing
+// content in place when it can't fetch a submodule.
+func TestTransitionGitLink(t *testing.T) {
+	// Define the problems that we expect to see.
+	const (
+		removalRefused   = "submodule isn't removed automatically; remove it manually"
+		fetchUnavailable = "submodule fetching is unavailable"
+	)
+
+	// Define a directory containing a submodule at a lower level, along with
+	// what remains of it after a removal.
+	nestedDirectory := &Entry{Contents: map[string]*Entry{
+		"file":   tF1,
+		"nested": tDG,
+	}}
+	nestedDirectoryReduced := &Entry{Contents: map[string]*Entry{"nested": tDGO}}
+
+	// Define test cases. Each operates on the same on-disk content, in which the
+	// directories that stand in for submodules are ordinary directories. Paths
+	// in present and absent are relative to the root and indicate the on-disk
+	// content expected afterward.
+	tests := []struct {
+		description      string
+		transitions      []*Change
+		contentMap       testingContentMap
+		expectedResults  []*Entry
+		expectedProblems []*Problem
+		present          []string
+		absent           []string
+	}{
+		{
+			description:      "submodule removal",
+			transitions:      []*Change{{Path: "directory/submodule", Old: tG1}},
+			expectedResults:  []*Entry{tG1},
+			expectedProblems: []*Problem{{Path: "directory/submodule", Error: removalRefused}},
+			present:          []string{"directory/submodule/file"},
+		},
+		{
+			description:      "removal of missing submodule",
+			transitions:      []*Change{{Path: "missing", Old: tG1}},
+			expectedResults:  []*Entry{tG1},
+			expectedProblems: []*Problem{{Path: "missing", Error: removalRefused}},
+		},
+		{
+			description:      "directory removal containing submodule",
+			transitions:      []*Change{{Path: "directory", Old: tDG}},
+			expectedResults:  []*Entry{tDGO},
+			expectedProblems: []*Problem{{Path: "directory/submodule", Error: removalRefused}},
+			present:          []string{"directory/submodule/file"},
+			absent:           []string{"directory/file"},
+		},
+		{
+			description:      "directory removal containing nested submodule",
+			transitions:      []*Change{{Path: "parent", Old: nestedDirectory}},
+			expectedResults:  []*Entry{nestedDirectoryReduced},
+			expectedProblems: []*Problem{{Path: "parent/nested/submodule", Error: removalRefused}},
+			present:          []string{"parent/nested/submodule/file"},
+			absent:           []string{"parent/file", "parent/nested/file"},
+		},
+		{
+			description:      "submodule replacement with file",
+			transitions:      []*Change{{Path: "directory/submodule", Old: tG1, New: tF2}},
+			contentMap:       testingContentMap{"directory/submodule": []byte(tF2Content)},
+			expectedResults:  []*Entry{tG1},
+			expectedProblems: []*Problem{{Path: "directory/submodule", Error: removalRefused}},
+			present:          []string{"directory/submodule/file"},
+		},
+		{
+			description:      "submodule replacement with directory",
+			transitions:      []*Change{{Path: "directory/submodule", Old: tG1, New: tD0}},
+			expectedResults:  []*Entry{tG1},
+			expectedProblems: []*Problem{{Path: "directory/submodule", Error: removalRefused}},
+			present:          []string{"directory/submodule/file"},
+		},
+		{
+			description:      "directory replacement with file containing submodule",
+			transitions:      []*Change{{Path: "directory", Old: tDG, New: tF2}},
+			contentMap:       testingContentMap{"directory": []byte(tF2Content)},
+			expectedResults:  []*Entry{tDGO},
+			expectedProblems: []*Problem{{Path: "directory/submodule", Error: removalRefused}},
+			present:          []string{"directory/submodule/file"},
+			absent:           []string{"directory/file"},
+		},
+		{
+			description:      "submodule creation",
+			transitions:      []*Change{{Path: "created", New: tG1}},
+			expectedResults:  []*Entry{nil},
+			expectedProblems: []*Problem{{Path: "created", Error: fetchUnavailable}},
+			absent:           []string{"created"},
+		},
+		{
+			description:      "directory creation containing submodule",
+			transitions:      []*Change{{Path: "created", New: tDG}},
+			contentMap:       testingContentMap{"created/file": []byte(tF1Content)},
+			expectedResults:  []*Entry{tD1},
+			expectedProblems: []*Problem{{Path: "created/submodule", Error: fetchUnavailable}},
+			present:          []string{"created/file"},
+			absent:           []string{"created/submodule"},
+		},
+		{
+			description:      "submodule move",
+			transitions:      []*Change{{Path: "directory/submodule", Old: tG1, New: tG2}},
+			expectedResults:  []*Entry{tG1},
+			expectedProblems: []*Problem{{Path: "directory/submodule", Error: fetchUnavailable}},
+			present:          []string{"directory/submodule/file"},
+		},
+		{
+			description:      "empty directory replacement with submodule",
+			transitions:      []*Change{{Path: "empty", Old: tD0, New: tG1}},
+			expectedResults:  []*Entry{tD0},
+			expectedProblems: []*Problem{{Path: "empty", Error: fetchUnavailable}},
+			present:          []string{"empty"},
+		},
+		{
+			description:      "directory replacement with submodule",
+			transitions:      []*Change{{Path: "directory", Old: tDG, New: tG2}},
+			expectedResults:  []*Entry{tDG},
+			expectedProblems: []*Problem{{Path: "directory", Error: fetchUnavailable}},
+			present:          []string{"directory/file", "directory/submodule/file"},
+		},
+		{
+			description:      "file replacement with submodule",
+			transitions:      []*Change{{Path: "replaced", Old: tF1, New: tG1}},
+			expectedResults:  []*Entry{tF1},
+			expectedProblems: []*Problem{{Path: "replaced", Error: fetchUnavailable}},
+			present:          []string{"replaced"},
+		},
+		{
+			description: "failures alongside other transitions",
+			transitions: []*Change{
+				{Path: "directory/submodule", Old: tG1, New: tG2},
+				{Path: "replaced", Old: tF1},
+			},
+			expectedResults:  []*Entry{tG1, nil},
+			expectedProblems: []*Problem{{Path: "directory/submodule", Error: fetchUnavailable}},
+			present:          []string{"directory/submodule/file"},
+			absent:           []string{"replaced"},
+		},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			// Create the on-disk content.
+			root := filepath.Join(t.TempDir(), "root")
+			for _, path := range []string{
+				"directory/submodule",
+				"parent/nested/submodule",
+				"empty",
+			} {
+				if err := os.MkdirAll(filepath.Join(root, path), 0700); err != nil {
+					t.Fatal("unable to create directory:", err)
+				}
+			}
+			for _, path := range []string{
+				"replaced",
+				"directory/file",
+				"directory/submodule/file",
+				"parent/file",
+				"parent/nested/file",
+				"parent/nested/submodule/file",
+			} {
+				if err := os.WriteFile(filepath.Join(root, path), []byte(tF1Content), 0600); err != nil {
+					t.Fatal("unable to create file:", err)
+				}
+			}
+
+			// Create an ignorer that doesn't ignore anything.
+			ignorer, err := mutagenignore.NewIgnorer(nil)
+			if err != nil {
+				t.Fatal("unable to create ignorer:", err)
+			}
+
+			// Perform a scan to extract filesystem behavior and a cache.
+			snapshot, cache, _, err := Scan(
+				context.Background(),
+				root,
+				nil, nil,
+				newTestingHasher(), nil,
+				ignorer, nil,
+				behavior.ProbeMode_ProbeModeProbe,
+				SymbolicLinkMode_SymbolicLinkModePortable,
+				PermissionsMode_PermissionsModePortable,
+			)
+			if err != nil {
+				t.Fatal("unable to perform scan of baseline:", err)
+			}
+
+			// Copy the transitions' old entries so that we can verify below that
+			// removals don't modify them.
+			originals := make([]*Entry, len(test.transitions))
+			for i, transition := range test.transitions {
+				originals[i] = transition.Old.Copy(EntryCopyBehaviorDeep)
+			}
+
+			// Perform the transitions.
+			results, problems, missingFiles := Transition(
+				context.Background(),
+				root,
+				test.transitions,
+				cache,
+				newTestingHasher(),
+				SymbolicLinkMode_SymbolicLinkModePortable,
+				0600,
+				0700,
+				nil,
+				snapshot.DecomposesUnicode,
+				&testingProvider{
+					storage:    t.TempDir(),
+					contentMap: test.contentMap,
+					hasher:     newTestingHasher(),
+				},
+			)
+
+			// Check results.
+			if len(results) != len(test.expectedResults) {
+				t.Fatalf("length of results does not match expected: %d != %d", len(results), len(test.expectedResults))
+			}
+			for r, result := range results {
+				if !result.Equal(test.expectedResults[r], true) {
+					t.Errorf("result %d does not match expected: %v != %v", r, result, test.expectedResults[r])
+				}
+				if err := result.EnsureValid(true); err != nil {
+					t.Errorf("result %d is invalid: %v", r, err)
+				}
+			}
+
+			// Check problems.
+			if !testingProblemListsEqual(problems, test.expectedProblems) {
+				t.Errorf("problems do not match expected: %v != %v", problems, test.expectedProblems)
+			}
+
+			// Check missing file status.
+			if missingFiles {
+				t.Error("unexpectedly missing staged files")
+			}
+
+			// Verify that the old entries weren't modified.
+			for i, transition := range test.transitions {
+				if !transition.Old.Equal(originals[i], true) {
+					t.Errorf("old entry %d was modified", i)
+				}
+			}
+
+			// Check the on-disk content.
+			for _, path := range test.present {
+				if _, err := os.Lstat(filepath.Join(root, path)); err != nil {
+					t.Errorf("expected content is missing (%s): %v", path, err)
+				}
+			}
+			for _, path := range test.absent {
+				if _, err := os.Lstat(filepath.Join(root, path)); !os.IsNotExist(err) {
+					t.Errorf("unexpected content is present (%s): %v", path, err)
+				}
+			}
+		})
+	}
+}
+
 // TestTransitionPortableSymbolicLinkEmptyComponents tests that Transition in
 // portable symbolic link mode refuses to create a symbolic link whose target
 // escapes the synchronization root through empty components (leaving nothing

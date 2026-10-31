@@ -1035,6 +1035,371 @@ func TestReconcile(t *testing.T) {
 				BetaChanges:  []*Change{{Path: "problematic", New: tP1}},
 			}},
 		},
+
+		// Test cases where alpha and beta agree on a submodule. Only the commit
+		// identifies a submodule, so differing URLs don't constitute a
+		// disagreement.
+		{
+			description: "all same submodule",
+			modes:       allModes,
+			ancestor:    tG1,
+			alpha:       tG1,
+			beta:        tG1,
+		},
+		{
+			description: "all same submodule with different URLs",
+			modes:       allModes,
+			ancestor:    tG1,
+			alpha:       tG1U,
+			beta:        tG1,
+		},
+		{
+			description:             "both created same submodule with different URLs",
+			modes:                   allModes,
+			alpha:                   tG1,
+			beta:                    tG1U,
+			expectedAncestorChanges: []*Change{{New: tG1}},
+		},
+		{
+			description:             "both moved submodule to same commit",
+			modes:                   allModes,
+			ancestor:                tG1,
+			alpha:                   tG2,
+			beta:                    tG2,
+			expectedAncestorChanges: []*Change{{New: tG2}},
+		},
+		{
+			description:             "both deleted submodule",
+			modes:                   allModes,
+			ancestor:                tG1,
+			expectedAncestorChanges: []*Change{{}},
+		},
+
+		// Test cases where a submodule moves on one side.
+		{
+			description:         "alpha moved submodule",
+			modes:               allModes,
+			ancestor:            tG1,
+			alpha:               tG2,
+			beta:                tG1,
+			expectedBetaChanges: []*Change{{Old: tG1, New: tG2}},
+		},
+		{
+			description:          "beta moved submodule",
+			modes:                twoWayModes,
+			ancestor:             tG1,
+			alpha:                tG1,
+			beta:                 tG2,
+			expectedAlphaChanges: []*Change{{Old: tG1, New: tG2}},
+		},
+		{
+			description: "beta moved submodule",
+			modes:       oneWaySafeMode,
+			ancestor:    tG1,
+			alpha:       tG1,
+			beta:        tG2,
+			expectedConflicts: []*Conflict{{
+				AlphaChanges: []*Change{{Old: tG1, New: tG1}},
+				BetaChanges:  []*Change{{Old: tG1, New: tG2}},
+			}},
+		},
+		{
+			description:         "beta moved submodule",
+			modes:               oneWayReplicaMode,
+			ancestor:            tG1,
+			alpha:               tG1,
+			beta:                tG2,
+			expectedBetaChanges: []*Change{{Old: tG2, New: tG1}},
+		},
+
+		// Test cases where a submodule moves on both sides.
+		{
+			description: "both moved submodule to different commits",
+			modes:       safeModes,
+			ancestor:    tG1,
+			alpha:       tG2,
+			beta:        tG3,
+			expectedConflicts: []*Conflict{{
+				AlphaChanges: []*Change{{Old: tG1, New: tG2}},
+				BetaChanges:  []*Change{{Old: tG1, New: tG3}},
+			}},
+		},
+		{
+			description:         "both moved submodule to different commits",
+			modes:               resolvedModes,
+			ancestor:            tG1,
+			alpha:               tG2,
+			beta:                tG3,
+			expectedBetaChanges: []*Change{{Old: tG3, New: tG2}},
+		},
+		{
+			description: "both created submodule at different commits",
+			modes:       safeModes,
+			alpha:       tG1,
+			beta:        tG2,
+			expectedConflicts: []*Conflict{{
+				AlphaChanges: []*Change{{New: tG1}},
+				BetaChanges:  []*Change{{New: tG2}},
+			}},
+		},
+		{
+			description:         "both created submodule at different commits",
+			modes:               resolvedModes,
+			alpha:               tG1,
+			beta:                tG2,
+			expectedBetaChanges: []*Change{{Old: tG2, New: tG1}},
+		},
+
+		// Test cases where a submodule is created or deleted on one side.
+		{
+			description:         "alpha created submodule",
+			modes:               allModes,
+			alpha:               tG1,
+			expectedBetaChanges: []*Change{{New: tG1}},
+		},
+		{
+			description:          "beta created submodule",
+			modes:                twoWayModes,
+			beta:                 tG1,
+			expectedAlphaChanges: []*Change{{New: tG1}},
+		},
+		{
+			description: "beta created submodule",
+			modes:       oneWaySafeMode,
+			beta:        tG1,
+		},
+		{
+			description:         "beta created submodule",
+			modes:               oneWayReplicaMode,
+			beta:                tG1,
+			expectedBetaChanges: []*Change{{Old: tG1}},
+		},
+		{
+			description:         "alpha deleted submodule",
+			modes:               allModes,
+			ancestor:            tG1,
+			beta:                tG1,
+			expectedBetaChanges: []*Change{{Old: tG1}},
+		},
+		{
+			description:          "beta deleted submodule",
+			modes:                twoWayModes,
+			ancestor:             tG1,
+			alpha:                tG1,
+			expectedAlphaChanges: []*Change{{Old: tG1}},
+		},
+		{
+			description:         "beta deleted submodule",
+			modes:               oneWayModes,
+			ancestor:            tG1,
+			alpha:               tG1,
+			expectedBetaChanges: []*Change{{New: tG1}},
+		},
+
+		// Test cases where one side moves a submodule and the other deletes it,
+		// which is the way to manually resolve a conflict over its commit.
+		{
+			description:         "alpha moved submodule, beta deleted submodule",
+			modes:               allModes,
+			ancestor:            tG1,
+			alpha:               tG2,
+			expectedBetaChanges: []*Change{{New: tG2}},
+		},
+		{
+			description:          "alpha deleted submodule, beta moved submodule",
+			modes:                twoWayModes,
+			ancestor:             tG1,
+			beta:                 tG2,
+			expectedAlphaChanges: []*Change{{New: tG2}},
+		},
+		{
+			description:             "alpha deleted submodule, beta moved submodule",
+			modes:                   oneWaySafeMode,
+			ancestor:                tG1,
+			beta:                    tG2,
+			expectedAncestorChanges: []*Change{{}},
+		},
+		{
+			description:         "alpha deleted submodule, beta moved submodule",
+			modes:               oneWayReplicaMode,
+			ancestor:            tG1,
+			beta:                tG2,
+			expectedBetaChanges: []*Change{{Old: tG2}},
+		},
+
+		// Test cases where a submodule is opposite a non-empty directory, which
+		// a submodule can't be fetched over and which must not be overlooked.
+		{
+			description: "alpha created submodule, beta created directory",
+			modes:       safeModes,
+			alpha:       tG1,
+			beta:        tD1,
+			expectedConflicts: []*Conflict{{
+				AlphaChanges: []*Change{{New: tG1}},
+				BetaChanges:  []*Change{{New: tD1}},
+			}},
+		},
+		{
+			description:         "alpha created submodule, beta created directory",
+			modes:               resolvedModes,
+			alpha:               tG1,
+			beta:                tD1,
+			expectedBetaChanges: []*Change{{Old: tD1, New: tG1}},
+		},
+		{
+			description: "alpha created directory, beta created submodule",
+			modes:       safeModes,
+			alpha:       tD1,
+			beta:        tG1,
+			expectedConflicts: []*Conflict{{
+				AlphaChanges: []*Change{{New: tD1}},
+				BetaChanges:  []*Change{{New: tG1}},
+			}},
+		},
+		{
+			description:         "alpha created directory, beta created submodule",
+			modes:               resolvedModes,
+			alpha:               tD1,
+			beta:                tG1,
+			expectedBetaChanges: []*Change{{Old: tG1, New: tD1}},
+		},
+		{
+			description:         "alpha replaced submodule with directory",
+			modes:               allModes,
+			ancestor:            tG1,
+			alpha:               tD1,
+			beta:                tG1,
+			expectedBetaChanges: []*Change{{Old: tG1, New: tD1}},
+		},
+		{
+			description: "alpha created submodule, beta created directory with only untracked content",
+			modes:       safeModes,
+			alpha:       tG1,
+			beta:        tDU,
+			expectedConflicts: []*Conflict{{
+				AlphaChanges: []*Change{{New: tG1}},
+				BetaChanges:  []*Change{{New: tD0}},
+			}},
+		},
+		{
+			description: "alpha created submodule, beta created directory with only untracked content",
+			modes:       resolvedModes,
+			alpha:       tG1,
+			beta:        tDU,
+			expectedConflicts: []*Conflict{{
+				AlphaChanges: []*Change{{New: tG1}},
+				BetaChanges:  []*Change{{Path: "untracked", New: tU}},
+			}},
+		},
+
+		// Test cases where a submodule is opposite an empty directory, which
+		// isn't a conflict, whatever the ancestor contains, since that's what
+		// a clone without submodules or a deinitialized submodule looks like.
+		{
+			description:         "alpha has submodule, beta has empty directory, no ancestor",
+			modes:               allModes,
+			alpha:               tG1,
+			beta:                tD0,
+			expectedBetaChanges: []*Change{{Old: tD0, New: tG1}},
+		},
+		{
+			description:         "alpha has submodule, beta deinitialized submodule",
+			modes:               allModes,
+			ancestor:            tG1,
+			alpha:               tG1,
+			beta:                tD0,
+			expectedBetaChanges: []*Change{{Old: tD0, New: tG1}},
+		},
+		{
+			description:         "alpha moved submodule, beta deinitialized submodule",
+			modes:               allModes,
+			ancestor:            tG1,
+			alpha:               tG2,
+			beta:                tD0,
+			expectedBetaChanges: []*Change{{Old: tD0, New: tG2}},
+		},
+		{
+			description:         "alpha replaced empty directory with submodule",
+			modes:               allModes,
+			ancestor:            tD0,
+			alpha:               tG1,
+			beta:                tD0,
+			expectedBetaChanges: []*Change{{Old: tD0, New: tG1}},
+		},
+		{
+			description:         "alpha replaced directory with submodule, beta emptied directory",
+			modes:               allModes,
+			ancestor:            tD1,
+			alpha:               tG1,
+			beta:                tD0,
+			expectedBetaChanges: []*Change{{Old: tD0, New: tG1}},
+		},
+		{
+			description:             "alpha has submodule in directory, beta has empty directory",
+			modes:                   allModes,
+			alpha:                   nested("submodule", tG1),
+			beta:                    nested("submodule", tD0),
+			expectedAncestorChanges: []*Change{{New: tD0}},
+			expectedBetaChanges:     []*Change{{Path: "submodule", Old: tD0, New: tG1}},
+		},
+		{
+			description:          "alpha has empty directory, beta has submodule, no ancestor",
+			modes:                twoWayModes,
+			alpha:                tD0,
+			beta:                 tG1,
+			expectedAlphaChanges: []*Change{{Old: tD0, New: tG1}},
+		},
+		{
+			description: "alpha has empty directory, beta has submodule, no ancestor",
+			modes:       oneWayModes,
+			alpha:       tD0,
+			beta:        tG1,
+		},
+		{
+			description:          "alpha deinitialized submodule, beta has submodule",
+			modes:                twoWayModes,
+			ancestor:             tG1,
+			alpha:                tD0,
+			beta:                 tG1,
+			expectedAlphaChanges: []*Change{{Old: tD0, New: tG1}},
+		},
+		{
+			description: "alpha deinitialized submodule, beta has submodule",
+			modes:       oneWayModes,
+			ancestor:    tG1,
+			alpha:       tD0,
+			beta:        tG1,
+		},
+		{
+			description:          "alpha deinitialized submodule, beta moved submodule",
+			modes:                twoWayModes,
+			ancestor:             tG1,
+			alpha:                tD0,
+			beta:                 tG2,
+			expectedAlphaChanges: []*Change{{Old: tD0, New: tG2}},
+		},
+		{
+			description: "alpha deinitialized submodule, beta moved submodule",
+			modes:       oneWayModes,
+			ancestor:    tG1,
+			alpha:       tD0,
+			beta:        tG2,
+		},
+		{
+			description:             "alpha has empty directory, beta has submodule in directory",
+			modes:                   twoWayModes,
+			alpha:                   nested("submodule", tD0),
+			beta:                    nested("submodule", tG1),
+			expectedAncestorChanges: []*Change{{New: tD0}},
+			expectedAlphaChanges:    []*Change{{Path: "submodule", Old: tD0, New: tG1}},
+		},
+		{
+			description:             "alpha has empty directory, beta has submodule in directory",
+			modes:                   oneWayModes,
+			alpha:                   nested("submodule", tD0),
+			beta:                    nested("submodule", tG1),
+			expectedAncestorChanges: []*Change{{New: tD0}},
+		},
 	}
 
 	// Process test cases.

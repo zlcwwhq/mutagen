@@ -12,8 +12,13 @@ enum EntryKind {
     File = 1;
     // EntryKind_SymbolicLink indicates a symbolic link.
     SymbolicLink = 2;
+    // EntryKind_GitLink indicates a submodule pinned to a commit. Its digest
+    // holds the raw bytes of the commit identifier and its URL indicates where
+    // the commit can be fetched from. Its contents aren't tracked, because the
+    // endpoint that receives one checks the commit out for itself.
+    GitLink = 3;
 
-    // Values 3-99 are reserved for future synchronizable entry types.
+    // Values 4-99 are reserved for future synchronizable entry types.
 
     // EntryKind_Untracked indicates content (or the root of content) that is
     // intentionally excluded from synchronization by Mutagen. This includes
@@ -61,8 +66,9 @@ message Entry {
 
     // Fields 6-7 are reserved for future directory entry data.
 
-    // Digest represents the hash of a file entry's contents. It must only be
-    // non-nil for file entries.
+    // Digest represents the hash of a file entry's contents or the raw bytes of
+    // a GitLink entry's commit identifier. It must only be non-nil for file and
+    // GitLink entries.
     bytes digest = 8;
     // Executable indicates whether or not a file entry is marked as executable.
     // It must only be set (if appropriate) for file entries.
@@ -79,4 +85,10 @@ message Entry {
     // Problem indicates the relevant error for problematic content. It must be
     // non-empty if and only if the entry represents problematic content.
     string problem = 15;
+
+    // URL is the location from which a GitLink entry's commit can be fetched.
+    // It must be non-empty if and only if the entry is a GitLink. It isn't part
+    // of the entry's identity, because only the commit identifies a GitLink and
+    // two endpoints may reach the same repository through different URLs.
+    string url = 16;
 }

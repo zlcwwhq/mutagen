@@ -21,6 +21,11 @@ func TestReifyPhantomDirectories(t *testing.T) {
 		{tN, tF1, tD0, tF1, tD0, 0, 1},
 		{tN, tD1, tF1, tD1, tF1, 1, 0},
 
+		{tN, tG1, tG2, tG1, tG2, 0, 0},
+		{tN, tG1, tD0, tG1, tD0, 0, 1},
+		{tN, tG1, tPD0, tG1, tU, 0, 0},
+		{tN, tPD0, tG1, tU, tG1, 0, 0},
+
 		{tN, tPD0, tPD0, tU, tU, 0, 0},
 		{tF1, tPD0, tPD0, tU, tU, 0, 0},
 		{tD0, tPD0, tPD0, tD0, tD0, 1, 1},

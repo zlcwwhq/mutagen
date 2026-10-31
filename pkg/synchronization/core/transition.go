@@ -44,6 +44,11 @@ const (
 var (
 	// errTransitionCancelled indicates that the transition was cancelled.
 	errTransitionCancelled = errors.New("transition cancelled")
+	// errGitLinkRemovalRefused indicates that a submodule's removal was refused.
+	// A submodule's working tree can hold work that exists nowhere else, such as
+	// unpushed commits and uncommitted changes, and it isn't tracked, so its
+	// removal is never performed automatically.
+	errGitLinkRemovalRefused = errors.New("submodule isn't removed automatically; remove it manually")
 )
 
 // Provider defines the interface that higher-level logic can use to provide
@@ -502,6 +507,12 @@ ContentLoop:
 				t.recordProblem(contentPath, fmt.Errorf("unable to remove symbolic link: %w", err))
 				continue
 			}
+		} else if entry.Kind == EntryKind_GitLink {
+			// Keep the submodule in the reduced entry, along with this
+			// directory, but continue removing its siblings.
+			contentRemovalFailed = true
+			t.recordProblem(contentPath, errGitLinkRemovalRefused)
+			continue
 		} else {
 			contentRemovalFailed = true
 			t.recordProblem(contentPath, errors.New("unknown entry type found in removal target"))
@@ -566,6 +577,13 @@ func (t *transitioner) remove(path string, entry *Entry) *Entry {
 	// If the entry is nil, we're done.
 	if entry == nil {
 		return nil
+	}
+
+	// Refuse to remove a submodule, leaving its entry in place. We check this
+	// before accessing the filesystem so that the refusal is unconditional.
+	if entry.Kind == EntryKind_GitLink {
+		t.recordProblem(path, errGitLinkRemovalRefused)
+		return entry
 	}
 
 	// Walk down to the parent of the target and compute the target's leaf name.
@@ -849,6 +867,20 @@ func (t *transitioner) createSymbolicLink(parent *filesystem.Directory, name, pa
 	return nil
 }
 
+// transitionToGitLink transitions the content at the specified path to the
+// specified submodule, returning an entry representing the resulting content.
+// The old entry describes the existing content and is nil if there is none. All
+// transitions that yield a submodule go through this function, including those
+// from a different commit, and any removal of the old content is left to this
+// function, so that a failure leaves that content in place and yields its
+// entry.
+//
+// Fetching submodules isn't implemented yet, so every transition fails.
+func (t *transitioner) transitionToGitLink(path string, old, target *Entry) *Entry {
+	t.recordProblem(path, errors.New("submodule fetching is unavailable"))
+	return old
+}
+
 // createDirectory creates the target directory at the specified path. If only a
 // portion of the directory can be created, an entry representing that portion
 // will be returned.
@@ -935,6 +967,10 @@ ContentLoop:
 			} else {
 				created.Contents[name] = entry
 			}
+		} else if entry.Kind == EntryKind_GitLink {
+			if c := t.transitionToGitLink(contentPath, nil, entry); c != nil {
+				created.Contents[name] = c
+			}
 		} else {
 			t.recordProblem(contentPath, errors.New("creation requested for unknown entry type"))
 		}
@@ -979,6 +1015,8 @@ func (t *transitioner) create(path string, target *Entry) *Entry {
 		} else {
 			return target
 		}
+	} else if target.Kind == EntryKind_GitLink {
+		return t.transitionToGitLink(path, nil, target)
 	} else {
 		t.recordProblem(path, errors.New("creation requested for unknown entry type"))
 		return nil
@@ -1052,6 +1090,19 @@ func Transition(
 			} else {
 				results = append(results, t.New)
 			}
+			continue
+		}
+
+		// Handle the special case of replacing existing content with a
+		// submodule, including a submodule at a different commit. This can't go
+		// through the removal and creation below, because the old content must
+		// stay in place if the submodule can't be fetched, and because a
+		// submodule's removal is always refused. Creations with nothing to
+		// replace reach the same function through the creation below.
+		replacedByGitLink := t.Old != nil && t.New != nil &&
+			t.New.Kind == EntryKind_GitLink
+		if replacedByGitLink {
+			results = append(results, transitioner.transitionToGitLink(t.Path, t.Old, t.New))
 			continue
 		}
 

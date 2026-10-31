@@ -23,6 +23,9 @@ func TestApply(t *testing.T) {
 		{tD0, Diff(tD0, tDM), false, tDM},
 		{tDM, Diff(tDM, tD0), false, tD0},
 		{nested("child", tD1), []*Change{{Path: "child/file"}}, false, nested("child", tD0)},
+		{tD0, []*Change{{Path: "submodule", New: tG1}}, false, tDGO},
+		{tDGO, []*Change{{Path: "submodule", New: tG2}}, false, nested("submodule", tG2)},
+		{tDGO, []*Change{{Path: "submodule"}}, false, tD0},
 	}
 
 	// Process test cases.

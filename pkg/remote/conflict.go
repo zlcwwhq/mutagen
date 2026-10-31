@@ -35,6 +35,10 @@ type ConflictRoot struct {
 	// conflict root, in which case remote can write a result, such as a merge
 	// of both copies, to both endpoints.
 	Files bool `json:",omitempty"`
+	// Submodule indicates whether either endpoint has a submodule at the
+	// conflict root, in which case remote can't resolve the conflict, but
+	// checking out the same commit on both endpoints or deleting one side can.
+	Submodule bool `json:",omitempty"`
 	// AlphaTakable and BetaTakable indicate whether remote can resolve the
 	// conflict by taking alpha's or beta's copy unchanged, which it writes to
 	// the other endpoint.

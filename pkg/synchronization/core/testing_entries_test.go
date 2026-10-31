@@ -48,6 +48,19 @@ var tSR = &Entry{Kind: EntryKind_SymbolicLink, Target: "file"}
 // tSA is a symbolic link entry with an absolute path for testing.
 var tSA = &Entry{Kind: EntryKind_SymbolicLink, Target: "/path/file"}
 
+// tG1 is a submodule entry for testing.
+var tG1 = &Entry{Kind: EntryKind_GitLink, Digest: testingDigest("first test commit"), Url: "https://example.org/submodule"}
+
+// tG1U is a version of tG1 that reaches the same commit through a different URL
+// for testing.
+var tG1U = &Entry{Kind: EntryKind_GitLink, Digest: tG1.Digest, Url: "ssh://example.org/submodule"}
+
+// tG2 is an alternative submodule entry for testing.
+var tG2 = &Entry{Kind: EntryKind_GitLink, Digest: testingDigest("second test commit"), Url: "https://example.org/submodule"}
+
+// tG3 is an alternative submodule entry for testing.
+var tG3 = &Entry{Kind: EntryKind_GitLink, Digest: testingDigest("third test commit"), Url: "https://example.org/submodule"}
+
 // tU is an untracked entry for testing.
 var tU = &Entry{Kind: EntryKind_Untracked}
 
@@ -190,6 +203,17 @@ var tDP2 = &Entry{Contents: map[string]*Entry{"problematic": tP2}}
 // tDPD0 is a directory entry (containing tPD0 with name "phantom") for testing.
 var tDPD0 = &Entry{Contents: map[string]*Entry{"phantom": tPD0}}
 
+// tDG is a directory entry (containing tF1 with name "file" and tG1 with name
+// "submodule") for testing.
+var tDG = &Entry{Contents: map[string]*Entry{
+	"file":      tF1,
+	"submodule": tG1,
+}}
+
+// tDGO is a directory entry (containing only tG1 with name "submodule") for
+// testing. It represents what remains of tDG after a removal.
+var tDGO = &Entry{Contents: map[string]*Entry{"submodule": tG1}}
+
 // tIDDE is an invalid directory entry (with an empty but non-nil file digest)
 // for testing.
 var tIDDE = &Entry{Digest: []byte{}}
@@ -205,6 +229,9 @@ var tIDT = &Entry{Target: "invalid target"}
 
 // tIDP is an invalid directory entry (with a problem) for testing.
 var tIDP = &Entry{Problem: "invalid problem"}
+
+// tIDU is an invalid directory entry (with a URL) for testing.
+var tIDU = &Entry{Url: "invalid URL"}
 
 // tIDCE is an invalid directory (containing a file with an empty name) for
 // testing.
@@ -244,6 +271,9 @@ var tIFDN = &Entry{Kind: EntryKind_File}
 // tIFDE is an invalid file entry (with an empty digest) for testing.
 var tIFDE = &Entry{Kind: EntryKind_File, Digest: []byte{}}
 
+// tIFU is an invalid file entry (with a URL) for testing.
+var tIFU = &Entry{Kind: EntryKind_File, Digest: tF1.Digest, Url: "invalid URL"}
+
 // tISCE is an invalid symbolic link entry (with an empty but non-nil content
 // map) for testing.
 var tISCE = &Entry{Kind: EntryKind_SymbolicLink, Contents: map[string]*Entry{}}
@@ -267,6 +297,35 @@ var tISP = &Entry{Kind: EntryKind_SymbolicLink, Problem: "invalid problem"}
 
 // tISTE is an invalid symbolic link entry (with an empty target) for testing.
 var tISTE = &Entry{Kind: EntryKind_SymbolicLink}
+
+// tISU is an invalid symbolic link entry (with a URL) for testing.
+var tISU = &Entry{Kind: EntryKind_SymbolicLink, Target: "file", Url: "invalid URL"}
+
+// tIGCE is an invalid submodule entry (with an empty but non-nil content map)
+// for testing.
+var tIGCE = &Entry{Kind: EntryKind_GitLink, Digest: tG1.Digest, Url: tG1.Url, Contents: map[string]*Entry{}}
+
+// tIGC is an invalid submodule entry (with a non-empty content map) for
+// testing.
+var tIGC = &Entry{Kind: EntryKind_GitLink, Digest: tG1.Digest, Url: tG1.Url, Contents: map[string]*Entry{"invalid": tF1}}
+
+// tIGE is an invalid submodule entry (with executability set) for testing.
+var tIGE = &Entry{Kind: EntryKind_GitLink, Digest: tG1.Digest, Url: tG1.Url, Executable: true}
+
+// tIGT is an invalid submodule entry (with a symbolic link target) for testing.
+var tIGT = &Entry{Kind: EntryKind_GitLink, Digest: tG1.Digest, Url: tG1.Url, Target: "invalid target"}
+
+// tIGP is an invalid submodule entry (with a problem) for testing.
+var tIGP = &Entry{Kind: EntryKind_GitLink, Digest: tG1.Digest, Url: tG1.Url, Problem: "invalid problem"}
+
+// tIGDN is an invalid submodule entry (with a nil digest) for testing.
+var tIGDN = &Entry{Kind: EntryKind_GitLink, Url: tG1.Url}
+
+// tIGDE is an invalid submodule entry (with an empty digest) for testing.
+var tIGDE = &Entry{Kind: EntryKind_GitLink, Digest: []byte{}, Url: tG1.Url}
+
+// tIGUE is an invalid submodule entry (with an empty URL) for testing.
+var tIGUE = &Entry{Kind: EntryKind_GitLink, Digest: tG1.Digest}
 
 // tIUCE is an invalid untracked entry (with an empty but non-nil content
 // map) for testing.
@@ -292,6 +351,9 @@ var tIUT = &Entry{Kind: EntryKind_Untracked, Target: "invalid target"}
 // tIUP is an invalid untracked entry (with a problem) for testing.
 var tIUP = &Entry{Kind: EntryKind_Untracked, Problem: "invalid problem"}
 
+// tIUU is an invalid untracked entry (with a URL) for testing.
+var tIUU = &Entry{Kind: EntryKind_Untracked, Url: "invalid URL"}
+
 // tIPCE is an invalid problematic entry (with an empty but non-nil content map)
 // for testing.
 var tIPCE = &Entry{Kind: EntryKind_Problematic, Contents: map[string]*Entry{}}
@@ -316,6 +378,12 @@ var tIPT = &Entry{Kind: EntryKind_Problematic, Target: "invalid target"}
 
 // tIPPE is an invalid problematic entry (with an empty problem) for testing.
 var tIPPE = &Entry{Kind: EntryKind_Problematic}
+
+// tIPU is an invalid problematic entry (with a URL) for testing.
+var tIPU = &Entry{Kind: EntryKind_Problematic, Problem: "problem", Url: "invalid URL"}
+
+// tIPDU is an invalid phantom directory entry (with a URL) for testing.
+var tIPDU = &Entry{Kind: EntryKind_PhantomDirectory, Url: "invalid URL"}
 
 // tII is an invalid entry of unknown kind.
 var tII = &Entry{Kind: EntryKind(-1)}

@@ -219,6 +219,111 @@ func TestRemoteDirectoryConflicts(t *testing.T) {
 	}
 }
 
+func TestRemoteSubmoduleConflicts(t *testing.T) {
+	// A submodule is a directory on disk, so a conflict involving one can't be
+	// resolved by remote, even if the other side's copy could normally be taken,
+	// and its listing identifies it as involving a submodule so that it can
+	// explain what does resolve it.
+	commit := func(value byte) []byte {
+		digest := make([]byte, 20)
+		for i := range digest {
+			digest[i] = value
+		}
+		return digest
+	}
+	submodule := func(value byte) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_GitLink, Digest: commit(value), Url: "https://example.org/submodule"}
+	}
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	link := &core.Entry{Kind: core.EntryKind_SymbolicLink, Target: "target"}
+	directory := &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"child": file}}
+	wrap := func(entry *core.Entry) *core.Entry {
+		if entry == nil {
+			return &core.Entry{Kind: core.EntryKind_Directory}
+		}
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"conflict": entry}}
+	}
+	for _, mode := range []core.SynchronizationMode{
+		core.SynchronizationMode_SynchronizationModeTwoWaySafe,
+		core.SynchronizationMode_SynchronizationModeOneWaySafe,
+	} {
+		for _, test := range []struct {
+			description           string
+			ancestor, alpha, beta *core.Entry
+			alphaNew              string
+			betaNew               string
+		}{
+			{"different commits", submodule(0x11), submodule(0x22), submodule(0x33), "submodule at 2222222", "submodule at 3333333"},
+			{"created at different commits", nil, submodule(0x22), submodule(0x33), "submodule at 2222222", "submodule at 3333333"},
+			{"alpha file", nil, file, submodule(0x33), "file", "submodule at 3333333"},
+			{"beta file", nil, submodule(0x22), file, "submodule at 2222222", "file"},
+			{"alpha symbolic link", nil, link, submodule(0x33), "symbolic link", "submodule at 3333333"},
+			{"alpha directory", nil, directory, submodule(0x33), "directory", "submodule at 3333333"},
+			{"beta directory", nil, submodule(0x22), directory, "submodule at 2222222", "directory"},
+		} {
+			t.Run(fmt.Sprintf("mode=%d/%s", mode, test.description), func(t *testing.T) {
+				_, _, _, conflicts := core.Reconcile(wrap(test.ancestor), wrap(test.alpha), wrap(test.beta), mode)
+				if len(conflicts) != 1 {
+					t.Fatalf("unexpected conflicts: %+v", conflicts)
+				}
+				root := resolution(conflicts[0], "sha1")
+				if root.Path != "conflict" || root.Resolvable() || root.Files || root.AlphaTakable || root.BetaTakable {
+					t.Fatalf("submodule conflict reported as resolvable: %+v", root)
+				} else if !root.Submodule {
+					t.Fatalf("submodule conflict not identified: %+v", root)
+				} else if root.AlphaDigest != "" || root.BetaDigest != "" || root.BaseDigest != "" {
+					t.Fatalf("submodule conflict reported digests: %+v", root)
+				}
+				if len(root.AlphaChanges) != 1 || root.AlphaChanges[0].New != test.alphaNew {
+					t.Fatalf("incorrect alpha changes: %+v", root.AlphaChanges)
+				} else if len(root.BetaChanges) != 1 || root.BetaChanges[0].New != test.betaNew {
+					t.Fatalf("incorrect beta changes: %+v", root.BetaChanges)
+				}
+			})
+		}
+	}
+
+	// Conflicts that don't involve a submodule at their root aren't identified
+	// as such, including a directory that happens to contain one.
+	for _, conflict := range []*core.Conflict{
+		{
+			Root:         "conflict",
+			AlphaChanges: []*core.Change{{Path: "conflict", New: file}},
+			BetaChanges:  []*core.Change{{Path: "conflict", New: link}},
+		},
+		{
+			Root:         "conflict",
+			AlphaChanges: []*core.Change{{Path: "conflict", New: file}},
+			BetaChanges: []*core.Change{{Path: "conflict", New: &core.Entry{
+				Kind:     core.EntryKind_Directory,
+				Contents: map[string]*core.Entry{"submodule": submodule(0x33)},
+			}}},
+		},
+	} {
+		if root := resolution(conflict, "sha1"); root.Submodule {
+			t.Errorf("conflict incorrectly identified as involving a submodule: %+v", root)
+		}
+	}
+}
+
+func TestDescribeRemoteSubmodule(t *testing.T) {
+	// Submodules are described by their abbreviated commits, including commits
+	// that are too short to abbreviate, which only tests can produce.
+	for _, test := range []struct {
+		digest   []byte
+		expected string
+	}{
+		{[]byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}, "submodule at 0123456"},
+		{[]byte{0x01, 0x23, 0x45, 0x67}, "submodule at 0123456"},
+		{[]byte{0x01, 0x23}, "submodule at 0123"},
+	} {
+		entry := &core.Entry{Kind: core.EntryKind_GitLink, Digest: test.digest, Url: "https://example.org/submodule"}
+		if description := describeRemoteEntry(entry); description != test.expected {
+			t.Errorf("incorrect description: %q != %q", description, test.expected)
+		}
+	}
+}
+
 func TestCommandExecutionLocation(t *testing.T) {
 	hostname, err := os.Hostname()
 	if err != nil {

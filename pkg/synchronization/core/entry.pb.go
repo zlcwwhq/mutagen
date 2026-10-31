@@ -31,6 +31,11 @@ const (
 	EntryKind_File EntryKind = 1
 	// EntryKind_SymbolicLink indicates a symbolic link.
 	EntryKind_SymbolicLink EntryKind = 2
+	// EntryKind_GitLink indicates a submodule pinned to a commit. Its digest
+	// holds the raw bytes of the commit identifier and its URL indicates where
+	// the commit can be fetched from. Its contents aren't tracked, because the
+	// endpoint that receives one checks the commit out for itself.
+	EntryKind_GitLink EntryKind = 3
 	// EntryKind_Untracked indicates content (or the root of content) that is
 	// intentionally excluded from synchronization by Mutagen. This includes
 	// explicitly ignored content, content that is ignored due to settings (such
@@ -65,6 +70,7 @@ var (
 		0:   "Directory",
 		1:   "File",
 		2:   "SymbolicLink",
+		3:   "GitLink",
 		100: "Untracked",
 		101: "Problematic",
 		102: "PhantomDirectory",
@@ -73,6 +79,7 @@ var (
 		"Directory":        0,
 		"File":             1,
 		"SymbolicLink":     2,
+		"GitLink":          3,
 		"Untracked":        100,
 		"Problematic":      101,
 		"PhantomDirectory": 102,
@@ -117,8 +124,9 @@ type Entry struct {
 	// Contents represents a directory entry's contents. It must only be non-nil
 	// for directory entries.
 	Contents map[string]*Entry `protobuf:"bytes,5,rep,name=contents,proto3" json:"contents,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Digest represents the hash of a file entry's contents. It must only be
-	// non-nil for file entries.
+	// Digest represents the hash of a file entry's contents or the raw bytes of
+	// a GitLink entry's commit identifier. It must only be non-nil for file and
+	// GitLink entries.
 	Digest []byte `protobuf:"bytes,8,opt,name=digest,proto3" json:"digest,omitempty"`
 	// Executable indicates whether or not a file entry is marked as executable.
 	// It must only be set (if appropriate) for file entries.
@@ -128,7 +136,12 @@ type Entry struct {
 	Target string `protobuf:"bytes,12,opt,name=target,proto3" json:"target,omitempty"`
 	// Problem indicates the relevant error for problematic content. It must be
 	// non-empty if and only if the entry represents problematic content.
-	Problem       string `protobuf:"bytes,15,opt,name=problem,proto3" json:"problem,omitempty"`
+	Problem string `protobuf:"bytes,15,opt,name=problem,proto3" json:"problem,omitempty"`
+	// URL is the location from which a GitLink entry's commit can be fetched.
+	// It must be non-empty if and only if the entry is a GitLink. It isn't part
+	// of the entry's identity, because only the commit identifies a GitLink and
+	// two endpoints may reach the same repository through different URLs.
+	Url           string `protobuf:"bytes,16,opt,name=url,proto3" json:"url,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -205,11 +218,18 @@ func (x *Entry) GetProblem() string {
 	return ""
 }
 
+func (x *Entry) GetUrl() string {
+	if x != nil {
+		return x.Url
+	}
+	return ""
+}
+
 var File_synchronization_core_entry_proto protoreflect.FileDescriptor
 
 const file_synchronization_core_entry_proto_rawDesc = "" +
 	"\n" +
-	" synchronization/core/entry.proto\x12\x04core\"\x97\x02\n" +
+	" synchronization/core/entry.proto\x12\x04core\"\xa9\x02\n" +
 	"\x05Entry\x12#\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x0f.core.EntryKindR\x04kind\x125\n" +
 	"\bcontents\x18\x05 \x03(\v2\x19.core.Entry.ContentsEntryR\bcontents\x12\x16\n" +
@@ -218,14 +238,16 @@ const file_synchronization_core_entry_proto_rawDesc = "" +
 	"executable\x18\t \x01(\bR\n" +
 	"executable\x12\x16\n" +
 	"\x06target\x18\f \x01(\tR\x06target\x12\x18\n" +
-	"\aproblem\x18\x0f \x01(\tR\aproblem\x1aH\n" +
+	"\aproblem\x18\x0f \x01(\tR\aproblem\x12\x10\n" +
+	"\x03url\x18\x10 \x01(\tR\x03url\x1aH\n" +
 	"\rContentsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12!\n" +
-	"\x05value\x18\x02 \x01(\v2\v.core.EntryR\x05value:\x028\x01*l\n" +
+	"\x05value\x18\x02 \x01(\v2\v.core.EntryR\x05value:\x028\x01*y\n" +
 	"\tEntryKind\x12\r\n" +
 	"\tDirectory\x10\x00\x12\b\n" +
 	"\x04File\x10\x01\x12\x10\n" +
-	"\fSymbolicLink\x10\x02\x12\r\n" +
+	"\fSymbolicLink\x10\x02\x12\v\n" +
+	"\aGitLink\x10\x03\x12\r\n" +
 	"\tUntracked\x10d\x12\x0f\n" +
 	"\vProblematic\x10e\x12\x14\n" +
 	"\x10PhantomDirectory\x10fB8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"

@@ -25,6 +25,9 @@ func TestTransitionDependencies(t *testing.T) {
 		{[]*Change{{New: tD1}}, []string{"file"}, [][]byte{tF1.Digest}},
 		{[]*Change{{Old: tF3, New: tF3E}}, nil, nil},
 		{[]*Change{{Old: tF3E, New: tF3}}, nil, nil},
+		{[]*Change{{New: tG1}}, nil, nil},
+		{[]*Change{{Old: tG1, New: tG2}}, nil, nil},
+		{[]*Change{{New: tDG}}, []string{"file"}, [][]byte{tF1.Digest}},
 	}
 
 	// Process test cases.

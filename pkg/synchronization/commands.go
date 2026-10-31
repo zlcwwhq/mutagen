@@ -562,10 +562,12 @@ func (c *controller) remoteConflicts(algorithm string) (*remote.Listing, error) 
 // it's the ancestor of.
 //
 // Conflicts involving directories require manual resolution, as do other
-// conflicts at the root, which change its type. For other conflicts, such as
-// between a file and a symbolic link, the result is one of the copies, which
-// can't be content that can't be synchronized (such as a named pipe), and
-// replacing the other copy requires reading it.
+// conflicts at the root, which change its type. So do conflicts involving a
+// submodule at the conflict root, which is a directory on disk whose contents
+// aren't synchronized, so it can't be copied to the other endpoint. For other
+// conflicts, such as between a file and a symbolic link, the result is one of
+// the copies, which can't be content that can't be synchronized (such as a
+// named pipe), and replacing the other copy requires reading it.
 func resolution(conflict *core.Conflict, algorithm string) remote.ConflictRoot {
 	root := remote.ConflictRoot{
 		Path: conflict.Root, AlphaChanges: remoteChanges(conflict.AlphaChanges),
@@ -580,8 +582,12 @@ func resolution(conflict *core.Conflict, algorithm string) remote.ConflictRoot {
 		for _, change := range changes {
 			// A change below the conflict root also identifies a directory,
 			// even if no change describes the directory itself.
-			if change.Path != conflict.Root || (change.New != nil && change.New.Kind == core.EntryKind_Directory) {
+			if change.Path != conflict.Root {
 				directory = true
+			} else if change.New != nil && change.New.Kind == core.EntryKind_Directory {
+				directory = true
+			} else if change.New != nil && change.New.Kind == core.EntryKind_GitLink {
+				directory, root.Submodule = true, true
 			}
 		}
 	}
@@ -656,6 +662,9 @@ func describeRemoteEntry(entry *core.Entry) string {
 		return "file"
 	case core.EntryKind_SymbolicLink:
 		return "symbolic link"
+	case core.EntryKind_GitLink:
+		commit := fmt.Sprintf("%x", entry.Digest)
+		return "submodule at " + commit[:min(len(commit), 7)]
 	case core.EntryKind_Untracked:
 		return "untracked content"
 	case core.EntryKind_Problematic:

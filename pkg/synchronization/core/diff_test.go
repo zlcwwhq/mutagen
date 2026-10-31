@@ -20,6 +20,10 @@ func TestDiff(t *testing.T) {
 		{"sub", tN, tF1, []*Change{{Path: "sub", New: tF1}}},
 		{"sub", tD0, tD1, []*Change{{Path: "sub/file", New: tF1}}},
 		{"sub", tD1, tD0, []*Change{{Path: "sub/file", Old: tF1}}},
+		{"", tG1, tG1U, nil},
+		{"", tG1, tG2, []*Change{{Old: tG1, New: tG2}}},
+		{"", tG1, tD0, []*Change{{Old: tG1, New: tD0}}},
+		{"", tD0, tDGO, []*Change{{Path: "submodule", New: tG1}}},
 	}
 
 	// Process test cases.

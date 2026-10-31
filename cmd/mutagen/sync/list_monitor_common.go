@@ -74,6 +74,8 @@ func formatEntry(entry *core.Entry) string {
 		return fmt.Sprintf("File (%x)", entry.Digest)
 	} else if entry.Kind == core.EntryKind_SymbolicLink {
 		return fmt.Sprintf("Symbolic Link (%s)", entry.Target)
+	} else if entry.Kind == core.EntryKind_GitLink {
+		return fmt.Sprintf("Submodule (%x)", entry.Digest)
 	} else if entry.Kind == core.EntryKind_Untracked {
 		return "Untracked content"
 	} else if entry.Kind == core.EntryKind_Problematic {
