@@ -210,23 +210,44 @@ endpoints, or delete the submodule on one.
 preventing commands: submodules with uncommitted changes (the other endpoint
 only gets their commit), commits that the other endpoint can't fetch, such as
 unpushed ones (push them, and the next synchronization fetches them), failed
-fetches, a `.git` that isn't a valid repository or an endpoint without `git`,
+fetches, a `.git` that isn't a valid repository or an endpoint without `git`
+(the directory then isn't synchronized at all, until you fix it or remove it),
 and tracked files that rules ignore (see above).
 
 **Requirements and limitations.**
 
-- Endpoints need `git`, network access, and read access to each submodule's
-  repository, from the system that fetches it. Git's own configuration applies,
-  so `url.<base>.insteadOf` can rewrite the URLs of an endpoint, such as to a
-  mirror. Fetches never prompt for credentials or run hooks, and only use the
-  `https`, `http`, `ssh`, and `git` protocols (or those in `GIT_ALLOW_PROTOCOL`,
-  if set). A fetch that shows no progress for 60 seconds is stopped, and its
-  URL isn't tried again for 5 minutes; other failures, such as an unknown commit
-  or failed authentication, aren't delayed, so a push takes effect at the next
-  synchronization. A system without outside network access can't fetch
-  submodules and only reports a problem: provide the code by other means.
+- Endpoints need `git` 2.29 or newer, network access, and read access to each
+  submodule's repository, from the system that fetches it. Git's own
+  configuration applies, so `url.<base>.insteadOf` can rewrite the URLs of an
+  endpoint, such as to a mirror, and Git's own ownership check applies too: a
+  repository that another user owns is reported, with the `safe.directory`
+  setting that would allow it, rather than being used. For that reason, a clone
+  belongs to the user running the endpoint, whatever `permissions.defaultOwner`
+  says. Fetches never prompt for
+  credentials or run hooks, and only use the `https`, `http`, `ssh`, and `git`
+  protocols (or those in `GIT_ALLOW_PROTOCOL`, if set). URLs are reported to the
+  other endpoint without credentials, so give that endpoint its own, such as
+  with a credential helper or an SSH key. A fetch that shows no progress for 60
+  seconds is stopped, and its URL isn't tried again for 5 minutes; other
+  failures, such as an unknown commit or failed authentication, aren't delayed,
+  so a push takes effect at the next synchronization. A system without outside
+  network access can't fetch submodules and only reports a problem: provide the
+  code by other means.
+- A commit is fetched by its ID. If a server doesn't allow that, then only the
+  commits that its default branch reaches can be obtained: for a commit on
+  another branch, fetch it on that endpoint by hand.
 - A large repository's first clone blocks the session's whole synchronization
   cycle, so flushes, and the `remote` commands that wait for them, wait for it.
+- Checking out another commit in a submodule is noticed at the next scan, which
+  can take up to the watch polling interval (10 seconds by default) where
+  recursive watching isn't available, since submodules' directories aren't
+  watched individually.
+- A failure to update the submodules nested in a submodule is reported once,
+  since the submodule's commit is in place by then, and isn't tried again until
+  its commit changes: run `git submodule update --init --recursive` there.
+- If the system or the agent stops abruptly during a clone, then a directory
+  named `.mutagen-temporary-submodule-*` can remain next to the submodule. It's
+  neither synchronized nor reused, so remove it by hand.
 - If the other endpoint already has a directory without a `.gitignore`, the
   first scan hashes all of its content, but doesn't transfer it. While a
   `.gitignore` itself is in conflict, each endpoint applies its own copy, so

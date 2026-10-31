@@ -110,6 +110,8 @@ func init() {
 
 // scanner provides the recursive implementation of scanning.
 type scanner struct {
+	// ctx is the scan context, which operations on repositories run in.
+	ctx context.Context
 	// cancelled is the cancellation channel from the scan context.
 	cancelled <-chan struct{}
 	// root is the path to the synchronization root.
@@ -132,6 +134,9 @@ type scanner struct {
 	symbolicLinkMode SymbolicLinkMode
 	// permissionsMode is the permissions mode being used.
 	permissionsMode PermissionsMode
+	// gitProvider identifies submodules. If it's nil, then directories with
+	// entries named .git are treated like any other directory.
+	gitProvider GitProvider
 	// newCache is the new file digest cache to populate.
 	newCache *Cache
 	// newIgnoreCache is the new ignored path behavior cache to populate.
@@ -435,6 +440,70 @@ func (s *scanner) recordNonUTF8Contents(contents map[string]*Entry, names []stri
 	return nil
 }
 
+// gitLink determines whether or not the directory at the specified path, with
+// the specified contents, should be represented by an entry other than a
+// directory because of an entry named .git in it. It returns that entry, or nil
+// if the directory should be scanned as usual. The only error that it returns
+// is ErrScanCancelled.
+//
+// This has to be done by the directory itself, rather than by its parent when
+// iterating over its contents, because the parent doesn't have the directory's
+// listing.
+func (s *scanner) gitLink(path string, contents []*filesystem.Metadata, ignoreMask bool) (*Entry, error) {
+	// Submodules don't apply to scans that aren't in Git mode or to the root,
+	// whose repository is the one that's being synchronized.
+	if s.gitProvider == nil || path == "" {
+		return nil, nil
+	}
+
+	// Look for an entry named .git. We use the same case-insensitive comparison
+	// as the ignorer that keeps these entries from being synchronized. On a
+	// case-sensitive filesystem, Git won't treat a differently cased entry as a
+	// repository, so it's reported as invalid below, since it isn't
+	// synchronized and the directory would otherwise look incomplete on the
+	// other endpoint.
+	var containsGitEntry bool
+	for _, content := range contents {
+		if strings.EqualFold(content.Name, ".git") {
+			containsGitEntry = true
+			break
+		}
+	}
+	if !containsGitEntry {
+		return nil, nil
+	}
+
+	// If the directory is ignore masked, then it's only being traversed to look
+	// for unignored content, and it would become a phantom directory if we were
+	// to continue. We don't want that, because whatever we'd find in it can
+	// reify the directory, which would then be created on the other endpoint
+	// without its .git. Masked content is ignored, so there's no need to probe.
+	if ignoreMask {
+		return &Entry{Kind: EntryKind_Untracked}, nil
+	}
+
+	// Examine the repository. A failure can be the result of cancellation,
+	// which says nothing about the repository.
+	commit, url, err := s.gitProvider.Probe(s.ctx, filepath.Join(s.root, filepath.FromSlash(path)))
+	if err != nil {
+		if s.ctx.Err() != nil {
+			return nil, ErrScanCancelled
+		}
+		return &Entry{Kind: EntryKind_Problematic, Problem: err.Error()}, nil
+	}
+
+	// A repository without commits or an origin can't be fetched elsewhere, so
+	// it's synchronized as an ordinary directory, and the ignorer will exclude
+	// its .git entry.
+	if len(commit) == 0 {
+		return nil, nil
+	}
+
+	// The directory is a submodule. It doesn't count towards any of the scan's
+	// statistics, because the session doesn't synchronize its contents.
+	return &Entry{Kind: EntryKind_GitLink, Digest: commit, Url: url}, nil
+}
+
 // directory performs processing of a directory entry. Exactly one of parent or
 // directory will be non-nil, depending on whether or not the path represents
 // the synchronization root. If the path represents the synchronization root,
@@ -488,6 +557,14 @@ func (s *scanner) directory(
 			Kind:    EntryKind_Problematic,
 			Problem: fmt.Errorf("unable to read directory contents: %w", err).Error(),
 		}, nil
+	}
+
+	// Check if the directory is something other than an ordinary directory
+	// because of a .git entry in its listing.
+	if entry, err := s.gitLink(path, directoryContents, ignoreMask); err != nil {
+		return nil, err
+	} else if entry != nil {
+		return entry, nil
 	}
 
 	// RACE: There is technically a race condition here between the listing of
@@ -614,7 +691,9 @@ func (s *scanner) directory(
 		// incurring additional symbolic link reads that we could potentially
 		// replace with baseline content, but they are statistically rarer, they
 		// only require a single system call, and we're only performing them in
-		// directories marked as dirty, so the additional cost is very low.
+		// directories marked as dirty, so the additional cost is very low. A
+		// submodule isn't a directory in this sense, so its baseline is dropped
+		// here, and the directory handler only ever sees directory baselines.
 		var directoryBaseline *Entry
 		if contentIsDirectory && baseline != nil {
 			directoryBaseline = baseline.Contents[contentName]
@@ -668,7 +747,11 @@ func (s *scanner) directory(
 						s.symbolicLinks++
 					}
 
-					// Propagate any ignore cache entries that we can.
+					// Propagate any ignore cache entries that we can. A submodule's
+					// decision was recorded for a directory, so this wouldn't find
+					// it, but that doesn't matter: submodules only exist in Git
+					// mode, which doesn't use an ignore cache, and they're marked
+					// as dirty, so they aren't part of reused baselines anyway.
 					if entry.Kind != EntryKind_Untracked && entry.Kind != EntryKind_Problematic {
 						ignoreCacheKey := ignore.IgnoreCacheKey{Path: path, Directory: entryIsDirectoryKind}
 						if ignoreBehavior, ok := s.ignoreCache[ignoreCacheKey]; ok {
@@ -788,6 +871,60 @@ func Scan(
 	probeMode behavior.ProbeMode,
 	symbolicLinkMode SymbolicLinkMode,
 	permissionsMode PermissionsMode,
+) (*Snapshot, *Cache, ignore.IgnoreCache, error) {
+	return scan(
+		ctx,
+		root,
+		baseline, recheckPaths,
+		hasher, cache,
+		ignorer, ignoreCache,
+		probeMode,
+		symbolicLinkMode,
+		permissionsMode,
+		nil,
+	)
+}
+
+// ScanGitMode is a variant of Scan for sessions in Git mode. It represents
+// directories that are submodules, as determined by the specified provider,
+// using entries that identify their commits. Submodules in the baseline are
+// always examined again, even if there are no re-check paths, because their
+// commits can change without any filesystem event at their paths.
+func ScanGitMode(
+	ctx context.Context,
+	root string,
+	baseline *Snapshot, recheckPaths map[string]bool,
+	hasher hash.Hash, cache *Cache,
+	ignorer ignore.Ignorer, ignoreCache ignore.IgnoreCache,
+	probeMode behavior.ProbeMode,
+	symbolicLinkMode SymbolicLinkMode,
+	permissionsMode PermissionsMode,
+	gitProvider GitProvider,
+) (*Snapshot, *Cache, ignore.IgnoreCache, error) {
+	return scan(
+		ctx,
+		root,
+		baseline, recheckPaths,
+		hasher, cache,
+		ignorer, ignoreCache,
+		probeMode,
+		symbolicLinkMode,
+		permissionsMode,
+		gitProvider,
+	)
+}
+
+// scan provides the implementation of Scan and ScanGitMode.
+func scan(
+	ctx context.Context,
+	root string,
+	baseline *Snapshot, recheckPaths map[string]bool,
+	hasher hash.Hash, cache *Cache,
+	ignorer ignore.Ignorer, ignoreCache ignore.IgnoreCache,
+	probeMode behavior.ProbeMode,
+	symbolicLinkMode SymbolicLinkMode,
+	permissionsMode PermissionsMode,
+	gitProvider GitProvider,
 ) (*Snapshot, *Cache, ignore.IgnoreCache, error) {
 	// Verify that the symbolic link mode is valid for this platform.
 	if symbolicLinkMode == SymbolicLinkMode_SymbolicLinkModePOSIXRaw && runtime.GOOS == "windows" {
@@ -936,22 +1073,32 @@ func Scan(
 		}
 	}
 
+	// Identify the submodules in the baseline, if any. A submodule's commit can
+	// change without any filesystem event at its path, because its HEAD is
+	// usually elsewhere (e.g. at .git/modules/x/HEAD), and its parent would
+	// otherwise reuse a stale entry for it, so we always treat them as dirty.
+	var gitLinkPaths []string
+	if gitProvider != nil && baseline != nil {
+		gitLinkPaths = baseline.Content.GitLinkPaths()
+	}
+
 	// If a baseline of the correct kind is available, and there aren't any
-	// re-check paths specified, then we can just re-use that baseline directly.
-	// We don't explicitly check here that the digest cache and ignore cache
-	// correspond to the baseline, because doing so is expensive. We place the
-	// burden of enforcing that invariant on the caller.
-	if baseline != nil && len(recheckPaths) == 0 {
+	// re-check paths specified or submodules to examine, then we can just
+	// re-use that baseline directly. We don't explicitly check here that the
+	// digest cache and ignore cache correspond to the baseline, because doing
+	// so is expensive. We place the burden of enforcing that invariant on the
+	// caller.
+	if baseline != nil && len(recheckPaths) == 0 && len(gitLinkPaths) == 0 {
 		return baseline, cache, ignoreCache, nil
 	}
 
-	// Convert the list of re-check paths into a set of dirty paths. The rule is
-	// that we add any re-check path as well as any parent component of any
-	// re-check path.
+	// Convert the lists of re-check paths and submodules into a set of dirty
+	// paths. The rule is that we add any such path as well as any parent
+	// component of that path.
 	var dirtyPaths map[string]bool
-	if baseline != nil && len(recheckPaths) > 0 {
+	if baseline != nil && (len(recheckPaths) > 0 || len(gitLinkPaths) > 0) {
 		dirtyPaths = make(map[string]bool)
-		for path := range recheckPaths {
+		markDirty := func(path string) {
 			for {
 				dirtyPaths[path] = true
 				if path == "" {
@@ -959,6 +1106,12 @@ func Scan(
 				}
 				path = fastpath.Dir(path)
 			}
+		}
+		for path := range recheckPaths {
+			markDirty(path)
+		}
+		for _, path := range gitLinkPaths {
+			markDirty(path)
 		}
 	}
 
@@ -990,6 +1143,7 @@ func Scan(
 
 	// Create a scanner.
 	s := &scanner{
+		ctx:                    ctx,
 		cancelled:              ctx.Done(),
 		root:                   root,
 		dirtyPaths:             dirtyPaths,
@@ -1000,6 +1154,7 @@ func Scan(
 		ignoreCache:            ignoreCache,
 		symbolicLinkMode:       symbolicLinkMode,
 		permissionsMode:        permissionsMode,
+		gitProvider:            gitProvider,
 		newCache:               newCache,
 		newIgnoreCache:         newIgnoreCache,
 		copyBuffer:             make([]byte, scannerCopyBufferSize),

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"golang.org/x/text/unicode/norm"
 
@@ -24,6 +25,20 @@ const (
 	// crossDeviceRenameTemporaryNamePrefix is the file name prefix to use for
 	// intermediate temporary files used in cross-device renames.
 	crossDeviceRenameTemporaryNamePrefix = filesystem.TemporaryNamePrefix + "cross-device-rename"
+
+	// gitLinkTemporaryNamePrefix is the name prefix to use for the temporary
+	// directories in which submodules are cloned. Sessions can share a
+	// directory (e.g. the edges of a star at its center), so these names have
+	// to be unique rather than being derived from the name of the submodule.
+	gitLinkTemporaryNamePrefix = filesystem.TemporaryNamePrefix + "submodule-"
+
+	// gitLinkTemporaryRemovalAttempts is the number of times to try removing a
+	// temporary clone. Processes that Git spawned can take a moment to exit
+	// after it's been killed, and until then they can add content to the
+	// directory or (on Windows) keep it from being removed.
+	gitLinkTemporaryRemovalAttempts = 5
+	// gitLinkTemporaryRemovalInterval is the time between those attempts.
+	gitLinkTemporaryRemovalInterval = 200 * time.Millisecond
 
 	// transitionCopyBufferSize specifies the size of the internal buffer that a
 	// transitioner uses to copy file data (e.g. when performing cross-device
@@ -44,10 +59,10 @@ const (
 var (
 	// errTransitionCancelled indicates that the transition was cancelled.
 	errTransitionCancelled = errors.New("transition cancelled")
-	// errGitLinkRemovalRefused indicates that a submodule's removal was refused.
-	// A submodule's working tree can hold work that exists nowhere else, such as
-	// unpushed commits and uncommitted changes, and it isn't tracked, so its
-	// removal is never performed automatically.
+	// errGitLinkRemovalRefused indicates that a submodule's removal was
+	// refused. A submodule's working tree can hold work that exists nowhere
+	// else, such as unpushed commits and uncommitted changes, and it isn't
+	// tracked, so its removal is never performed automatically.
 	errGitLinkRemovalRefused = errors.New("submodule isn't removed automatically; remove it manually")
 )
 
@@ -62,6 +77,8 @@ type Provider interface {
 
 // transitioner provides the recursive implementation of transitioning.
 type transitioner struct {
+	// ctx is the transition context, which operations on repositories run in.
+	ctx context.Context
 	// cancelled is the cancellation channel from the transition context.
 	cancelled <-chan struct{}
 	// root is the path to the synchronization root.
@@ -92,6 +109,9 @@ type transitioner struct {
 	recomposeUnicode bool
 	// provider is the staged file provider.
 	provider Provider
+	// gitProvider obtains submodules. If it's nil, then transitions to
+	// submodules fail, since there's no way to obtain them.
+	gitProvider GitProvider
 	// problems are the problems encountered during transition operations.
 	problems []*Problem
 	// providerMissingFiles indicates that the staged file provider returned an
@@ -875,10 +895,236 @@ func (t *transitioner) createSymbolicLink(parent *filesystem.Directory, name, pa
 // function, so that a failure leaves that content in place and yields its
 // entry.
 //
-// Fetching submodules isn't implemented yet, so every transition fails.
+// A failure doesn't cause a retry of its own. Yielding the old entry means that
+// the transition doesn't count as having changed anything on disk, and nothing
+// that happens along the way can wake the session: temporary directories are
+// neither scanned nor watched, and fetches don't change the files in Git
+// directories that matter to filesystem watching. Thus, the next attempt is in
+// the next synchronization cycle, whenever something else causes that.
 func (t *transitioner) transitionToGitLink(path string, old, target *Entry) *Entry {
-	t.recordProblem(path, errors.New("submodule fetching is unavailable"))
-	return old
+	// Without a provider, there's no way to obtain a submodule.
+	if t.gitProvider == nil {
+		t.recordProblem(path, errors.New("submodule fetching is unavailable"))
+		return old
+	}
+
+	// Scans don't treat the root as a submodule, so only a malfunctioning or
+	// malicious controller could request this. We refuse it, because the
+	// temporary directory would be a sibling of the root, and because old
+	// content is removed by replacing it.
+	if path == "" {
+		t.recordProblem(path, errors.New("synchronization root can't be a submodule"))
+		return old
+	}
+
+	// Check for cancellation before starting operations that can take a long
+	// time.
+	if t.ctx.Err() != nil {
+		t.recordProblem(path, errTransitionCancelled)
+		return old
+	}
+
+	// Handle the transition based on whether or not a repository is in place.
+	if old != nil && old.Kind == EntryKind_GitLink {
+		return t.updateGitLink(path, old, target)
+	}
+	return t.cloneGitLink(path, old, target)
+}
+
+// recordGitProblem records a problem for a failed operation on a repository. If
+// the transition has been cancelled, then that's what the problem says, because
+// the operation's failure isn't meaningful in that case.
+func (t *transitioner) recordGitProblem(path string, err error) {
+	if t.ctx.Err() != nil {
+		err = errTransitionCancelled
+	}
+	t.recordProblem(path, err)
+}
+
+// removeTemporaryClone removes a temporary directory in which a submodule was
+// cloned, recording a problem if that isn't possible, because it wouldn't be
+// synchronized, but it wouldn't go away either.
+func (t *transitioner) removeTemporaryClone(path, temporary string) {
+	var err error
+	for attempt := 0; attempt < gitLinkTemporaryRemovalAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(gitLinkTemporaryRemovalInterval)
+		}
+		if err = os.RemoveAll(temporary); err == nil {
+			return
+		}
+	}
+	t.recordProblem(path, fmt.Errorf("unable to remove temporary clone: %w", err))
+}
+
+// cloneGitLink transitions content that isn't a submodule to a submodule by
+// cloning it next to that content, and only then replacing that content with
+// the clone. If the clone fails for any reason, including cancellation, then
+// the existing content stays where it is. This is the crucial property of this
+// function: content must never be lost to a submodule that can't be obtained,
+// which is entirely expected if it hasn't been pushed or if the endpoint
+// doesn't have network access.
+func (t *transitioner) cloneGitLink(path string, old, target *Entry) *Entry {
+	// Walk down to the parent of the target and compute the target's leaf name,
+	// which ensures that we don't traverse symbolic links. The leaf's casing
+	// only matters if we're expecting to find something there. If we are
+	// successful, defer closure of the parent.
+	parent, name, err := t.walkToParentAndComputeLeafName(path, old != nil)
+	if err != nil {
+		t.recordProblem(path, fmt.Errorf("unable to walk to transition root parent: %w", err))
+		return old
+	}
+	defer parent.Close()
+
+	// If we don't expect to find anything at the path, then verify that. A
+	// clone can take a long time, so we don't want to leave this for the rename
+	// to catch.
+	if old == nil {
+		if _, err := parent.ReadContentMetadata(name); err == nil {
+			t.recordProblem(path, errors.New("unable to create submodule: unknown content exists at path"))
+			return nil
+		} else if !os.IsNotExist(err) {
+			t.recordProblem(path, fmt.Errorf("unable to verify that path is available for submodule: %w", err))
+			return nil
+		}
+	}
+
+	// Create a temporary directory next to the target, which ensures that it's
+	// on the same filesystem. Git has to be given a path, and Directory can't
+	// create a directory with a unique name, so we create it by path, and then
+	// verify that it's in the parent that we validated.
+	//
+	// RACE: There is a race condition here if the parent path is replaced by a
+	// symbolic link after we've validated it. The worst case fallout is that an
+	// unused temporary directory is created and removed at the link's target,
+	// because the check below prevents us from cloning into it.
+	parentPath := filepath.Dir(filepath.Join(t.root, filepath.FromSlash(path)))
+	temporary, err := os.MkdirTemp(parentPath, gitLinkTemporaryNamePrefix+"*")
+	if err != nil {
+		t.recordProblem(path, fmt.Errorf("unable to create temporary directory for clone: %w", err))
+		return old
+	}
+	temporaryName := filepath.Base(temporary)
+	if metadata, err := parent.ReadContentMetadata(temporaryName); err != nil {
+		t.removeTemporaryClone(path, temporary)
+		t.recordProblem(path, fmt.Errorf("unable to verify temporary directory for clone: %w", err))
+		return old
+	} else if metadata.Mode&filesystem.ModeTypeMask != filesystem.ModeTypeDirectory {
+		t.removeTemporaryClone(path, temporary)
+		t.recordProblem(path, errors.New("temporary directory for clone has unexpected type"))
+		return old
+	}
+
+	// Perform the clone. If this fails, then we haven't touched anything else.
+	if err := t.gitProvider.Clone(t.ctx, temporary, target.Url, target.Digest); err != nil {
+		t.removeTemporaryClone(path, temporary)
+		t.recordGitProblem(path, err)
+		return old
+	}
+
+	// Update nested submodules while it's still possible to back out. A failure
+	// doesn't prevent us from using the clone, since it has the commit that's
+	// being synchronized, but we do have to back out if we're cancelled.
+	nestedErr := t.gitProvider.UpdateNested(t.ctx, temporary, target.Url)
+	if t.ctx.Err() != nil {
+		t.removeTemporaryClone(path, temporary)
+		t.recordProblem(path, errTransitionCancelled)
+		return old
+	}
+
+	// Remove the old content, which verifies that it hasn't been modified. If
+	// only a portion of it can be removed, then the submodule can't go in its
+	// place. In particular, it can be a directory containing submodules, which
+	// are never removed. The removal has already recorded the relevant
+	// problems.
+	if reduced := t.remove(path, old); reduced != nil {
+		t.removeTemporaryClone(path, temporary)
+		return reduced
+	}
+
+	// Move the clone into place. If this fails, then the old content is already
+	// gone, which is what the result has to represent.
+	if err := filesystem.Rename(parent, temporaryName, parent, name, false); err != nil {
+		t.removeTemporaryClone(path, temporary)
+		t.recordProblem(path, fmt.Errorf("unable to move clone into place: %w", err))
+		return nil
+	}
+
+	// Set the permissions of the top-level directory, as we would for any other
+	// directory that we create, but not its ownership. Git refuses to operate on
+	// a repository owned by another user, so a clone has to stay owned by the
+	// user that runs Git on it, or the next scan couldn't examine it, and that
+	// would be just as true if we changed the ownership of its entire contents.
+	// A failure doesn't change the fact that the submodule is in place.
+	if err := parent.SetPermissions(name, nil, t.defaultDirectoryMode); err != nil {
+		t.recordProblem(path, fmt.Errorf("unable to set submodule directory permissions: %w", err))
+	}
+
+	// Report any failure to update nested submodules.
+	if nestedErr != nil {
+		t.recordProblem(path, fmt.Errorf("unable to update nested submodules: %w", nestedErr))
+	}
+
+	// Success.
+	return target
+}
+
+// updateGitLink transitions a submodule to a different commit by checking it
+// out in place. If that isn't possible, then the old commit stays checked out.
+func (t *transitioner) updateGitLink(path string, old, target *Entry) *Entry {
+	// Walk down to the parent of the target and compute the target's leaf name,
+	// which ensures that we don't traverse symbolic links, and verify that the
+	// target itself isn't one either. If we are successful, defer closure of
+	// the parent.
+	parent, name, err := t.walkToParentAndComputeLeafName(path, true)
+	if err != nil {
+		t.recordProblem(path, fmt.Errorf("unable to walk to transition root: %w", err))
+		return old
+	}
+	defer parent.Close()
+	if metadata, err := parent.ReadContentMetadata(name); err != nil {
+		t.recordProblem(path, fmt.Errorf("unable to query submodule: %w", err))
+		return old
+	} else if metadata.Mode&filesystem.ModeTypeMask != filesystem.ModeTypeDirectory {
+		t.recordProblem(path, errors.New("submodule is no longer a directory"))
+		return old
+	}
+	directory := filepath.Join(t.root, filepath.FromSlash(path))
+
+	// Determine what's checked out. If that's already the target commit, then
+	// there's nothing to do. If it's neither that nor the expected commit, then
+	// something has happened since the scan, and the next cycle has to look at
+	// it.
+	head, err := t.gitProvider.Head(t.ctx, directory)
+	if err != nil {
+		t.recordGitProblem(path, fmt.Errorf("unable to determine submodule's commit: %w", err))
+		return old
+	} else if bytes.Equal(head, target.Digest) {
+		return target
+	} else if !bytes.Equal(head, old.Digest) {
+		t.recordProblem(path, errors.New("submodule's commit changed since the scan"))
+		return old
+	}
+
+	// RACE: There is a race condition here between the commit check and the
+	// checkout. Git refuses to overwrite local changes, so the worst case
+	// fallout is that a commit made during this window is no longer checked
+	// out, though it remains in the repository's reference logs.
+
+	// Check out the commit, fetching it if necessary.
+	if err := t.gitProvider.Update(t.ctx, directory, target.Url, target.Digest); err != nil {
+		t.recordGitProblem(path, err)
+		return old
+	}
+
+	// Update nested submodules. The commit is checked out by this point, so
+	// this doesn't affect the result, not even if we're cancelled.
+	if err := t.gitProvider.UpdateNested(t.ctx, directory, target.Url); err != nil {
+		t.recordGitProblem(path, fmt.Errorf("unable to update nested submodules: %w", err))
+	}
+
+	// Success.
+	return target
 }
 
 // createDirectory creates the target directory at the specified path. If only a
@@ -1042,11 +1288,75 @@ func Transition(
 	recomposeUnicode bool,
 	provider Provider,
 ) ([]*Entry, []*Problem, bool) {
+	return transition(
+		ctx,
+		root,
+		transitions,
+		cache,
+		hasher,
+		symbolicLinkMode,
+		defaultFileMode,
+		defaultDirectoryMode,
+		defaultOwnership,
+		recomposeUnicode,
+		provider,
+		nil,
+	)
+}
+
+// TransitionGitMode is a variant of Transition for sessions in Git mode, which
+// obtains submodules using the specified provider.
+func TransitionGitMode(
+	ctx context.Context,
+	root string,
+	transitions []*Change,
+	cache *Cache,
+	hasher hash.Hash,
+	symbolicLinkMode SymbolicLinkMode,
+	defaultFileMode filesystem.Mode,
+	defaultDirectoryMode filesystem.Mode,
+	defaultOwnership *filesystem.OwnershipSpecification,
+	recomposeUnicode bool,
+	provider Provider,
+	gitProvider GitProvider,
+) ([]*Entry, []*Problem, bool) {
+	return transition(
+		ctx,
+		root,
+		transitions,
+		cache,
+		hasher,
+		symbolicLinkMode,
+		defaultFileMode,
+		defaultDirectoryMode,
+		defaultOwnership,
+		recomposeUnicode,
+		provider,
+		gitProvider,
+	)
+}
+
+// transition provides the implementation of Transition and TransitionGitMode.
+func transition(
+	ctx context.Context,
+	root string,
+	transitions []*Change,
+	cache *Cache,
+	hasher hash.Hash,
+	symbolicLinkMode SymbolicLinkMode,
+	defaultFileMode filesystem.Mode,
+	defaultDirectoryMode filesystem.Mode,
+	defaultOwnership *filesystem.OwnershipSpecification,
+	recomposeUnicode bool,
+	provider Provider,
+	gitProvider GitProvider,
+) ([]*Entry, []*Problem, bool) {
 	// Extract the cancellation channel.
 	cancelled := ctx.Done()
 
 	// Create the transitioner.
 	transitioner := &transitioner{
+		ctx:                  ctx,
 		cancelled:            cancelled,
 		root:                 root,
 		cache:                cache,
@@ -1058,6 +1368,7 @@ func Transition(
 		copyBuffer:           make([]byte, transitionCopyBufferSize),
 		recomposeUnicode:     recomposeUnicode,
 		provider:             provider,
+		gitProvider:          gitProvider,
 	}
 
 	// Set up results.

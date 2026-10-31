@@ -6,11 +6,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mutagen-io/mutagen/pkg/filesystem"
+	"github.com/mutagen-io/mutagen/pkg/filesystem/watching"
 	"github.com/mutagen-io/mutagen/pkg/integration/protocols/netpipe"
+	"github.com/mutagen-io/mutagen/pkg/logging"
+	"github.com/mutagen-io/mutagen/pkg/project"
 	"github.com/mutagen-io/mutagen/pkg/selection"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
@@ -34,9 +39,15 @@ type gitModeOptions struct {
 	// watch indicates that the session should watch for changes. Otherwise, it
 	// only performs synchronization when flushed.
 	watch bool
+	// watchMode is the watch mode to use if the session should watch for
+	// changes, or the default if unset.
+	watchMode synchronization.WatchMode
 	// remoteBeta indicates that beta should be reached through the remote
 	// endpoint implementation.
 	remoteBeta bool
+	// betaEndpoint specifies how beta should be reached, if set, returning its
+	// URL and its root on this system. It takes precedence over remoteBeta.
+	betaEndpoint func() (*url.URL, string)
 	// betaMissing indicates that beta's root shouldn't exist. Beta must not
 	// have any initial contents.
 	betaMissing bool
@@ -44,12 +55,21 @@ type gitModeOptions struct {
 	alpha map[string]string
 	// beta are the initial contents of beta.
 	beta map[string]string
+	// prepare performs any further setup of the roots, before the session
+	// starts.
+	prepare func(*gitModeSession)
+	// commands is the session's remote command mode.
+	commands synchronization.RemoteCommandMode
+	// manager is the session manager, or synchronizationManager if nil.
+	manager *synchronization.Manager
 }
 
 // gitModeSession is a session in Git mode for an integration test.
 type gitModeSession struct {
 	// t is the test.
 	t *testing.T
+	// manager is the session manager.
+	manager *synchronization.Manager
 	// alpha is the root of alpha.
 	alpha string
 	// beta is the root of beta.
@@ -73,9 +93,20 @@ func newGitModeSession(t *testing.T, options gitModeOptions) *gitModeSession {
 	}
 	t.Cleanup(func() { os.RemoveAll(base) })
 	session := &gitModeSession{
-		t:     t,
-		alpha: filepath.Join(base, "alpha"),
-		beta:  filepath.Join(base, "beta"),
+		t:       t,
+		manager: options.manager,
+		alpha:   filepath.Join(base, "alpha"),
+		beta:    filepath.Join(base, "beta"),
+	}
+	if session.manager == nil {
+		session.manager = synchronizationManager
+	}
+	betaURL := &url.URL{Path: session.beta}
+	if options.remoteBeta {
+		betaURL.Protocol = netpipe.Protocol_Netpipe
+	}
+	if options.betaEndpoint != nil {
+		betaURL, session.beta = options.betaEndpoint()
 	}
 	for _, root := range []string{session.alpha, session.beta} {
 		if err := os.Mkdir(root, 0700); err != nil {
@@ -89,6 +120,9 @@ func newGitModeSession(t *testing.T, options gitModeOptions) *gitModeSession {
 			t.Fatal(err)
 		}
 	}
+	if options.prepare != nil {
+		options.prepare(session)
+	}
 
 	// Create the session.
 	configuration := &synchronization.Configuration{
@@ -96,16 +130,15 @@ func newGitModeSession(t *testing.T, options gitModeOptions) *gitModeSession {
 		SynchronizationMode:  options.mode,
 		Ignores:              options.ignores,
 		WatchPollingInterval: 1,
+		RemoteCommandMode:    options.commands,
 	}
-	if !options.watch {
+	if options.watch {
+		configuration.WatchMode = options.watchMode
+	} else {
 		configuration.WatchMode = synchronization.WatchMode_WatchModeNoWatch
 	}
-	betaURL := &url.URL{Path: session.beta}
-	if options.remoteBeta {
-		betaURL.Protocol = netpipe.Protocol_Netpipe
-	}
 	ctx := context.Background()
-	id, err := synchronizationManager.Create(
+	id, err := session.manager.Create(
 		ctx,
 		&url.URL{Path: session.alpha}, betaURL,
 		configuration, &synchronization.Configuration{}, &synchronization.Configuration{},
@@ -115,7 +148,7 @@ func newGitModeSession(t *testing.T, options gitModeOptions) *gitModeSession {
 		t.Fatal("unable to create session:", err)
 	}
 	session.selection = &selection.Selection{Specifications: []string{id}}
-	t.Cleanup(func() { synchronizationManager.Terminate(ctx, session.selection, "") })
+	t.Cleanup(func() { session.manager.Terminate(ctx, session.selection, "") })
 	logSessionOnFailure(t, id)
 
 	// Wait for the synchronization loop to start, since a session only accepts
@@ -133,7 +166,7 @@ func (s *gitModeSession) waitForState(condition func(*synchronization.State) boo
 	defer cancel()
 	var previousStateIndex uint64
 	for {
-		stateIndex, states, err := synchronizationManager.List(ctx, s.selection, previousStateIndex)
+		stateIndex, states, err := s.manager.List(ctx, s.selection, previousStateIndex)
 		if err != nil {
 			s.t.Fatal("unable to wait for session state:", err)
 		} else if len(states) != 1 {
@@ -151,19 +184,27 @@ func (s *gitModeSession) state() *synchronization.State {
 	return s.waitForState(func(*synchronization.State) bool { return true })
 }
 
-// flush performs a flush, which must succeed, and verifies that there are no
-// conflicts or transition problems, none of which any of these tests expect.
-func (s *gitModeSession) flush() {
+// flushAllowingProblems performs a flush, which must succeed, and returns the
+// session's state, verifying only that the session hasn't reported an error.
+func (s *gitModeSession) flushAllowingProblems() *synchronization.State {
 	s.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if err := synchronizationManager.Flush(ctx, s.selection, "", false); err != nil {
+	if err := s.manager.Flush(ctx, s.selection, "", false); err != nil {
 		s.t.Fatal("unable to flush session:", err)
 	}
 	state := s.state()
 	if state.LastError != "" {
 		s.t.Error("session reported error:", state.LastError)
 	}
+	return state
+}
+
+// flush performs a flush, which must succeed, and verifies that there are no
+// conflicts or transition problems, none of which any of these tests expect.
+func (s *gitModeSession) flush() {
+	s.t.Helper()
+	state := s.flushAllowingProblems()
 	if len(state.Conflicts) > 0 {
 		s.t.Errorf("unexpected conflicts: %v", state.Conflicts)
 	}
@@ -700,7 +741,9 @@ func TestGitModeSessionIgnoresOverride(t *testing.T) {
 // TestGitModeGitEntriesNotSynchronized tests that entries named .git, whether
 // they're directories (as in repositories) or files (as in submodules and
 // linked worktrees), are never synchronized, even if the session tries to allow
-// it, and that endpoints' own entries don't interfere with each other.
+// it, and that endpoints' own entries don't interfere with each other. A
+// directory below the root whose .git entry isn't a valid repository isn't
+// synchronized at all, which is reported on the endpoint that has it.
 func TestGitModeGitEntriesNotSynchronized(t *testing.T) {
 	session := newGitModeSession(t, gitModeOptions{
 		ignores: []string{"!.git"},
@@ -710,6 +753,7 @@ func TestGitModeGitEntriesNotSynchronized(t *testing.T) {
 			"sub/file":           "file",
 			"directory/.GIT/any": "alpha upper",
 			"directory/file":     "file",
+			"plain/file":         "file",
 		},
 		beta: map[string]string{
 			".git/config":        "beta config",
@@ -719,26 +763,62 @@ func TestGitModeGitEntriesNotSynchronized(t *testing.T) {
 	})
 	session.flush()
 	session.expect(session.beta, map[string]string{
-		"sub/file":           "file",
-		"directory/file":     "file",
+		"plain/file":         "file",
 		".git/config":        "beta config",
 		"other/.git/objects": "beta objects",
-	})
-	session.expectMissing(session.beta, "sub/.git", "directory/.GIT")
-	session.expect(session.alpha, map[string]string{
 		"other/file":         "file",
+	})
+	session.expectMissing(session.beta, "sub", "directory")
+	session.expect(session.alpha, map[string]string{
 		".git/config":        "alpha config",
 		"sub/.git":           "gitdir: ../.git/modules/sub\n",
+		"sub/file":           "file",
 		"directory/.GIT/any": "alpha upper",
+		"directory/file":     "file",
 	})
-	session.expectMissing(session.alpha, "other/.git")
+	session.expectMissing(session.alpha, "other")
+
+	// The directories that weren't synchronized are reported where they are.
+	state := session.state()
+	alphaErrors, betaErrors := problemErrors(state.AlphaState.ScanProblems), problemErrors(state.BetaState.ScanProblems)
+	if len(alphaErrors) != 2 || !strings.Contains(alphaErrors["sub"], "remove the directory") || !strings.Contains(alphaErrors["directory"], "remove the directory") {
+		t.Errorf("incorrect alpha problems: %v", alphaErrors)
+	}
+	if len(betaErrors) != 1 || !strings.Contains(betaErrors["other"], "remove the directory") {
+		t.Errorf("incorrect beta problems: %v", betaErrors)
+	}
 
 	// Changes to them don't result in any changes on the opposite endpoint.
 	session.write(session.alpha, map[string]string{".git/config": "changed", "sub/.git": "changed"})
 	session.remove(session.alpha, "directory/.GIT/any")
 	session.flush()
 	session.expect(session.beta, map[string]string{".git/config": "beta config"})
-	session.expectMissing(session.beta, "sub/.git")
+	session.expectMissing(session.beta, "sub")
+}
+
+// TestGitModeNestedRepositoryWithoutOrigin tests that nested repositories that
+// can't be fetched, since they don't have an origin or any commits, are
+// synchronized as ordinary directories, without their Git directories.
+func TestGitModeNestedRepositoryWithoutOrigin(t *testing.T) {
+	isolateGitMode(t)
+	session := newGitModeSession(t, gitModeOptions{
+		alpha: map[string]string{"local/file": "file", "new/file": "file"},
+		prepare: func(session *gitModeSession) {
+			local, created := filepath.Join(session.alpha, "local"), filepath.Join(session.alpha, "new")
+			gitModeRun(t, local, "init", "--quiet")
+			gitModeRun(t, local, "add", "--", "file")
+			gitModeRun(t, local, "commit", "--quiet", "--no-gpg-sign", "-m", "commit")
+			gitModeRun(t, created, "init", "--quiet")
+			gitModeRun(t, created, "config", "remote.origin.url", "https://example.org/repository.git")
+		},
+	})
+	session.flush()
+	session.expect(session.beta, map[string]string{"local/file": "file", "new/file": "file"})
+	session.expectMissing(session.beta, "local/.git", "new/.git")
+	state := session.state()
+	if len(state.AlphaState.ScanProblems) != 0 || len(state.BetaState.ScanProblems) != 0 {
+		t.Errorf("unexpected problems: %v, %v", state.AlphaState.ScanProblems, state.BetaState.ScanProblems)
+	}
 }
 
 // TestGitModePreexistingContentNotPulled tests that content that already exists
@@ -798,13 +878,21 @@ func TestGitModePreexistingContentNotPulled(t *testing.T) {
 // TestGitModeWatching tests that a session that's watching for changes, rather
 // than one driven by flushes, delivers rules and leaves content in place.
 func TestGitModeWatching(t *testing.T) {
-	session := newGitModeSession(t, gitModeOptions{watch: true, alpha: map[string]string{
-		"keep":                           "keep",
-		"data/file":                      "data",
-		".git/index":                     "index",
-		"sub/.git/index":                 "index",
-		"sub/.mutagen-temporary-x/index": "index",
-	}})
+	isolateGitMode(t)
+	session := newGitModeSession(t, gitModeOptions{
+		watch: true,
+		alpha: map[string]string{
+			"keep":                           "keep",
+			"data/file":                      "data",
+			".git/index":                     "index",
+			"sub/.mutagen-temporary-x/index": "index",
+		},
+		// Use a repository for which the directory is synchronized as usual, so
+		// that its .git directory is as close as possible to a change.
+		prepare: func(session *gitModeSession) {
+			gitModeRun(t, filepath.Join(session.alpha, "sub"), "init", "--quiet")
+		},
+	})
 	waitForFile := func(path, expected string) {
 		t.Helper()
 		deadline := time.Now().Add(time.Minute)
@@ -932,6 +1020,1028 @@ func problemErrors(problems []*core.Problem) map[string]string {
 		errors[problem.Path] = problem.Error
 	}
 	return errors
+}
+
+// isolateGitMode sets up the environment of the Git commands run by a test's
+// endpoints, including those of agents (which is why it uses the environment),
+// enabling the file transport and insulating them from the user's
+// configuration. It skips the test if Git isn't available.
+func isolateGitMode(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("Git is not available:", err)
+	}
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+}
+
+// gitModeRun runs Git in a directory for test setup purposes, which must
+// succeed, and returns its output without surrounding whitespace. The command
+// isn't affected by the environment variables that may be set for a repository
+// in which the test is being run or by the user's configuration, such as for
+// signing commits.
+func gitModeRun(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = directory
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "GIT_") {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	command.Env = append(command.Env,
+		"GIT_ALLOW_PROTOCOL=file", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.org",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.org",
+	)
+	var errorOutput strings.Builder
+	command.Stderr = &errorOutput
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("unable to run Git with arguments %v in %s: %v: %s", args, directory, err, errorOutput.String())
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// gitModeUpstream is a bare repository for a submodule, which is reachable
+// using a file URL, with a single commit.
+type gitModeUpstream struct {
+	// url is the repository's URL.
+	url string
+	// path is the repository's path.
+	path string
+	// first is the commit that it has.
+	first string
+}
+
+// newGitModeUpstream creates a bare repository for a submodule.
+func newGitModeUpstream(t *testing.T) *gitModeUpstream {
+	t.Helper()
+	base, err := os.MkdirTemp("", "mgu-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	if base, err = filepath.EvalSymlinks(base); err != nil {
+		t.Fatal(err)
+	}
+	upstream := &gitModeUpstream{path: filepath.Join(base, "upstream.git")}
+	upstream.url = "file://" + filepath.ToSlash(upstream.path)
+	if !strings.HasPrefix(filepath.ToSlash(upstream.path), "/") {
+		upstream.url = "file:///" + filepath.ToSlash(upstream.path)
+	}
+	if err := os.Mkdir(upstream.path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	gitModeRun(t, upstream.path, "init", "--quiet", "--bare", "--initial-branch=main")
+	work := filepath.Join(base, "work")
+	if err := os.Mkdir(work, 0700); err != nil {
+		t.Fatal(err)
+	}
+	gitModeRun(t, work, "init", "--quiet", "--initial-branch=main")
+	upstream.first = gitModeCommit(t, work, "file", "first")
+	gitModeRun(t, work, "push", "--quiet", upstream.url, "HEAD:refs/heads/main")
+	return upstream
+}
+
+// gitModeCommit creates a commit in a repository with a file having the
+// specified name and contents, returning its identifier.
+func gitModeCommit(t *testing.T, directory, name, contents string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(directory, name), []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitModeRun(t, directory, "add", "--", name)
+	gitModeRun(t, directory, "commit", "--quiet", "--no-gpg-sign", "-m", "commit "+name)
+	return gitModeRun(t, directory, "rev-parse", "HEAD")
+}
+
+// gitModePush pushes the commit that's checked out in a repository to a branch
+// of its origin.
+func gitModePush(t *testing.T, directory, branch string) {
+	t.Helper()
+	gitModeRun(t, directory, "push", "--quiet", "origin", "HEAD:refs/heads/"+branch)
+}
+
+// gitModeHead returns the commit that's checked out in a repository.
+func gitModeHead(t *testing.T, directory string) string {
+	t.Helper()
+	return gitModeRun(t, directory, "rev-parse", "HEAD")
+}
+
+// gitModeProblem returns the problem at the specified path, failing the test if
+// there isn't one, and verifies that its message contains the specified text.
+func gitModeProblem(t *testing.T, problems []*core.Problem, path string, contents ...string) *core.Problem {
+	t.Helper()
+	for _, problem := range problems {
+		if problem.Path == path {
+			for _, content := range contents {
+				if !strings.Contains(problem.Error, content) {
+					t.Errorf("problem doesn't contain %q: %s", content, problem.Error)
+				}
+			}
+			return problem
+		}
+	}
+	t.Fatalf("no problem at %q: %v", path, problems)
+	return nil
+}
+
+// gitSubmoduleFixture is a session whose alpha is a superproject that has a
+// real submodule named sub, with a bare upstream repository, and a file named
+// top.
+type gitSubmoduleFixture struct {
+	*gitModeSession
+	// upstream is the submodule's upstream repository.
+	upstream *gitModeUpstream
+	// leader is alpha's directory for the submodule.
+	leader string
+	// follower is beta's directory for the submodule.
+	follower string
+}
+
+// newGitSubmoduleFixture creates a session with a submodule on alpha. The
+// options are those for the transport, in addition to those provided by the
+// test.
+func newGitSubmoduleFixture(t *testing.T, transport gitSubmoduleTransport, options gitModeOptions) *gitSubmoduleFixture {
+	t.Helper()
+	upstream := newGitModeUpstream(t)
+	if transport.configure != nil {
+		transport.configure(&options)
+	}
+	options.alpha = map[string]string{"top": "top"}
+	options.prepare = func(session *gitModeSession) {
+		gitModeRun(t, session.alpha, "init", "--quiet", "--initial-branch=main")
+		gitModeRun(t, session.alpha, "submodule", "add", "--quiet", upstream.url, "sub")
+		gitModeRun(t, session.alpha, "commit", "--quiet", "--no-gpg-sign", "-m", "add submodule")
+	}
+	session := newGitModeSession(t, options)
+	return &gitSubmoduleFixture{
+		gitModeSession: session,
+		upstream:       upstream,
+		leader:         filepath.Join(session.alpha, "sub"),
+		follower:       filepath.Join(session.beta, "sub"),
+	}
+}
+
+// verifyFollowing verifies that the submodule has the specified commit checked
+// out on beta. It's in a repository of its own, rather than in a superproject.
+func (f *gitSubmoduleFixture) verifyFollowing(commit string) {
+	f.t.Helper()
+	if head := gitModeHead(f.t, f.follower); head != commit {
+		f.t.Errorf("incorrect commit on beta: %s != %s", head, commit)
+	}
+	if prefix := gitModeRun(f.t, f.follower, "rev-parse", "--show-toplevel"); filepath.Base(prefix) != "sub" {
+		f.t.Errorf("incorrect top level directory on beta: %s", prefix)
+	}
+	if status := gitModeRun(f.t, f.follower, "status", "--porcelain"); status != "" {
+		f.t.Errorf("working tree isn't clean on beta: %s", status)
+	}
+}
+
+// verifyAlphaAt verifies that the submodule has the specified commit checked
+// out on alpha, where it's still part of the superproject.
+func (f *gitSubmoduleFixture) verifyAlphaAt(commit string) {
+	f.t.Helper()
+	if head := gitModeHead(f.t, f.leader); head != commit {
+		f.t.Errorf("incorrect commit on alpha: %s != %s", head, commit)
+	}
+	if info, err := os.Lstat(filepath.Join(f.leader, ".git")); err != nil {
+		f.t.Error("unable to query submodule's .git on alpha:", err)
+	} else if !info.Mode().IsRegular() {
+		f.t.Error("submodule on alpha no longer has a .git file")
+	}
+}
+
+// verifyRemote runs a command through the remote command line, if the transport
+// supports that, verifying that the command succeeds and that the specified
+// text is reported along with it.
+func (f *gitSubmoduleFixture) verifyRemote(transport gitSubmoduleTransport, reported ...string) {
+	f.t.Helper()
+	if !transport.commands {
+		return
+	}
+	code, output, diagnostics := runRemote(f.t, f.alpha, "--timeout", "30s", "cat", "top")
+	if code != 0 || output != "top" {
+		f.t.Errorf("command failed: %d: %q: %s", code, output, diagnostics)
+	}
+	for _, content := range reported {
+		if !strings.Contains(diagnostics, content) {
+			f.t.Errorf("command's diagnostics don't contain %q: %s", content, diagnostics)
+		}
+	}
+}
+
+// gitSubmoduleTransport describes how scenarios for submodules reach beta.
+type gitSubmoduleTransport struct {
+	// configure sets the options that are necessary to use the transport.
+	configure func(*gitModeOptions)
+	// commands indicates whether or not sessions support remote commands, in
+	// which case scenarios verify what those report, and that they still run.
+	commands bool
+}
+
+// gitSubmoduleScenarios are the scenarios for submodules that are run with each
+// transport.
+var gitSubmoduleScenarios = []struct {
+	name string
+	run  func(*testing.T, gitSubmoduleTransport)
+}{
+	{"clone into empty root", func(t *testing.T, transport gitSubmoduleTransport) {
+		testGitSubmoduleClone(t, transport, false)
+	}},
+	{"clone into missing root", func(t *testing.T, transport gitSubmoduleTransport) {
+		testGitSubmoduleClone(t, transport, true)
+	}},
+	{"pushed commits", testGitSubmodulePushedCommits},
+	{"one way", testGitSubmoduleOneWay},
+	{"unpushed commit", testGitSubmoduleUnpushedCommit},
+	{"dirty submodule", testGitSubmoduleDirty},
+	{"conflict", testGitSubmoduleConflict},
+	{"removal from beta", func(t *testing.T, transport gitSubmoduleTransport) {
+		testGitSubmoduleRemoval(t, transport, true)
+	}},
+	{"removal from alpha", func(t *testing.T, transport gitSubmoduleTransport) {
+		testGitSubmoduleRemoval(t, transport, false)
+	}},
+	{"dangling .git file", testGitSubmoduleDanglingGitfile},
+	{"empty directory", testGitSubmoduleEmptyDirectory},
+	{"replaced directory", testGitSubmoduleReplacedDirectory},
+}
+
+// testGitSubmoduleClone tests that a submodule reaches an endpoint without it
+// through a clone, without anything of the superproject's repository.
+func testGitSubmoduleClone(t *testing.T, transport gitSubmoduleTransport, betaMissing bool) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{betaMissing: betaMissing})
+	f.flush()
+
+	// Verify the content on beta, which is an independent repository.
+	f.verifyFollowing(f.upstream.first)
+	f.expect(f.beta, map[string]string{"top": "top", "sub/file": "first"})
+	f.expectMissing(f.beta, ".git")
+	if info, err := os.Lstat(filepath.Join(f.follower, ".git")); err != nil {
+		t.Error("unable to query clone's .git:", err)
+	} else if !info.IsDir() {
+		t.Error("clone's .git isn't a directory")
+	}
+	if contents, err := os.ReadFile(filepath.Join(f.beta, ".gitmodules")); err != nil {
+		t.Error(".gitmodules wasn't synchronized:", err)
+	} else if !strings.Contains(string(contents), f.upstream.url) {
+		t.Errorf("incorrect .gitmodules contents: %s", contents)
+	}
+	if url := gitModeRun(t, f.follower, "config", "--get", "remote.origin.url"); url != f.upstream.url {
+		t.Errorf("incorrect origin for clone: %s", url)
+	}
+
+	// Alpha hasn't changed.
+	f.verifyAlphaAt(f.upstream.first)
+
+	// The session has settled, with nothing to report.
+	before := f.state()
+	if len(before.AlphaState.ScanProblems) != 0 || len(before.BetaState.ScanProblems) != 0 {
+		t.Errorf("unexpected problems: %v, %v", before.AlphaState.ScanProblems, before.BetaState.ScanProblems)
+	}
+	f.flush()
+	if after := f.state(); after.SuccessfulCycles != before.SuccessfulCycles+1 {
+		t.Errorf("session hasn't settled: %d cycles after %d", after.SuccessfulCycles, before.SuccessfulCycles)
+	}
+	f.verifyRemote(transport)
+}
+
+// testGitSubmodulePushedCommits tests that pushed commits are followed from
+// either endpoint, whether or not the endpoint's repository is part of a
+// superproject.
+func testGitSubmodulePushedCommits(t *testing.T, transport gitSubmoduleTransport) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{})
+	f.flush()
+	f.verifyFollowing(f.upstream.first)
+
+	// A commit on alpha is followed on beta.
+	second := gitModeCommit(t, f.leader, "second", "second")
+	gitModePush(t, f.leader, "main")
+	f.flush()
+	f.verifyFollowing(second)
+	f.expect(f.beta, map[string]string{"sub/second": "second"})
+	f.verifyAlphaAt(second)
+
+	// A commit on beta is followed on alpha, on a branch other than the
+	// default.
+	third := gitModeCommit(t, f.follower, "third", "third")
+	gitModePush(t, f.follower, "work")
+	f.flush()
+	f.verifyAlphaAt(third)
+	f.expect(f.alpha, map[string]string{"sub/third": "third"})
+	f.verifyFollowing(third)
+
+	// What a session does to a submodule is a detached HEAD.
+	if head := gitModeRun(t, f.leader, "rev-parse", "--abbrev-ref", "HEAD"); head != "HEAD" {
+		t.Errorf("HEAD isn't detached on alpha: %s", head)
+	}
+
+	// Going back to an earlier commit is a change like any other.
+	gitModeRun(t, f.leader, "checkout", "--quiet", "--detach", second)
+	f.flush()
+	f.verifyFollowing(second)
+}
+
+// testGitSubmoduleOneWay tests that commits go only from alpha to beta in a
+// session with a one-way mode.
+func testGitSubmoduleOneWay(t *testing.T, transport gitSubmoduleTransport) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{mode: core.SynchronizationMode_SynchronizationModeOneWayReplica})
+	f.flush()
+	f.verifyFollowing(f.upstream.first)
+
+	// A commit on alpha is followed on beta.
+	second := gitModeCommit(t, f.leader, "second", "second")
+	gitModePush(t, f.leader, "main")
+	f.flush()
+	f.verifyFollowing(second)
+
+	// A different commit on beta is replaced by alpha's commit.
+	third := gitModeCommit(t, f.follower, "third", "third")
+	gitModePush(t, f.follower, "work")
+	f.flush()
+	f.verifyAlphaAt(second)
+	if head := gitModeHead(t, f.follower); head != second {
+		t.Errorf("commit on beta wasn't replaced: %s instead of %s (with %s created there)", head, second, third)
+	}
+}
+
+// testGitSubmoduleUnpushedCommit tests that a commit that isn't available to
+// the other endpoint is reported, that it doesn't prevent anything else, and
+// that pushing it takes effect at the next synchronization.
+func testGitSubmoduleUnpushedCommit(t *testing.T, transport gitSubmoduleTransport) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{})
+	f.flush()
+
+	// A commit that hasn't been pushed doesn't reach beta, and it's reported
+	// there, while what else there is to synchronize goes ahead.
+	unpushed := gitModeCommit(t, f.leader, "second", "second")
+	f.write(f.alpha, map[string]string{"added": "added"})
+	state := f.flushAllowingProblems()
+	gitModeProblem(t, state.BetaState.TransitionProblems, "sub", unpushed[:12], "isn't available from "+f.upstream.url, "push it")
+	if len(state.Conflicts) != 0 {
+		t.Errorf("unexpected conflicts: %v", state.Conflicts)
+	}
+	f.verifyFollowing(f.upstream.first)
+	f.verifyAlphaAt(unpushed)
+	f.expect(f.beta, map[string]string{"added": "added"})
+
+	// Commands still run, with the problem reported to the user.
+	f.verifyRemote(transport, "isn't available from", "push it")
+
+	// The next synchronization reports the same thing, but does nothing else.
+	state = f.flushAllowingProblems()
+	gitModeProblem(t, state.BetaState.TransitionProblems, "sub", "isn't available from")
+	f.verifyFollowing(f.upstream.first)
+
+	// Once it's pushed, the next synchronization fetches it.
+	gitModePush(t, f.leader, "main")
+	f.flush()
+	f.verifyFollowing(unpushed)
+	f.expect(f.beta, map[string]string{"sub/second": "second"})
+	f.verifyRemote(transport)
+}
+
+// testGitSubmoduleDirty tests that uncommitted changes in a submodule result in
+// a warning on the endpoint with those changes, without being synchronized.
+func testGitSubmoduleDirty(t *testing.T, transport gitSubmoduleTransport) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{})
+	f.flush()
+	f.verifyRemote(transport)
+
+	// verifyWarning verifies the warning, along with what isn't warned about.
+	verifyWarning := func(warned, other []*core.Problem) {
+		t.Helper()
+		if problem := gitModeProblem(t, warned, "sub", "uncommitted changes", "commit and push"); !problem.Warning {
+			t.Error("uncommitted changes aren't reported as a warning")
+		}
+		if len(other) != 0 {
+			t.Errorf("unexpected problems: %v", other)
+		}
+	}
+
+	// Verify the warning for alpha.
+	f.write(f.leader, map[string]string{"untracked": "untracked"})
+	f.flush()
+	state := f.state()
+	verifyWarning(state.AlphaState.ScanProblems, state.BetaState.ScanProblems)
+	f.expectMissing(f.beta, "sub/untracked")
+	f.verifyRemote(transport, "uncommitted changes")
+
+	// It's gone once they are.
+	f.remove(f.leader, "untracked")
+	f.flush()
+	state = f.state()
+	if len(state.AlphaState.ScanProblems) != 0 {
+		t.Errorf("unexpected problems: %v", state.AlphaState.ScanProblems)
+	}
+
+	// Verify the warning for beta, where the repository has a different
+	// structure.
+	f.write(f.follower, map[string]string{"file": "modified"})
+	f.flush()
+	state = f.state()
+	verifyWarning(state.BetaState.ScanProblems, state.AlphaState.ScanProblems)
+	f.expect(f.alpha, map[string]string{"sub/file": "first"})
+	f.verifyRemote(transport, "uncommitted changes")
+}
+
+// testGitSubmoduleConflict tests that different new commits on the endpoints
+// are a conflict, that remote can't resolve it, and that it's over once they
+// match.
+func testGitSubmoduleConflict(t *testing.T, transport gitSubmoduleTransport) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{})
+	f.flush()
+
+	// Create different commits, which both endpoints could obtain.
+	alphaCommit := gitModeCommit(t, f.leader, "alpha", "alpha")
+	gitModePush(t, f.leader, "alpha")
+	betaCommit := gitModeCommit(t, f.follower, "beta", "beta")
+	gitModePush(t, f.follower, "beta")
+
+	// There's a conflict, and neither moves.
+	state := f.flushAllowingProblems()
+	if len(state.Conflicts) != 1 || state.Conflicts[0].Root != "sub" {
+		t.Fatalf("incorrect conflicts: %v", state.Conflicts)
+	}
+	if len(state.AlphaState.TransitionProblems) != 0 || len(state.BetaState.TransitionProblems) != 0 {
+		t.Errorf("unexpected problems: %v, %v", state.AlphaState.TransitionProblems, state.BetaState.TransitionProblems)
+	}
+	f.verifyAlphaAt(alphaCommit)
+	f.verifyFollowing(betaCommit)
+
+	// It's listed, with no way of resolving it using remote.
+	var commands *conflictCommands
+	if transport.commands {
+		commands = &conflictCommands{t: t, directory: f.alpha}
+		listing := commands.list()
+		if len(listing.Conflicts) != 1 {
+			t.Fatalf("incorrect listing: %+v", listing)
+		}
+		conflict := listing.Conflicts[0]
+		if conflict.Path != "sub" || conflict.Resolvable || conflict.Files || len(conflict.Take) != 0 {
+			t.Errorf("incorrect conflict: %+v", conflict)
+		}
+		commands.fail("isn't a conflict that remote can resolve", "--conflict-checkout", "sub")
+		commands.fail("isn't a conflict that remote can resolve", "--conflict-apply", "--take", "local", "sub")
+	}
+
+	// Commands still run.
+	f.verifyRemote(transport)
+
+	// Check out the same commit on both endpoints.
+	gitModeRun(t, f.follower, "fetch", "--quiet", "origin", "alpha")
+	gitModeRun(t, f.follower, "checkout", "--quiet", "--detach", alphaCommit)
+	f.flush()
+	f.verifyAlphaAt(alphaCommit)
+	f.verifyFollowing(alphaCommit)
+	if commands != nil {
+		if listing := commands.list(); len(listing.Conflicts) != 0 {
+			t.Errorf("conflict remains: %+v", listing)
+		}
+	}
+
+	// The session continues as usual.
+	second := gitModeCommit(t, f.leader, "second", "second")
+	gitModePush(t, f.leader, "main")
+	f.flush()
+	f.verifyFollowing(second)
+}
+
+// testGitSubmoduleRemoval tests that a submodule that's removed from an
+// endpoint isn't removed from the other, which reports it, until that's done by
+// hand.
+func testGitSubmoduleRemoval(t *testing.T, transport gitSubmoduleTransport, removeFromBeta bool) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{})
+	f.flush()
+	removed, kept := f.leader, f.follower
+	if removeFromBeta {
+		removed, kept = f.follower, f.leader
+	}
+	if err := os.RemoveAll(removed); err != nil {
+		t.Fatal(err)
+	}
+
+	// It's reported, but not removed, including in further cycles.
+	for i := 0; i < 2; i++ {
+		state := f.flushAllowingProblems()
+		problems := state.BetaState.TransitionProblems
+		if removeFromBeta {
+			problems = state.AlphaState.TransitionProblems
+		}
+		gitModeProblem(t, problems, "sub", "isn't removed automatically")
+		if len(state.Conflicts) != 0 {
+			t.Errorf("unexpected conflicts: %v", state.Conflicts)
+		}
+		if head := gitModeHead(t, kept); head != f.upstream.first {
+			t.Errorf("incorrect commit in submodule: %s != %s", head, f.upstream.first)
+		}
+		if contents, err := os.ReadFile(filepath.Join(kept, "file")); err != nil || string(contents) != "first" {
+			t.Errorf("submodule's content changed: %q, %v", contents, err)
+		}
+		if _, err := os.Lstat(removed); !os.IsNotExist(err) {
+			t.Errorf("submodule came back: %v", err)
+		}
+	}
+
+	// Commands still run.
+	f.verifyRemote(transport, "isn't removed automatically")
+
+	// Removing it by hand ends that.
+	if err := os.RemoveAll(kept); err != nil {
+		t.Fatal(err)
+	}
+	f.flush()
+	f.expectMissing(f.alpha, "sub")
+	f.expectMissing(f.beta, "sub")
+	f.verifyRemote(transport)
+}
+
+// testGitSubmoduleDanglingGitfile tests what's left by a session that didn't
+// use Git mode, which is a directory on the other endpoint with a copy of the
+// .git file that doesn't point to anything: it's reported, it stays until it's
+// been removed by hand, and then it's filled in.
+func testGitSubmoduleDanglingGitfile(t *testing.T, transport gitSubmoduleTransport) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{beta: map[string]string{
+		"sub/.git":  "gitdir: ../.git/modules/sub\n",
+		"sub/file":  "first",
+		"sub/local": "local",
+	}})
+	state := f.flushAllowingProblems()
+	gitModeProblem(t, state.BetaState.ScanProblems, "sub", "isn't a valid repository", "remove the directory")
+
+	// Nothing has been touched, and what else there is has been synchronized.
+	f.expect(f.beta, map[string]string{"sub/.git": "gitdir: ../.git/modules/sub\n", "sub/file": "first", "sub/local": "local", "top": "top"})
+	f.verifyAlphaAt(f.upstream.first)
+	f.verifyRemote(transport, "remove the directory")
+
+	// That's still the case at the next synchronization.
+	state = f.flushAllowingProblems()
+	gitModeProblem(t, state.BetaState.ScanProblems, "sub", "remove the directory")
+	f.expect(f.beta, map[string]string{"sub/local": "local"})
+
+	// Following those instructions gives the expected result.
+	if err := os.RemoveAll(f.follower); err != nil {
+		t.Fatal(err)
+	}
+	f.flush()
+	f.verifyFollowing(f.upstream.first)
+	f.verifyAlphaAt(f.upstream.first)
+	if state = f.state(); len(state.BetaState.ScanProblems) != 0 {
+		t.Errorf("unexpected problems: %v", state.BetaState.ScanProblems)
+	}
+}
+
+// testGitSubmoduleEmptyDirectory tests that an empty directory is filled by a
+// clone, without any conflict, as for a superproject whose submodules haven't
+// been initialized or have been deinitialized, including when that's the one
+// with a repository already.
+func testGitSubmoduleEmptyDirectory(t *testing.T, transport gitSubmoduleTransport) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{
+		beta: map[string]string{"top": "top"},
+	})
+	if err := os.Mkdir(f.follower, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f.flush()
+	f.verifyFollowing(f.upstream.first)
+	f.verifyAlphaAt(f.upstream.first)
+
+	// The other direction, by way of the corresponding Git command. The result
+	// is a plain clone in the superproject, since the superproject wasn't
+	// involved.
+	gitModeRun(t, f.alpha, "submodule", "--quiet", "deinit", "--force", "--", "sub")
+	if entries, err := os.ReadDir(f.leader); err != nil || len(entries) != 0 {
+		t.Fatalf("submodule directory isn't empty: %v, %v", entries, err)
+	}
+	f.flush()
+	if head := gitModeHead(t, f.leader); head != f.upstream.first {
+		t.Errorf("incorrect commit on alpha: %s != %s", head, f.upstream.first)
+	}
+	f.expect(f.alpha, map[string]string{"sub/file": "first"})
+	f.verifyFollowing(f.upstream.first)
+}
+
+// testGitSubmoduleReplacedDirectory tests that a submodule that can't be
+// fetched doesn't replace a directory that's been deleted on the other
+// endpoint, and that it does so as soon as it can be fetched. Content is at
+// stake, since this is a case where the session has decided to replace it.
+func testGitSubmoduleReplacedDirectory(t *testing.T, transport gitSubmoduleTransport) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{})
+	f.flush()
+
+	// Make the content on beta an ordinary directory, as far as the session
+	// knows. To do that in a way that doesn't involve the submodule, make
+	// alpha's ordinary as well, by removing their repositories.
+	if err := os.Remove(filepath.Join(f.leader, ".git")); err != nil {
+		t.Fatal(err)
+	} else if err := os.RemoveAll(filepath.Join(f.follower, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	f.flush()
+	f.expect(f.beta, map[string]string{"sub/file": "first"})
+	f.expect(f.alpha, map[string]string{"sub/file": "first"})
+
+	// Turn alpha's directory into a submodule for a commit that isn't
+	// available.
+	if err := os.RemoveAll(f.leader); err != nil {
+		t.Fatal(err)
+	}
+	gitModeRun(t, f.alpha, "clone", "--quiet", f.upstream.url, "sub")
+	unpushed := gitModeCommit(t, f.leader, "second", "second")
+	state := f.flushAllowingProblems()
+	gitModeProblem(t, state.BetaState.TransitionProblems, "sub", "isn't available from", "push it")
+
+	// The content remains in place, without any trace of the attempt.
+	f.expect(f.beta, map[string]string{"sub/file": "first"})
+	f.expectMissing(f.beta, "sub/.git", "sub/second")
+	if entries, err := os.ReadDir(f.beta); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), filesystem.TemporaryNamePrefix) {
+				t.Error("temporary content left behind:", entry.Name())
+			}
+		}
+	}
+
+	// Once it's available, it takes the directory's place.
+	gitModePush(t, f.leader, "main")
+	f.flush()
+	f.verifyFollowing(unpushed)
+	f.expect(f.beta, map[string]string{"sub/second": "second"})
+}
+
+// testGitSubmoduleNoHotLoop tests that failure to fetch a commit or to perform
+// a clone doesn't result in further synchronization cycles, without any
+// changes, in a session that's watching for changes.
+func testGitSubmoduleNoHotLoop(t *testing.T, transport gitSubmoduleTransport, watchMode synchronization.WatchMode, clone bool) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{watch: true, watchMode: watchMode})
+	deadline := time.Now().Add(time.Minute)
+	for {
+		if _, err := os.Stat(filepath.Join(f.follower, "file")); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for clone:", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Create a commit that can't be obtained, and wait for that to be reported.
+	// The session wakes up on its own, since it's watching for changes.
+	unpushed := gitModeCommit(t, f.leader, "second", "second")
+	reported := func(state *synchronization.State) bool {
+		for _, problem := range state.BetaState.TransitionProblems {
+			if problem.Path == "sub" && strings.Contains(problem.Error, "isn't available from") {
+				return true
+			}
+		}
+		return false
+	}
+	state := f.waitForState(reported)
+
+	// If the attempt should be a clone, then replace the submodule on beta with
+	// an empty directory, which the session tries to fill. That creates a
+	// temporary directory in a directory that can be watched, which has to be
+	// disregarded.
+	if clone {
+		if err := os.RemoveAll(f.follower); err != nil {
+			t.Fatal(err)
+		} else if err := os.Mkdir(f.follower, 0700); err != nil {
+			t.Fatal(err)
+		}
+		before := state.SuccessfulCycles
+		state = f.waitForState(func(state *synchronization.State) bool {
+			return state.SuccessfulCycles > before && reported(state)
+		})
+	}
+
+	// Wait for the session to become idle, which takes longer than the polling
+	// interval. We can't observe idleness directly, so we watch the number of
+	// synchronization cycles, and there's only a limited number of them to
+	// allow before deciding that the session isn't going to become idle.
+	idleWindow := 2500 * time.Millisecond
+	cycles := state.SuccessfulCycles
+	for attempts, settled := 0, false; !settled; attempts++ {
+		if attempts == 4 {
+			t.Fatalf("session isn't becoming idle after a failure: %d cycles after %d", f.state().SuccessfulCycles, state.SuccessfulCycles)
+		}
+		time.Sleep(idleWindow)
+		current := f.state().SuccessfulCycles
+		settled = current == cycles
+		cycles = current
+	}
+
+	// Verify that it stays that way.
+	time.Sleep(idleWindow)
+	state = f.state()
+	if state.SuccessfulCycles != cycles {
+		t.Errorf("session woken after a failure: %d cycles after %d", state.SuccessfulCycles, cycles)
+	}
+	if !reported(state) {
+		t.Error("problem is no longer reported:", state.BetaState.TransitionProblems)
+	}
+	if clone {
+		if entries, err := os.ReadDir(f.follower); err != nil || len(entries) != 0 {
+			t.Errorf("directory that couldn't be filled has changed: %v, %v", entries, err)
+		}
+	}
+
+	// It isn't stuck, though: a push takes effect at the next synchronization.
+	gitModePush(t, f.leader, "main")
+	f.flush()
+	f.verifyFollowing(unpushed)
+}
+
+// gitSubmoduleWatchModes describes the watch modes for tests with sessions that
+// are watching for changes. Each endpoint picks the kind of watching that's
+// available on its system, so the portable mode is either recursive or
+// non-recursive watching, the other of which can only be skipped.
+var gitSubmoduleWatchModes = []struct {
+	// name is the name of the mode.
+	name string
+	// mode is the watch mode for a session.
+	mode synchronization.WatchMode
+	// recursive indicates whether or not recursive watching is required, or,
+	// otherwise, that its absence is required, if the mode is the portable
+	// mode.
+	recursive bool
+}{
+	{name: "poll", mode: synchronization.WatchMode_WatchModeForcePoll},
+	{name: "non-recursive", mode: synchronization.WatchMode_WatchModePortable},
+	{name: "recursive", mode: synchronization.WatchMode_WatchModePortable, recursive: true},
+}
+
+// runGitSubmoduleNoHotLoop runs testGitSubmoduleNoHotLoop for each of the watch
+// modes that are possible on this system.
+func runGitSubmoduleNoHotLoop(t *testing.T, transport gitSubmoduleTransport) {
+	for _, mode := range gitSubmoduleWatchModes {
+		for _, attempt := range []struct {
+			name  string
+			clone bool
+		}{{"fetch", false}, {"clone", true}} {
+			t.Run(mode.name+"/"+attempt.name, func(t *testing.T) {
+				if mode.mode == synchronization.WatchMode_WatchModePortable && mode.recursive != watching.RecursiveWatchingSupported {
+					t.Skip("this kind of watching isn't what this system uses")
+				}
+				testGitSubmoduleNoHotLoop(t, transport, mode.mode, attempt.clone)
+			})
+		}
+	}
+}
+
+// TestGitModeSubmodules runs the scenarios for submodules between local
+// endpoints and through the remote endpoint implementation, the latter of which
+// also supports remote commands.
+func TestGitModeSubmodules(t *testing.T) {
+	isolateGitMode(t)
+	transports := []struct {
+		name      string
+		transport gitSubmoduleTransport
+	}{
+		{"local", gitSubmoduleTransport{}},
+		{"remote endpoint", gitSubmoduleTransport{
+			commands: true,
+			configure: func(options *gitModeOptions) {
+				options.remoteBeta = true
+				options.commands = synchronization.RemoteCommandMode_RemoteCommandModeBeta
+			},
+		}},
+	}
+	for _, transport := range transports {
+		for _, scenario := range gitSubmoduleScenarios {
+			t.Run(transport.name+"/"+scenario.name, func(t *testing.T) {
+				if transport.transport.commands && runtime.GOOS == "windows" {
+					t.Skip("commands require a POSIX shell")
+				}
+				scenario.run(t, transport.transport)
+			})
+		}
+	}
+}
+
+// TestGitModeSubmoduleNoHotLoop tests that failures don't cause hot loops.
+func TestGitModeSubmoduleNoHotLoop(t *testing.T) {
+	isolateGitMode(t)
+	runGitSubmoduleNoHotLoop(t, gitSubmoduleTransport{})
+}
+
+// gitSubmoduleStarOptions describes how a star reaches its nodes.
+type gitSubmoduleStarOptions struct {
+	// manager is the session manager.
+	manager *synchronization.Manager
+	// base is a directory for the star's center, which is a project directory.
+	base string
+	// endpoints are the URLs of the server and gpu nodes.
+	endpoints map[string]string
+	// roots are the roots of the server and gpu nodes on this system.
+	roots map[string]string
+	// adjust adjusts session specifications before sessions are created.
+	adjust func(*project.SessionSpecifications)
+}
+
+// testGitSubmoduleStar tests submodules in a star with its nodes around a local
+// center that has the submodule: each node has its own clone, and each edge
+// fetches commits on its own, with the center passing on commits from the
+// nodes.
+func testGitSubmoduleStar(t *testing.T, options gitSubmoduleStarOptions) {
+	upstream := newGitModeUpstream(t)
+	center := filepath.Join(options.base, "center")
+	if err := os.Mkdir(center, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range options.roots {
+		if err := os.Mkdir(root, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(center, "top"), []byte("top"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitModeRun(t, center, "init", "--quiet", "--initial-branch=main")
+	gitModeRun(t, center, "submodule", "add", "--quiet", upstream.url, "sub")
+	gitModeRun(t, center, "commit", "--quiet", "--no-gpg-sign", "-m", "add submodule")
+
+	// Expand and create the star.
+	path := filepath.Join(options.base, "mutagen.yml")
+	config := fmt.Sprintf(`star:
+  remote: true
+  sync:
+    git: enabled
+    watch: {mode: no-watch}
+  center: local
+  nodes:
+    local: {endpoint: ./center}
+    server: {endpoint: %q}
+    gpu: {endpoint: %q, mode: one-way-safe}
+`, options.endpoints["server"], options.endpoints["gpu"])
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(options.base)
+	configuration, err := project.LoadConfiguration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specifications, err := project.NewSessionSpecifications(configuration, nil, "star-git", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.adjust != nil {
+		options.adjust(specifications)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	var identifiers []string
+	for _, s := range specifications.Synchronization {
+		id, err := options.manager.Create(ctx, s.Alpha, s.Beta, s.Configuration, s.ConfigurationAlpha, s.ConfigurationBeta, s.Name, s.Labels, s.Star, false, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		identifiers = append(identifiers, id)
+		logSessionOnFailure(t, id)
+	}
+	all := &selection.Selection{Specifications: identifiers}
+	t.Cleanup(func() { options.manager.Terminate(context.Background(), all, "") })
+
+	// flush flushes the star's sessions, returning its states, once it has
+	// allowed for commits having to go through the center to reach another
+	// node.
+	flush := func() []*synchronization.State {
+		t.Helper()
+		for i := 0; i < 2; i++ {
+			if err := options.manager.Flush(ctx, all, "", false); err != nil {
+				t.Fatal("unable to flush star:", err)
+			}
+		}
+		_, states, err := options.manager.List(ctx, all, 0)
+		if err != nil {
+			t.Fatal("unable to list star's sessions:", err)
+		}
+		return states
+	}
+	verifyHeads := func(commit string) {
+		t.Helper()
+		if head := gitModeHead(t, filepath.Join(center, "sub")); head != commit {
+			t.Errorf("incorrect commit on center: %s != %s", head, commit)
+		}
+		for name, root := range options.roots {
+			if head := gitModeHead(t, filepath.Join(root, "sub")); head != commit {
+				t.Errorf("incorrect commit on %s: %s != %s", name, head, commit)
+			}
+		}
+	}
+
+	// Wait for the synchronization loops to start, since a session only accepts
+	// flush requests once it has.
+	for {
+		_, states, err := options.manager.List(ctx, all, 0)
+		if err != nil {
+			t.Fatal("unable to list star's sessions:", err)
+		}
+		ready := len(states) == 2
+		for _, state := range states {
+			ready = ready && state.Status >= synchronization.Status_Watching
+		}
+		if ready {
+			break
+		} else if ctx.Err() != nil {
+			t.Fatal("timed out waiting for star:", states)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// A flush provides each node with its own clone.
+	for _, state := range flush() {
+		if len(state.AlphaState.TransitionProblems) != 0 || len(state.BetaState.TransitionProblems) != 0 || len(state.Conflicts) != 0 {
+			t.Errorf("unexpected problems: %v, %v, %v", state.AlphaState.TransitionProblems, state.BetaState.TransitionProblems, state.Conflicts)
+		}
+	}
+	verifyHeads(upstream.first)
+	for name, root := range options.roots {
+		if contents, err := os.ReadFile(filepath.Join(root, "top")); err != nil || string(contents) != "top" {
+			t.Errorf("incorrect content on %s: %q, %v", name, contents, err)
+		}
+		if _, err := os.Lstat(filepath.Join(root, ".git")); !os.IsNotExist(err) {
+			t.Errorf("superproject's repository reached %s: %v", name, err)
+		}
+		if info, err := os.Lstat(filepath.Join(root, "sub", ".git")); err != nil || !info.IsDir() {
+			t.Errorf("no clone on %s: %v, %v", name, info, err)
+		}
+	}
+
+	// Pushed commits go from the center to the nodes.
+	second := gitModeCommit(t, filepath.Join(center, "sub"), "second", "second")
+	gitModePush(t, filepath.Join(center, "sub"), "main")
+	flush()
+	verifyHeads(second)
+
+	// They also go from a node to the center, and from there to the other node.
+	third := gitModeCommit(t, filepath.Join(options.roots["server"], "sub"), "third", "third")
+	gitModePush(t, filepath.Join(options.roots["server"], "sub"), "main")
+	flush()
+	verifyHeads(third)
+
+	// A commit that's not available is reported on each edge, but it doesn't
+	// stop commands from running on nodes, including in the submodule's
+	// directory.
+	unpushed := gitModeCommit(t, filepath.Join(center, "sub"), "fourth", "fourth")
+	states := flush()
+	for _, state := range states {
+		gitModeProblem(t, state.BetaState.TransitionProblems, "sub", "isn't available from "+upstream.url, "push it")
+	}
+	code, output, diagnostics := runRemote(t, filepath.Join(center, "sub"), "--timeout", "30s", "--node", "server", "cat", "third")
+	if code != 0 || output != "third" || !strings.Contains(diagnostics, "isn't available from") {
+		t.Errorf("command on node failed: %d: %q: %s", code, output, diagnostics)
+	}
+
+	// Once it's pushed, it's fetched by each node.
+	gitModePush(t, filepath.Join(center, "sub"), "main")
+	flush()
+	verifyHeads(unpushed)
+}
+
+// TestGitModeSubmoduleStar tests submodules in a star whose nodes are reached
+// through the remote endpoint implementation.
+func TestGitModeSubmoduleStar(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("commands require a POSIX shell")
+	}
+	isolateGitMode(t)
+
+	// Use a short directory for the data directory, which keeps the registries'
+	// socket paths within Unix limits (see newFakeSSHSystem).
+	base, err := os.MkdirTemp("/tmp", "mgs-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	if base, err = filepath.EvalSymlinks(base); err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(base, "data")
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
+	manager, err := synchronization.NewManager(logging.NewLogger(logging.LevelDebug, &synchronizationLog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(manager.Shutdown)
+	server, gpu := filepath.Join(base, "server"), filepath.Join(base, "gpu")
+	testGitSubmoduleStar(t, gitSubmoduleStarOptions{
+		manager:   manager,
+		base:      base,
+		endpoints: map[string]string{"server": "./server", "gpu": "./gpu"},
+		roots:     map[string]string{"server": server, "gpu": gpu},
+		adjust: func(specifications *project.SessionSpecifications) {
+			for _, s := range specifications.Synchronization {
+				if s.Beta.Path == server || s.Beta.Path == gpu {
+					s.Beta.Protocol = netpipe.Protocol_Netpipe
+				}
+			}
+		},
+	})
 }
 
 // TestGitModeTrackedIgnoredWarnings tests that files that are tracked by Git

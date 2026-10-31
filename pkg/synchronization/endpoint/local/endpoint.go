@@ -100,6 +100,10 @@ type endpoint struct {
 	// gitMode indicates whether or not the session is in Git mode. This field
 	// is static and thus safe for concurrent reads.
 	gitMode bool
+	// gitProvider is the provider used to operate on submodules, which is only
+	// set in Git mode. This field is static and the provider is safe for
+	// concurrent usage.
+	gitProvider core.GitProvider
 	// scope is the registration of the content that the endpoint synchronizes
 	// (see remote.RegisterScope), or nil if it couldn't be registered. This
 	// field is static and thus safe for concurrent reads.
@@ -299,8 +303,13 @@ func NewEndpoint(
 		return nil, err
 	}
 
-	// Determine whether or not the session is in Git mode.
+	// Determine whether or not the session is in Git mode and, if so, create
+	// the provider that's used to operate on submodules.
 	gitMode := synchronization.GitModeEnabled(configuration, version)
+	var gitProvider core.GitProvider
+	if gitMode {
+		gitProvider = newGitProvider(logger)
+	}
 
 	// Track whether or not any non-default ownership or directory permissions
 	// are set. We don't care about non-default file permissions since we're
@@ -476,6 +485,7 @@ func NewEndpoint(
 		defaultDirectoryMode:         defaultDirectoryMode,
 		defaultOwnership:             defaultOwnership,
 		gitMode:                      gitMode,
+		gitProvider:                  gitProvider,
 		scope:                        scope,
 		workerCancel:                 workerCancel,
 		saveCacheSignal:              saveCacheSignal,
@@ -782,7 +792,11 @@ func (e *endpoint) watchPoll(ctx context.Context, pollingInterval uint32, nonRec
 		// logging, then perform a full diff to determine what's changed. This
 		// will let us determine the most recently updated paths that we should
 		// watch, as well as establish those watches. Any watch establishment
-		// errors will be reported on the watch errors channel.
+		// errors will be reported on the watch errors channel. We don't watch
+		// submodules, since a watch on their directories wouldn't see their
+		// commits change (their HEADs are in their Git directories, which are
+		// usually elsewhere), so these changes are seen by the next scan, which
+		// probes them again, at the latest one polling interval later.
 		if watcher != nil || logger.Level() >= logging.LevelTrace {
 			changes := core.Diff(previous.Content, snapshot.Content)
 			for _, change := range changes {
@@ -1030,16 +1044,34 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 	}
 
 	// Perform a full (warm) scan, watching for errors.
-	snapshot, newCache, newIgnoreCache, err := core.Scan(
-		ctx,
-		e.root,
-		baseline, recheckPaths,
-		e.hasher, e.cache,
-		ignorer, ignoreCache,
-		e.probeMode,
-		e.symbolicLinkMode,
-		e.permissionsMode,
-	)
+	var snapshot *core.Snapshot
+	var newCache *core.Cache
+	var newIgnoreCache ignore.IgnoreCache
+	var err error
+	if e.gitMode {
+		snapshot, newCache, newIgnoreCache, err = core.ScanGitMode(
+			ctx,
+			e.root,
+			baseline, recheckPaths,
+			e.hasher, e.cache,
+			ignorer, ignoreCache,
+			e.probeMode,
+			e.symbolicLinkMode,
+			e.permissionsMode,
+			e.gitProvider,
+		)
+	} else {
+		snapshot, newCache, newIgnoreCache, err = core.Scan(
+			ctx,
+			e.root,
+			baseline, recheckPaths,
+			e.hasher, e.cache,
+			ignorer, ignoreCache,
+			e.probeMode,
+			e.symbolicLinkMode,
+			e.permissionsMode,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -1364,6 +1396,22 @@ func (e *endpoint) Supply(paths []string, signatures []*rsync.Signature, receive
 // endpoint's transition parameters. It returns the results of core.Transition.
 // It doesn't require the scan lock (see Transition).
 func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool) {
+	if e.gitMode {
+		return core.TransitionGitMode(
+			ctx,
+			e.root,
+			transitions,
+			e.lastReturnedScanCache,
+			e.transitionHasher,
+			e.symbolicLinkMode,
+			e.defaultFileMode,
+			e.defaultDirectoryMode,
+			e.defaultOwnership,
+			e.lastReturnedScanSnapshotDecomposesUnicode,
+			e.stager,
+			e.gitProvider,
+		)
+	}
 	return core.Transition(
 		ctx,
 		e.root,

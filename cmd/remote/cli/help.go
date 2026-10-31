@@ -185,15 +185,17 @@ between a star's center and one of its nodes:
     compares the commits that submodules have checked out, in the direction
     of its mode (in two-way modes, a commit checked out on either endpoint
     moves the other to it, on a detached HEAD), and each endpoint fetches
-    missing commits from the repository's URL itself, so it needs git,
-    network access, and read access there. A large first clone delays the
-    session's synchronization, and so remote's flushes. An empty directory is
-    filled in, and nothing removes a submodule automatically. Commands run in
-    submodules' directories as in others, and --pull copies content beneath a
-    submodule, which isn't synchronized file by file, but not the submodule
+    missing commits from the repository's URL itself, so it needs git 2.29 or
+    newer, network access, and read access there. A large first clone delays
+    the session's synchronization, and so remote's flushes. An empty directory
+    is filled in, and nothing removes a submodule automatically. Commands run
+    in submodules' directories as in others, and --pull copies content beneath
+    a submodule, which isn't synchronized file by file, but not the submodule
     itself. After synchronizing, remote warns, without preventing commands,
     about submodules with uncommitted changes, which the other endpoint
-    doesn't get, and about commits it can't fetch, such as unpushed ones.
+    doesn't get, about commits it can't fetch, such as unpushed ones, and about
+    a .git that isn't a valid repository, whose directory isn't synchronized
+    until it's removed.
   - --pull preserves regular files' modification times, including files in
     directories, truncated to whole seconds, so copies are never newer than
     their sources. Times use the executing endpoint's clock; clock skew is

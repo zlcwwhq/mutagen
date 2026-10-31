@@ -3,6 +3,7 @@ package local
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,9 +12,12 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 )
@@ -848,5 +852,1399 @@ func TestGitWarningsUnusualNames(t *testing.T) {
 	})
 	if len(warnings) != 1 || warnings[0].Path != composed || strings.Contains(warnings[0].Error, "whole directory") {
 		t.Errorf("incorrect warnings for decomposed name: %v", warnings)
+	}
+}
+
+// gitUpstream is a bare repository for tests to clone and fetch from using a
+// file URL, along with a working copy for creating commits in it.
+type gitUpstream struct {
+	// t is the test.
+	t *testing.T
+	// bare is the path to the bare repository.
+	bare string
+	// url is the URL of the bare repository.
+	url string
+	// work is the path to the working copy.
+	work string
+	// head is the hexadecimal identifier of the commit most recently created.
+	head string
+}
+
+// isolateGit sets up the environment of Git commands for a test, enabling the
+// file transport and insulating them from the user's configuration, such as
+// commit signing.
+func isolateGit(t *testing.T) {
+	t.Helper()
+	requireGit(t)
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_AUTHOR_NAME", "test")
+	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.org")
+	t.Setenv("GIT_COMMITTER_NAME", "test")
+	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.org")
+}
+
+// mustGit runs a Git command that must succeed and returns its trimmed output.
+func mustGit(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	output, err := runGit(directory, args...)
+	if err != nil {
+		t.Fatalf("unable to run Git with arguments %v: %v", args, err)
+	}
+	return output
+}
+
+// fileURL returns the file URL for a path.
+func fileURL(path string) string {
+	path = filepath.ToSlash(path)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return "file://" + path
+}
+
+// newGitUpstream creates an upstream repository with a single commit that has
+// been pushed. The name distinguishes it from other upstreams in the same test.
+func newGitUpstream(t *testing.T, name string) *gitUpstream {
+	t.Helper()
+	isolateGit(t)
+	base := filepath.Join(realTemporaryDirectory(t), name)
+	u := &gitUpstream{
+		t:    t,
+		bare: filepath.Join(base, "upstream.git"),
+		work: filepath.Join(base, "work"),
+	}
+	u.url = fileURL(u.bare)
+	initializeRepository(t, u.bare, "--bare", "--initial-branch=main")
+	initializeRepository(t, u.work, "--initial-branch=main")
+	mustGit(t, u.work, "remote", "add", "origin", u.url)
+	u.commit("file", "first")
+	u.push()
+	return u
+}
+
+// commit creates a commit in the upstream's working copy that hasn't been
+// pushed and returns its identifier.
+func (u *gitUpstream) commit(name, contents string) string {
+	u.t.Helper()
+	writeTree(u.t, u.work, map[string]string{name: contents})
+	mustGit(u.t, u.work, "add", "--", name)
+	mustGit(u.t, u.work, "commit", "--quiet", "--no-gpg-sign", "-m", "commit "+name)
+	u.head = mustGit(u.t, u.work, "rev-parse", "HEAD")
+	return u.head
+}
+
+// push pushes the upstream's working copy.
+func (u *gitUpstream) push() {
+	u.t.Helper()
+	mustGit(u.t, u.work, "push", "--quiet", "origin", "HEAD:refs/heads/main")
+}
+
+// entry returns the entry for a commit of the upstream.
+func (u *gitUpstream) entry(commit string) *core.Entry {
+	u.t.Helper()
+	digest, err := hex.DecodeString(commit)
+	if err != nil {
+		u.t.Fatal("invalid commit:", err)
+	}
+	return &core.Entry{Kind: core.EntryKind_GitLink, Digest: digest, Url: u.url}
+}
+
+// transitionEndpoint performs a scan, which is what enables an endpoint to
+// perform a transition, followed by the specified transitions, and verifies
+// that no temporary content is left in the root.
+func transitionEndpoint(t *testing.T, ctx context.Context, e *endpoint, changes ...*core.Change) ([]*core.Entry, []*core.Problem) {
+	t.Helper()
+	scanEndpoint(t, e, true)
+	results, problems, _, err := e.Transition(ctx, changes)
+	if err != nil {
+		t.Fatal("transition failed:", err)
+	}
+	verifyNoTemporaryContent(t, e.root)
+	return results, problems
+}
+
+// verifyNoTemporaryContent verifies that a root doesn't have temporary content.
+func verifyNoTemporaryContent(t *testing.T, root string) {
+	t.Helper()
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		} else if strings.HasPrefix(entry.Name(), filesystem.TemporaryNamePrefix) {
+			t.Error("temporary content left behind:", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Error("unable to walk root:", err)
+	}
+}
+
+// verifyCheckout verifies that a repository has a commit checked out on a
+// detached HEAD, and that its working tree has the commit's content.
+func verifyCheckout(t *testing.T, directory, commit string) {
+	t.Helper()
+	if head := mustGit(t, directory, "rev-parse", "HEAD"); head != commit {
+		t.Errorf("incorrect commit checked out in %s: %s != %s", directory, head, commit)
+	}
+	if _, err := runGit(directory, "symbolic-ref", "--quiet", "HEAD"); err == nil {
+		t.Errorf("HEAD isn't detached in %s", directory)
+	}
+	if status := mustGit(t, directory, "status", "--porcelain"); status != "" {
+		t.Errorf("working tree isn't clean in %s: %s", directory, status)
+	}
+}
+
+// verifySingleProblem verifies that a list of problems consists of one problem,
+// for the specified path, whose message contains the specified strings.
+func verifySingleProblem(t *testing.T, problems []*core.Problem, path string, contents ...string) {
+	t.Helper()
+	if len(problems) != 1 {
+		t.Fatalf("incorrect number of problems: %v", problems)
+	}
+	if problems[0].Path != path {
+		t.Errorf("incorrect problem path: %q != %q", problems[0].Path, path)
+	}
+	for _, content := range contents {
+		if !strings.Contains(problems[0].Error, content) {
+			t.Errorf("problem doesn't contain %q: %s", content, problems[0].Error)
+		}
+	}
+}
+
+// newGitRoot creates a root for an endpoint with the specified files.
+func newGitRoot(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root := filepath.Join(realTemporaryDirectory(t), "root")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal("unable to create root:", err)
+	}
+	writeTree(t, root, files)
+	return root
+}
+
+// newGitWithOrigin creates a repository in a new directory within a root that
+// has a single commit and, if the URL isn't empty, an origin.
+func newGitWithOrigin(t *testing.T, root, name, url string) string {
+	t.Helper()
+	directory := filepath.Join(root, name)
+	initializeRepository(t, directory)
+	writeTree(t, directory, map[string]string{"file": "first"})
+	mustGit(t, directory, "add", "--", "file")
+	mustGit(t, directory, "commit", "--quiet", "--no-gpg-sign", "-m", "first")
+	if url != "" {
+		mustGit(t, directory, "config", "remote.origin.url", url)
+	}
+	return directory
+}
+
+// TestGitProviderProbe tests the classification of directories with .git
+// entries.
+func TestGitProviderProbe(t *testing.T) {
+	isolateGit(t)
+	provider := newGitProvider(nil)
+	base := realTemporaryDirectory(t)
+	ctx := context.Background()
+
+	// A repository with a commit and an origin is a submodule.
+	t.Run("submodule", func(t *testing.T) {
+		directory := newGitWithOrigin(t, base, "submodule", "https://example.org/repository.git")
+		commit, url, err := provider.Probe(ctx, directory)
+		if err != nil {
+			t.Fatal("probe failed:", err)
+		} else if url != "https://example.org/repository.git" {
+			t.Error("incorrect URL:", url)
+		} else if hex.EncodeToString(commit) != mustGit(t, directory, "rev-parse", "HEAD") {
+			t.Errorf("incorrect commit: %x", commit)
+		} else if len(commit) != 20 {
+			t.Error("incorrect commit length:", len(commit))
+		}
+	})
+
+	// That includes repositories that use SHA-256.
+	t.Run("SHA-256", func(t *testing.T) {
+		directory := filepath.Join(base, "sha256")
+		if _, err := runGit(base, "init", "--quiet", "--object-format=sha256", directory); err != nil {
+			t.Skip("SHA-256 repositories aren't supported:", err)
+		}
+		writeTree(t, directory, map[string]string{"file": "first"})
+		mustGit(t, directory, "add", "--", "file")
+		mustGit(t, directory, "commit", "--quiet", "--no-gpg-sign", "-m", "first")
+		mustGit(t, directory, "config", "remote.origin.url", "https://example.org/repository.git")
+		commit, url, err := provider.Probe(ctx, directory)
+		if err != nil {
+			t.Fatal("probe failed:", err)
+		} else if url != "https://example.org/repository.git" {
+			t.Error("incorrect URL:", url)
+		} else if hex.EncodeToString(commit) != mustGit(t, directory, "rev-parse", "HEAD") {
+			t.Errorf("incorrect commit: %x", commit)
+		} else if len(commit) != 32 {
+			t.Error("incorrect commit length:", len(commit))
+		}
+	})
+
+	// A URL isn't subject to this system's rewrites, since the other endpoint
+	// has to be able to apply its own.
+	t.Run("rewritten URL", func(t *testing.T) {
+		directory := newGitWithOrigin(t, base, "rewritten", "https://example.org/repository.git")
+		mustGit(t, directory, "config", "url.https://mirror.example.org/.insteadOf", "https://example.org/")
+		if _, url, err := provider.Probe(ctx, directory); err != nil {
+			t.Fatal("probe failed:", err)
+		} else if url != "https://example.org/repository.git" {
+			t.Error("rewritten URL reported:", url)
+		}
+	})
+
+	// A repository without an origin or commits is an ordinary directory.
+	t.Run("no origin", func(t *testing.T) {
+		directory := newGitWithOrigin(t, base, "no-origin", "")
+		if commit, url, err := provider.Probe(ctx, directory); err != nil {
+			t.Fatal("probe failed:", err)
+		} else if commit != nil || url != "" {
+			t.Errorf("repository without origin treated as submodule: %x %s", commit, url)
+		}
+	})
+	t.Run("no commits", func(t *testing.T) {
+		directory := filepath.Join(base, "no-commits")
+		initializeRepository(t, directory)
+		mustGit(t, directory, "config", "remote.origin.url", "https://example.org/repository.git")
+		if commit, url, err := provider.Probe(ctx, directory); err != nil {
+			t.Fatal("probe failed:", err)
+		} else if commit != nil || url != "" {
+			t.Errorf("repository without commits treated as submodule: %x %s", commit, url)
+		}
+	})
+
+	// Everything else is a problem with an actionable message.
+	verifyProblem := func(t *testing.T, directory string, contents ...string) {
+		t.Helper()
+		commit, url, err := provider.Probe(ctx, directory)
+		if err == nil {
+			t.Fatalf("probe succeeded: %x %s", commit, url)
+		}
+		for _, content := range contents {
+			if !strings.Contains(err.Error(), content) {
+				t.Errorf("error doesn't contain %q: %v", content, err)
+			}
+		}
+	}
+	t.Run("empty .git directory", func(t *testing.T) {
+		directory := filepath.Join(base, "empty-git")
+		if err := os.MkdirAll(filepath.Join(directory, ".git"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		verifyProblem(t, directory, "isn't a valid repository", "remove the directory")
+	})
+	t.Run("dangling gitfile", func(t *testing.T) {
+		directory := filepath.Join(base, "dangling")
+		writeTree(t, directory, map[string]string{".git": "gitdir: ../.git/modules/dangling\n"})
+		verifyProblem(t, directory, "isn't a valid repository", "remove the directory")
+	})
+	t.Run("uppercase", func(t *testing.T) {
+		directory := filepath.Join(base, "uppercase")
+		if err := os.MkdirAll(filepath.Join(directory, ".GIT"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		verifyProblem(t, directory, "remove the directory")
+	})
+	t.Run("bare repository", func(t *testing.T) {
+		directory := filepath.Join(base, "bare")
+		initializeRepository(t, filepath.Join(directory, ".git"), "--bare")
+		verifyProblem(t, directory, "working tree", "remove the directory")
+	})
+	t.Run("working tree elsewhere", func(t *testing.T) {
+		directory := newGitWithOrigin(t, base, "elsewhere", "https://example.org/repository.git")
+		mustGit(t, directory, "config", "core.worktree", base)
+		verifyProblem(t, directory, "working tree")
+	})
+	t.Run("missing commit", func(t *testing.T) {
+		directory := newGitWithOrigin(t, base, "damaged", "https://example.org/repository.git")
+		if err := os.RemoveAll(filepath.Join(directory, ".git", "objects")); err != nil {
+			t.Fatal(err)
+		} else if err := os.MkdirAll(filepath.Join(directory, ".git", "objects"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		verifyProblem(t, directory, "damaged", "remove the directory")
+	})
+	t.Run("relative origin", func(t *testing.T) {
+		for i, url := range []string{"../relative.git", "./relative.git", "relative.git"} {
+			verifyProblem(t, newGitWithOrigin(t, base, fmt.Sprintf("relative-%d", i), url), "is relative", "set-url")
+		}
+	})
+	t.Run("origin starting with dash", func(t *testing.T) {
+		verifyProblem(t, newGitWithOrigin(t, base, "dash", "--upload-pack=touch"), "starts with a dash", "set-url")
+	})
+	t.Run("unusable origin without credentials", func(t *testing.T) {
+		directory := newGitWithOrigin(t, base, "dash-credentials", "-https://user:secret@example.org/repository.git")
+		_, _, err := provider.Probe(ctx, directory)
+		if err == nil {
+			t.Fatal("probe succeeded")
+		} else if strings.Contains(err.Error(), "secret") {
+			t.Error("error contains credentials:", err)
+		}
+	})
+	t.Run("different owner", func(t *testing.T) {
+		directory := newGitWithOrigin(t, base, "owner", "https://example.org/repository.git")
+		t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+		if _, _, err := provider.Probe(ctx, directory); err == nil {
+			t.Skip("Git doesn't check ownership")
+		}
+		verifyProblem(t, directory, "safe.directory", directory)
+
+		// The check isn't ours to override, but what the user decides is
+		// respected.
+		configuration := filepath.Join(t.TempDir(), "config")
+		writeFiles(t, filepath.Dir(configuration), map[string]string{"config": "[safe]\n\tdirectory = *\n"})
+		t.Setenv("GIT_CONFIG_GLOBAL", configuration)
+		if _, _, err := provider.Probe(ctx, directory); err != nil {
+			t.Error("safe.directory not respected:", err)
+		}
+	})
+	t.Run("without Git", func(t *testing.T) {
+		directory := newGitWithOrigin(t, base, "without-git", "https://example.org/repository.git")
+		t.Setenv("PATH", t.TempDir())
+		verifyProblem(t, directory, "git isn't installed")
+	})
+}
+
+// TestGitStripCredentials tests the removal of credentials from URLs.
+func TestGitStripCredentials(t *testing.T) {
+	tests := []struct {
+		url      string
+		expected string
+	}{
+		// Web URLs lose all user information, along with queries and fragments.
+		{"https://example.org/repository.git", "https://example.org/repository.git"},
+		{"https://user@example.org/repository.git", "https://example.org/repository.git"},
+		{"https://user:token@example.org/repository.git", "https://example.org/repository.git"},
+		{"http://user:token@example.org:8080/repository.git", "http://example.org:8080/repository.git"},
+		{"HTTPS://user:token@example.org/repository.git", "HTTPS://example.org/repository.git"},
+		{"https://user:p@ss@example.org/repository.git", "https://example.org/repository.git"},
+		{"https://example.org/repository@v2.git", "https://example.org/repository@v2.git"},
+		{"https://example.org/repository.git?token=secret", "https://example.org/repository.git"},
+		{"https://example.org/repository.git#secret", "https://example.org/repository.git"},
+		{"https://user:token@example.org", "https://example.org"},
+		{"https://user:token@example.org?token=secret", "https://example.org"},
+
+		// URLs that use SSH keep the user, but not the password.
+		{"ssh://git@example.org/repository.git", "ssh://git@example.org/repository.git"},
+		{"ssh://git:secret@example.org:22/repository.git", "ssh://git@example.org:22/repository.git"},
+		{"git+ssh://git:secret@example.org/repository.git", "git+ssh://git@example.org/repository.git"},
+		{"ssh+git://git:secret@example.org/repository.git", "ssh+git://git@example.org/repository.git"},
+		{"ssh://example.org/repository.git", "ssh://example.org/repository.git"},
+		{"ssh://[::1]:22/repository.git", "ssh://[::1]:22/repository.git"},
+		{"git@example.org:repository.git", "git@example.org:repository.git"},
+		{"example.org:repository.git", "example.org:repository.git"},
+
+		// Other transports lose all user information.
+		{"git://user:secret@example.org/repository.git", "git://example.org/repository.git"},
+		{"ftp://user:secret@example.org/repository.git", "ftp://example.org/repository.git"},
+		{"file://user:secret@/path/repository.git", "file:///path/repository.git"},
+		{"file:///path/repository.git", "file:///path/repository.git"},
+
+		// Remote helpers have the same treatment applied to their addresses.
+		{"helper::https://user:token@example.org/repository.git", "helper::https://example.org/repository.git"},
+		{"helper::address", "helper::address"},
+
+		// Paths don't have anything to remove.
+		{"/path/repository.git", "/path/repository.git"},
+		{"../repository.git", "../repository.git"},
+	}
+	for _, test := range tests {
+		if result := gitStripCredentials(test.url); result != test.expected {
+			t.Errorf("incorrect result for %q: %q != %q", test.url, result, test.expected)
+		}
+	}
+}
+
+// TestGitUsableURL tests the validation of URLs.
+func TestGitUsableURL(t *testing.T) {
+	tests := []struct {
+		url      string
+		expected string
+		failure  string
+	}{
+		{url: "https://user:token@example.org/repository.git", expected: "https://example.org/repository.git"},
+		{url: "ssh://git@example.org/repository.git", expected: "ssh://git@example.org/repository.git"},
+		{url: "git@example.org:path/repository.git", expected: "git@example.org:path/repository.git"},
+		{url: "git@example.org:path/repository@v2.git", expected: "git@example.org:path/repository@v2.git"},
+		{url: "example.org:repository.git", expected: "example.org:repository.git"},
+		{url: "/path/repository.git", expected: "/path/repository.git"},
+		{url: "file:///path/repository.git", expected: "file:///path/repository.git"},
+		{url: "helper::address", expected: "helper::address"},
+		{url: "-https://example.org", failure: "dash"},
+		{url: "--upload-pack=touch", failure: "dash"},
+		{url: "relative", failure: "relative"},
+		{url: "../relative", failure: "relative"},
+		{url: "./colon:in/path", failure: "relative"},
+		{url: "user:password@example.org:repository.git", failure: "password"},
+		{url: "https://example.org/\nrepository.git", failure: "invalid characters"},
+		{url: "https://example.org/\xffrepository.git", failure: "invalid characters"},
+	}
+	for _, test := range tests {
+		result, err := gitUsableURL(test.url)
+		if test.failure != "" {
+			if err == nil {
+				t.Errorf("no error for %q", test.url)
+			} else if !strings.Contains(err.Error(), test.failure) {
+				t.Errorf("incorrect error for %q: %v", test.url, err)
+			} else if strings.Contains(err.Error(), "password@") {
+				t.Errorf("error for %q contains credentials: %v", test.url, err)
+			}
+		} else if err != nil {
+			t.Errorf("unexpected error for %q: %v", test.url, err)
+		} else if result != test.expected {
+			t.Errorf("incorrect result for %q: %q != %q", test.url, result, test.expected)
+		}
+	}
+}
+
+// TestGitOutputRecorderMessage tests the summaries of commands' output, which
+// must omit progress and must not contain credentials, whatever Git reports.
+func TestGitOutputRecorderMessage(t *testing.T) {
+	// Progress and hints are removed, and credentials don't survive.
+	recorder := newGitOutputRecorder()
+	output := "Cloning into '.'...\n" +
+		"remote: Enumerating objects: 6, done.\n" +
+		"remote: Counting objects:  16% (1/6)\rremote: Counting objects: 100% (6/6), done.\n" +
+		"Receiving objects:  50% (3/6)\rReceiving objects: 100% (6/6), done.\n" +
+		"From https://user:secret@example.org/repository\n" +
+		" * branch            1234 -> FETCH_HEAD\n" +
+		"hint: Using something\n" +
+		"fatal: unable to access 'https://user:token@example.org/repository.git/': error\n" +
+		"fatal: could not read from ssh://git:password@example.org/repository.git, or http://example.org/x?token=abc\n"
+	if _, err := recorder.Write([]byte(output)); err != nil {
+		t.Fatal(err)
+	}
+	expected := "fatal: unable to access 'https://example.org/repository.git/': error; " +
+		"fatal: could not read from ssh://git@example.org/repository.git, or http://example.org/x"
+	if message := recorder.message(); message != expected {
+		t.Errorf("incorrect message: %q != %q", message, expected)
+	}
+
+	// A URL that was cut in half by the limit on what's retained could
+	// otherwise contain what's left of its credentials without any way to
+	// recognize them.
+	recorder = newGitOutputRecorder()
+	url := "https://user:secret@example.org/repository.git"
+	padding := strings.Repeat("x", gitOutputTailSize-len(url)/2)
+	for i := 0; i < 3; i++ {
+		if _, err := recorder.Write([]byte(url + padding)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := recorder.Write([]byte("\nfatal: failure\n")); err != nil {
+		t.Fatal(err)
+	}
+	if message := recorder.message(); message != "fatal: failure" {
+		t.Errorf("incorrect message after truncation: %q", message)
+	}
+
+	// Output has to be usable in Protocol Buffers messages.
+	recorder = newGitOutputRecorder()
+	if _, err := recorder.Write([]byte("fatal: invalid \xff UTF-8\n")); err != nil {
+		t.Fatal(err)
+	}
+	if message := recorder.message(); !utf8.ValidString(message) {
+		t.Errorf("message isn't valid UTF-8: %q", message)
+	}
+	recorder = newGitOutputRecorder()
+	if _, err := recorder.Write([]byte("fatal: " + strings.Repeat("x", 4*gitMaximumMessageSize) + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	if message := recorder.message(); len(message) > gitMaximumMessageSize+3 {
+		t.Errorf("message isn't limited: %d", len(message))
+	}
+}
+
+// TestEndpointGitModeCredentialsNotReported tests that credentials in the
+// origin of a submodule don't reach the snapshot or any messages, including
+// when using that origin fails, which requires that they still be there in its
+// configuration.
+func TestEndpointGitModeCredentialsNotReported(t *testing.T) {
+	isolateGit(t)
+	t.Setenv("GIT_ALLOW_PROTOCOL", "https:file")
+
+	// Create a submodule whose origin has credentials and can't be reached.
+	origin := "https://user:secret-token@127.0.0.1:1/repository.git"
+	root := newGitRoot(t, nil)
+	directory := newGitWithOrigin(t, root, "sub", origin)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+
+	// Verify the snapshot, including its serialized form, which is what goes to
+	// the other endpoint and ends up in the session's archive.
+	snapshot := scanEndpoint(t, e, true)
+	entry := entryAt(snapshot, "sub")
+	if entry == nil || entry.Kind != core.EntryKind_GitLink {
+		t.Fatalf("incorrect entry: %v", entry)
+	}
+	if entry.Url != "https://127.0.0.1:1/repository.git" {
+		t.Errorf("incorrect URL: %s", entry.Url)
+	}
+	if serialized, err := proto.Marshal(snapshot); err != nil {
+		t.Error("unable to marshal snapshot:", err)
+	} else if bytes.Contains(serialized, []byte("secret-token")) {
+		t.Error("serialized snapshot contains credentials")
+	}
+
+	// The repository's own configuration is left alone, so it can still be
+	// used.
+	if url := mustGit(t, directory, "config", "--get", "remote.origin.url"); url != origin {
+		t.Errorf("origin was changed: %s", url)
+	}
+
+	// Verify the problem from trying to fetch from it, which will fail.
+	missing := &core.Entry{Kind: core.EntryKind_GitLink, Digest: bytes.Repeat([]byte{1}, 20), Url: entry.Url}
+	results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{Path: "sub", Old: entry, New: missing})
+	if !results[0].Equal(entry, true) {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleProblem(t, problems, "sub", "127.0.0.1")
+	if strings.Contains(problems[0].Error, "secret-token") {
+		t.Error("problem contains credentials:", problems[0].Error)
+	}
+}
+
+// TestEndpointGitModeFirstClone tests that a transition obtains a submodule
+// that's absent, and that the scan that follows finds it in the same state.
+func TestEndpointGitModeFirstClone(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	root := newGitRoot(t, map[string]string{"kept": "kept"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+
+	// Perform the transition.
+	target := upstream.entry(upstream.head)
+	results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{Path: "sub", New: target})
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	} else if results[0] != target {
+		t.Error("incorrect result:", results[0])
+	}
+
+	// Verify the result on disk.
+	directory := filepath.Join(root, "sub")
+	verifyCheckout(t, directory, upstream.head)
+	if contents, err := os.ReadFile(filepath.Join(directory, "file")); err != nil || string(contents) != "first" {
+		t.Errorf("incorrect file contents: %q, %v", contents, err)
+	}
+	if info, err := os.Lstat(filepath.Join(directory, ".git")); err != nil || !info.IsDir() {
+		t.Errorf("clone doesn't have .git directory: %v, %v", info, err)
+	}
+	if runtime.GOOS != "windows" {
+		if info, err := os.Lstat(directory); err != nil {
+			t.Error("unable to query clone:", err)
+		} else if info.Mode().Perm() != os.FileMode(e.defaultDirectoryMode&filesystem.ModePermissionsMask) {
+			t.Errorf("incorrect directory permissions: %v", info.Mode().Perm())
+		}
+	}
+
+	// Verify that the next scan agrees, without counting what's in the
+	// submodule.
+	snapshot := scanEndpoint(t, e, true)
+	entry := entryAt(snapshot, "sub")
+	if !entry.Equal(target, true) || entry.Url != upstream.url {
+		t.Errorf("incorrect entry: %v != %v", entry, target)
+	}
+	if snapshot.Directories != 1 || snapshot.Files != 1 {
+		t.Errorf("incorrect statistics: %d directories, %d files", snapshot.Directories, snapshot.Files)
+	}
+	if len(snapshot.Warnings) != 0 {
+		t.Errorf("unexpected warnings: %v", snapshot.Warnings)
+	}
+}
+
+// TestEndpointGitModeCloneOfUnreachableCommit tests a clone of a repository
+// that doesn't have the commit on any branch, but which can provide it when
+// it's asked for by its identifier.
+func TestEndpointGitModeCloneOfUnreachableCommit(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	unreachable := upstream.commit("second", "second")
+	mustGit(t, upstream.work, "push", "--quiet", "origin", "HEAD:refs/heads/unusual")
+	mustGit(t, upstream.bare, "update-ref", "refs/hidden/unusual", unreachable)
+	mustGit(t, upstream.bare, "update-ref", "-d", "refs/heads/unusual")
+
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{Path: "sub", New: upstream.entry(unreachable)})
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	} else if results[0] == nil {
+		t.Fatal("submodule not created")
+	}
+	verifyCheckout(t, filepath.Join(root, "sub"), unreachable)
+}
+
+// TestEndpointGitModeUpdateFollowsPushedCommits tests that a pushed commit is
+// followed, and that one that hasn't been pushed leaves the submodule where it
+// is with a message that says what to do, until it's pushed, which takes effect
+// at the next attempt.
+func TestEndpointGitModeUpdateFollowsPushedCommits(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	ctx := context.Background()
+
+	// Obtain the submodule.
+	first := upstream.entry(upstream.head)
+	if _, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", New: first}); len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	}
+	directory := filepath.Join(root, "sub")
+
+	// Follow a pushed commit.
+	upstream.commit("second", "second")
+	upstream.push()
+	second := upstream.entry(upstream.head)
+	results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: first, New: second})
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	} else if results[0] != second {
+		t.Error("incorrect result:", results[0])
+	}
+	verifyCheckout(t, directory, upstream.head)
+	if _, err := os.Stat(filepath.Join(directory, "second")); err != nil {
+		t.Error("commit's content is missing:", err)
+	}
+
+	// A commit that hasn't been pushed isn't available.
+	unpushed := upstream.commit("third", "third")
+	third := upstream.entry(unpushed)
+	head := mustGit(t, directory, "rev-parse", "HEAD")
+	results, problems = transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: second, New: third})
+	if results[0] != second {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleProblem(t, problems, "sub", gitShortCommit(unpushed), "isn't available from "+upstream.url, "push it")
+	if current := mustGit(t, directory, "rev-parse", "HEAD"); current != head {
+		t.Errorf("submodule moved: %s != %s", current, head)
+	}
+
+	// Fetching must not have written any of the files that wake a session.
+	if _, err := os.Stat(filepath.Join(directory, ".git", "FETCH_HEAD")); !os.IsNotExist(err) {
+		t.Error("FETCH_HEAD was written:", err)
+	}
+
+	// Once it's pushed, the next attempt succeeds, without having to wait.
+	upstream.push()
+	results, problems = transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: second, New: third})
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	} else if results[0] != third {
+		t.Error("incorrect result:", results[0])
+	}
+	verifyCheckout(t, directory, unpushed)
+
+	// A transition to what's already checked out doesn't require anything.
+	if err := os.RemoveAll(upstream.bare); err != nil {
+		t.Fatal(err)
+	}
+	results, problems = transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: second, New: third})
+	if len(problems) != 0 || results[0] != third {
+		t.Error("incorrect results for transition to current commit:", results, problems)
+	}
+}
+
+// TestEndpointGitModeUpdateChecks tests the conditions that prevent a submodule
+// from moving to another commit.
+func TestEndpointGitModeUpdateChecks(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	first := upstream.head
+	second := upstream.commit("second", "second")
+	upstream.push()
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	ctx := context.Background()
+	if _, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", New: upstream.entry(first)}); len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	}
+	directory := filepath.Join(root, "sub")
+
+	// A commit made since the scan isn't discarded.
+	local := upstream.entry(second)
+	writeTree(t, directory, map[string]string{"local": "local"})
+	mustGit(t, directory, "add", "--", "local")
+	mustGit(t, directory, "commit", "--quiet", "--no-gpg-sign", "-m", "local")
+	head := mustGit(t, directory, "rev-parse", "HEAD")
+	old := upstream.entry(first)
+	results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: old, New: local})
+	if results[0] != old {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleProblem(t, problems, "sub", "changed since the scan")
+	if current := mustGit(t, directory, "rev-parse", "HEAD"); current != head {
+		t.Errorf("submodule moved: %s != %s", current, head)
+	}
+	mustGit(t, directory, "reset", "--quiet", "--hard", first)
+
+	// Conflicting local changes are for Git to refuse.
+	writeTree(t, directory, map[string]string{"second": "conflicting"})
+	results, problems = transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: old, New: local})
+	if results[0] != old {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleProblem(t, problems, "sub", "unable to check out", "second")
+	if contents, err := os.ReadFile(filepath.Join(directory, "second")); err != nil || string(contents) != "conflicting" {
+		t.Errorf("local change was lost: %q, %v", contents, err)
+	}
+	if current := mustGit(t, directory, "rev-parse", "HEAD"); current != first {
+		t.Errorf("submodule moved: %s != %s", current, first)
+	}
+
+	// Changes that don't conflict come along.
+	if err := os.Remove(filepath.Join(directory, "second")); err != nil {
+		t.Fatal(err)
+	}
+	writeTree(t, directory, map[string]string{"untracked": "untracked"})
+	results, problems = transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: old, New: local})
+	if len(problems) != 0 || results[0] != local {
+		t.Error("incorrect results with non-conflicting changes:", results, problems)
+	}
+	if contents, err := os.ReadFile(filepath.Join(directory, "untracked")); err != nil || string(contents) != "untracked" {
+		t.Errorf("local change was lost: %q, %v", contents, err)
+	}
+}
+
+// TestEndpointGitModeUpdateFromOtherURL tests that a commit that's missing from
+// a repository's own origin can be fetched from the URL that the other endpoint
+// reports, and that the origin is tried first.
+func TestEndpointGitModeUpdateFromOtherURL(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	ctx := context.Background()
+	first := upstream.entry(upstream.head)
+	if _, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", New: first}); len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	}
+	directory := filepath.Join(root, "sub")
+
+	// Create a commit that's only in a second repository, which the other
+	// endpoint reaches, with this endpoint's origin not having it.
+	fork := newGitUpstream(t, "fork")
+	mustGit(t, fork.work, "fetch", "--quiet", upstream.url, "main")
+	mustGit(t, fork.work, "reset", "--quiet", "--hard", "FETCH_HEAD")
+	fork.commit("forked", "forked")
+	mustGit(t, fork.work, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main")
+	target := fork.entry(fork.head)
+
+	// The origin doesn't have it, but the other URL does.
+	results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: first, New: target})
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	} else if results[0] != target {
+		t.Error("incorrect result:", results[0])
+	}
+	verifyCheckout(t, directory, fork.head)
+	if url := mustGit(t, directory, "config", "--get", "remote.origin.url"); url != upstream.url {
+		t.Errorf("origin was changed: %s", url)
+	}
+
+	// A commit that's in neither results in a problem that mentions both.
+	unavailable := fork.commit("unavailable", "unavailable")
+	results, problems = transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: target, New: fork.entry(unavailable)})
+	if results[0] != target {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleProblem(t, problems, "sub", "isn't available from "+upstream.url, "isn't available from "+fork.url)
+
+	// A URL that the other endpoint has provided that's not usable is reported
+	// and isn't provided to Git, even though we have another one that's tried
+	// first.
+	missing := &core.Entry{Kind: core.EntryKind_GitLink, Digest: bytes.Repeat([]byte{2}, 20), Url: "--upload-pack=touch"}
+	_, problems = transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: target, New: missing})
+	verifySingleProblem(t, problems, "sub", "isn't available from "+upstream.url, "starts with a dash")
+}
+
+// TestEndpointGitModeFailedCloneKeepsContent tests that content that a
+// submodule is supposed to replace stays in place if the submodule can't be
+// obtained.
+func TestEndpointGitModeFailedCloneKeepsContent(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	files := map[string]string{"sub/file": "precious", "sub/deep/file": "also precious", "kept": "kept"}
+	unavailable := upstream.commit("unavailable", "unavailable")
+
+	verify := func(t *testing.T, target *core.Entry, contents ...string) {
+		t.Helper()
+		root := newGitRoot(t, files)
+		e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+		ctx := context.Background()
+		old := entryAt(scanEndpoint(t, e, true), "sub")
+		results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: old, New: target})
+		if results[0] != old {
+			t.Error("incorrect result:", results[0])
+		}
+		verifySingleProblem(t, problems, "sub", contents...)
+		for name, expected := range files {
+			if actual, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name))); err != nil || string(actual) != expected {
+				t.Errorf("content was lost at %s: %q, %v", name, actual, err)
+			}
+		}
+		if _, err := os.Lstat(filepath.Join(root, "sub", ".git")); !os.IsNotExist(err) {
+			t.Error("clone left in place:", err)
+		}
+		if entries, err := os.ReadDir(root); err != nil {
+			t.Error("unable to read root:", err)
+		} else if len(entries) != 2 {
+			t.Errorf("unexpected content in root: %v", entries)
+		}
+	}
+
+	// In all of these cases, the repository doesn't make it, for different
+	// reasons.
+	t.Run("repository doesn't exist", func(t *testing.T) {
+		url := fileURL(filepath.Join(filepath.Dir(upstream.bare), "missing.git"))
+		verify(t, &core.Entry{Kind: core.EntryKind_GitLink, Digest: upstream.entry(unavailable).Digest, Url: url}, "unable to clone "+url)
+	})
+	t.Run("commit doesn't exist", func(t *testing.T) {
+		verify(t, upstream.entry(unavailable), gitShortCommit(unavailable), "isn't available from "+upstream.url, "push it")
+	})
+	t.Run("protocol isn't allowed", func(t *testing.T) {
+		t.Setenv("GIT_ALLOW_PROTOCOL", "https")
+		verify(t, upstream.entry(unavailable), "unable to clone "+upstream.url)
+	})
+	t.Run("URL isn't usable", func(t *testing.T) {
+		verify(t, &core.Entry{Kind: core.EntryKind_GitLink, Digest: upstream.entry(unavailable).Digest, Url: "--upload-pack=touch"}, "starts with a dash")
+	})
+	t.Run("Git isn't available", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		verify(t, upstream.entry(unavailable), "unable to clone")
+	})
+}
+
+// TestEndpointGitModeCloneReplacesContent tests that a successful clone
+// replaces what's there, including an empty directory and a file.
+func TestEndpointGitModeCloneReplacesContent(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	ctx := context.Background()
+	for _, test := range []struct {
+		name string
+		make func(t *testing.T, root string)
+	}{
+		{"empty directory", func(t *testing.T, root string) {
+			if err := os.Mkdir(filepath.Join(root, "sub"), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"directory", func(t *testing.T, root string) {
+			writeTree(t, root, map[string]string{"sub/replaced": "replaced", "sub/deep/replaced": "replaced"})
+		}},
+		{"file", func(t *testing.T, root string) {
+			writeTree(t, root, map[string]string{"sub": "replaced"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := newGitRoot(t, nil)
+			test.make(t, root)
+			e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+			old := entryAt(scanEndpoint(t, e, true), "sub")
+			target := upstream.entry(upstream.head)
+			results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: old, New: target})
+			if len(problems) != 0 {
+				t.Fatal("unexpected problems:", problems)
+			} else if results[0] != target {
+				t.Error("incorrect result:", results[0])
+			}
+			verifyCheckout(t, filepath.Join(root, "sub"), upstream.head)
+			if _, err := os.Lstat(filepath.Join(root, "sub", "replaced")); !os.IsNotExist(err) {
+				t.Error("replaced content remains:", err)
+			}
+		})
+	}
+
+	// Content that was modified since the scan is caught by the removal,
+	// despite the clone having succeeded, and the clone doesn't go anywhere.
+	t.Run("modified content", func(t *testing.T) {
+		root := newGitRoot(t, map[string]string{"sub/file": "original", "sub/kept": "kept"})
+		e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+		old := entryAt(scanEndpoint(t, e, true), "sub")
+		scanEndpoint(t, e, true)
+		writeTree(t, root, map[string]string{"sub/file": "modified"})
+		results, problems, _, err := e.Transition(ctx, []*core.Change{{Path: "sub", Old: old, New: upstream.entry(upstream.head)}})
+		if err != nil {
+			t.Fatal("transition failed:", err)
+		}
+		verifyNoTemporaryContent(t, root)
+		if results[0] == nil || results[0].Kind != core.EntryKind_Directory {
+			t.Fatalf("incorrect result: %v", results[0])
+		}
+		if len(problems) == 0 {
+			t.Error("no problem reported")
+		}
+		if contents, err := os.ReadFile(filepath.Join(root, "sub", "file")); err != nil || string(contents) != "modified" {
+			t.Errorf("modification was lost: %q, %v", contents, err)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "sub", ".git")); !os.IsNotExist(err) {
+			t.Error("clone was moved into place:", err)
+		}
+	})
+}
+
+// TestEndpointGitModeInvalidRepository tests that an invalid .git entry in a
+// directory is reported and that it can't lead to the use of an enclosing
+// repository, whether for scanning, warnings, or transitions.
+func TestEndpointGitModeInvalidRepository(t *testing.T) {
+	isolateGit(t)
+	files := map[string]string{"sub/.git": "gitdir: ../.git/modules/sub\n", "sub/file": "content"}
+
+	// Create a superproject that contains the directory, with something for
+	// each operation to find if it were to reach this repository.
+	root := newGitRoot(t, files)
+	initializeRepository(t, root)
+	mustGit(t, root, "config", "remote.origin.url", "https://example.org/superproject.git")
+	writeTree(t, root, map[string]string{"tracked": "tracked"})
+	mustGit(t, root, "add", "--", "tracked")
+	mustGit(t, root, "commit", "--quiet", "--no-gpg-sign", "-m", "commit")
+	writeTree(t, root, map[string]string{"tracked": "modified"})
+	head := mustGit(t, root, "rev-parse", "HEAD")
+
+	verify := func(t *testing.T) {
+		t.Helper()
+		e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+		snapshot := scanEndpoint(t, e, true)
+
+		// The directory is problematic, and it hasn't been taken for the
+		// enclosing repository. If it had been, then it would be reported as a
+		// submodule, with a warning, since that repository has a change.
+		entry := entryAt(snapshot, "sub")
+		if entry == nil || entry.Kind != core.EntryKind_Problematic {
+			t.Fatalf("incorrect entry: %v", entry)
+		} else if !strings.Contains(entry.Problem, "remove the directory") {
+			t.Errorf("message doesn't say what to do: %s", entry.Problem)
+		}
+		if len(snapshot.Warnings) != 0 {
+			t.Errorf("unexpected warnings: %v", snapshot.Warnings)
+		}
+
+		// A transition for this directory must not affect the superproject
+		// either.
+		digest, err := hex.DecodeString(head)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old := &core.Entry{Kind: core.EntryKind_GitLink, Digest: digest, Url: "https://example.org/superproject.git"}
+		target := &core.Entry{Kind: core.EntryKind_GitLink, Digest: bytes.Repeat([]byte{1}, 20), Url: old.Url}
+		results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{Path: "sub", Old: old, New: target})
+		if results[0] != old {
+			t.Error("incorrect result:", results[0])
+		}
+		verifySingleProblem(t, problems, "sub", "unable to determine submodule's commit")
+
+		// Everything is as it was.
+		if current := mustGit(t, root, "rev-parse", "HEAD"); current != head {
+			t.Errorf("superproject moved: %s != %s", current, head)
+		}
+		if status := mustGit(t, root, "status", "--porcelain", "--", "tracked"); status != "M tracked" {
+			t.Errorf("superproject's working tree changed: %q", status)
+		}
+		for name, expected := range files {
+			if actual, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name))); err != nil || string(actual) != expected {
+				t.Errorf("content changed at %s: %q, %v", name, actual, err)
+			}
+		}
+	}
+
+	t.Run("dangling gitfile", verify)
+	if err := os.Remove(filepath.Join(root, "sub", ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "sub", ".git"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	delete(files, "sub/.git")
+	t.Run("empty directory", verify)
+}
+
+// TestEndpointGitModeGitfileSubmodule tests that a submodule created by Git
+// within a superproject, whose .git is a file that points into the
+// superproject's Git directory, is treated the same way, and that it's updated
+// in place.
+func TestEndpointGitModeGitfileSubmodule(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	root := newGitRoot(t, nil)
+	initializeRepository(t, root)
+	mustGit(t, root, "submodule", "add", "--quiet", upstream.url, "third_party/sub")
+	mustGit(t, root, "commit", "--quiet", "--no-gpg-sign", "-m", "add submodule")
+	directory := filepath.Join(root, "third_party", "sub")
+	if info, err := os.Lstat(filepath.Join(directory, ".git")); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("submodule doesn't use a .git file: %v, %v", info, err)
+	}
+
+	// Verify that it's a submodule with the correct URL.
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	snapshot := scanEndpoint(t, e, true)
+	old := entryAt(snapshot, "third_party/sub")
+	if !old.Equal(upstream.entry(upstream.head), true) || old.Url != upstream.url {
+		t.Fatalf("incorrect entry: %v", old)
+	}
+	if status := entryAt(snapshot, ".gitmodules"); status == nil || status.Kind != core.EntryKind_File {
+		t.Errorf(".gitmodules isn't synchronized as a file: %v", status)
+	}
+
+	// Update it in place.
+	upstream.commit("second", "second")
+	upstream.push()
+	target := upstream.entry(upstream.head)
+	results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{Path: "third_party/sub", Old: old, New: target})
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	} else if results[0] != target {
+		t.Error("incorrect result:", results[0])
+	}
+	verifyCheckout(t, directory, upstream.head)
+	if info, err := os.Lstat(filepath.Join(directory, ".git")); err != nil || !info.Mode().IsRegular() {
+		t.Errorf("submodule no longer uses a .git file: %v, %v", info, err)
+	}
+	if !entryAt(scanEndpoint(t, e, true), "third_party/sub").Equal(target, true) {
+		t.Error("next scan doesn't agree")
+	}
+
+	// Verify that an accelerated scan notices a change of HEAD that was made
+	// outside of the submodule's directory, without re-check paths that would
+	// indicate it.
+	e.watchMode = reifiedWatchModeRecursive
+	e.accelerate = true
+	e.recheckPaths = make(map[string]bool)
+	mustGit(t, directory, "checkout", "--quiet", "--detach", "HEAD~1")
+	if entry := entryAt(scanEndpoint(t, e, false), "third_party/sub"); entry == nil || entry.Equal(target, true) {
+		t.Errorf("accelerated scan returned a stale entry: %v", entry)
+	}
+}
+
+// TestEndpointGitModePollDetectsCommit tests that a change of commit in a
+// submodule wakes a session that uses poll-based watching, because each of its
+// scans probes the submodule, despite the absence of any non-recursive watch
+// for it, and that nothing else about the submodule does, such as a fetch.
+func TestEndpointGitModePollDetectsCommit(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mode synchronization.WatchMode
+	}{
+		{"poll", synchronization.WatchMode_WatchModeForcePoll},
+		{"portable", synchronization.WatchMode_WatchModePortable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := newGitUpstream(t, "upstream")
+			upstream.commit("second", "second")
+			upstream.push()
+			root := newGitRoot(t, nil)
+			directory := filepath.Join(root, "sub")
+			if _, err := runGit(root, "clone", "--quiet", upstream.url, directory); err != nil {
+				t.Fatal("unable to clone:", err)
+			}
+
+			// Wait for the baseline scan.
+			e := newGitModeEndpoint(t, root, test.mode)
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				e.lockScanLock(context.Background())
+				accelerate := e.accelerate
+				e.unlockScanLock()
+				if accelerate {
+					break
+				} else if time.Now().After(deadline) {
+					t.Fatal("timed out waiting for baseline scan")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			initial := entryAt(scanEndpoint(t, e, false), "sub")
+			if initial == nil || initial.Kind != core.EntryKind_GitLink {
+				t.Fatalf("incorrect initial entry: %v", initial)
+			}
+
+			// Verify that a fetch doesn't result in a wake up.
+			mustGit(t, directory, "fetch", "--quiet", "--no-write-fetch-head", "origin")
+			quiet, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+			defer cancel()
+			if err := e.Poll(quiet); err != nil {
+				t.Fatal("polling failed:", err)
+			} else if quiet.Err() == nil {
+				t.Error("session woken by a fetch")
+			}
+
+			// Change the commit.
+			mustGit(t, directory, "checkout", "--quiet", "--detach", "HEAD~1")
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := e.Poll(ctx); err != nil {
+				t.Fatal("polling failed:", err)
+			} else if ctx.Err() != nil {
+				t.Fatal("timed out waiting for commit change to be detected")
+			}
+			if entry := entryAt(scanEndpoint(t, e, false), "sub"); entry == nil || entry.Equal(initial, true) {
+				t.Errorf("stale entry: %v", entry)
+			}
+		})
+	}
+}
+
+// TestEndpointGitModeNestedSubmodules tests that submodules nested in a
+// submodule are updated along with it, and that failure to do that isn't
+// failure of the transition, since the commit that's being synchronized is in
+// place.
+func TestEndpointGitModeNestedSubmodules(t *testing.T) {
+	nested := newGitUpstream(t, "nested")
+	upstream := newGitUpstream(t, "upstream")
+	mustGit(t, upstream.work, "submodule", "add", "--quiet", nested.url, "nested")
+	mustGit(t, upstream.work, "commit", "--quiet", "--no-gpg-sign", "-m", "add submodule")
+	upstream.head = mustGit(t, upstream.work, "rev-parse", "HEAD")
+	upstream.push()
+
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	ctx := context.Background()
+
+	// A clone populates nested submodules, with the gitfiles remaining valid
+	// after the clone is moved from its temporary location.
+	first := upstream.entry(upstream.head)
+	if _, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", New: first}); len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	}
+	directory := filepath.Join(root, "sub")
+	nestedDirectory := filepath.Join(directory, "nested")
+	if contents, err := os.ReadFile(filepath.Join(nestedDirectory, "file")); err != nil || string(contents) != "first" {
+		t.Errorf("nested submodule not populated: %q, %v", contents, err)
+	}
+	if head := mustGit(t, nestedDirectory, "rev-parse", "HEAD"); head != nested.head {
+		t.Errorf("incorrect commit in nested submodule: %s != %s", head, nested.head)
+	}
+	if status := mustGit(t, directory, "status", "--porcelain"); status != "" {
+		t.Errorf("clone isn't clean: %s", status)
+	}
+
+	// Nested submodules aren't compared separately, so they don't appear.
+	snapshot := scanEndpoint(t, e, true)
+	if entry := entryAt(snapshot, "sub"); !entry.Equal(first, true) {
+		t.Errorf("incorrect entry: %v", entry)
+	}
+	if paths := snapshot.Content.GitLinkPaths(); !slices.Equal(paths, []string{"sub"}) {
+		t.Errorf("incorrect submodules: %v", paths)
+	}
+
+	// An update brings nested submodules along.
+	nested.commit("nested-second", "nested second")
+	nested.push()
+	mustGit(t, filepath.Join(upstream.work, "nested"), "pull", "--quiet", "origin", "main")
+	mustGit(t, upstream.work, "add", "--", "nested")
+	mustGit(t, upstream.work, "commit", "--quiet", "--no-gpg-sign", "-m", "update submodule")
+	upstream.head = mustGit(t, upstream.work, "rev-parse", "HEAD")
+	upstream.push()
+	second := upstream.entry(upstream.head)
+	results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: first, New: second})
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	} else if results[0] != second {
+		t.Error("incorrect result:", results[0])
+	}
+	if head := mustGit(t, nestedDirectory, "rev-parse", "HEAD"); head != nested.head {
+		t.Errorf("nested submodule didn't follow: %s != %s", head, nested.head)
+	}
+	if _, err := os.Stat(filepath.Join(nestedDirectory, "nested-second")); err != nil {
+		t.Error("nested submodule's content is missing:", err)
+	}
+}
+
+// TestEndpointGitModeNestedSubmoduleFailure tests that a submodule whose nested
+// submodule can't be obtained still ends up in place, along with a problem,
+// whether it's being cloned or updated.
+func TestEndpointGitModeNestedSubmoduleFailure(t *testing.T) {
+	nested := newGitUpstream(t, "nested")
+	upstream := newGitUpstream(t, "upstream")
+	mustGit(t, upstream.work, "submodule", "add", "--quiet", nested.url, "nested")
+	mustGit(t, upstream.work, "commit", "--quiet", "--no-gpg-sign", "-m", "add submodule")
+	upstream.head = mustGit(t, upstream.work, "rev-parse", "HEAD")
+	upstream.push()
+	ctx := context.Background()
+
+	// Make the nested submodule's repository unavailable.
+	if err := os.RemoveAll(nested.bare); err != nil {
+		t.Fatal(err)
+	}
+
+	// A clone that replaces content goes ahead.
+	root := newGitRoot(t, map[string]string{"sub/replaced": "replaced"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	old := entryAt(scanEndpoint(t, e, true), "sub")
+	first := upstream.entry(upstream.head)
+	results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: old, New: first})
+	if results[0] != first {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleProblem(t, problems, "sub", "unable to update nested submodules")
+	directory := filepath.Join(root, "sub")
+	if head := mustGit(t, directory, "rev-parse", "HEAD"); head != upstream.head {
+		t.Errorf("incorrect commit: %s != %s", head, upstream.head)
+	}
+	if _, err := os.Lstat(filepath.Join(directory, "replaced")); !os.IsNotExist(err) {
+		t.Error("replaced content remains:", err)
+	}
+
+	// An update goes ahead as well.
+	upstream.commit("second", "second")
+	upstream.push()
+	second := upstream.entry(upstream.head)
+	results, problems = transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: first, New: second})
+	if results[0] != second {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleProblem(t, problems, "sub", "unable to update nested submodules")
+	if head := mustGit(t, directory, "rev-parse", "HEAD"); head != upstream.head {
+		t.Errorf("incorrect commit: %s != %s", head, upstream.head)
+	}
+}
+
+// TestGitWarningsDirtySubmodule tests warnings about uncommitted changes in
+// submodules, and that the check doesn't change anything on disk, which would
+// result in events that wake the session.
+func TestGitWarningsDirtySubmodule(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	root := newGitRoot(t, nil)
+	directory := filepath.Join(root, "deep", "sub")
+	if err := os.MkdirAll(filepath.Dir(directory), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(root, "clone", "--quiet", upstream.url, directory); err != nil {
+		t.Fatal("unable to clone:", err)
+	}
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+
+	// A clean submodule doesn't get a warning.
+	if paths := warningPaths(scanEndpoint(t, e, true)); len(paths) != 0 {
+		t.Errorf("unexpected warnings: %v", paths)
+	}
+
+	// Modify the file's metadata but not its contents. The status of this
+	// repository doesn't change, but Git will need to examine the file, and it
+	// would normally save what it finds in the index.
+	index := filepath.Join(directory, ".git", "index")
+	file := filepath.Join(directory, "file")
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(file, past, past); err != nil {
+		t.Fatal(err)
+	}
+	indexBefore, err := os.ReadFile(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexInfoBefore, err := os.Lstat(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := warningPaths(scanEndpoint(t, e, true)); len(paths) != 0 {
+		t.Errorf("unexpected warnings for unchanged content: %v", paths)
+	}
+	indexAfter, err := os.ReadFile(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexInfoAfter, err := os.Lstat(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(indexBefore, indexAfter) || !indexInfoBefore.ModTime().Equal(indexInfoAfter.ModTime()) {
+		t.Error("checking status modified the index")
+	}
+
+	// Verify that the premise of the above is correct, which is that this is
+	// due to the lack of optional locks. If Git were not to update its index at
+	// all, then the test above would prove nothing.
+	control := gitCommand(context.Background(), directory, "status", "--porcelain")
+	control.Args = slices.DeleteFunc(control.Args, func(argument string) bool { return argument == "--no-optional-locks" })
+	if err := control.Run(); err != nil {
+		t.Fatal("unable to run status:", err)
+	}
+	if indexControl, err := os.ReadFile(index); err != nil {
+		t.Fatal(err)
+	} else if bytes.Equal(indexBefore, indexControl) {
+		t.Error("status didn't update index even without --no-optional-locks")
+	}
+
+	// Each kind of uncommitted change gets a warning at the submodule's path.
+	verifyWarned := func() {
+		t.Helper()
+		snapshot := scanEndpoint(t, e, true)
+		if len(snapshot.Warnings) != 1 {
+			t.Fatalf("incorrect warnings: %v", snapshot.Warnings)
+		}
+		warning := snapshot.Warnings[0]
+		if warning.Path != "deep/sub" {
+			t.Errorf("incorrect warning path: %s", warning.Path)
+		} else if !warning.Warning {
+			t.Error("not indicated as a warning")
+		} else if !strings.Contains(warning.Error, "uncommitted changes") || !strings.Contains(warning.Error, "commit and push") {
+			t.Errorf("incorrect warning message: %s", warning.Error)
+		}
+		if err := snapshot.EnsureValid(); err != nil {
+			t.Error("snapshot invalid:", err)
+		}
+		if len(e.snapshot.Warnings) != 0 {
+			t.Error("warnings stored in the endpoint's snapshot")
+		}
+	}
+	writeTree(t, directory, map[string]string{"untracked": "untracked"})
+	verifyWarned()
+	if err := os.Remove(filepath.Join(directory, "untracked")); err != nil {
+		t.Fatal(err)
+	}
+	writeTree(t, directory, map[string]string{"file": "modified"})
+	verifyWarned()
+	mustGit(t, directory, "add", "--", "file")
+	verifyWarned()
+
+	// Changes that have been committed aren't uncommitted changes, even if they
+	// aren't pushed, which is reported by the other endpoint if it can't fetch
+	// them.
+	mustGit(t, directory, "commit", "--quiet", "--no-gpg-sign", "-m", "local")
+	if paths := warningPaths(scanEndpoint(t, e, true)); len(paths) != 0 {
+		t.Errorf("unexpected warnings after commit: %v", paths)
+	}
+
+	// Ignored content isn't a change.
+	writeTree(t, directory, map[string]string{".git/info/exclude": "*.ignored\n", "local.ignored": "ignored"})
+	if paths := warningPaths(scanEndpoint(t, e, true)); len(paths) != 0 {
+		t.Errorf("unexpected warnings for ignored content: %v", paths)
+	}
+
+	// A failure doesn't produce a warning, because it's not known to be true.
+	if err := os.Chmod(filepath.Join(directory, ".git", "HEAD"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := scanEndpoint(t, e, true)
+	if err := os.RemoveAll(filepath.Join(directory, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if warnings := e.gitWarnings(context.Background(), snapshot); len(warnings) != 0 {
+		t.Errorf("unexpected warnings after failure: %v", warnings)
+	}
+
+	// Cancellation doesn't produce warnings either.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if warnings := e.gitWarnings(ctx, snapshot); len(warnings) != 0 {
+		t.Errorf("unexpected warnings after cancellation: %v", warnings)
+	}
+}
+
+// TestGitWarningsDirtySubmoduleLimit tests that warnings about uncommitted
+// changes in submodules are limited in number.
+func TestGitWarningsDirtySubmoduleLimit(t *testing.T) {
+	isolateGit(t)
+	root := newGitRoot(t, nil)
+	count := maximumDirtySubmoduleWarnings + 5
+	for i := 0; i < count; i++ {
+		directory := newGitWithOrigin(t, root, fmt.Sprintf("sub%02d", i), "https://example.org/repository.git")
+		writeTree(t, directory, map[string]string{"file": "modified"})
+	}
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	snapshot := scanEndpoint(t, e, true)
+	if len(snapshot.Warnings) != maximumDirtySubmoduleWarnings+1 {
+		t.Fatalf("incorrect warning count: %d", len(snapshot.Warnings))
+	}
+	if err := snapshot.EnsureValid(); err != nil {
+		t.Error("snapshot invalid:", err)
+	}
+	summary := snapshot.Warnings[maximumDirtySubmoduleWarnings]
+	if !strings.Contains(summary.Error, "this and 4 more submodules") || !summary.Warning || summary.Path == "" {
+		t.Errorf("incorrect summary: %v", summary)
 	}
 }
