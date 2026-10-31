@@ -82,8 +82,10 @@ disables execution there fail with 125.
     --node NAME. Session identifiers are internal synchronization handles.
   - Relative directories map from source root to target root. --cwd (-C)
     overrides the mapped directory; absolute and quoted ~ paths belong to the
-    target system. Ignored directories require an explicit --cwd, and ignored
-    content isn't synchronized. --ignores without --node inspects local rules.
+    target system. Ignored directories (in Git mode, also those that .gitignore
+    rules ignore, but not submodules' directories) require an explicit --cwd,
+    and ignored content isn't synchronized. --ignores without --node inspects
+    local rules.
   - Every operation crosses exactly one edge, which is an ordinary pair
     session, and behaves as for a pair: commands, scripts, detached jobs,
     --flush, --no-flush, --pull, --diff, --ignores, and conflicts (see
@@ -166,6 +168,32 @@ between a star's center and one of its nodes:
     session also ignores where they lead. --pull only follows links that the
     session ignores, and never one at the path itself, which a pulled file or
     link replaces.
+  - In Git mode (git: enabled), the session also ignores what .gitignore
+    files at every level and the root repository's .git/info/exclude ignore,
+    which each endpoint reads from its own copy of the tree, case-sensitively
+    (global excludes and files above the root don't count). The session's
+    ignore patterns take precedence, so a pattern such as !.env synchronizes
+    a file that a rule ignores. Entries named .git, files as well as
+    directories, are never synchronized and can't be unignored. remote
+    --ignores lists these sources and says which one ignores a path, and
+    --pull copies what they ignore. A rule added later doesn't delete files
+    that were synchronized. Files that Git tracks but rules ignore aren't
+    synchronized: remote warns and suggests the pattern that unignores them.
+  - In Git mode, a submodule is a directory, other than the root, that
+    contains .git and has an origin and commits; other nested repositories
+    are synchronized as directories, without their .git. The session
+    compares the commits that submodules have checked out, in the direction
+    of its mode (in two-way modes, a commit checked out on either endpoint
+    moves the other to it, on a detached HEAD), and each endpoint fetches
+    missing commits from the repository's URL itself, so it needs git,
+    network access, and read access there. A large first clone delays the
+    session's synchronization, and so remote's flushes. An empty directory is
+    filled in, and nothing removes a submodule automatically. Commands run in
+    submodules' directories as in others, and --pull copies content beneath a
+    submodule, which isn't synchronized file by file, but not the submodule
+    itself. After synchronizing, remote warns, without preventing commands,
+    about submodules with uncommitted changes, which the other endpoint
+    doesn't get, and about commits it can't fetch, such as unpushed ones.
   - --pull preserves regular files' modification times, including files in
     directories, truncated to whole seconds, so copies are never newer than
     their sources. Times use the executing endpoint's clock; clock skew is
@@ -378,7 +406,8 @@ Stop writers on both endpoints until apply finishes. Apply refuses copies
 changed since checkout; concurrent edits during apply can be overwritten.
 Each conflict has one checkout, through one endpoint. A workspace on your
 system may belong to someone else; only apply or discard your own checkouts.
-Directories require manual resolution. Other supported types require --take.
+Directories and submodules require manual resolution. Other supported types
+require --take.
 
 Failed apply can leave a partial result: retry using the retained workspace.
 If a copy changed or the conflict disappeared, inspect the current files and
@@ -457,7 +486,9 @@ alongside Error.
     fails if the copies changed since they were listed (the ancestor might not
     be theirs); check out again. To check out with --base after checking out
     without it, discard the workspace first. Conflicts involving directories
-    require manual resolution; checkout and apply reject them.
+    or submodules require manual resolution; checkout and apply reject them.
+    For a submodule, check out the same commit on both endpoints, or delete
+    it on one.
   - For two files, --conflict-apply writes the merged file (or the copy chosen
     by --take, or deletion with --delete) to both copies, but refuses a merged
     file that still contains conflict markers, or one that's empty while

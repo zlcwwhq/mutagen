@@ -88,6 +88,107 @@ func TestPrintIgnores(t *testing.T) {
 	}
 }
 
+func TestPrintIgnoresGitMode(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFiles(t, root, map[string]string{
+		".gitignore":     "*.log\nbuild/\n.env\nsecret\n",
+		"src/.gitignore": "!*.log\n",
+		"app.log":        "",
+		"src/x.log":      "",
+		"build/out":      "",
+		".env":           "",
+		"secret":         "",
+		"plain.txt":      "",
+		"sub/.git":       "gitdir: ../.git/modules/sub\n",
+		"sub/src/main.c": "",
+	})
+	ignores := (&remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"!.env", "/secret"}, VCS: true, Git: true}).WithRoot(root)
+	target := &remote.Target{Session: "sync_x", Name: "gpu", Root: root, Contained: true, Ignores: ignores}
+
+	// The listing says where the rest of the ignores come from, since they
+	// aren't among the session's patterns.
+	var output, errorOutput strings.Builder
+	if code, err := printIgnores(pinnedRouter(target, &errorOutput), nil, &output); err != nil || code != 0 {
+		t.Fatalf("listing failed: %d, %v", code, err)
+	}
+	expected := "Node gpu ignores (Mutagen syntax):\n" +
+		"  !.env\n" +
+		"  /secret\n" +
+		"  VCS directories (.git, .svn, .hg, .bzr, and _darcs)\n" +
+		"  Git rules: .gitignore files at every level and .git/info/exclude, case-sensitively; the patterns above take precedence, so they can also unignore\n" +
+		"  .git files and directories, which are never synchronized\n" +
+		"  Content of submodules (directories that contain .git, other than the root), which the session synchronizes by commit; commands can still run there\n" +
+		"Ignored paths aren't synchronized; remote --ignores <path> checks a path, and remote --pull <path> copies ignored paths from the opposite endpoint.\n"
+	if output.String() != expected {
+		t.Fatalf("incorrect listing:\n%s", output.String())
+	}
+
+	// A session in Git mode ignores more than nothing, even without patterns.
+	output.Reset()
+	target.Ignores = (&remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Git: true}).WithRoot(root)
+	if _, err := printIgnores(pinnedRouter(target, &errorOutput), nil, &output); err != nil || strings.Contains(output.String(), "ignores nothing") ||
+		!strings.Contains(output.String(), "Git rules:") {
+		t.Fatalf("Git mode listed as ignoring nothing: %q, %v", output.String(), err)
+	}
+	target.Ignores = ignores
+
+	// Paths say what ignores them, if it isn't the session's own patterns:
+	// rules in .gitignore files, which nested files override, .git entries, and
+	// submodules, whose content isn't synchronized file by file. The
+	// submodule's directory itself is synchronized.
+	submodule := "ignored (inside submodule sub, which the session synchronizes by commit, not file by file)"
+	output.Reset()
+	code, err := printIgnores(pinnedRouter(target, &errorOutput), []string{
+		"app.log", "src/x.log", "build", "build/out", ".env", "secret", "plain.txt", "sub", "sub/src", "sub/src/main.c", "sub/.git", "sub/missing", ".git",
+	}, &output)
+	if err != nil || code != 1 {
+		t.Fatalf("checking failed: %d, %v", code, err)
+	}
+	expected = "" +
+		"app.log: ignored (by Git rules)\n" +
+		"src/x.log: synchronized\n" +
+		"build: ignored (by Git rules)\n" +
+		"build/out: ignored (inside build, which Git rules ignore)\n" +
+		".env: synchronized\n" +
+		"secret: ignored\n" +
+		"plain.txt: synchronized\n" +
+		"sub: synchronized\n" +
+		"sub/src: " + submodule + "\n" +
+		"sub/src/main.c: " + submodule + "\n" +
+		"sub/.git: ignored (Git mode never synchronizes .git entries)\n" +
+		"sub/missing: not present locally; if a file or directory: " + submodule + "\n" +
+		".git: not present locally; if a file or directory: ignored (Git mode never synchronizes .git entries)\n"
+	if output.String() != expected {
+		t.Fatalf("incorrect checks:\n%s", output.String())
+	}
+
+	// Paths that are synchronized give status 0, whatever the mode.
+	output.Reset()
+	if code, err := printIgnores(pinnedRouter(target, &errorOutput), []string{"plain.txt", "sub", ".env"}, &output); err != nil || code != 0 {
+		t.Fatalf("synchronized paths reported as ignored: %d, %v, %s", code, err, output.String())
+	}
+
+	// Without a root, only .git entries are known to be ignored.
+	output.Reset()
+	target.Ignores = &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, VCS: true, Git: true}
+	if code, err := printIgnores(pinnedRouter(target, &errorOutput), []string{"app.log", "sub/.git", "sub/src"}, &output); err != nil || code != 1 ||
+		output.String() != "app.log: synchronized\nsub/.git: ignored (Git mode never synchronizes .git entries)\nsub/src: synchronized\n" {
+		t.Fatalf("incorrect checks without a root: %d, %v, %s", code, err, output.String())
+	}
+
+	// Sessions that aren't in Git mode are unaffected: they read no rule
+	// files, a .git file is synchronized, and exclusions are the session's.
+	output.Reset()
+	target.Ignores = (&remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"build/"}, VCS: true}).WithRoot(root)
+	if code, err := printIgnores(pinnedRouter(target, &errorOutput), []string{"app.log", "build", "build/out", "sub/.git", "sub/src/main.c"}, &output); err != nil || code != 1 ||
+		output.String() != "app.log: synchronized\nbuild: ignored\nbuild/out: ignored (inside build, which the session ignores)\nsub/.git: synchronized\nsub/src/main.c: synchronized\n" {
+		t.Fatalf("incorrect checks without Git mode: %d, %v, %s", code, err, output.String())
+	}
+}
+
 func TestPrintIgnoresAsPulled(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "src"), 0700); err != nil {

@@ -116,6 +116,151 @@ Only the daemon's system needs an installation. The `mutagen-setup` agent skill
 (see below) automates this.
 
 
+## Git mode
+
+Git mode makes a session follow the conventions of Git working trees, so that
+`.gitignore` files decide what's synchronized instead of `ignore.paths` that
+repeat them, `.git` entries are never synchronized, and submodules are
+synchronized by commit, with each endpoint fetching them itself, instead of as
+copies of their files (a submodule's `.git` file would point nowhere on the
+other endpoint). It's disabled by default. Enable it with `git: enabled` for a
+session, under `defaults`, in global configuration, or under `star.sync`, or
+with `--git` for `mutagen sync create`:
+
+```yaml
+sync:
+  code:
+    alpha: "."
+    beta: "server:~/project"
+    git: enabled
+    remote: true
+    ignore:
+      paths: ["!.env", ".venv/"]
+```
+
+```sh
+mutagen sync create --git --remote=true . server:~/project
+```
+
+It applies to the whole session, so it can't be set for one endpoint, and stars
+inherit it like other synchronization settings: `star.sync` or the defaults
+apply it to every edge, while nodes can't set it individually. Git mode implies
+`ignore.vcs: true` and is rejected together with a request to propagate VCS
+directories (`--no-ignore-vcs`, or `ignore.vcs: false`). Changing it in a
+project recreates the session when you apply the project, like other
+configuration changes. `mutagen sync list -l` shows the mode.
+
+**Ignores.** The session ignores what Git would: the rules of the `.gitignore`
+files at every level beneath the synchronization root, and of the root
+repository's `.git/info/exclude`. Global excludes (`core.excludesFile`) and
+directories above the root aren't read, and rules always match
+case-sensitively, so that both endpoints agree. Each endpoint reads the files
+in its own copy of the tree, and a scan reads them anew, so changes to them
+apply at the next scan. `.git/info/exclude` is inside `.git`, which is never
+synchronized, so it only applies on endpoints that have the repository: put
+ignores that both endpoints share in `.gitignore`. `ignore.paths` takes
+precedence over the files: a pattern such as `!.env` synchronizes a file that a
+rule ignores, and a rule can't unignore what a pattern ignores. Entries named
+`.git`, files (as used by submodules and worktrees) as well as directories, are
+never synchronized, and no pattern can unignore them. Files that Git tracks but
+rules ignore aren't synchronized either: the endpoint that has the repository
+reports a problem that suggests the `ignore.paths` pattern to unignore them
+(`!path`, or `!directory` for a file inside an ignored directory).
+
+A rule change can't delete files. If a rule starts to ignore files that were
+synchronized, they stay on both endpoints, and the session stops tracking them,
+and removing the rule resumes synchronizing them. Since each endpoint reads its
+own copy of the rule files, endpoints can briefly disagree about them. So a
+cycle that has rule files to deliver or remove does only that, on both
+endpoints, and every other change waits for the next cycle. Content that the new
+rules ignore, such as a `data/` directory that you prepared on a server, is thus
+neither copied back nor deleted before the rules arrive. If a rule file can't be
+written, the session reports the problem, and nothing else synchronizes until
+it's fixed.
+
+**Submodules.** A directory other than the root that contains a `.git` entry
+and whose repository has an origin and at least one commit is a submodule:
+any nested repository qualifies, whether or not `.gitmodules` lists it, and
+`.gitmodules` is synchronized as an ordinary file and not interpreted. Other
+directories, including nested repositories without an origin or commits, are
+synchronized as ordinary directories, without their `.git`. The session
+compares the commits that the endpoints have checked out, not their files, in
+the direction of the session's mode: in one-way modes, alpha's commit is
+checked out on beta, and in two-way modes, a commit checked out on either
+endpoint is checked out on the other, which leaves a detached HEAD. Each
+endpoint obtains the commit itself, from the `origin` URL of its own repository
+and then from the one that the other endpoint reports (without credentials),
+and checks it out with `git checkout --detach`, leaving changes that would
+conflict to Git to refuse. Plain content that a submodule replaces is only
+removed once a clone succeeds, in a temporary directory next to it; if the
+clone fails, the content stays and the session reports a problem. An empty
+directory isn't a conflict: it's filled by cloning, so `git submodule deinit`
+on one endpoint is undone (a one-way session leaves an empty directory on alpha
+alone). Submodules nested in a submodule are updated recursively as part of
+its checkout and aren't compared separately. A submodule is never removed
+automatically: if it's gone from one endpoint, the session reports a problem
+and you remove it from the other by hand. Conflicts that involve a submodule,
+such as both endpoints checking out different new commits, or a submodule on
+one endpoint and a file on the other, are listed by `mutagen sync list` and by
+`remote`, which can't resolve them: check out the same commit on both
+endpoints, or delete the submodule on one.
+
+**Warnings.** What Git mode doesn't synchronize is reported as problems by
+`mutagen sync list`, and `remote` prints them after each flush without
+preventing commands: submodules with uncommitted changes (the other endpoint
+only gets their commit), commits that the other endpoint can't fetch, such as
+unpushed ones (push them, and the next synchronization fetches them), failed
+fetches, a `.git` that isn't a valid repository or an endpoint without `git`,
+and tracked files that rules ignore (see above).
+
+**Requirements and limitations.**
+
+- Endpoints need `git`, network access, and read access to each submodule's
+  repository, from the system that fetches it. Git's own configuration applies,
+  so `url.<base>.insteadOf` can rewrite the URLs of an endpoint, such as to a
+  mirror. Fetches never prompt for credentials or run hooks, and only use the
+  `https`, `http`, `ssh`, and `git` protocols (or those in `GIT_ALLOW_PROTOCOL`,
+  if set). A fetch that shows no progress for 60 seconds is stopped, and its
+  URL isn't tried again for 5 minutes; other failures, such as an unknown commit
+  or failed authentication, aren't delayed, so a push takes effect at the next
+  synchronization. A system without outside network access can't fetch
+  submodules and only reports a problem: provide the code by other means.
+- A large repository's first clone blocks the session's whole synchronization
+  cycle, so flushes, and the `remote` commands that wait for them, wait for it.
+- If the other endpoint already has a directory without a `.gitignore`, the
+  first scan hashes all of its content, but doesn't transfer it. While a
+  `.gitignore` itself is in conflict, each endpoint applies its own copy, so
+  content that only one copy ignores can be transferred.
+- A flush waits for one further cycle after delivering rule files. If relaxing a
+  rule exposes another rule file, the content behind it needs a second flush or
+  the next filesystem event.
+- If one endpoint deletes a directory and the other has ignored content in it,
+  that's still a conflict, as in sessions without Git mode, such as
+  `__pycache__` directories that commands run with `remote` create.
+- Nested repositories that you cloned manually, and worktrees, are compared by
+  commit too if they have an origin, and unpushed commits in them only produce
+  warnings. Add them to `.gitignore` to leave them out.
+- A submodule inside a directory that rules ignore is neither synchronized nor
+  fetched.
+- To migrate a session that used `ignore.vcs: true`, replace it with
+  `git: enabled`, remove the `ignore.paths` patterns that repeat `.gitignore`
+  files, and apply the project. A dangling `sub/.git` file that the old session
+  synchronized to the other endpoint is reported as a problem there, since the
+  directory is then a submodule or an invalid repository: remove `sub` by hand,
+  and the session fills it in.
+
+`remote` follows the session's mode. It reads the rules from the tree on the
+system where it runs, so `remote --ignores` lists where the session's ignores
+come from, and `remote --ignores <path>...` says which of them ignores a path;
+`--pull` copies what rules ignore. Commands run in the directories of
+submodules as in any other, since they exist on both endpoints, but directories
+that rules ignore require an explicit `--cwd`. Content beneath a submodule isn't
+synchronized file by file, so `remote --pull sub/build/output` copies it (and
+creates missing directories beneath an existing submodule), while
+`remote --pull sub` is refused: the session synchronizes the submodule, and
+pulling it would merge two `.git` directories. `remote` can't tell whether a
+directory with a `.git` is a submodule, so it treats every one as such.
+
 ## Star workspaces
 
 A project can declare one star of directory workspaces, managed by one daemon:
@@ -163,7 +308,7 @@ edges as it relays a pair whose endpoints are both remote. Either way, each
 command crosses a single edge, without intermediate copies.
 
 Settings under `star.sync` extend global and project synchronization defaults,
-including ignores, and apply to every edge. A node's `mode` sets the
+including ignores and [Git mode](#git-mode), and apply to every edge. A node's `mode` sets the
 synchronization mode of its own edge (`two-way-safe`, `two-way-resolved`,
 `one-way-safe`, or `one-way-replica`), taking precedence over `star.sync.mode`
 and the defaults; edges use `two-way-safe` if nothing selects a mode. The
@@ -321,8 +466,10 @@ and rejected with status 125.** Unset the environment variable and use
 internal synchronization edges, managed through `mutagen sync` and projects.
 
 Ignored directories require an explicit `--cwd`; their files still aren't
-synchronized. `remote --ignores` inspects the source's ignore rules. Each call
-pins its selected target and doesn't switch to another node after a failure.
+synchronized. In [Git mode](#git-mode), that includes directories that
+`.gitignore` rules ignore, but not the directories of submodules. `remote
+--ignores` inspects the source's ignore rules. Each call pins its selected
+target and doesn't switch to another node after a failure.
 
 `--cwd` overrides the working directory (relative values are resolved against
 the corresponding directory, or against the opposite endpoint's root when
@@ -571,6 +718,13 @@ but different mtime are atomically replaced, keeping their local permissions
 (but not hard links, owner, or extended attributes), and counted as
 `metadata updated`; another pull leaves matching files unchanged.
 
+In [Git mode](#git-mode), `--ignores` also lists where the session's rules come
+from (`.gitignore` files and `.git/info/exclude`, which `remote` reads from the
+tree on its own system) and says which of them ignores each path. `--pull`
+copies content that they ignore, and content beneath a submodule, which the
+session doesn't synchronize file by file, including into missing directories
+beneath it, but refuses the submodule itself, which the session synchronizes.
+
 After each flush, `remote` also warns about content that the session couldn't
 synchronize: conflicts (paths modified on both endpoints, which aren't
 synchronized until resolved) and problems such as permission errors.
@@ -610,8 +764,10 @@ Stop writers on both endpoints until apply finishes. A checkout belongs to one
 endpoint, and an existing workspace may be another person's work; only apply
 or discard checkouts that you made. Apply refuses copies changed since checkout,
 but concurrent edits while it writes can be overwritten. Review the entire
-merged file, even when it has no conflict markers. Directories require manual
-resolution; other supported types can be resolved with `--take local|remote`.
+merged file, even when it has no conflict markers. Directories and submodules
+require manual resolution (for a submodule, check out the same commit on both
+endpoints, or delete it on one); other supported types can be resolved with
+`--take local|remote`.
 
 Failed apply retains its workspace for retry, including partially applied
 results. Successful apply and discard keep the original copies as backups.

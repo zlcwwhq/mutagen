@@ -136,11 +136,11 @@ func TestHelp(t *testing.T) {
 	// Every listed topic has its own help.
 	expectations := map[string][]string{
 		"nodes":       {"--nodes", "--node"},
-		"sync":        {fmt.Sprintf("take over %d seconds", ProgressDelay/time.Second), "--progress=false", fmt.Sprintf("every %d seconds", progressLineInterval/time.Second), "staging on alpha"},
+		"sync":        {fmt.Sprintf("take over %d seconds", ProgressDelay/time.Second), "--progress=false", fmt.Sprintf("every %d seconds", progressLineInterval/time.Second), "staging on alpha", "In Git mode (git: enabled)", ".git/info/exclude", "A large first clone"},
 		"termination": {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second)},
 		"jobs":        {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second), "--log FILE", "[--follow]", "--follow prints the log", "status 124"},
 		"scripts":     {fmt.Sprintf("limited to %d KiB", remote.MaximumScriptSize/1024), "or with " + remote.DefaultScriptInterpreter + " if it has none"},
-		"conflicts":   {"--conflict-checkout", "--take SIDE", "--base FILE", "--json"},
+		"conflicts":   {"--conflict-checkout", "--take SIDE", "--base FILE", "--json", "Directories and submodules require manual resolution"},
 	}
 	for _, topic := range helpTopics {
 		if !strings.Contains(help, "\n  "+topic.name+" ") {
