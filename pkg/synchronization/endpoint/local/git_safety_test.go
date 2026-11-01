@@ -713,6 +713,12 @@ func TestPruneGitTransitions(t *testing.T) {
 			expected: []*core.Entry{file, file},
 		},
 		{
+			name:     "rule file replaced by a directory that only rules for directories exclude",
+			rules:    ".gitignore/\n",
+			changes:  []*core.Change{{Path: ".gitignore", Old: file, New: directory(map[string]*core.Entry{".gitignore": other, "sub": directory(map[string]*core.Entry{".gitignore": other})})}},
+			expected: []*core.Entry{directory(map[string]*core.Entry{".gitignore": other, "sub": directory(map[string]*core.Entry{".gitignore": other})})},
+		},
+		{
 			name:     "only regular files provide rules",
 			rules:    "outputs/\n",
 			changes:  []*core.Change{{Path: "outputs", New: directory(map[string]*core.Entry{".gitignore": link})}, {Path: "outputs/sub", New: directory(map[string]*core.Entry{".gitignore": directory(nil)})}},
