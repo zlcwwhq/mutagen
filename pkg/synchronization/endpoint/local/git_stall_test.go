@@ -105,6 +105,12 @@ func (h *hangingTransport) verifyExited(t *testing.T) {
 	}
 }
 
+// gitTransportStallTimeout is the stall timeout for tests that count attempts to
+// contact a transport. Git has to get as far as running the transport within this
+// time, since an attempt that's stopped earlier isn't recorded, and that takes a
+// while on a busy system.
+const gitTransportStallTimeout = 2 * time.Second
+
 // useShortStallDurations makes stall detection use the specified durations for
 // an endpoint.
 func useShortStallDurations(e *endpoint, timeout, backoff time.Duration) *gitProvider {
@@ -136,7 +142,7 @@ func TestEndpointGitModeCloneStallBackoff(t *testing.T) {
 	transport := newHangingTransport(t)
 	root := newGitRoot(t, map[string]string{"sub/file": "precious"})
 	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
-	provider := useShortStallDurations(e, 250*time.Millisecond, 3*time.Second)
+	provider := useShortStallDurations(e, gitTransportStallTimeout, 3*time.Second)
 	old := entryAt(scanEndpoint(t, e, true), "sub")
 	target := &core.Entry{Kind: core.EntryKind_GitLink, Digest: make([]byte, 20), Url: transport.url}
 	change := &core.Change{Path: "sub", Old: old, New: target}
@@ -158,7 +164,7 @@ func TestEndpointGitModeCloneStallBackoff(t *testing.T) {
 	// here.
 	start := time.Now()
 	results, problems := transitionEndpoint(t, ctx, e, change)
-	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
+	if elapsed := time.Since(start); elapsed < gitTransportStallTimeout {
 		t.Errorf("clone stopped before stall timeout: %s", elapsed)
 	} else if elapsed > time.Minute {
 		t.Errorf("clone stopped long after stall timeout: %s", elapsed)
@@ -206,7 +212,7 @@ func TestEndpointGitModeFetchStallBackoff(t *testing.T) {
 	}
 	mustGit(t, directory, "config", "remote.origin.url", transport.url)
 	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
-	provider := useShortStallDurations(e, 250*time.Millisecond, time.Minute)
+	provider := useShortStallDurations(e, gitTransportStallTimeout, time.Minute)
 	old := entryAt(scanEndpoint(t, e, true), "sub")
 	if old == nil || old.Kind != core.EntryKind_GitLink {
 		t.Fatalf("incorrect entry: %v", old)
