@@ -467,3 +467,303 @@ func TestEndpointMaximumEntryCountRepeatedRefusal(t *testing.T) {
 		t.Errorf("incorrect target content: %v != %v", content, expected)
 	}
 }
+
+// newGitModeEndpoint creates an endpoint in Git mode, using a new Mutagen data
+// directory, by applying options to its configuration. The endpoint is shut
+// down when the test completes.
+func newGitModeEndpoint(t *testing.T, root string, watchMode synchronization.WatchMode, ignores ...string) *endpoint {
+	t.Helper()
+
+	// Use a short data directory, since registrations create sockets in it,
+	// whose paths have tight length limits.
+	dataDirectory, err := os.MkdirTemp("", "mtg-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dataDirectory) })
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", dataDirectory)
+
+	// Create the endpoint.
+	configuration := &synchronization.Configuration{
+		GitMode:              synchronization.GitMode_GitModeEnabled,
+		WatchMode:            watchMode,
+		WatchPollingInterval: 1,
+		Ignores:              ignores,
+	}
+	result, err := NewEndpoint(nil, root, "sync_git_mode", synchronization.Version_Version1, configuration, true)
+	if err != nil {
+		t.Fatal("unable to create endpoint:", err)
+	}
+	t.Cleanup(func() { result.Shutdown() })
+	return result.(*endpoint)
+}
+
+// writeTree writes files with the specified relative paths and contents,
+// creating parent directories as necessary. Each file is created outside of the
+// root and renamed into place, so that a concurrent scan can't see it partially
+// written.
+func writeTree(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for name, contents := range files {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal("unable to create parent directory:", err)
+		}
+		temporary, err := os.CreateTemp(filepath.Dir(root), "write-")
+		if err != nil {
+			t.Fatal("unable to create temporary file:", err)
+		}
+		_, err = temporary.WriteString(contents)
+		temporary.Close()
+		if err != nil {
+			t.Fatal("unable to write temporary file:", err)
+		} else if err := os.Rename(temporary.Name(), path); err != nil {
+			t.Fatal("unable to move file into place:", err)
+		}
+	}
+}
+
+// entryAt returns the entry at the specified path in a snapshot, or nil if
+// there isn't one.
+func entryAt(snapshot *core.Snapshot, path string) *core.Entry {
+	entry := snapshot.Content
+	for _, component := range strings.Split(path, "/") {
+		if entry == nil {
+			return nil
+		}
+		entry = entry.Contents[component]
+	}
+	return entry
+}
+
+// verifyKinds verifies the kinds of the entries at the specified paths.
+func verifyKinds(t *testing.T, snapshot *core.Snapshot, expected map[string]core.EntryKind) {
+	t.Helper()
+	for path, kind := range expected {
+		if entry := entryAt(snapshot, path); entry == nil {
+			t.Errorf("no entry at %q", path)
+		} else if entry.Kind != kind {
+			t.Errorf("incorrect kind at %q: %s != %s", path, entry.Kind, kind)
+		}
+	}
+}
+
+// scanEndpoint performs a scan that must succeed.
+func scanEndpoint(t *testing.T, e *endpoint, full bool) *core.Snapshot {
+	t.Helper()
+	snapshot, err, _ := e.Scan(context.Background(), nil, full)
+	if err != nil {
+		t.Fatal("scan failed:", err)
+	}
+	return snapshot
+}
+
+// TestEndpointGitModePollRuleChange tests that poll-based watching detects
+// changes to ignore rules, which requires that rule files be read again and
+// that decisions not be cached, even though nothing else on disk has changed.
+func TestEndpointGitModePollRuleChange(t *testing.T) {
+	// Create content and an endpoint, then wait for its baseline scan so that
+	// it treats what happens next as modifications.
+	root := filepath.Join(t.TempDir(), "root")
+	writeTree(t, root, map[string]string{
+		"kept":           "kept",
+		"data/file":      "data",
+		"deep/sub/x.log": "log",
+	})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeForcePoll)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		e.lockScanLock(context.Background())
+		accelerate := e.accelerate
+		e.unlockScanLock()
+		if accelerate {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for baseline scan")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// waitForModification waits for the watching Goroutine to signal changes.
+	waitForModification := func() {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := e.Poll(ctx); err != nil {
+			t.Fatal("polling failed:", err)
+		} else if ctx.Err() != nil {
+			t.Fatal("timed out waiting for modifications to be detected")
+		}
+	}
+
+	// Verify the initial state, using the snapshot from the watching Goroutine.
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		"kept":           core.EntryKind_File,
+		"data":           core.EntryKind_Directory,
+		"data/file":      core.EntryKind_File,
+		"deep/sub/x.log": core.EntryKind_File,
+	})
+
+	// Add rules.
+	writeTree(t, root, map[string]string{".gitignore": "data/\n*.log\n"})
+	waitForModification()
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		"kept":           core.EntryKind_File,
+		".gitignore":     core.EntryKind_File,
+		"data":           core.EntryKind_Untracked,
+		"deep/sub":       core.EntryKind_Directory,
+		"deep/sub/x.log": core.EntryKind_Untracked,
+	})
+
+	// Change the rules.
+	writeTree(t, root, map[string]string{".gitignore": "data/\n"})
+	waitForModification()
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		"data":           core.EntryKind_Untracked,
+		"deep/sub/x.log": core.EntryKind_File,
+	})
+
+	// Remove the rules.
+	if err := os.Remove(filepath.Join(root, ".gitignore")); err != nil {
+		t.Fatal("unable to remove rules:", err)
+	}
+	waitForModification()
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		"data/file":      core.EntryKind_File,
+		"deep/sub/x.log": core.EntryKind_File,
+	})
+
+	// Add rules using the repository's exclude file, which isn't synchronized,
+	// and thus doesn't change the snapshot except for what it ignores.
+	writeTree(t, root, map[string]string{".git/info/exclude": "kept\n"})
+	waitForModification()
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		".git": core.EntryKind_Untracked,
+		"kept": core.EntryKind_Untracked,
+	})
+
+	// Decisions must never have been cached.
+	e.lockScanLock(context.Background())
+	ignoreCache := e.ignoreCache
+	e.unlockScanLock()
+	if ignoreCache != nil {
+		t.Error("ignore cache stored in Git mode")
+	}
+}
+
+// TestEndpointGitModeFullScanRuleChange tests that full scans, which are what
+// flushes use, detect changes to ignore rules.
+func TestEndpointGitModeFullScanRuleChange(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root")
+	writeTree(t, root, map[string]string{"kept": "kept", "data/file": "data"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	verifyKinds(t, scanEndpoint(t, e, true), map[string]core.EntryKind{"data/file": core.EntryKind_File})
+
+	writeTree(t, root, map[string]string{".gitignore": "data/\n"})
+	verifyKinds(t, scanEndpoint(t, e, true), map[string]core.EntryKind{"data": core.EntryKind_Untracked})
+
+	writeTree(t, root, map[string]string{".gitignore": "kept\n"})
+	verifyKinds(t, scanEndpoint(t, e, true), map[string]core.EntryKind{
+		"data/file": core.EntryKind_File,
+		"kept":      core.EntryKind_Untracked,
+	})
+}
+
+// TestEndpointGitModeAcceleratedRuleChange tests that scans accelerated by
+// recursive watching discard the baseline, and with it all of the decisions
+// that it reflects, if a rule file is among the re-check paths. This test
+// simulates recursive watching, which isn't available on all platforms.
+func TestEndpointGitModeAcceleratedRuleChange(t *testing.T) {
+	// Create an endpoint with a baseline for accelerated scanning.
+	root := filepath.Join(t.TempDir(), "root")
+	writeTree(t, root, map[string]string{
+		"other/a":        "a",
+		"deep/sub/x.log": "log",
+		"deep/sub/y":     "y",
+	})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	scanEndpoint(t, e, true)
+	e.watchMode = reifiedWatchModeRecursive
+	e.accelerate = true
+
+	// Verify that an unrelated re-check path doesn't cause directories away
+	// from it to be scanned, so a change to rules wouldn't be seen by a regular
+	// accelerated scan. This means that the remainder of the test is meaningful
+	// and also that propagation from the baseline tolerates the lack of an
+	// ignore cache.
+	writeTree(t, root, map[string]string{".gitignore": "*.log\n"})
+	e.recheckPaths = map[string]bool{"other/a": true}
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		".gitignore":     core.EntryKind_File,
+		"deep/sub/x.log": core.EntryKind_File,
+	})
+	if len(e.recheckPaths) != 0 {
+		t.Error("re-check paths not reset by accelerated scan")
+	}
+
+	// Verify the same if there aren't any re-check paths.
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{"deep/sub/x.log": core.EntryKind_File})
+
+	// Verify that a root rule file forces a complete re-evaluation, and that
+	// re-check paths are reset afterward.
+	e.recheckPaths = map[string]bool{".gitignore": true}
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		"deep/sub/x.log": core.EntryKind_Untracked,
+		"deep/sub/y":     core.EntryKind_File,
+	})
+	if len(e.recheckPaths) != 0 {
+		t.Error("re-check paths not reset by full scan")
+	}
+
+	// Verify the same for a nested rule file, which is mixed with other paths.
+	writeTree(t, root, map[string]string{"deep/.gitignore": "y\n"})
+	e.recheckPaths = map[string]bool{"deep/.gitignore": true, "other/a": true}
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{"deep/sub/y": core.EntryKind_Untracked})
+	if len(e.recheckPaths) != 0 {
+		t.Error("re-check paths not reset by full scan")
+	}
+
+	// Verify the same for the repository's exclude file.
+	writeTree(t, root, map[string]string{".git/info/exclude": "a\n"})
+	e.recheckPaths = map[string]bool{".git/info/exclude": true}
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{"other/a": core.EntryKind_Untracked})
+
+	// Verify that all of this occurred without a stored ignore cache.
+	if e.ignoreCache != nil {
+		t.Error("ignore cache stored in Git mode")
+	}
+}
+
+// TestEndpointNoGitModeRetainsIgnoreCache tests that the ignore cache continues
+// to be used without Git mode, in which rule files aren't read.
+func TestEndpointNoGitModeRetainsIgnoreCache(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root")
+	writeTree(t, root, map[string]string{"data/file": "data"})
+	dataDirectory, err := os.MkdirTemp("", "mtg-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dataDirectory) })
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", dataDirectory)
+	configuration := &synchronization.Configuration{WatchMode: synchronization.WatchMode_WatchModeNoWatch}
+	result, err := NewEndpoint(nil, root, "sync_no_git_mode", synchronization.Version_Version1, configuration, true)
+	if err != nil {
+		t.Fatal("unable to create endpoint:", err)
+	}
+	t.Cleanup(func() { result.Shutdown() })
+	e := result.(*endpoint)
+
+	// Rule files are ordinary content, and nothing is attached to the snapshot.
+	writeTree(t, root, map[string]string{".gitignore": "data/\n"})
+	snapshot := scanEndpoint(t, e, true)
+	verifyKinds(t, snapshot, map[string]core.EntryKind{
+		".gitignore": core.EntryKind_File,
+		"data/file":  core.EntryKind_File,
+	})
+	if e.ignoreCache == nil {
+		t.Error("ignore cache not stored")
+	}
+	if snapshot != e.snapshot {
+		t.Error("snapshot copied without Git mode")
+	}
+}

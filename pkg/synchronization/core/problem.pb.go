@@ -30,7 +30,12 @@ type Problem struct {
 	// synchronization root).
 	Path string `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
 	// Error is a human-readable summary of the problem.
-	Error         string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	Error string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	// Warning indicates that the problem describes content that isn't
+	// synchronized by design rather than a failure, such as a path that's
+	// tracked by Git but matched by an ignore rule in Git mode. Warnings don't
+	// call into question whether or not anything else has been synchronized.
+	Warning       bool `protobuf:"varint,3,opt,name=warning,proto3" json:"warning,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -79,14 +84,22 @@ func (x *Problem) GetError() string {
 	return ""
 }
 
+func (x *Problem) GetWarning() bool {
+	if x != nil {
+		return x.Warning
+	}
+	return false
+}
+
 var File_synchronization_core_problem_proto protoreflect.FileDescriptor
 
 const file_synchronization_core_problem_proto_rawDesc = "" +
 	"\n" +
-	"\"synchronization/core/problem.proto\x12\x04core\"3\n" +
+	"\"synchronization/core/problem.proto\x12\x04core\"M\n" +
 	"\aProblem\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05errorB8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"
+	"\x05error\x18\x02 \x01(\tR\x05error\x12\x18\n" +
+	"\awarning\x18\x03 \x01(\bR\awarningB8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"
 
 var (
 	file_synchronization_core_problem_proto_rawDescOnce sync.Once

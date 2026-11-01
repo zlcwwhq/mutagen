@@ -490,6 +490,31 @@ func TestUnsettledResolution(t *testing.T) {
 	if err := a.unsettled(&remote.Listing{Conflicts: []remote.ConflictRoot{{Path: "sub"}}}); err == nil || !strings.Contains(err.Error(), "conflicts again") {
 		t.Fatal("conflict at an ancestor didn't block verification:", err)
 	}
+
+	// Warnings describe content that isn't synchronized by design, so they
+	// don't block verification, whether they overlap the conflict root in any
+	// way or not, while an ordinary problem at the same path still does.
+	for _, path := range []string{"sub/link", "sub", "", "sub/link/child", "unrelated"} {
+		for _, alpha := range []bool{true, false} {
+			warning := remote.Problem{Alpha: alpha, Path: path, Error: "tracked by Git, but ignored", Warning: true}
+			if err := a.unsettled(&remote.Listing{Problems: []remote.Problem{warning}}); err != nil {
+				t.Errorf("warning at %q blocked verification: %v", path, err)
+			}
+		}
+	}
+	mixed := []remote.Problem{
+		{Path: "sub/link", Error: "tracked by Git, but ignored", Warning: true},
+		{Path: "sub/link", Error: "permission denied"},
+	}
+	if err := a.unsettled(&remote.Listing{Problems: mixed}); err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Error("problem following a warning didn't block verification:", err)
+	}
+	if err := a.unsettled(&remote.Listing{
+		Conflicts: []remote.ConflictRoot{{Path: "sub/link"}},
+		Problems:  []remote.Problem{{Path: "sub/link", Error: "tracked by Git, but ignored", Warning: true}},
+	}); err == nil || !strings.Contains(err.Error(), "conflicts again") {
+		t.Error("conflict with a warning didn't block verification:", err)
+	}
 }
 
 // newTestWorkspace creates a workspace with the specified copies.

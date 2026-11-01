@@ -22,6 +22,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/fastpath"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/gitignore"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/local/staging"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
 	"github.com/mutagen-io/mutagen/pkg/timeutil"
@@ -96,6 +97,9 @@ type endpoint struct {
 	// "portable" permission propagation. This field is static and thus safe for
 	// concurrent reads.
 	defaultOwnership *filesystem.OwnershipSpecification
+	// gitMode indicates whether or not the session is in Git mode. This field
+	// is static and thus safe for concurrent reads.
+	gitMode bool
 	// scope is the registration of the content that the endpoint synchronizes
 	// (see remote.RegisterScope), or nil if it couldn't be registered. This
 	// field is static and thus safe for concurrent reads.
@@ -167,7 +171,7 @@ type endpoint struct {
 	// ignorer is the ignorer to use for scans.
 	ignorer ignore.Ignorer
 	// ignoreCache is the ignore cache from the last successful scan on the
-	// endpoint.
+	// endpoint. It remains nil in Git mode (see scan).
 	ignoreCache ignore.IgnoreCache
 	// cacheWriteError is the last error encountered when trying to write the
 	// cache to disk, if any.
@@ -294,6 +298,9 @@ func NewEndpoint(
 	if err != nil {
 		return nil, err
 	}
+
+	// Determine whether or not the session is in Git mode.
+	gitMode := synchronization.GitModeEnabled(configuration, version)
 
 	// Track whether or not any non-default ownership or directory permissions
 	// are set. We don't care about non-default file permissions since we're
@@ -468,6 +475,7 @@ func NewEndpoint(
 		defaultFileMode:              defaultFileMode,
 		defaultDirectoryMode:         defaultDirectoryMode,
 		defaultOwnership:             defaultOwnership,
+		gitMode:                      gitMode,
 		scope:                        scope,
 		workerCancel:                 workerCancel,
 		saveCacheSignal:              saveCacheSignal,
@@ -710,7 +718,12 @@ func (e *endpoint) watchPoll(ctx context.Context, pollingInterval uint32, nonRec
 				// temporary directories will never be added to the watcher
 				// (since they'll never be included in the scan), and thus we'll
 				// never see changes to their contents that would need to be
-				// filtered out.
+				// filtered out. For the same reason, we don't need the filter
+				// that recursive watching uses in Git mode: .git entries are
+				// never included in the scan either, and even if an event for
+				// one were to arrive here, it would only result in a scan,
+				// which wakes the session only if it finds that content has
+				// changed.
 				ignore := strings.HasPrefix(filepath.Base(path), filesystem.TemporaryNamePrefix)
 				if ignore {
 					logger.Tracef("Ignoring event path: \"%s\"", path)
@@ -953,8 +966,13 @@ WatchEstablishment:
 				// check the entire path for a temporary prefix to identify
 				// temporary directories (whose contents may have non-temporary
 				// names, such as in the case of internal staging directories).
+				// In Git mode, we also have to filter Git's own activity. Scans
+				// don't include it, so it couldn't change anything, and a
+				// command that fails but updates files in a Git directory would
+				// otherwise wake the session in a loop.
 				ignore := strings.HasPrefix(path, filesystem.TemporaryNamePrefix) ||
-					strings.HasPrefix(fastpath.Base(path), filesystem.TemporaryNamePrefix)
+					strings.HasPrefix(fastpath.Base(path), filesystem.TemporaryNamePrefix) ||
+					(e.gitMode && !gitModeEventRelevant(path))
 				if ignore {
 					logger.Tracef("Ignoring event path: \"%s\"", path)
 					continue
@@ -997,13 +1015,27 @@ func (e *endpoint) Poll(ctx context.Context) error {
 // scan is the internal function which performs a scan operation on the root and
 // updates the endpoint scan parameters. The caller must hold the scan lock.
 func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPaths map[string]bool) error {
+	// Determine the ignorer and ignore cache to use. In Git mode, ignore
+	// decisions depend on the contents of rule files, which are read from disk
+	// during the scan, and whose contents can change without any change to the
+	// session's configuration. Thus, each scan uses a new ignorer that reads
+	// them again, and decisions can't be carried over from a previous scan by
+	// the ignore cache, because that would hide rule changes from scans that
+	// aren't accelerated (i.e. in poll-based watching and when flushing). For
+	// this reason, we also don't retain the ignore cache that the scan
+	// generates.
+	ignorer, ignoreCache := e.ignorer, e.ignoreCache
+	if e.gitMode {
+		ignorer, ignoreCache = gitignore.NewIgnorer(e.root, e.ignorer), nil
+	}
+
 	// Perform a full (warm) scan, watching for errors.
 	snapshot, newCache, newIgnoreCache, err := core.Scan(
 		ctx,
 		e.root,
 		baseline, recheckPaths,
 		e.hasher, e.cache,
-		e.ignorer, e.ignoreCache,
+		ignorer, ignoreCache,
 		e.probeMode,
 		e.symbolicLinkMode,
 		e.permissionsMode,
@@ -1017,7 +1049,9 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 
 	// Update caches.
 	e.cache = newCache
-	e.ignoreCache = newIgnoreCache
+	if !e.gitMode {
+		e.ignoreCache = newIgnoreCache
+	}
 
 	// Update the last scan entry count.
 	e.lastScanEntryCount = snapshot.Content.Count()
@@ -1034,6 +1068,32 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 
 // Scan implements the Scan method for local endpoints.
 func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, full bool) (*core.Snapshot, error, bool) {
+	// Compute the snapshot.
+	snapshot, err, tryAgain := e.lockAndScan(ctx, full)
+	if err != nil {
+		return nil, err, tryAgain
+	}
+
+	// In Git mode, attach warnings about the content of the snapshot. Doing
+	// this here means that it happens once per synchronization cycle and not
+	// for the watching Goroutines' scans. We've released the scan lock by this
+	// point so that running Git doesn't get in the way of the watching
+	// Goroutines. Since the snapshot may be the baseline of the next scan, and
+	// it's compared with previous snapshots by poll-based watching, it stays
+	// free of warnings, and we only return a copy of it that has them.
+	if e.gitMode {
+		if warnings := e.gitWarnings(ctx, snapshot); len(warnings) > 0 {
+			snapshot = snapshot.WithWarnings(warnings)
+		}
+	}
+
+	// Success.
+	return snapshot, nil, false
+}
+
+// lockAndScan performs the scan for Scan, acquiring the scan lock for its
+// duration. It has the same return values as Scan.
+func (e *endpoint) lockAndScan(ctx context.Context, full bool) (*core.Snapshot, error, bool) {
 	// Grab the scan lock and defer its release. If lock acquisition is
 	// preempted, then the controller has cancelled the request.
 	if !e.lockScanLock(ctx) {
@@ -1067,10 +1127,23 @@ func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, full bool) (*core.Sn
 	// accelerated scanning with recursive watching, there's no need to disable
 	// acceleration on failure so long as the watch is still established (and if
 	// it's not, that will handled elsewhere).
+	//
+	// In Git mode, a change to a rule file can affect the ignore status of any
+	// content beneath its directory, but an accelerated scan only re-evaluates
+	// content along the re-check paths, and it would reuse the entries (and
+	// thus the decisions) of other directories from the baseline. In that case,
+	// we perform a full scan instead, using the same error handling. Since the
+	// resulting snapshot accounts for the re-check paths, they're reset as
+	// usual.
 	if e.accelerate && !full {
 		if e.watchMode == reifiedWatchModeRecursive {
 			e.logger.Debug("Performing accelerated scan with", len(e.recheckPaths), "recheck paths")
-			if err := e.scan(ctx, e.snapshot, e.recheckPaths); err != nil {
+			baseline, recheckPaths := e.snapshot, e.recheckPaths
+			if e.gitMode && containsGitRulePath(recheckPaths) {
+				e.logger.Debug("Ignore rules changed, performing full scan")
+				baseline, recheckPaths = nil, nil
+			}
+			if err := e.scan(ctx, baseline, recheckPaths); err != nil {
 				return nil, err, !errors.Is(err, core.ErrScanCancelled)
 			} else {
 				e.recheckPaths = make(map[string]bool)

@@ -912,6 +912,15 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		ignoreSyntax = c.session.Version.DefaultIgnoreSyntax()
 	}
 
+	// Determine whether or not the session is in Git mode and select the
+	// corresponding reconciliation behavior. In Git mode, ignore rules are read
+	// separately on each endpoint, which reconciliation has to account for.
+	gitMode := GitModeEnabled(c.session.Configuration, c.session.Version)
+	reconcile := core.Reconcile
+	if gitMode {
+		reconcile = core.ReconcileGitMode
+	}
+
 	// Compute the effective permissions mode.
 	permissionsMode := c.session.Configuration.PermissionsMode
 	if permissionsMode.IsDefault() {
@@ -941,6 +950,11 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 
 	// Create variables to track our reasons for skipping polling.
 	var skippingPollingDueToScanError, skippingPollingDueToMissingFiles bool
+	var skippingPollingDueToRuleOnlyCycle bool
+
+	// Track whether or not the flush request (if any) has already been held for
+	// another synchronization cycle because its cycle only delivered rules.
+	var flushHeldDueToRuleOnlyCycle bool
 
 	// Loop until there is a synchronization error.
 	for {
@@ -1170,13 +1184,13 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.state.AlphaState.Files = αSnapshot.Files
 		c.state.AlphaState.SymbolicLinks = αSnapshot.SymbolicLinks
 		c.state.AlphaState.TotalFileSize = αSnapshot.TotalFileSize
-		c.state.AlphaState.ScanProblems = αContent.Problems()
+		c.state.AlphaState.ScanProblems = append(αContent.Problems(), αSnapshot.Warnings...)
 		c.state.BetaState.Scanned = true
 		c.state.BetaState.Directories = βDirectoryCount
 		c.state.BetaState.Files = βSnapshot.Files
 		c.state.BetaState.SymbolicLinks = βSnapshot.SymbolicLinks
 		c.state.BetaState.TotalFileSize = βSnapshot.TotalFileSize
-		c.state.BetaState.ScanProblems = βContent.Problems()
+		c.state.BetaState.ScanProblems = append(βContent.Problems(), βSnapshot.Warnings...)
 		c.state.Status = Status_Reconciling
 		c.stateLock.Unlock()
 
@@ -1205,7 +1219,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		// synchronization root. In any case, we switch to a halted state and
 		// wait for the user to either manually propagate the deletion and
 		// resume the session, recreate the session, or reset the session.
-		if oneEndpointEmptiedRoot(ancestor, αContent, βContent) {
+		if oneEndpointEmptiedRoot(ancestor, αContent, βContent, gitMode) {
 			c.stateLock.Lock()
 			c.state.Status = Status_HaltedOnRootEmptied
 			c.stateLock.Unlock()
@@ -1214,7 +1228,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 
 		// Perform reconciliation.
 		c.logger.Debug("Performing reconciliation")
-		ancestorChanges, αTransitions, βTransitions, conflicts := core.Reconcile(
+		ancestorChanges, αTransitions, βTransitions, conflicts := reconcile(
 			ancestor,
 			αContent,
 			βContent,
@@ -1275,6 +1289,28 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			c.state.Status = Status_HaltedOnRootTypeChange
 			c.stateLock.Unlock()
 			return errHaltedForSafety
+		}
+
+		// In Git mode, if either endpoint has ignore rules to receive, then
+		// this cycle delivers only those rules, on both endpoints, since every
+		// other transition may be for content that the rules would ignore (see
+		// ruleOnlyTransitions). The next cycle recomputes the transitions that
+		// we drop here. This has to happen before staging, which is where
+		// content is actually transferred, but after the root deletion and root
+		// type change checks above, which need the full transition lists.
+		//
+		// This fails closed: a rule file that can never be written (and is thus
+		// computed as a delivery in every cycle) blocks all of the session's
+		// other transitions until it's fixed. This is deliberate, because
+		// proceeding without the rules is what deletes data. The failure stays
+		// visible as a transition problem, and flush requests are still
+		// answered (see below).
+		var ruleOnlyCycle bool
+		if gitMode {
+			αTransitions, βTransitions, ruleOnlyCycle = ruleOnlyTransitions(αTransitions, βTransitions)
+			if ruleOnlyCycle {
+				c.logger.Debug("Only delivering ignore rules in this cycle")
+			}
 		}
 
 		// Stage files on alpha.
@@ -1459,16 +1495,51 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			skippingPollingDueToMissingFiles = false
 		}
 
+		// If this cycle only delivered rules, then skip polling and run another
+		// synchronization cycle immediately, even if no other transitions were
+		// dropped, because the new rules may change what's synchronized and
+		// nothing else may come along to trigger a cycle. We only do this if
+		// we're not already in a synchronization cycle that was forced in this
+		// way. If we are, then the delivery of rules has failed (and the
+		// failure is reported as a transition problem) or there are new rules,
+		// such as those that a relaxed rule has just exposed, and another
+		// immediate cycle could continue indefinitely for the same reason, so
+		// we leave it to the next event. Cycles continue to only deliver rules
+		// in the mean time.
+		if ruleOnlyCycle && !skippingPollingDueToRuleOnlyCycle {
+			c.logger.Debug("Only delivered ignore rules, skipping polling")
+			skipPolling = true
+			skippingPollingDueToRuleOnlyCycle = true
+		} else {
+			skippingPollingDueToRuleOnlyCycle = false
+		}
+
 		// Increment the synchronization cycle count.
 		c.stateLock.Lock()
 		c.state.SuccessfulCycles++
 		c.stateLock.Unlock()
 
 		// If a flush request triggered this synchronization cycle, then tell it
-		// that the cycle has completed and remove it from our tracking.
+		// that the cycle has completed and remove it from our tracking. The
+		// exception is a cycle that only delivered rules, because a flush
+		// promises that synchronization has taken place, in which case we hold
+		// the request for the next cycle. We only do this once, because if that
+		// cycle also only delivers rules, then it may keep doing so, and the
+		// request can't be left waiting indefinitely. While we hold a request
+		// we have to skip polling, both to reach the next cycle immediately,
+		// and because polling would overwrite the request with any new one that
+		// it receives. Holding the request also keeps the next cycle's scan a
+		// full one.
 		if flushRequest != nil {
-			flushRequest <- nil
-			flushRequest = nil
+			if ruleOnlyCycle && !flushHeldDueToRuleOnlyCycle {
+				c.logger.Debug("Only delivered ignore rules, holding flush request for another cycle")
+				flushHeldDueToRuleOnlyCycle = true
+				skipPolling = true
+			} else {
+				flushRequest <- nil
+				flushRequest = nil
+				flushHeldDueToRuleOnlyCycle = false
+			}
 		}
 	}
 }
