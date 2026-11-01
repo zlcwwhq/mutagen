@@ -324,6 +324,9 @@ func TestIgnoreRuleFileTypes(t *testing.T) {
 	// A path whose parent isn't a directory doesn't cause problems.
 	writeTree(t, root, map[string]string{"file": ""})
 	expectIgnored(t, NewIgnorer(root, nil), "file/a", false, false)
+	if err := NewIgnorer(root, nil).EnsureDirectory("file"); err != nil {
+		t.Error("non-directory parent treated as read failure:", err)
+	}
 	expectIgnored(t, NewIgnorer(root, nil), "missing/a", false, false)
 
 	// A symbolic link to a rule file isn't followed.
@@ -334,7 +337,7 @@ func TestIgnoreRuleFileTypes(t *testing.T) {
 		expectIgnored(t, NewIgnorer(root, nil), "link/a", false, false)
 	}
 
-	// A rule file that can't be read doesn't provide rules.
+	// A rule file that can't be read blocks its subtree.
 	writeTree(t, root, map[string]string{"unreadable/.gitignore": "*\n"})
 	unreadable := filepath.Join(root, "unreadable", ".gitignore")
 	if runtime.GOOS != "windows" && os.Chmod(unreadable, 0) == nil {
@@ -342,7 +345,9 @@ func TestIgnoreRuleFileTypes(t *testing.T) {
 			file.Close()
 			t.Log("unable to make rule file unreadable, skipping")
 		} else {
-			expectIgnored(t, NewIgnorer(root, nil), "unreadable/a", false, false)
+			if err := NewIgnorer(root, nil).EnsureDirectory("unreadable"); err == nil {
+				t.Error("unreadable rule file did not block its subtree")
+			}
 		}
 	}
 
@@ -440,7 +445,7 @@ func TestExcludeFileLocation(t *testing.T) {
 				t.Fatal("unable to create root:", err)
 			}
 			expected := test.setup(t, root)
-			if actual := excludeFileLocation(root); actual != expected {
+			if actual, err := excludeFileLocation(root); err != nil || actual != expected {
 				t.Errorf("location did not match expected: %q != %q", actual, expected)
 			}
 		})
@@ -573,4 +578,100 @@ func BenchmarkIgnore(b *testing.B) {
 		e := entries[i%len(entries)]
 		ignorer.Ignore(e.path, e.directory)
 	}
+}
+
+// TestRuleReadFailures covers failures independently of process privileges and
+// verifies that an error is retained for descendants until the next scan.
+func TestRuleReadFailures(t *testing.T) {
+	for _, path := range []string{".gitignore", "nested/.gitignore", ".git/info/exclude", ".git", "gitdir/commondir"} {
+		t.Run(path, func(t *testing.T) {
+			root := t.TempDir()
+			if path == "gitdir/commondir" {
+				writeTree(t, root, map[string]string{".git": "gitdir: gitdir\n"})
+			}
+			writeTree(t, root, map[string]string{path: "secret.env\n"})
+			fullPath := filepath.Join(root, filepath.FromSlash(path))
+			limit := int64(maximumRuleFileSize)
+			if path == ".git" || path == "gitdir/commondir" {
+				limit = maximumPointerFileSize
+			}
+			if err := os.Truncate(fullPath, limit+1); err != nil {
+				t.Fatal(err)
+			}
+			ignorer := NewIgnorer(root, nil)
+			blocked := ""
+			if path == "nested/.gitignore" {
+				blocked = "nested"
+			}
+			if err := ignorer.EnsureDirectory(blocked); err == nil {
+				t.Fatal("oversized rules accepted")
+			}
+			if err := ignorer.EnsureDirectory(blocked + "/child"); err == nil {
+				t.Error("error not inherited")
+			}
+			if err := os.Remove(fullPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := ignorer.EnsureDirectory(blocked); err == nil {
+				t.Error("read failure not retained")
+			}
+			if err := NewIgnorer(root, nil).EnsureDirectory(blocked); err != nil {
+				t.Error("missing file treated as failure:", err)
+			}
+		})
+	}
+}
+
+// TestIgnorerSymbolicLinkDirectories tests that rules aren't read through
+// symbolic links, which scans don't traverse, but which can be in the way of a
+// directory that a transition is about to create. The rules of the parents of a
+// symbolic link still apply beneath it.
+func TestIgnorerSymbolicLinkDirectories(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		".gitignore":               "*.log\n",
+		"elsewhere/.gitignore":     "secret\n",
+		"elsewhere/sub/.gitignore": "deep\n",
+		"real/.gitignore":          "local\n",
+	})
+	for link, target := range map[string]string{
+		"link":      "elsewhere",
+		"loop":      "loop",
+		"dangling":  "missing",
+		"real/link": "../elsewhere",
+	} {
+		if err := os.Symlink(target, filepath.Join(root, filepath.FromSlash(link))); err != nil {
+			t.Skip("unable to create symbolic link:", err)
+		}
+	}
+
+	// There are no failures to read rules, regardless of the order in which
+	// directories are visited. A cycle would otherwise cause one.
+	for _, directories := range [][]string{
+		{"link", "link/sub", "loop", "loop/sub", "dangling", "dangling/sub", "real/link", "real/link/sub"},
+		{"real/link/sub", "real/link", "dangling/sub", "dangling", "loop/sub", "loop", "link/sub", "link"},
+	} {
+		ignorer := NewIgnorer(root, nil)
+		for _, directory := range directories {
+			if err := ignorer.EnsureDirectory(directory); err != nil {
+				t.Errorf("unable to load rules for %s: %v", directory, err)
+			}
+		}
+	}
+
+	// The rules at the targets don't apply, but those of the parents do.
+	ignorer := NewIgnorer(root, nil)
+	expectIgnored(t, ignorer, "link/secret", false, false)
+	expectIgnored(t, ignorer, "link/sub/deep", false, false)
+	expectIgnored(t, ignorer, "loop/secret", false, false)
+	expectIgnored(t, ignorer, "real/link/secret", false, false)
+	expectIgnored(t, ignorer, "link/out.log", false, true)
+	expectIgnored(t, ignorer, "link/sub/out.log", false, true)
+	expectIgnored(t, ignorer, "loop/out.log", false, true)
+	expectIgnored(t, ignorer, "dangling/out.log", false, true)
+	expectIgnored(t, ignorer, "real/link/local", false, true)
+
+	// The rules still apply at the targets themselves.
+	expectIgnored(t, ignorer, "elsewhere/secret", false, true)
+	expectIgnored(t, ignorer, "elsewhere/sub/deep", false, true)
 }

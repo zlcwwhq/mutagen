@@ -220,7 +220,17 @@ func (i *Ignores) excluded(path string, directory, every bool) string {
 	components := strings.Split(path, "/")
 	result := 0
 	for _, form := range []string{path, norm.NFC.String(path), norm.NFD.String(path)} {
-		depth := excludedDepth(ignorer, strings.Split(form, "/"), directory)
+		excluded, err := ignore.Excluded(ignorer, form, directory)
+		if err != nil {
+			// Rules that can't be read don't exclude anything, which errs
+			// towards reporting the path as synchronized, and thus towards
+			// refusing writes. Scans report the failure for the subtree.
+			return ""
+		}
+		depth := 0
+		if excluded != "" {
+			depth = strings.Count(excluded, "/") + 1
+		}
 		if !every && depth > 0 {
 			result = depth
 			break
@@ -233,31 +243,4 @@ func (i *Ignores) excluded(path string, directory, every bool) string {
 		return ""
 	}
 	return strings.Join(components[:result], "/")
-}
-
-// excludedDepth returns the number of components of the path to the entry that
-// keeps the entry with the specified path components, which is a directory if
-// directory is true, from being synchronized in the form in which they're
-// given (see Ignores.ExcludedInAnyForm), or zero if there's none. Ignorers
-// never direct traversal of entries other than directories, so those are
-// excluded whenever they're ignored or masked.
-func excludedDepth(ignorer ignore.Ignorer, components []string, directory bool) int {
-	masked := false
-	for c := range components {
-		status, traverse := ignorer.Ignore(strings.Join(components[:c+1], "/"), directory || c < len(components)-1)
-		switch status {
-		case ignore.IgnoreStatusIgnored:
-			if !traverse {
-				return c + 1
-			}
-			masked = true
-		case ignore.IgnoreStatusUnignored:
-			masked = false
-		default:
-			if masked && !traverse {
-				return c + 1
-			}
-		}
-	}
-	return 0
 }

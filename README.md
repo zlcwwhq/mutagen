@@ -174,7 +174,18 @@ endpoints, and every other change waits for the next cycle. Content that the new
 rules ignore, such as a `data/` directory that you prepared on a server, is thus
 neither copied back nor deleted before the rules arrive. If a rule file can't be
 written, the session reports the problem, and nothing else synchronizes until
-it's fixed.
+it's fixed. If a rule file can't be read, then the session reports the problem
+and doesn't synchronize its directory until it's fixed.
+
+An endpoint also applies its own rules to what it receives, including paths
+that it doesn't have yet, so a `.git/info/exclude` on one endpoint keeps the
+other endpoint's copies of what it excludes away. An excluded path isn't written
+and is reported as a warning, while the rest of its directory still is written:
+if `*.log` excludes `pkg/debug.log`, then `pkg/a.go` still arrives. Rule files
+themselves are still delivered, even into an excluded directory. If the endpoint
+already has the excluded path, then there's nothing to warn about, since the
+session simply doesn't track it. A pattern such as `!pkg/debug.log` in
+`ignore.paths` overrides the exclusion.
 
 **Nested repositories.** A directory other than the root that contains a `.git`
 entry, such as a submodule, is synchronized as an ordinary directory, without its
@@ -182,16 +193,19 @@ entry, such as a submodule, is synchronized as an ordinary directory, without it
 branches stay on the endpoint that has them. `.gitmodules` is synchronized as an
 ordinary file and not interpreted.
 
-**Warnings.** What Git mode doesn't synchronize is reported as problems by
-`mutagen sync list`, and `remote` prints them after each flush without
-preventing commands: tracked files that rules ignore (see above).
+**Warnings.** What Git mode doesn't synchronize is reported by
+`mutagen sync list`, and `remote` prints it after each flush without preventing
+commands: tracked files or incoming paths that rules ignore (see above). What's
+left out by design is listed as a warning rather than a problem.
 
 **Requirements and limitations.**
 
 - If the other endpoint already has a directory without a `.gitignore`, the
   first scan hashes all of its content, but doesn't transfer it. While a
   `.gitignore` itself is in conflict, each endpoint applies its own copy, so
-  content that only one copy ignores can be transferred.
+  neither writes content that its copy ignores.
+- Rules follow Git 2.52 and later; older versions of Git treat patterns like
+  `foo**/bar` differently, so they can disagree with the session about them.
 - A flush waits for one further cycle after delivering rule files. If relaxing a
   rule exposes another rule file, the content behind it needs a second flush or
   the next filesystem event.
@@ -206,7 +220,8 @@ preventing commands: tracked files that rules ignore (see above).
 system where it runs, so `remote --ignores` lists where the session's ignores
 come from, and `remote --ignores <path>...` says which of them ignores a path;
 `--pull` copies what rules ignore. Directories that rules ignore require an
-explicit `--cwd`.
+explicit `--cwd`. If a rule file can't be read, then `--pull` refuses, since it
+can't tell whether the session synchronizes the path.
 
 ## Star workspaces
 

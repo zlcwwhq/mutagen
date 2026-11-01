@@ -453,3 +453,24 @@ func TestSynchronizingGitMode(t *testing.T) {
 		}
 	}
 }
+
+func TestIgnoresGitModeUnreadableRules(t *testing.T) {
+	root := resolveSymbolicLinks(t.TempDir())
+	writeTestFiles(t, root, map[string]string{".gitignore": "secret.env\n"})
+	path := filepath.Join(root, ".gitignore")
+	if err := os.Chmod(path, 0); err != nil {
+		t.Skip(err)
+	}
+	t.Cleanup(func() { os.Chmod(path, 0600) })
+	if file, err := os.Open(path); err == nil {
+		file.Close()
+		t.Skip("process can read permission-denied files")
+	}
+	ignores := gitModeIgnores(root)
+	if ignores.ExcludedInEveryForm("secret.env", false) != "" {
+		t.Error("unknown rules authorized a write")
+	}
+	if ignores.ExcludedInAnyForm("secret.env", false) != "" {
+		t.Error("unknown rules reported an exclusion")
+	}
+}

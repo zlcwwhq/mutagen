@@ -176,8 +176,13 @@ between a star's center and one of its nodes:
     directories, are never synchronized and can't be unignored. remote
     --ignores lists these sources and says which one ignores a path, and
     --pull copies what they ignore. A rule added later doesn't delete files
-    that were synchronized. Files that Git tracks but rules ignore aren't
-    synchronized: remote warns and suggests the pattern that unignores them.
+    that were synchronized. If a rule file can't be read, then its directory
+    isn't synchronized until that's fixed, and --pull refuses to write there.
+    An endpoint doesn't write a path that its own rules ignore, even if it
+    doesn't have that path yet: remote warns, and the rest of the directory,
+    including any .gitignore files, still arrives. Files that Git tracks but
+    rules ignore aren't synchronized: remote warns and suggests the pattern
+    that unignores them.
   - In Git mode, nested repositories are synchronized as directories, without
     their .git, so their commits and branches stay on the endpoint that has
     them.
