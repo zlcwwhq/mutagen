@@ -14,6 +14,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 )
@@ -872,6 +873,36 @@ func isolateGit(t *testing.T) {
 	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.org")
 	t.Setenv("GIT_COMMITTER_NAME", "test")
 	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.org")
+}
+
+// transitionEndpoint performs a scan, which is what enables an endpoint to
+// perform a transition, followed by the specified transitions, and verifies
+// that no temporary content is left in the root.
+func transitionEndpoint(t *testing.T, ctx context.Context, e *endpoint, changes ...*core.Change) ([]*core.Entry, []*core.Problem) {
+	t.Helper()
+	scanEndpoint(t, e, true)
+	results, problems, _, err := e.Transition(ctx, changes)
+	if err != nil {
+		t.Fatal("transition failed:", err)
+	}
+	verifyNoTemporaryContent(t, e.root)
+	return results, problems
+}
+
+// verifyNoTemporaryContent verifies that a root doesn't have temporary content.
+func verifyNoTemporaryContent(t *testing.T, root string) {
+	t.Helper()
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		} else if strings.HasPrefix(entry.Name(), filesystem.TemporaryNamePrefix) {
+			t.Error("temporary content left behind:", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Error("unable to walk root:", err)
+	}
 }
 
 // verifySingleProblem verifies that a list of problems consists of one problem,

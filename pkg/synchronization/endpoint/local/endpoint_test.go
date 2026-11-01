@@ -480,10 +480,26 @@ func TestEndpointMaximumEntryCountRepeatedRefusal(t *testing.T) {
 	}
 }
 
+// gitModeSession is the session identifier for endpoints created by
+// newGitModeEndpoint and newConfiguredGitModeEndpoint.
+const gitModeSession = "sync_git_mode"
+
 // newGitModeEndpoint creates an endpoint in Git mode, using a new Mutagen data
 // directory, by applying options to its configuration. The endpoint is shut
 // down when the test completes.
 func newGitModeEndpoint(t *testing.T, root string, watchMode synchronization.WatchMode, ignores ...string) *endpoint {
+	t.Helper()
+	return newConfiguredGitModeEndpoint(t, root, &synchronization.Configuration{
+		WatchMode:            watchMode,
+		WatchPollingInterval: 1,
+		Ignores:              ignores,
+	})
+}
+
+// newConfiguredGitModeEndpoint creates an endpoint with the specified
+// configuration, with Git mode enabled, using a new Mutagen data directory. The
+// endpoint is shut down when the test completes.
+func newConfiguredGitModeEndpoint(t *testing.T, root string, configuration *synchronization.Configuration) *endpoint {
 	t.Helper()
 
 	// Use a short data directory, since registrations create sockets in it,
@@ -496,13 +512,8 @@ func newGitModeEndpoint(t *testing.T, root string, watchMode synchronization.Wat
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", dataDirectory)
 
 	// Create the endpoint.
-	configuration := &synchronization.Configuration{
-		GitMode:              synchronization.GitMode_GitModeEnabled,
-		WatchMode:            watchMode,
-		WatchPollingInterval: 1,
-		Ignores:              ignores,
-	}
-	result, err := NewEndpoint(nil, root, "sync_git_mode", synchronization.Version_Version1, configuration, true)
+	configuration.GitMode = synchronization.GitMode_GitModeEnabled
+	result, err := NewEndpoint(nil, root, gitModeSession, synchronization.Version_Version1, configuration, true)
 	if err != nil {
 		t.Fatal("unable to create endpoint:", err)
 	}
