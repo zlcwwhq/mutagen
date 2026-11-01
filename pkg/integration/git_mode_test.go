@@ -855,6 +855,61 @@ func TestGitModeNestedRepositoryWithoutOrigin(t *testing.T) {
 	}
 }
 
+// TestGitModeNestedRepositoryChanged tests what happens to a directory with a
+// nested repository that isn't a submodule when it's deleted or replaced on the
+// opposite endpoint. Its Git directory stays where it is, and that isn't the
+// result of a refusal, which is only for changes that synchronization can't
+// produce: it's content that synchronization doesn't track, which keeps it from
+// computing a change that would remove the directory.
+func TestGitModeNestedRepositoryChanged(t *testing.T) {
+	isolateGitMode(t)
+	for _, test := range []struct {
+		name   string
+		change func(*testing.T, string)
+	}{
+		{"deleted", func(t *testing.T, path string) {
+			if err := os.RemoveAll(path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"replaced", func(t *testing.T, path string) {
+			if err := os.RemoveAll(path); err != nil {
+				t.Fatal(err)
+			} else if err := os.WriteFile(path, []byte("replacement"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		for _, mode := range gitModeSynchronizationModes {
+			t.Run(test.name+"/"+mode.Description(), func(t *testing.T) {
+				session := newGitModeSession(t, gitModeOptions{
+					mode:  mode,
+					alpha: map[string]string{"keep": "keep", "other": "other", "nested/file": "file"},
+					beta:  map[string]string{"nested/file": "file"},
+					prepare: func(session *gitModeSession) {
+						gitModeRun(t, filepath.Join(session.beta, "nested"), "init", "--quiet")
+					},
+				})
+				session.flush()
+				session.expect(session.beta, map[string]string{"keep": "keep", "nested/file": "file"})
+
+				test.change(t, filepath.Join(session.alpha, "nested"))
+				state := session.flushAllowingProblems()
+				if _, err := os.Lstat(filepath.Join(session.beta, "nested", ".git", "HEAD")); err != nil {
+					t.Error("Git directory affected:", err)
+				}
+				for _, problems := range [][]*core.Problem{state.AlphaState.TransitionProblems, state.BetaState.TransitionProblems} {
+					for _, problem := range problems {
+						if strings.Contains(problem.Error, "Git metadata") {
+							t.Error("change refused:", problem)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestGitModePreexistingContentNotPulled tests that content that already exists
 // on an endpoint, and that the opposite endpoint's rules would ignore, isn't
 // transferred to the endpoint with those rules before they've been delivered.
