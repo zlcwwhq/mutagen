@@ -152,9 +152,21 @@ func TestIgnoreRuleDeliveries(t *testing.T) {
 		// Changes at rule paths that don't involve regular files.
 		{"rule file symbolic link created", []*core.Change{{Path: ".gitignore", New: link}}, nil},
 		{"rule file symbolic link removed", []*core.Change{{Path: ".gitignore", Old: link}}, nil},
-		{"rule file replaced by symbolic link", []*core.Change{{Path: ".gitignore", Old: file, New: link}}, nil},
-		{"rule file replaced by directory", []*core.Change{{Path: ".gitignore", Old: file, New: withoutRules}}, nil},
 		{"directory named as rule file removed", []*core.Change{{Path: ".gitignore", Old: withoutRules}}, nil},
+		{"symbolic link replaced by directory at rule path", []*core.Change{{Path: ".gitignore", Old: link, New: withoutRules}}, nil},
+		{"directory replaced by symbolic link at rule path", []*core.Change{{Path: ".gitignore", Old: withoutRules, New: link}}, nil},
+
+		// Rule files that are replaced, whose rules are thereby removed, which is
+		// all that's delivered, other than any rule files in the replacement.
+		{"rule file replaced by symbolic link", []*core.Change{{Path: ".gitignore", Old: file, New: link}}, []*core.Change{{Path: ".gitignore", Old: file}}},
+		{"rule file replaced by directory", []*core.Change{{Path: ".gitignore", Old: file, New: withoutRules}}, []*core.Change{{Path: ".gitignore", Old: file}}},
+		{"rule file replaced by empty directory", []*core.Change{{Path: ".gitignore", Old: file, New: directory(nil)}}, []*core.Change{{Path: ".gitignore", Old: file}}},
+		{"rule file replaced by directory containing only rule file", []*core.Change{{Path: ".gitignore", Old: file, New: onlyRules}}, []*core.Change{{Path: ".gitignore", Old: file, New: onlyRules}}},
+		{"rule file replaced by directory containing rule file", []*core.Change{{Path: ".gitignore", Old: file, New: withRules}}, []*core.Change{{Path: ".gitignore", Old: file, New: onlyRules}}},
+		{"rule file replaced by directory with rule file only in Git directory", []*core.Change{{Path: ".gitignore", Old: file, New: directory(map[string]*core.Entry{".git": gitRules, "a": file})}}, []*core.Change{{Path: ".gitignore", Old: file}}},
+		{"nested rule file replaced by symbolic link", []*core.Change{{Path: "pkg/.gitignore", Old: file, New: link}}, []*core.Change{{Path: "pkg/.gitignore", Old: file}}},
+		{"rule file in Git directory replaced", []*core.Change{{Path: ".git/.gitignore", Old: file, New: link}}, nil},
+		{"similar name replaced", []*core.Change{{Path: ".gitignore2", Old: file, New: link}}, nil},
 
 		// Creation of directories, which are pruned.
 		{"directory without rule files", []*core.Change{{Path: "d", New: withoutRules}}, nil},
@@ -297,6 +309,7 @@ func TestRuleOnlyTransitions(t *testing.T) {
 	directory := &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{".gitignore": file, "a": file}}
 	rule := &core.Change{Path: ".gitignore", New: file}
 	removal := &core.Change{Path: "sub/.gitignore", Old: file}
+	replacement := &core.Change{Path: "sub/.gitignore", Old: file, New: &core.Entry{Kind: core.EntryKind_SymbolicLink, Target: "a"}}
 	created := &core.Change{Path: "created", New: directory}
 	deleted := &core.Change{Path: "deleted", Old: directory}
 	plain := &core.Change{Path: "plain", New: file}
@@ -327,6 +340,8 @@ func TestRuleOnlyTransitions(t *testing.T) {
 		{"alpha receives rules", []*core.Change{plain, rule}, []*core.Change{otherPlain}, []string{".gitignore"}, nil, true},
 		{"beta loses rules", []*core.Change{plain}, []*core.Change{otherPlain, removal}, nil, []string{"sub/.gitignore"}, true},
 		{"alpha receives directory", []*core.Change{created, plain}, []*core.Change{otherPlain}, []string{"created"}, nil, true},
+		{"beta's rule file replaced", []*core.Change{plain}, []*core.Change{otherPlain, replacement}, nil, []string{"sub/.gitignore"}, true},
+		{"alpha's rule file replaced", []*core.Change{plain, replacement}, []*core.Change{otherPlain}, []string{"sub/.gitignore"}, nil, true},
 		{"both receive rules", []*core.Change{plain, rule}, []*core.Change{created, otherPlain}, []string{".gitignore"}, []string{"created"}, true},
 		{"nothing else to drop on alpha", []*core.Change{rule}, nil, []string{".gitignore"}, nil, true},
 		{"nothing else to drop on beta", nil, []*core.Change{removal}, nil, []string{"sub/.gitignore"}, true},
@@ -481,6 +496,109 @@ func TestRuleOnlyCycleRemainder(t *testing.T) {
 			t.Errorf("%s: ancestor doesn't match alpha", test.description)
 		}
 		ancestorChanges, αTransitions, βTransitions, conflicts = core.ReconcileGitMode(ancestor, content, beta, mode)
+		if len(ancestorChanges) != 0 || len(αTransitions) != 0 || len(βTransitions) != 0 || len(conflicts) != 0 {
+			t.Errorf("%s: unsettled after second cycle", test.description)
+		}
+	}
+}
+
+// TestRuleFileReplacementCycles tests that replacing a rule file takes a single
+// cycle that only delivers rules, whatever replaces it, because that's the number
+// of such cycles that a flush is held for, and that the next cycle reconciles
+// everything else, including what that first cycle dropped. Transitions are
+// modeled as they are in TestRuleOnlyCycleRemainder.
+func TestRuleFileReplacementCycles(t *testing.T) {
+	// Define entries.
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	other := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{2}}
+	directory := func(contents map[string]*core.Entry) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: contents}
+	}
+	mode := core.SynchronizationMode_SynchronizationModeTwoWaySafe
+
+	// Define test cases. All of them replace the rule file at the root, in a
+	// cycle that has another change to make.
+	tests := []struct {
+		description string
+		replacement *core.Entry
+		// expected is what the first cycle should leave at the rule file's path.
+		expected *core.Entry
+	}{
+		{"symbolic link", &core.Entry{Kind: core.EntryKind_SymbolicLink, Target: "a"}, nil},
+		{"submodule", &core.Entry{Kind: core.EntryKind_GitLink, Digest: make([]byte, 20), Url: "https://example.org/repository.git"}, nil},
+		{"empty directory", directory(nil), nil},
+		{"directory without rule files", directory(map[string]*core.Entry{"a": file}), nil},
+		{
+			"directory with only a rule file",
+			directory(map[string]*core.Entry{".gitignore": other}),
+			directory(map[string]*core.Entry{".gitignore": other}),
+		},
+		{
+			"directory with a rule file",
+			directory(map[string]*core.Entry{".gitignore": other, "a": file}),
+			directory(map[string]*core.Entry{".gitignore": other}),
+		},
+		{
+			"directory with nested rule files",
+			directory(map[string]*core.Entry{"sub": directory(map[string]*core.Entry{".gitignore": other, "a": file}), "b": file}),
+			directory(map[string]*core.Entry{"sub": directory(map[string]*core.Entry{".gitignore": other})}),
+		},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		original := directory(map[string]*core.Entry{".gitignore": file, "keep": file})
+		alpha := directory(map[string]*core.Entry{".gitignore": test.replacement, "keep": file, "new": file})
+		ancestor, beta := original, original
+
+		// apply models a transition, including its propagation to the ancestor.
+		apply := func(ancestorChanges, transitions []*core.Change) {
+			t.Helper()
+			var err error
+			if beta, err = core.Apply(beta, transitions); err != nil {
+				t.Fatalf("%s: unable to apply transitions: %v", test.description, err)
+			}
+			if ancestor, err = core.Apply(ancestor, append(ancestorChanges, transitions...)); err != nil {
+				t.Fatalf("%s: unable to apply changes to ancestor: %v", test.description, err)
+			}
+			if err = ancestor.EnsureValid(true); err != nil {
+				t.Fatalf("%s: invalid ancestor: %v", test.description, err)
+			}
+		}
+
+		// The first cycle only delivers rules.
+		ancestorChanges, αTransitions, βTransitions, conflicts := core.ReconcileGitMode(ancestor, alpha, beta, mode)
+		if len(conflicts) != 0 || len(αTransitions) != 0 {
+			t.Fatalf("%s: unexpected first reconciliation: %v, %v", test.description, conflicts, αTransitions)
+		}
+		_, βTransitions, ruleOnly := ruleOnlyTransitions(αTransitions, βTransitions)
+		if !ruleOnly {
+			t.Errorf("%s: first cycle isn't rule-only", test.description)
+		}
+		if len(βTransitions) != 1 || βTransitions[0].Path != ".gitignore" {
+			t.Fatalf("%s: incorrect first transitions: %v", test.description, βTransitions)
+		} else if !βTransitions[0].Old.Equal(file, true) {
+			t.Errorf("%s: rule file isn't what's replaced: %v", test.description, βTransitions[0].Old)
+		} else if !βTransitions[0].New.Equal(test.expected, true) {
+			t.Errorf("%s: incorrect delivery: %v", test.description, βTransitions[0].New)
+		}
+		apply(ancestorChanges, βTransitions)
+
+		// The second cycle isn't limited to rules, so that a flush can finish
+		// with it, and it leaves nothing to do.
+		ancestorChanges, αTransitions, βTransitions, conflicts = core.ReconcileGitMode(ancestor, alpha, beta, mode)
+		if len(conflicts) != 0 || len(αTransitions) != 0 {
+			t.Fatalf("%s: unexpected second reconciliation: %v, %v", test.description, conflicts, αTransitions)
+		}
+		_, βTransitions, ruleOnly = ruleOnlyTransitions(αTransitions, βTransitions)
+		if ruleOnly {
+			t.Errorf("%s: second cycle is rule-only", test.description)
+		}
+		apply(ancestorChanges, βTransitions)
+		if !beta.Equal(alpha, true) {
+			t.Errorf("%s: beta doesn't match alpha", test.description)
+		}
+		ancestorChanges, αTransitions, βTransitions, conflicts = core.ReconcileGitMode(ancestor, alpha, beta, mode)
 		if len(ancestorChanges) != 0 || len(αTransitions) != 0 || len(βTransitions) != 0 || len(conflicts) != 0 {
 			t.Errorf("%s: unsettled after second cycle", test.description)
 		}

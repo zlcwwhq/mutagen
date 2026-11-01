@@ -82,6 +82,17 @@ func isIgnoreRuleChange(change *core.Change) bool {
 	return change.Old != nil && change.Old.Kind == core.EntryKind_File
 }
 
+// isIgnoreRuleReplacement determines whether or not a change replaces a file
+// that provides ignore rules in Git mode with something else, such as a symbolic
+// link or a directory, none of which provide rules. That removes the file's
+// rules just as much as removing the file does (see isIgnoreRuleChange).
+func isIgnoreRuleReplacement(change *core.Change) bool {
+	return change.Old != nil && change.New != nil &&
+		change.Old.Kind == core.EntryKind_File &&
+		change.New.Kind != core.EntryKind_File &&
+		gitignore.IsDeliverableRuleFile(change.Path)
+}
+
 // pruneToIgnoreRules creates a copy of a directory entry containing only the
 // files beneath it that can be delivered to provide ignore rules in Git mode
 // (see gitignore.IsDeliverableRuleFile) and the directories leading to them, or
@@ -127,6 +138,19 @@ func pruneToIgnoreRules(path string, directory *core.Entry) *core.Entry {
 //
 // A change satisfying isIgnoreRuleChange is included as is.
 //
+// A change satisfying isIgnoreRuleReplacement is included as the rule file's
+// removal, along with the rule files in the replacement, if it's a directory
+// (see pruneToIgnoreRules). The rest of the replacement is then created by the
+// next synchronization cycle, in which the ancestor and the endpoint have what
+// was delivered. Unlike the rest of a replacement, what's delivered can't be
+// refused because of the endpoint's rules (see gitTransitionPruner in the local
+// endpoint package) or because the endpoint can't create a symbolic link or a
+// submodule, either of which would make the session compute it as a delivery in
+// every cycle, at the expense of everything else. The rule files have to be
+// delivered right away, because a flush is only held for a single cycle that only
+// delivers rules (see the synchronization loop), so they can't be left to a
+// cycle of their own without a flush returning before the rest is synchronized.
+//
 // A change that creates a directory (including the root) containing rule files
 // is included with a pruned copy of the directory (see pruneToIgnoreRules). The
 // remainder of the directory is then reconciled by the next synchronization
@@ -135,14 +159,21 @@ func pruneToIgnoreRules(path string, directory *core.Entry) *core.Entry {
 // into account.
 //
 // Anything else isn't a delivery, including a directory deletion or a type
-// change that happens to involve rule files. The former removes the rules along
-// with the content that they apply to, and the latter is left to the next cycle
-// because it has to replace what's there with all of the new content.
+// change of something other than a rule file that happens to involve rule files
+// beneath it. The former removes the rules along with the content that they
+// apply to, and the latter is left to the next cycle because it has to replace
+// what's there with all of the new content.
 func ignoreRuleDeliveries(changes []*core.Change) []*core.Change {
 	var deliveries []*core.Change
 	for _, change := range changes {
 		if isIgnoreRuleChange(change) {
 			deliveries = append(deliveries, change)
+		} else if isIgnoreRuleReplacement(change) {
+			delivery := &core.Change{Path: change.Path, Old: change.Old}
+			if change.New.Kind == core.EntryKind_Directory {
+				delivery.New = pruneToIgnoreRules(change.Path, change.New)
+			}
+			deliveries = append(deliveries, delivery)
 		} else if change.Old == nil && change.New != nil && change.New.Kind == core.EntryKind_Directory {
 			if pruned := pruneToIgnoreRules(change.Path, change.New); pruned != nil {
 				deliveries = append(deliveries, &core.Change{Path: change.Path, New: pruned})
