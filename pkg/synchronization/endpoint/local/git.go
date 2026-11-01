@@ -676,14 +676,18 @@ func gitModeEventRelevant(path string) bool {
 		case "logs":
 			return false
 		case "refs":
-			return true
+			// Git refuses reference names that end in .lock, so such a file can
+			// only be the lock file for a reference, which says nothing by
+			// itself: Git takes the one for refs/remotes/<remote>/HEAD in every
+			// fetch of a remote, even if nothing changes. An update is reported
+			// for the reference itself when the lock file is renamed.
+			return !strings.HasSuffix(components[len(components)-1], ".lock")
 		}
 	}
 
-	// Otherwise, only a few specific files are relevant. We don't have to worry
-	// about the lock files that are used to update them, because these have
-	// different names, and the update is reported for the file when the lock
-	// file is renamed.
+	// Otherwise, only a few specific files are relevant. Their lock files have
+	// different names, and an update is reported for the file itself when its
+	// lock file is renamed.
 	last := len(components) - 1
 	switch components[last] {
 	case "HEAD", "packed-refs":
