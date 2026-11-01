@@ -271,11 +271,15 @@ func (i *ignorer) load(directory string) *ruleSet {
 // which can be anything, including a cycle or another directory's rules, has
 // nothing to do with the paths beneath the link, and rule files mustn't be read
 // through it. The root itself is always traversed, since a symbolic link there
-// is how the user has chosen to specify it.
+// is how the user has chosen to specify it. A scan also only reaches directories
+// by the names that it finds in their parents, so a name that refers to a
+// directory itself or to its parent, or that spans several directories, isn't
+// traversable. Paths that aren't from a scan can have such names, and rule files
+// outside of the root have no say about anything.
 func (i *ignorer) traversable(directory, parent string) (bool, error) {
 	if directory == "" {
 		return true, nil
-	} else if i.untraversable[parent] {
+	} else if i.untraversable[parent] || !isEntryName(directory[strings.LastIndexByte(directory, '/')+1:]) {
 		i.untraversable[directory] = true
 		return false, nil
 	}
@@ -287,6 +291,14 @@ func (i *ignorer) traversable(directory, parent string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+// isEntryName determines whether or not a path component can be the name of an
+// entry in a directory, as opposed to a reference to the directory itself or to
+// its parent, or several components according to the system's path separator.
+func isEntryName(component string) bool {
+	return component != "" && component != "." && component != ".." &&
+		!strings.ContainsRune(component, filepath.Separator)
 }
 
 // excludeRules returns the rule set for the root repository's exclude file, or

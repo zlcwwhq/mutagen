@@ -747,3 +747,73 @@ func TestIgnorerSymbolicLinkDirectories(t *testing.T) {
 	expectIgnored(t, ignorer, "elsewhere/secret", false, true)
 	expectIgnored(t, ignorer, "elsewhere/sub/deep", false, true)
 }
+
+// TestPathsThatLeaveRoot tests that a path that a scan could never reach can't
+// cause rule files outside of the root to be read, and that names that merely
+// resemble the ones that do this aren't affected.
+func TestPathsThatLeaveRoot(t *testing.T) {
+	// Create rules outside of the root that would exclude the name that's used
+	// in the paths below, and rules inside of the root that don't.
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	tree := map[string]string{
+		".gitignore":          "secret\n",
+		"outside/.gitignore":  "secret\n",
+		"root/.gitignore":     "public\n",
+		"root/a/b/file":       "file",
+		"root/..x/.gitignore": "secret\n",
+	}
+	dotted := []string{"..x/secret"}
+
+	// Windows doesn't have directories whose names consist of dots.
+	if runtime.GOOS != "windows" {
+		tree["root/.../.gitignore"] = "secret\n"
+		dotted = append(dotted, ".../secret")
+	}
+	writeTree(t, parent, tree)
+
+	// Nothing but the root's rules apply to these, whatever they refer to.
+	separator := string(filepath.Separator)
+	for _, path := range []string{
+		"../secret",
+		"../outside/secret",
+		"a/../../secret",
+		"a/b/../../../secret",
+		"../../" + filepath.Base(parent) + "/secret",
+		"./../secret",
+		".." + separator + "outside/secret",
+	} {
+		ignorer := NewIgnorer(root, nil)
+		if excluded, err := ignore.Excluded(ignorer, path, false); err != nil {
+			t.Errorf("path %q: unable to evaluate: %v", path, err)
+		} else if excluded != "" {
+			t.Errorf("path %q: rules outside of the root used to exclude %q", path, excluded)
+		}
+	}
+
+	// The root's rules do apply to them.
+	if excluded, err := ignore.Excluded(NewIgnorer(root, nil), "../public", false); err != nil {
+		t.Error("unable to evaluate:", err)
+	} else if excluded != "../public" {
+		t.Error("rules of the root not used:", excluded)
+	}
+
+	// Names that merely begin with dots are ordinary names.
+	for _, path := range dotted {
+		if excluded, err := ignore.Excluded(NewIgnorer(root, nil), path, false); err != nil {
+			t.Errorf("path %q: unable to evaluate: %v", path, err)
+		} else if excluded != path {
+			t.Errorf("path %q: rules of directory not used: %q", path, excluded)
+		}
+	}
+
+	// A backslash is only special where it's a path separator.
+	if runtime.GOOS != "windows" {
+		writeTree(t, root, map[string]string{`b\c/.gitignore`: "secret\n"})
+		if excluded, err := ignore.Excluded(NewIgnorer(root, nil), `b\c/secret`, false); err != nil {
+			t.Error("unable to evaluate:", err)
+		} else if excluded != `b\c/secret` {
+			t.Error("rules of directory with a backslash in its name not used:", excluded)
+		}
+	}
+}
