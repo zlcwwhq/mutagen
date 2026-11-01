@@ -1116,8 +1116,17 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 			listed.RemotePending[p] = l.local(path)
 		}
 		return json.NewEncoder(output).Encode(&listed)
-	} else if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 && len(listing.Problems) == 0 {
-		_, err := fmt.Fprintln(output, "No conflicts.")
+	}
+	// Problems may hide a conflict, so the listing doesn't say that there are
+	// none when there are any (the problems themselves were printed above), and
+	// it says so instead, so that a listing without anything to list always says
+	// what it means.
+	if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 {
+		message := "No conflicts."
+		if len(listing.Problems) > 0 {
+			message = "Conflicts can't be ruled out, because some content couldn't be synchronized (see the warnings)."
+		}
+		_, err := fmt.Fprintln(output, message)
 		return err
 	}
 	for c, conflict := range conflicts {
