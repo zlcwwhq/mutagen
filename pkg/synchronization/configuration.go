@@ -135,6 +135,22 @@ func (c *Configuration) EnsureValid(endpointSpecific bool) error {
 		}
 	}
 
+	// Verify that the Git mode is unspecified or supported. Like the VCS ignore
+	// mode, it describes how the session as a whole interprets the
+	// synchronization roots, so it can't differ between endpoints. Its
+	// interaction with the VCS ignore mode can't be validated here because
+	// either one may be overridden by a configuration merged on top of this
+	// one, so that's checked when creating the ignorer (see NewIgnorer).
+	if endpointSpecific {
+		if !c.GitMode.IsDefault() {
+			return errors.New("Git mode cannot be specified on an endpoint-specific basis")
+		}
+	} else {
+		if !(c.GitMode.IsDefault() || c.GitMode.Supported()) {
+			return errors.New("unknown or unsupported Git mode")
+		}
+	}
+
 	// Verify that the permissions mode is unspecified or supported. Also
 	// determine the effective permissions mode for validating file and
 	// directory modes.
@@ -248,6 +264,7 @@ func (c *Configuration) Equal(other *Configuration) bool {
 		comparison.StringSlicesEqual(c.DefaultIgnores, other.DefaultIgnores) &&
 		comparison.StringSlicesEqual(c.Ignores, other.Ignores) &&
 		c.IgnoreVCSMode == other.IgnoreVCSMode &&
+		c.GitMode == other.GitMode &&
 		c.PermissionsMode == other.PermissionsMode &&
 		c.DefaultFileMode == other.DefaultFileMode &&
 		c.DefaultDirectoryMode == other.DefaultDirectoryMode &&
@@ -356,6 +373,13 @@ func MergeConfigurations(lower, higher *Configuration) *Configuration {
 		result.IgnoreVCSMode = higher.IgnoreVCSMode
 	} else {
 		result.IgnoreVCSMode = lower.IgnoreVCSMode
+	}
+
+	// Merge the Git mode.
+	if !higher.GitMode.IsDefault() {
+		result.GitMode = higher.GitMode
+	} else {
+		result.GitMode = lower.GitMode
 	}
 
 	// Merge the permissions mode.

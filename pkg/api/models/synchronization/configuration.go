@@ -77,6 +77,10 @@ type Configuration struct {
 		// Algorithm specifies the compression algorithm.
 		Algorithm compression.Algorithm `json:"algorithm,omitempty" yaml:"algorithm" mapstructure:"algorithm"`
 	} `json:"compression" yaml:"compression" mapstructure:"compression"`
+	// Git specifies whether or not synchronization honors the conventions of
+	// Git working trees: .gitignore files are applied and .git entries are never
+	// synchronized.
+	Git synchronization.GitMode `json:"git,omitempty" yaml:"git" mapstructure:"git"`
 	// Remote specifies which endpoints execute commands submitted from the
 	// opposite endpoint via the remote executable.
 	Remote synchronization.RemoteCommandMode `json:"remote,omitempty" yaml:"remote" mapstructure:"remote"`
@@ -121,6 +125,9 @@ func (c *Configuration) loadFromInternal(configuration *synchronization.Configur
 	// Propagate compression configuration.
 	c.Compression.Algorithm = configuration.CompressionAlgorithm
 
+	// Propagate Git configuration.
+	c.Git = configuration.GitMode
+
 	// Propagate remote command configuration.
 	c.Remote = configuration.RemoteCommandMode
 	c.RemotePrologue = configuration.RemotePrologue
@@ -150,6 +157,7 @@ func (c *Configuration) ToInternal() *synchronization.Configuration {
 		DefaultOwner:           c.Permissions.DefaultOwner,
 		DefaultGroup:           c.Permissions.DefaultGroup,
 		CompressionAlgorithm:   c.Compression.Algorithm,
+		GitMode:                c.Git,
 		RemoteCommandMode:      c.Remote,
 		RemotePrologue:         c.RemotePrologue,
 	}

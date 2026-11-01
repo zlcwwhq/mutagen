@@ -1,6 +1,8 @@
 package synchronization
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"testing"
 
@@ -45,6 +47,8 @@ permissions:
 compression:
   algorithm: deflate
 
+git: enabled
+
 remote: true
 remotePrologue: "~/.remote-prologue"
 `
@@ -74,6 +78,7 @@ var expectedConfiguration = &synchronization.Configuration{
 	DefaultDirectoryMode: 0755,
 	DefaultOwner:         "george",
 	DefaultGroup:         "presidents",
+	GitMode:              synchronization.GitMode_GitModeEnabled,
 	RemoteCommandMode:    synchronization.RemoteCommandMode_RemoteCommandModeBoth,
 	RemotePrologue:       "~/.remote-prologue",
 }
@@ -163,11 +168,52 @@ func TestLoadConfiguration(t *testing.T) {
 	if configuration.DefaultGroup != expectedConfiguration.DefaultGroup {
 		t.Error("default owner mismatch:", configuration.DefaultGroup, "!=", expectedConfiguration.DefaultGroup)
 	}
+	if configuration.GitMode != expectedConfiguration.GitMode {
+		t.Error("Git mode mismatch:", configuration.GitMode, "!=", expectedConfiguration.GitMode)
+	}
 	if configuration.RemoteCommandMode != expectedConfiguration.RemoteCommandMode {
 		t.Error("remote command mode mismatch:", configuration.RemoteCommandMode, "!=", expectedConfiguration.RemoteCommandMode)
 	}
 	if configuration.RemotePrologue != expectedConfiguration.RemotePrologue {
 		t.Error("remote prologue mismatch:", configuration.RemotePrologue, "!=", expectedConfiguration.RemotePrologue)
+	}
+}
+
+// TestConfigurationGit tests that the top-level Git mode is converted to and
+// from its internal representation and that it's encoded as expected.
+func TestConfigurationGit(t *testing.T) {
+	for _, mode := range []synchronization.GitMode{
+		synchronization.GitMode_GitModeDefault,
+		synchronization.GitMode_GitModeDisabled,
+		synchronization.GitMode_GitModeEnabled,
+	} {
+		// Verify the conversion in both directions.
+		configuration := &Configuration{Git: mode}
+		if internal := configuration.ToInternal(); internal.GitMode != mode {
+			t.Errorf("internal Git mode (%s) does not match original (%s)", internal.GitMode, mode)
+		}
+		loaded := &Configuration{}
+		loaded.loadFromInternal(&synchronization.Configuration{GitMode: mode})
+		if loaded.Git != mode {
+			t.Errorf("loaded Git mode (%s) does not match original (%s)", loaded.Git, mode)
+		}
+
+		// Verify JSON encoding, which omits the default mode and uses text
+		// representations for the others.
+		encoded, err := json.Marshal(configuration)
+		if err != nil {
+			t.Fatalf("unable to encode configuration with Git mode (%s): %v", mode, err)
+		}
+		if mode.IsDefault() {
+			if bytes.Contains(encoded, []byte(`"git"`)) {
+				t.Errorf("default Git mode encoded: %s", encoded)
+			}
+		} else {
+			text, _ := mode.MarshalText()
+			if !bytes.Contains(encoded, []byte(`"git":"`+string(text)+`"`)) {
+				t.Errorf("Git mode (%s) not encoded as expected: %s", mode, encoded)
+			}
+		}
 	}
 }
 
