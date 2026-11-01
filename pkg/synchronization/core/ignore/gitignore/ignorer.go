@@ -17,6 +17,8 @@ const (
 	// ruleFileName is the name of the rule files that are found in directories
 	// throughout a tree.
 	ruleFileName = ".gitignore"
+	// gitEntryName is the name of Git's own entry in a directory.
+	gitEntryName = ".git"
 	// excludeFilePath is the slash-separated, root-relative path of the rule
 	// file for the root repository.
 	excludeFilePath = ".git/info/exclude"
@@ -30,15 +32,46 @@ const (
 	maximumPointerFileSize = 64 * 1024
 )
 
-// IsRulePath returns true if a root-relative, slash-separated path identifies a
-// file whose contents affect ignore evaluation. This is the case for any file
-// whose base name is ".gitignore" and for the root repository's
-// ".git/info/exclude" file.
-func IsRulePath(path string) bool {
-	if path == excludeFilePath {
-		return true
+// IsGitEntry returns true if a name is that of Git's own entry in a directory,
+// which is either a directory or a file that points to one. Such entries are
+// never synchronized in Git mode (see Ignore). Names are compared
+// case-insensitively, since filesystems can treat them as the same entry.
+func IsGitEntry(name string) bool {
+	return len(name) == len(gitEntryName) && strings.EqualFold(name, gitEntryName)
+}
+
+// ShallowestGitEntry returns the shallowest part of a root-relative,
+// slash-separated path that identifies a Git entry (see IsGitEntry), which may
+// be all of it, or an empty string if the path isn't at or beneath a Git entry.
+func ShallowestGitEntry(path string) string {
+	components := strings.Split(path, "/")
+	for c, component := range components {
+		if IsGitEntry(component) {
+			return strings.Join(components[:c+1], "/")
+		}
 	}
-	return path[strings.LastIndexByte(path, '/')+1:] == ruleFileName
+	return ""
+}
+
+// IsDeliverableRuleFile returns true if a root-relative, slash-separated path
+// identifies a rule file that synchronization may deliver to an endpoint, even
+// if that endpoint's rules exclude it. This is the case for any file whose base
+// name is ".gitignore", unless it's beneath a Git entry, where such a file
+// isn't a rule file, and where nothing may be written. This is what to use to
+// decide what can be delivered or written.
+func IsDeliverableRuleFile(path string) bool {
+	return path[strings.LastIndexByte(path, '/')+1:] == ruleFileName && ShallowestGitEntry(path) == ""
+}
+
+// AffectsIgnoreEvaluation returns true if a root-relative, slash-separated path
+// identifies a file whose contents affect ignore evaluation, so that a change
+// to it on disk can change what a scan ignores. This is the case for
+// deliverable rule files (see IsDeliverableRuleFile) and for the root
+// repository's ".git/info/exclude" file. The latter is inside a Git directory
+// and belongs to its endpoint, so this doesn't say anything about what can be
+// written.
+func AffectsIgnoreEvaluation(path string) bool {
+	return path == excludeFilePath || IsDeliverableRuleFile(path)
 }
 
 // ruleSet is a list of rules that apply to a subtree, along with the rules that
@@ -129,7 +162,7 @@ func (i *ignorer) Ignore(path string, directory bool) (ignore.IgnoreStatus, bool
 
 	// Never allow Git metadata to be synchronized, regardless of any rules.
 	// This is checked before the session ignorer, so it can't be overridden.
-	if len(base) == len(".git") && strings.EqualFold(base, ".git") {
+	if IsGitEntry(base) {
 		return ignore.IgnoreStatusIgnored, false
 	}
 

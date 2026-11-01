@@ -68,9 +68,13 @@ func rootEmptied(ancestor, root *core.Entry, gitMode bool) bool {
 // provides ignore rules in Git mode, either by leaving a regular file at the
 // change's path or by removing one from it. Removals count because they change
 // what the next scan synchronizes just as additions do. Only regular files
-// count, because rule files that are symbolic links aren't read.
+// count, because rule files that are symbolic links aren't read. Only files
+// that can be delivered count (see gitignore.IsDeliverableRuleFile), so a
+// change in a Git directory, which scans don't produce and which endpoints
+// refuse, can't hold up the rest of a cycle, not even for the exclude file,
+// which is each endpoint's own.
 func isIgnoreRuleChange(change *core.Change) bool {
-	if !gitignore.IsRulePath(change.Path) {
+	if !gitignore.IsDeliverableRuleFile(change.Path) {
 		return false
 	} else if change.New != nil {
 		return change.New.Kind == core.EntryKind_File
@@ -79,10 +83,11 @@ func isIgnoreRuleChange(change *core.Change) bool {
 }
 
 // pruneToIgnoreRules creates a copy of a directory entry containing only the
-// files beneath it that provide ignore rules in Git mode and the directories
-// leading to them, or returns nil if there aren't any such files. The path is
-// the directory's path relative to the synchronization root. Entries are
-// immutable, so directories are newly created and files can be shared.
+// files beneath it that can be delivered to provide ignore rules in Git mode
+// (see gitignore.IsDeliverableRuleFile) and the directories leading to them, or
+// returns nil if there aren't any such files. The path is the directory's path
+// relative to the synchronization root. Entries are immutable, so directories
+// are newly created and files can be shared.
 func pruneToIgnoreRules(path string, directory *core.Entry) *core.Entry {
 	// Compute the prefix to add to content names to compute their paths.
 	contentPathPrefix := fastpath.Joinable(path)
@@ -92,7 +97,7 @@ func pruneToIgnoreRules(path string, directory *core.Entry) *core.Entry {
 	for name, entry := range directory.Contents {
 		contentPath := contentPathPrefix + name
 		var retained *core.Entry
-		if entry.Kind == core.EntryKind_File && gitignore.IsRulePath(contentPath) {
+		if entry.Kind == core.EntryKind_File && gitignore.IsDeliverableRuleFile(contentPath) {
 			retained = entry
 		} else if entry.Kind == core.EntryKind_Directory {
 			retained = pruneToIgnoreRules(contentPath, entry)

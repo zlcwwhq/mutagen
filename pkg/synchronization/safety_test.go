@@ -93,9 +93,8 @@ func TestIgnoreRuleDeliveries(t *testing.T) {
 	exclude := directory(map[string]*core.Entry{".git": directory(map[string]*core.Entry{
 		"info": directory(map[string]*core.Entry{"exclude": file, "other": file}),
 	})})
-	excludeOnly := directory(map[string]*core.Entry{".git": directory(map[string]*core.Entry{
-		"info": directory(map[string]*core.Entry{"exclude": file}),
-	})})
+	gitRules := directory(map[string]*core.Entry{".gitignore": file, "hooks": onlyRules})
+	withGitRules := directory(map[string]*core.Entry{".git": gitRules, ".gitignore": file, "a": file})
 
 	// Define test cases.
 	tests := []struct {
@@ -128,9 +127,27 @@ func TestIgnoreRuleDeliveries(t *testing.T) {
 		{"rule file removed", []*core.Change{{Path: ".gitignore", Old: file}}, []*core.Change{{Path: ".gitignore", Old: file}}},
 		{"nested rule file created", []*core.Change{{Path: "pkg/sub/.gitignore", New: file}}, []*core.Change{{Path: "pkg/sub/.gitignore", New: file}}},
 		{"nested rule file removed", []*core.Change{{Path: "pkg/sub/.gitignore", Old: file}}, []*core.Change{{Path: "pkg/sub/.gitignore", Old: file}}},
-		{"exclude file created", []*core.Change{{Path: ".git/info/exclude", New: file}}, []*core.Change{{Path: ".git/info/exclude", New: file}}},
 		{"symbolic link replaced by rule file", []*core.Change{{Path: ".gitignore", Old: link, New: file}}, []*core.Change{{Path: ".gitignore", Old: link, New: file}}},
 		{"directory replaced by rule file", []*core.Change{{Path: ".gitignore", Old: withoutRules, New: file}}, []*core.Change{{Path: ".gitignore", Old: withoutRules, New: file}}},
+		{
+			"rule files beneath names that resemble a Git entry",
+			[]*core.Change{{Path: ".gitx/.gitignore", New: file}, {Path: "x.git/.gitignore", New: file}},
+			[]*core.Change{{Path: ".gitx/.gitignore", New: file}, {Path: "x.git/.gitignore", New: file}},
+		},
+
+		// Changes at paths beneath a Git entry, which scans never produce. They
+		// aren't deliveries, whatever they do to whatever name, including the
+		// exclude file, which is only ever an endpoint's own.
+		{"exclude file created", []*core.Change{{Path: ".git/info/exclude", New: file}}, nil},
+		{"exclude file modified", []*core.Change{{Path: ".git/info/exclude", Old: file, New: other}}, nil},
+		{"exclude file removed", []*core.Change{{Path: ".git/info/exclude", Old: file}}, nil},
+		{"rule file in Git directory created", []*core.Change{{Path: ".git/.gitignore", New: file}}, nil},
+		{"rule file in Git directory modified", []*core.Change{{Path: ".git/.gitignore", Old: file, New: other}}, nil},
+		{"rule file in Git directory removed", []*core.Change{{Path: ".git/.gitignore", Old: file}}, nil},
+		{"rule file deep in Git directory", []*core.Change{{Path: ".git/hooks/.gitignore", New: file}}, nil},
+		{"rule file in nested Git directory", []*core.Change{{Path: "a/.git/x/.gitignore", New: file}}, nil},
+		{"rule file in differently cased Git directory", []*core.Change{{Path: ".GIT/.gitignore", New: file}}, nil},
+		{"other file in Git directory", []*core.Change{{Path: ".git/hooks/pre-commit", New: file}}, nil},
 
 		// Changes at rule paths that don't involve regular files.
 		{"rule file symbolic link created", []*core.Change{{Path: ".gitignore", New: link}}, nil},
@@ -179,14 +196,16 @@ func TestIgnoreRuleDeliveries(t *testing.T) {
 			[]*core.Change{{Path: ".gitignore", New: directory(map[string]*core.Entry{".gitignore": file, "a": file})}},
 			[]*core.Change{{Path: ".gitignore", New: onlyRules}},
 		},
-		{"root with exclude file", []*core.Change{{New: exclude}}, []*core.Change{{New: excludeOnly}}},
+		{"root with exclude file", []*core.Change{{New: exclude}}, nil},
 		{"directory with name of exclude file beneath it", []*core.Change{{Path: "d", New: exclude}}, nil},
 		{"directory with exclude file parents", []*core.Change{{Path: ".git", New: directory(map[string]*core.Entry{"info": withoutRules})}}, nil},
-		{
-			"created directory containing exclude file",
-			[]*core.Change{{Path: ".git/info", New: directory(map[string]*core.Entry{"exclude": file, "other": file})}},
-			[]*core.Change{{Path: ".git/info", New: directory(map[string]*core.Entry{"exclude": file})}},
-		},
+		{"created directory containing exclude file", []*core.Change{{Path: ".git/info", New: directory(map[string]*core.Entry{"exclude": file, "other": file})}}, nil},
+		{"created Git directory containing rule files", []*core.Change{{Path: ".git", New: gitRules}}, nil},
+		{"created nested Git directory containing rule files", []*core.Change{{Path: "a/.GIT", New: gitRules}}, nil},
+		{"created directory beneath Git directory containing rule files", []*core.Change{{Path: ".git/x", New: gitRules}}, nil},
+		{"directory with rule files only in Git directory", []*core.Change{{Path: "d", New: directory(map[string]*core.Entry{".git": gitRules, "a": file})}}, nil},
+		{"directory with rule files in and beside Git directory", []*core.Change{{Path: "d", New: withGitRules}}, []*core.Change{{Path: "d", New: onlyRules}}},
+		{"root with rule files in and beside Git directory", []*core.Change{{New: withGitRules}}, []*core.Change{{New: onlyRules}}},
 
 		// Other changes involving directories with rule files.
 		{"directory with rule file deleted", []*core.Change{{Path: "d", Old: withRules}}, nil},
@@ -282,6 +301,10 @@ func TestRuleOnlyTransitions(t *testing.T) {
 	deleted := &core.Change{Path: "deleted", Old: directory}
 	plain := &core.Change{Path: "plain", New: file}
 	otherPlain := &core.Change{Path: "other", Old: file}
+	gitRule := &core.Change{Path: ".git/.gitignore", New: file}
+	gitRemoval := &core.Change{Path: "sub/.GIT/.gitignore", Old: file}
+	gitExclude := &core.Change{Path: ".git/info/exclude", New: file}
+	gitDirectory := &core.Change{Path: "sub/.git", New: directory}
 
 	// Define test cases.
 	tests := []struct {
@@ -309,6 +332,15 @@ func TestRuleOnlyTransitions(t *testing.T) {
 		{"nothing else to drop on beta", nil, []*core.Change{removal}, nil, []string{"sub/.gitignore"}, true},
 		{"directory deletion with rules doesn't count", []*core.Change{deleted}, []*core.Change{plain}, []string{"deleted"}, []string{"plain"}, false},
 		{"directory deletion waits for rules", []*core.Change{deleted, rule}, nil, []string{".gitignore"}, nil, true},
+		{
+			"changes in Git directories don't count",
+			[]*core.Change{plain, gitRule, gitExclude},
+			[]*core.Change{gitRemoval, gitDirectory, otherPlain},
+			[]string{"plain", ".git/.gitignore", ".git/info/exclude"},
+			[]string{"sub/.GIT/.gitignore", "sub/.git", "other"},
+			false,
+		},
+		{"changes in Git directories aren't delivered with rules", []*core.Change{gitRule, rule, gitExclude}, []*core.Change{gitDirectory}, []string{".gitignore"}, nil, true},
 	}
 
 	// Process test cases.
