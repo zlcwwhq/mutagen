@@ -1119,15 +1119,17 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 	}
 	// Problems other than warnings may hide a conflict, so the listing doesn't
 	// say that there are none when there are any (the problems themselves were
-	// printed above). Warnings don't count, as in unsettled, because they
-	// describe content that isn't synchronized by design, such as paths that an
-	// endpoint's own rules exclude, and can persist for as long as a session
-	// runs, so they say nothing about conflicts.
-	failed := slices.ContainsFunc(listing.Problems, func(problem remote.Problem) bool {
-		return !problem.Warning
-	})
-	if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 && !failed {
-		_, err := fmt.Fprintln(output, "No conflicts.")
+	// printed above), and it says so instead, so that a listing without anything
+	// to list always says what it means. Warnings don't count, as in unsettled,
+	// because they describe content that isn't synchronized by design, such as
+	// paths that an endpoint's own rules exclude, and can persist for as long as
+	// a session runs, so they say nothing about conflicts.
+	if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 {
+		message := "No conflicts."
+		if slices.ContainsFunc(listing.Problems, func(problem remote.Problem) bool { return !problem.Warning }) {
+			message = "Conflicts can't be ruled out, because some content couldn't be synchronized (see the warnings)."
+		}
+		_, err := fmt.Fprintln(output, message)
 		return err
 	}
 	for c, conflict := range conflicts {

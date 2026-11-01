@@ -259,6 +259,7 @@ func TestNoConflictsWithWarnings(t *testing.T) {
 		BetaChanges:  []remote.Change{{Path: "file", Old: "file", New: "file"}},
 	}
 	const none = "No conflicts.\n"
+	const unknown = "Conflicts can't be ruled out, because some content couldn't be synchronized (see the warnings).\n"
 	for _, test := range []struct {
 		description string
 		listing     *remote.Listing
@@ -294,6 +295,13 @@ func TestNoConflictsWithWarnings(t *testing.T) {
 		}
 		if described := strings.Contains(output.String(), "file: "); described != test.conflicts {
 			t.Errorf("%s: conflict described: %t, listing: %q", test.description, described, output.String())
+		}
+		// A listing without anything to list says what it means, rather than
+		// leaving its output empty, if problems may be hiding conflicts.
+		if !test.reported && !test.conflicts && output.String() != unknown {
+			t.Errorf("%s: possibility of hidden conflicts not reported: %q", test.description, output.String())
+		} else if test.conflicts && strings.Contains(output.String(), unknown) {
+			t.Errorf("%s: conflicts reported as unknown: %q", test.description, output.String())
 		}
 		// Problems are never dropped from the text listing: they're warned
 		// about on the error output.

@@ -2613,6 +2613,32 @@ func TestGitModeRuleReplaced(t *testing.T) {
 	}
 }
 
+// TestGitModeRemoteWarnings tests how remote reports what isn't synchronized by
+// design, which in a listing of conflicts doesn't say anything about conflicts.
+func TestGitModeRemoteWarnings(t *testing.T) {
+	// Have beta's own rules exclude a path that alpha has, which beta doesn't.
+	session := newGitModeSession(t, gitModeOptions{
+		commands: synchronization.RemoteCommandMode_RemoteCommandModeBeta,
+		alpha:    map[string]string{"keep": "keep", "excluded": "excluded"},
+		beta:     map[string]string{".git/info/exclude": "excluded\n"},
+	})
+	session.waitForRemoteCommands()
+	session.flushAllowingProblems()
+	session.expect(session.beta, map[string]string{"keep": "keep"})
+	session.expectMissing(session.beta, "excluded")
+
+	code, output, diagnostic := runRemote(t, session.alpha, "--conflicts")
+	if code != 0 || output != "No conflicts.\n" {
+		t.Errorf("incorrect listing: %d: %q: %s", code, output, diagnostic)
+	}
+	if !strings.Contains(diagnostic, "remote: warning: this content isn't synchronized, by design:\n") ||
+		!strings.Contains(diagnostic, "excluded (remote): ignored by this endpoint's own rules") {
+		t.Errorf("warning not reported as being by design: %q", diagnostic)
+	} else if strings.Contains(diagnostic, "couldn't be synchronized") {
+		t.Errorf("warning reported as a failure: %q", diagnostic)
+	}
+}
+
 // TestGitModeRuleReplacedByDirectoryWithRules tests that a single flush also
 // covers replacing a rule file with a directory that contains rule files of its
 // own. A flush is only held for a single cycle that only delivers rules, and this
