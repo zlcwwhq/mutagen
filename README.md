@@ -265,7 +265,11 @@ is listed as a warning rather than a problem.
   because Mutagen has no way to protect its ignored files.
 - If the system or the agent stops abruptly during a clone, then a directory
   named `.mutagen-temporary-submodule-*` can remain next to the submodule. It's
-  neither synchronized nor reused, so remove it by hand.
+  neither synchronized nor reused, so remove it by hand. The same goes for a
+  nested submodule that was being cloned when that happened, or that showed no
+  progress on Windows, where Git can't be asked to clean up: if Git reports that
+  it isn't a repository, or can't find its current revision, remove its
+  directory's contents and its directory under the submodule's `.git/modules`.
 - If the other endpoint already has a directory without a `.gitignore`, the
   first scan hashes all of its content, but doesn't transfer it. While a
   `.gitignore` itself is in conflict, each endpoint applies its own copy, so

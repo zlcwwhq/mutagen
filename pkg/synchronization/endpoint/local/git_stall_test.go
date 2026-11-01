@@ -4,6 +4,7 @@ package local
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,6 +25,8 @@ import (
 type hangingTransport struct {
 	// url is the URL.
 	url string
+	// script is the path to the transport's script.
+	script string
 	// attempts is the path to the file that contains a line for each attempt to
 	// contact the remote.
 	attempts string
@@ -42,16 +45,29 @@ func newHangingTransport(t *testing.T) *hangingTransport {
 		attempts: filepath.Join(base, "attempts"),
 		process:  filepath.Join(base, "process"),
 	}
-	script := filepath.Join(base, "transport.sh")
+	transport.script = filepath.Join(base, "transport.sh")
+	transport.setCommand(t, "sleep 600")
+	transport.url = "ext::" + transport.script
+	return transport
+}
+
+// setCommand sets the command that the transport runs after recording an
+// attempt.
+func (h *hangingTransport) setCommand(t *testing.T, command string) {
+	t.Helper()
 	contents := "#!/bin/sh\n" +
-		"echo attempt >> " + transport.attempts + "\n" +
-		"echo $$ > " + transport.process + "\n" +
-		"exec sleep 600\n"
-	if err := os.WriteFile(script, []byte(contents), 0700); err != nil {
+		"echo attempt >> " + h.attempts + "\n" +
+		"echo $$ > " + h.process + "\n" +
+		"exec " + command + "\n"
+	if err := os.WriteFile(h.script, []byte(contents), 0700); err != nil {
 		t.Fatal("unable to create transport:", err)
 	}
-	transport.url = "ext::" + script
-	return transport
+}
+
+// recover makes the transport serve a bare repository.
+func (h *hangingTransport) recover(t *testing.T, bare string) {
+	t.Helper()
+	h.setCommand(t, "git upload-pack "+bare)
 }
 
 // count returns the number of attempts to contact the remote.
@@ -386,19 +402,23 @@ func TestEndpointGitModeCloneCancellation(t *testing.T) {
 
 // TestEndpointGitModeNestedStall tests that a nested submodule that shows no
 // progress stops the update of the others, whose URLs are unknown and thus
-// avoided as a group, and that the group is avoided for later updates, while the
-// submodule that contains them still ends up in place.
+// avoided as a group, that the group is avoided for later updates, that the
+// submodule that contains them still ends up in place, and that the stall leaves
+// nothing behind. A clone that's killed would leave a .git file with an absolute
+// path into the temporary clone, which stops working once that's moved into
+// place and which breaks every later checkout, and a repository without commits,
+// which Git won't clone again.
 func TestEndpointGitModeNestedStall(t *testing.T) {
 	// Create an upstream that records two nested submodules, the first of which
 	// never responds. Git doesn't let us add that one in the usual way, because
 	// that would have to contact it.
-	sibling := newGitUpstream(t, "sibling")
+	nested := newGitUpstream(t, "nested")
 	upstream := newGitUpstream(t, "upstream")
 	transport := newHangingTransport(t)
-	for path, url := range map[string]string{"a-hanging": transport.url, "b-sibling": sibling.url} {
+	for path, url := range map[string]string{"a-hanging": transport.url, "b-sibling": nested.url} {
 		mustGit(t, upstream.work, "config", "--file", ".gitmodules", "submodule."+path+".path", path)
 		mustGit(t, upstream.work, "config", "--file", ".gitmodules", "submodule."+path+".url", url)
-		mustGit(t, upstream.work, "update-index", "--add", "--cacheinfo", "160000,"+sibling.head+","+path)
+		mustGit(t, upstream.work, "update-index", "--add", "--cacheinfo", "160000,"+nested.head+","+path)
 	}
 	mustGit(t, upstream.work, "add", "--", ".gitmodules")
 	upstream.commitAll("add submodules")
@@ -406,7 +426,7 @@ func TestEndpointGitModeNestedStall(t *testing.T) {
 	// The clone goes ahead, but the update stops at the first nested submodule.
 	root := newGitRoot(t, nil)
 	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
-	useShortStallDurations(e, 250*time.Millisecond, time.Hour)
+	provider := useShortStallDurations(e, 250*time.Millisecond, time.Hour)
 	ctx := context.Background()
 	first := upstream.entry(upstream.head)
 	results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", New: first})
@@ -420,10 +440,16 @@ func TestEndpointGitModeNestedStall(t *testing.T) {
 		t.Errorf("incorrect number of attempts: %d", count)
 	}
 
+	// Nothing is left of the clone that stalled.
+	directory := filepath.Join(root, "sub")
+	if entries, err := os.ReadDir(filepath.Join(directory, "a-hanging")); err != nil || len(entries) != 0 {
+		t.Errorf("stalled clone left content behind: %v, %v", entries, err)
+	}
+	verifyAbsent(t, root, "sub/.git/modules/a-hanging")
+
 	// Trying again doesn't contact the group, and doesn't take any time.
-	provider := e.gitProvider.(*gitProvider)
 	start := time.Now()
-	err := provider.UpdateNested(ctx, filepath.Join(root, "sub"), first.Url)
+	err := provider.UpdateNested(ctx, directory, first.Url)
 	if err == nil || !strings.Contains(err.Error(), "a-hanging:") || !strings.Contains(err.Error(), "not contacting") {
 		t.Error("incorrect error during backoff:", err)
 	}
@@ -433,4 +459,83 @@ func TestEndpointGitModeNestedStall(t *testing.T) {
 	if count := transport.count(t); count != 1 {
 		t.Errorf("URL was contacted during backoff: %d", count)
 	}
+
+	// The submodule's next commit can be checked out in the meantime, which
+	// wouldn't be possible if the stalled clone had broken the repository.
+	second := upstream.entry(upstream.commit("second", "second"))
+	upstream.push()
+	results, problems = transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: first, New: second})
+	if results[0] != second {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleProblem(t, problems, "sub", "unable to update nested submodules", "a-hanging:", "not contacting")
+	verifyCheckoutCommit(t, directory, upstream.head)
+
+	// Once the URL works and the backoff has ended, the next commit brings all
+	// of the nested submodules in, since the clone that stalled isn't in the
+	// way.
+	transport.recover(t, nested.bare)
+	provider.backoffsLock.Lock()
+	clear(provider.backoffs)
+	provider.backoffsLock.Unlock()
+	third := upstream.entry(upstream.commit("third", "third"))
+	upstream.push()
+	results, problems = transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: second, New: third})
+	if results[0] != third {
+		t.Error("incorrect result:", results[0])
+	} else if len(problems) != 0 {
+		t.Error("unexpected problems:", problems)
+	}
+	verifyCheckoutCommit(t, filepath.Join(directory, "a-hanging"), nested.head)
+	verifyCheckoutCommit(t, filepath.Join(directory, "b-sibling"), nested.head)
+}
+
+// verifyCheckoutCommit verifies that a repository has a commit checked out.
+func verifyCheckoutCommit(t *testing.T, directory, commit string) {
+	t.Helper()
+	if head := mustGit(t, directory, "rev-parse", "HEAD"); head != commit {
+		t.Errorf("incorrect commit in %s: %s != %s", directory, head, commit)
+	}
+}
+
+// TestEndpointGitModeNestedSlowCheckout tests that a nested submodule's checkout
+// that takes longer than the stall timeout isn't taken for a stall, as long as
+// it's making progress. Stopping it would leave a partial working tree in the
+// way of checking the commit out again.
+func TestEndpointGitModeNestedSlowCheckout(t *testing.T) {
+	// Create a nested submodule whose files will be slow to check out.
+	nested := newGitUpstream(t, "nested")
+	const count = 30
+	files := map[string]string{".gitattributes": "file-* filter=slow\n"}
+	for f := 0; f < count; f++ {
+		files[fmt.Sprintf("file-%d", f)] = "content"
+	}
+	writeTree(t, nested.work, files)
+	mustGit(t, nested.work, "add", "--all")
+	nested.commitAll("add files")
+	upstream := newGitUpstream(t, "upstream")
+	upstream.addSubmodule(nested, "nested", "")
+
+	// Have each file take a while, using configuration that a real repository
+	// would have to get from elsewhere. Only the total exceeds the timeout.
+	configuration := filepath.Join(realTemporaryDirectory(t), "configuration")
+	if err := os.WriteFile(configuration, []byte("[filter \"slow\"]\n\tsmudge = \"sleep 0.1; cat\"\n"), 0600); err != nil {
+		t.Fatal("unable to write configuration:", err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", configuration)
+
+	// Git waits two seconds before it first reports progress. That's nothing
+	// compared to the default stall timeout, but it's longer than this test's.
+	t.Setenv("GIT_PROGRESS_DELAY", "0")
+
+	// Clone the submodule.
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	useShortStallDurations(e, time.Second, time.Hour)
+	_, problems := transitionEndpoint(t, context.Background(), e, &core.Change{Path: "sub", New: upstream.entry(upstream.head)})
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	}
+	verifyCheckoutCommit(t, filepath.Join(root, "sub", "nested"), nested.head)
+	verifyContents(t, root, fmt.Sprintf("sub/nested/file-%d", count-1), "content")
 }

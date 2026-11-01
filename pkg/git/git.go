@@ -164,10 +164,12 @@ func environment(directory string) []string {
 //   - Git is limited to the transports that GIT_ALLOW_PROTOCOL lists, which is
 //     the default list unless the caller's environment sets it.
 //
-// The command is killed when ctx is canceled, along with its helper processes
-// where the platform supports that, and waiting on it doesn't block for more
-// than a few seconds after that on helper processes that outlive it. The
-// command is returned unstarted, so callers can set up its I/O.
+// The command is stopped when ctx is canceled, along with its helper processes
+// where the platform supports that, which includes giving them a moment to
+// clean up where the platform supports that (see configureProcess), and waiting
+// on it doesn't block for more than a few seconds after that on processes that
+// are still running. The command is returned unstarted, so callers can set up
+// its I/O.
 func Command(ctx context.Context, directory string, args ...string) *exec.Cmd {
 	// Prepend Git's global options. They must come before the subcommand.
 	arguments := make([]string, 0, len(args)+5)

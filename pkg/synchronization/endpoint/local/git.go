@@ -80,8 +80,10 @@ var gitCheckoutOptions = []string{"--detach", "--no-overwrite-ignore", "--no-rec
 // rebase strategies that a repository can ask for in its .gitmodules file, leave
 // ignored files alone. Git passes the commit as an additional argument, and the
 // settings that Mutagen gives Git (such as those that disable hooks) reach the
-// command through its environment.
-var gitNestedUpdateStrategy = "!git checkout " + strings.Join(gitCheckoutOptions, " ")
+// command through its environment. Progress has to be requested because the
+// output isn't a terminal, and without it, a large checkout would look like a
+// stall to runNetwork, which would stop it.
+var gitNestedUpdateStrategy = "!git checkout --progress " + strings.Join(gitCheckoutOptions, " ")
 
 // gitShortCommit returns the abbreviated form of a commit's hexadecimal
 // identifier for use in messages.
