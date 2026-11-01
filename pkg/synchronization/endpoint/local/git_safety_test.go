@@ -1311,3 +1311,138 @@ func TestEndpointGitModeSymbolicLinkReplacement(t *testing.T) {
 		})
 	}
 }
+
+// TestPruneGitTransitionsOldContent tests that pruneGitTransitions refuses
+// changes that would remove a Git entry or anything beneath one, which only a
+// malfunctioning or compromised controller could request, since neither the
+// ancestor nor the synchronizable part of a scan has Git entries.
+func TestPruneGitTransitionsOldContent(t *testing.T) {
+	// Create the entries for tests.
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	link := &core.Entry{Kind: core.EntryKind_SymbolicLink, Target: "target"}
+	untracked := &core.Entry{Kind: core.EntryKind_Untracked}
+	directory := func(contents map[string]*core.Entry) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: contents}
+	}
+
+	// Define test cases.
+	tests := []struct {
+		name     string
+		change   *core.Change
+		refused  bool
+		failures []string
+	}{
+		{"Git entry", &core.Change{Path: ".git", Old: directory(nil)}, true, []string{".git"}},
+		{"untracked Git entry", &core.Change{Path: ".git", Old: untracked}, true, []string{".git"}},
+		{"nested Git entry", &core.Change{Path: "a/.Git", Old: link}, true, []string{"a/.Git"}},
+		{"directory beneath Git entry", &core.Change{Path: ".git/hooks", Old: directory(nil)}, true, []string{".git"}},
+		{"symbolic link beneath Git entry", &core.Change{Path: "a/.GIT/link", Old: link}, true, []string{"a/.GIT"}},
+		{"file beneath Git entry", &core.Change{Path: ".git/HEAD", Old: file}, true, []string{".git"}},
+		{"Git entry in deletion", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{".git": directory(nil), "b": file})}, true, []string{"a/.git"}},
+		{"Git entry deep in deletion", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{"b": directory(map[string]*core.Entry{".GIT": link})})}, true, []string{"a/b/.GIT"}},
+		{"Git entry in type change", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{".git": directory(nil)}), New: file}, true, []string{"a/.git"}},
+		{"Git entry in root replacement", &core.Change{Old: directory(map[string]*core.Entry{".git": file}), New: directory(map[string]*core.Entry{"a": file})}, true, []string{".git"}},
+		{"Git entry in nothing but old content", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{".git": link}), New: directory(nil)}, true, []string{"a/.git"}},
+		{"untracked Git entry in deletion", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{".git": untracked, "b": file})}, true, []string{"a/.git"}},
+		{"names that resemble a Git entry", &core.Change{Path: ".gitx", Old: directory(map[string]*core.Entry{"x.git": file, ".git2": link})}, false, nil},
+		{"unrelated deletion", &core.Change{Path: "a", Old: file}, false, nil},
+	}
+
+	// Process test cases. Each is accompanied by a change that's unaffected.
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			unaffected := &core.Change{Path: "unaffected", New: file}
+			results, problems := pruneGitTransitions(gitignore.NewIgnorer(t.TempDir(), nil), []*core.Change{test.change, unaffected})
+			if test.refused && results[0] != nil {
+				t.Error("change not refused:", results[0])
+			} else if !test.refused && results[0] != test.change {
+				t.Error("change not left as is:", results[0])
+			}
+			if results[1] != unaffected {
+				t.Error("unaffected change not left as is:", results[1])
+			}
+			var failures []string
+			for _, problem := range problems {
+				if problem.Warning {
+					t.Error("refusal reported as a warning:", problem)
+				}
+				failures = append(failures, problem.Path)
+			}
+			if !slices.Equal(failures, test.failures) {
+				t.Errorf("incorrect failures: %v != %v", failures, test.failures)
+			}
+		})
+	}
+}
+
+// TestEndpointGitModeRemovalsFromGitEntries tests that crafted changes don't
+// remove anything from Git entries on disk, including the empty directories and
+// symbolic links that removals don't need any cached information about, and that
+// a change that's refused for this doesn't remove anything else either.
+func TestEndpointGitModeRemovalsFromGitEntries(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links may require privileges")
+	}
+
+	// Create Git entries with content that could be removed, along with enough
+	// other content for the endpoint to accept that many entries being removed.
+	isolateGit(t)
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{"a": "a", "b": "b", "c": "c", "d": "d", "e": "e", "f": "f", "plain/file": "file"})
+	initializeRepository(t, root)
+	initializeRepository(t, filepath.Join(root, "plain"))
+	for _, path := range []string{".git/refs/tags", "nested/.git/refs", "typed/.git"} {
+		if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(path)), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("HEAD", filepath.Join(root, ".git", "link")); err != nil {
+		t.Fatal(err)
+	}
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	snapshot := scanEndpoint(t, e, true)
+
+	// Create changes that would remove that content.
+	empty := &core.Entry{Kind: core.EntryKind_Directory}
+	directory := func(contents map[string]*core.Entry) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: contents}
+	}
+	refs := directory(map[string]*core.Entry{"refs": empty})
+	changes := []*core.Change{
+		{Path: ".git/refs/tags", Old: empty},
+		{Path: ".git/link", Old: &core.Entry{Kind: core.EntryKind_SymbolicLink, Target: "HEAD"}},
+		{Path: "nested", Old: directory(map[string]*core.Entry{".git": refs})},
+		{Path: "typed", Old: directory(map[string]*core.Entry{".git": empty}), New: empty},
+		{Path: "plain", Old: entryAt(snapshot, "plain")},
+	}
+
+	// Perform the changes.
+	results, problems, _, err := e.Transition(context.Background(), changes)
+	if err != nil {
+		t.Fatal("transition failed:", err)
+	}
+
+	// Everything is still there.
+	for c := range changes {
+		if !results[c].Equal(changes[c].Old, true) {
+			t.Errorf("change %d not reported as refused: %v", c, results[c])
+		}
+	}
+	for _, path := range []string{".git/refs/tags", ".git/link", "nested/.git/refs", "typed/.git", "plain/.git", "plain/file"} {
+		if _, err := os.Lstat(filepath.Join(root, filepath.FromSlash(path))); err != nil {
+			t.Errorf("%s removed or can't be checked: %v", path, err)
+		}
+	}
+
+	// The refusals are failures that describe the Git entries.
+	var reported []string
+	for _, problem := range problems {
+		reported = append(reported, problem.Path)
+		if problem.Warning {
+			t.Error("problem reported as a warning:", problem)
+		}
+	}
+	if expected := []string{".git", "nested/.git", "typed/.git", "plain/.git"}; !slices.Equal(reported, expected) {
+		t.Errorf("incorrect problems: %v != %v", reported, expected)
+	}
+}

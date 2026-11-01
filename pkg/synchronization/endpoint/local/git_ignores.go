@@ -38,7 +38,7 @@ func gitReceivableFile(ignorer ignore.DirectoryIgnorer, path string) bool {
 // contains them is Untracked on this endpoint, which ends any further
 // reconciliation of it. None of this applies at or beneath a Git entry, which
 // isn't content that a session could ever need to deliver, and which is never
-// written (see refuseGitEntry).
+// written or removed (see refuseGitEntry and removesGitContent).
 type gitTransitionPruner struct {
 	// ignorer evaluates this endpoint's rules.
 	ignorer ignore.DirectoryIgnorer
@@ -86,6 +86,41 @@ func (p *gitTransitionPruner) refuseGitEntry(entry string) {
 		Path:  entry,
 		Error: "refused a change to Git metadata, which is never synchronized; scans don't produce such changes, so the daemon may be malfunctioning or compromised",
 	})
+}
+
+// removesGitContent determines whether or not removing a change's old content
+// would remove a Git entry or anything beneath one, reporting each Git entry
+// involved. Old content comes from the session's ancestor or the synchronizable
+// part of a scan, and neither of those has Git entries, since they're never
+// synchronized (a directory that has one on disk is left alone, as a conflict).
+// So only a malfunctioning or compromised controller can ask for this, and
+// removal acts on what it's given, unlike scans, which never look inside of Git
+// entries. Files are safe from this, since they have to be in the scan's cache to
+// be removed, but symbolic links and empty directories aren't.
+func (p *gitTransitionPruner) removesGitContent(change *core.Change) bool {
+	if gitEntry := gitignore.ShallowestGitEntry(change.Path); gitEntry != "" {
+		p.refuseGitEntry(gitEntry)
+		return true
+	}
+	return p.containsGitEntry(change.Path, change.Old)
+}
+
+// containsGitEntry determines whether or not an entry at a path that isn't at or
+// beneath a Git entry contains a Git entry, reporting each one that it finds.
+func (p *gitTransitionPruner) containsGitEntry(path string, entry *core.Entry) bool {
+	var found bool
+	if entry != nil && len(entry.Contents) > 0 {
+		contentPathPrefix := fastpath.Joinable(path)
+		for name, content := range entry.Contents {
+			if gitignore.IsGitEntry(name) {
+				p.refuseGitEntry(contentPathPrefix + name)
+				found = true
+			} else if p.containsGitEntry(contentPathPrefix+name, content) {
+				found = true
+			}
+		}
+	}
+	return found
 }
 
 // fail reports a path that can't be evaluated. Unlike an exclusion, this isn't
@@ -170,13 +205,17 @@ func (p *gitTransitionPruner) prune(path string, entry *core.Entry) *core.Entry 
 // each transition (see gitTransitionPruner), along with any resulting problems.
 // The returned slice corresponds to the transitions, with a change that has the
 // pruned content for each transition that's still to be applied, and with nil
-// for each that's refused, which leaves its old content in place. Deletions are
-// never affected: their old content is what the endpoint's scan tracked.
+// for each that's refused, which leaves its old content in place. Rules don't
+// affect deletions, whose old content is what the endpoint's scan tracked, but a
+// change that would remove Git metadata can't have come from a scan and is
+// refused, whatever else it does.
 func pruneGitTransitions(ignorer ignore.DirectoryIgnorer, transitions []*core.Change) ([]*core.Change, []*core.Problem) {
 	pruner := &gitTransitionPruner{ignorer: ignorer}
 	results := make([]*core.Change, len(transitions))
 	for t, transition := range transitions {
-		if transition.New == nil {
+		if pruner.removesGitContent(transition) {
+			continue
+		} else if transition.New == nil {
 			results[t] = transition
 		} else if pruned := pruner.prune(transition.Path, transition.New); pruned == transition.New {
 			results[t] = transition
