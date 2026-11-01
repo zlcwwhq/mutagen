@@ -116,6 +116,98 @@ Only the daemon's system needs an installation. The `mutagen-setup` agent skill
 (see below) automates this.
 
 
+## Git mode
+
+Git mode makes a session follow the conventions of Git working trees, so that
+`.gitignore` files decide what's synchronized instead of `ignore.paths` that
+repeat them, and `.git` entries are never synchronized. It's disabled by
+default. Enable it with `git: enabled` for a session, under `defaults`, in
+global configuration, or under `star.sync`, or with `--git` for `mutagen sync
+create`:
+
+```yaml
+sync:
+  code:
+    alpha: "."
+    beta: "server:~/project"
+    git: enabled
+    remote: true
+    ignore:
+      paths: ["!.env", ".venv/"]
+```
+
+```sh
+mutagen sync create --git --remote=true . server:~/project
+```
+
+It applies to the whole session, so it can't be set for one endpoint, and stars
+inherit it like other synchronization settings: `star.sync` or the defaults
+apply it to every edge, while nodes can't set it individually. Git mode implies
+`ignore.vcs: true` and is rejected together with a request to propagate VCS
+directories (`--no-ignore-vcs`, or `ignore.vcs: false`). Changing it in a
+project recreates the session when you apply the project, like other
+configuration changes. `mutagen sync list -l` shows the mode.
+
+**Ignores.** The session ignores what Git would: the rules of the `.gitignore`
+files at every level beneath the synchronization root, and of the root
+repository's `.git/info/exclude`. Global excludes (`core.excludesFile`) and
+directories above the root aren't read, and rules always match
+case-sensitively, so that both endpoints agree. Each endpoint reads the files
+in its own copy of the tree, and a scan reads them anew, so changes to them
+apply at the next scan. `.git/info/exclude` is inside `.git`, which is never
+synchronized, so it only applies on endpoints that have the repository: put
+ignores that both endpoints share in `.gitignore`. `ignore.paths` takes
+precedence over the files: a pattern such as `!.env` synchronizes a file that a
+rule ignores, and a rule can't unignore what a pattern ignores. Entries named
+`.git`, files (as used by submodules and worktrees) as well as directories, are
+never synchronized, and no pattern can unignore them. Files that Git tracks but
+rules ignore aren't synchronized either: the endpoint that has the repository
+reports a problem that suggests the `ignore.paths` pattern to unignore them
+(`!path`, or `!directory` for a file inside an ignored directory).
+
+A rule change can't delete files. If a rule starts to ignore files that were
+synchronized, they stay on both endpoints, and the session stops tracking them,
+and removing the rule resumes synchronizing them. Since each endpoint reads its
+own copy of the rule files, endpoints can briefly disagree about them. So a
+cycle that has rule files to deliver or remove does only that, on both
+endpoints, and every other change waits for the next cycle. Content that the new
+rules ignore, such as a `data/` directory that you prepared on a server, is thus
+neither copied back nor deleted before the rules arrive. If a rule file can't be
+written, the session reports the problem, and nothing else synchronizes until
+it's fixed.
+
+**Nested repositories.** A directory other than the root that contains a `.git`
+entry, such as a submodule, is synchronized as an ordinary directory, without its
+`.git`: its files are compared and copied like any others, while its commits and
+branches stay on the endpoint that has them. `.gitmodules` is synchronized as an
+ordinary file and not interpreted.
+
+**Warnings.** What Git mode doesn't synchronize is reported as problems by
+`mutagen sync list`, and `remote` prints them after each flush without
+preventing commands: tracked files that rules ignore (see above).
+
+**Requirements and limitations.**
+
+- If the other endpoint already has a directory without a `.gitignore`, the
+  first scan hashes all of its content, but doesn't transfer it. While a
+  `.gitignore` itself is in conflict, each endpoint applies its own copy, so
+  content that only one copy ignores can be transferred.
+- A flush waits for one further cycle after delivering rule files. If relaxing a
+  rule exposes another rule file, the content behind it needs a second flush or
+  the next filesystem event.
+- If one endpoint deletes a directory and the other has ignored content in it,
+  that's still a conflict, as in sessions without Git mode, such as
+  `__pycache__` directories that commands run with `remote` create.
+- To migrate a session that used `ignore.vcs: true`, replace it with
+  `git: enabled`, remove the `ignore.paths` patterns that repeat `.gitignore`
+  files, and apply the project.
+
+`remote` follows the session's mode. It reads the rules from the tree on the
+system where it runs, so `remote --ignores` lists where the session's ignores
+come from, and `remote --ignores <path>...` says which of them ignores a path;
+`--pull` copies what rules ignore. Directories that rules ignore require an
+explicit `--cwd`.
+
 ## Star workspaces
 
 A project can declare one star of directory workspaces, managed by one daemon:
@@ -163,7 +255,7 @@ edges as it relays a pair whose endpoints are both remote. Either way, each
 command crosses a single edge, without intermediate copies.
 
 Settings under `star.sync` extend global and project synchronization defaults,
-including ignores, and apply to every edge. A node's `mode` sets the
+including ignores and [Git mode](#git-mode), and apply to every edge. A node's `mode` sets the
 synchronization mode of its own edge (`two-way-safe`, `two-way-resolved`,
 `one-way-safe`, or `one-way-replica`), taking precedence over `star.sync.mode`
 and the defaults; edges use `two-way-safe` if nothing selects a mode. The
@@ -321,8 +413,10 @@ and rejected with status 125.** Unset the environment variable and use
 internal synchronization edges, managed through `mutagen sync` and projects.
 
 Ignored directories require an explicit `--cwd`; their files still aren't
-synchronized. `remote --ignores` inspects the source's ignore rules. Each call
-pins its selected target and doesn't switch to another node after a failure.
+synchronized. In [Git mode](#git-mode), that includes directories that
+`.gitignore` rules ignore. `remote --ignores` inspects the source's ignore rules.
+Each call pins its selected target and doesn't switch to another node after a
+failure.
 
 `--cwd` overrides the working directory (relative values are resolved against
 the corresponding directory, or against the opposite endpoint's root when
@@ -570,6 +664,11 @@ permissions, executable if the remote copy is. Files with identical contents
 but different mtime are atomically replaced, keeping their local permissions
 (but not hard links, owner, or extended attributes), and counted as
 `metadata updated`; another pull leaves matching files unchanged.
+
+In [Git mode](#git-mode), `--ignores` also lists where the session's rules come
+from (`.gitignore` files and `.git/info/exclude`, which `remote` reads from the
+tree on its own system) and says which of them ignores each path. `--pull`
+copies content that they ignore.
 
 After each flush, `remote` also warns about content that the session couldn't
 synchronize: conflicts (paths modified on both endpoints, which aren't

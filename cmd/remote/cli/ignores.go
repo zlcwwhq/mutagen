@@ -37,10 +37,37 @@ func describeExclusion(target *remote.Target, locator *locator, relative, root, 
 			return fmt.Sprintf("possibly synchronized as %s (through a symbolic link; %s)", at, describePartialExclusion(locator, physical, partially)), false
 		}
 		return fmt.Sprintf("synchronized as %s (through a symbolic link)", at), false
-	} else if excluded == relative {
-		return "ignored", true
 	}
-	return fmt.Sprintf("ignored (inside %s, which the session ignores)", locator.display(excluded)), true
+	return describeIgnored(ignores, locator, relative, excluded, directory), true
+}
+
+// describeIgnored describes an entry at a path relative to the root, which is a
+// directory if directory is true, that the session ignores in every form in
+// which scans could see its path, given the path of the entry that keeps it
+// from being synchronized, which is either the entry itself or one of its
+// parents (see remote.Ignores.ExcludedInEveryForm). Outside Git mode, that's
+// always the session's own patterns and VCS directories. In Git mode, the
+// description also says where the exclusion comes from when it isn't the
+// session's patterns: rules in .gitignore files or .git/info/exclude, or an
+// entry named .git (see remote.Ignores.ExclusionSource).
+func describeIgnored(ignores *remote.Ignores, locator *locator, relative, excluded string, directory bool) string {
+	inside := excluded != relative
+	switch ignores.ExclusionSource(excluded, directory || inside) {
+	case remote.ExcludedByGitRules:
+		if !inside {
+			return "ignored (by Git rules)"
+		}
+		return fmt.Sprintf("ignored (inside %s, which Git rules ignore)", locator.display(excluded))
+	case remote.ExcludedByGitEntry:
+		if !inside {
+			return "ignored (Git mode never synchronizes .git entries)"
+		}
+		return fmt.Sprintf("ignored (inside %s, which Git mode never synchronizes)", locator.display(excluded))
+	}
+	if !inside {
+		return "ignored"
+	}
+	return fmt.Sprintf("ignored (inside %s, which the session ignores)", locator.display(excluded))
 }
 
 // describePartialExclusion explains that the session ignores the entry at a
@@ -100,7 +127,7 @@ func printIgnores(router *router, paths []string, output io.Writer) (int, error)
 		if ignores == nil {
 			fmt.Fprintf(output, "The ignores of node %s aren't known.\n", session)
 			return 0, nil
-		} else if len(ignores.Patterns) == 0 && !ignores.VCS {
+		} else if len(ignores.Patterns) == 0 && !ignores.VCS && !ignores.Git {
 			fmt.Fprintf(output, "Node %s ignores nothing.\n", session)
 			return 0, nil
 		}
@@ -110,6 +137,14 @@ func printIgnores(router *router, paths []string, output io.Writer) (int, error)
 		}
 		if ignores.VCS {
 			fmt.Fprintln(output, "  VCS directories (.git, .svn, .hg, .bzr, and _darcs)")
+		}
+
+		// In Git mode, most of what the session ignores isn't in its patterns,
+		// but in files in the tree, which each endpoint reads for itself, so
+		// describe where they come from rather than listing them.
+		if ignores.Git {
+			fmt.Fprintln(output, "  Git rules: .gitignore files at every level and .git/info/exclude, case-sensitively; the patterns above take precedence, so they can also unignore")
+			fmt.Fprintln(output, "  .git files and directories, which are never synchronized")
 		}
 		fmt.Fprintf(output, "Ignored paths aren't synchronized; %[1]s --ignores <path> checks a path, and %[1]s --pull <path> copies ignored paths from the opposite endpoint.\n", router.followUp())
 		return 0, nil

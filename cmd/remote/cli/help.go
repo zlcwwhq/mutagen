@@ -82,8 +82,9 @@ disables execution there fail with 125.
     --node NAME. Session identifiers are internal synchronization handles.
   - Relative directories map from source root to target root. --cwd (-C)
     overrides the mapped directory; absolute and quoted ~ paths belong to the
-    target system. Ignored directories require an explicit --cwd, and ignored
-    content isn't synchronized. --ignores without --node inspects local rules.
+    target system. Ignored directories (in Git mode, also those that .gitignore
+    rules ignore) require an explicit --cwd, and ignored content isn't
+    synchronized. --ignores without --node inspects local rules.
   - Every operation crosses exactly one edge, which is an ordinary pair
     session, and behaves as for a pair: commands, scripts, detached jobs,
     --flush, --no-flush, --pull, --diff, --ignores, and conflicts (see
@@ -166,6 +167,20 @@ between a star's center and one of its nodes:
     session also ignores where they lead. --pull only follows links that the
     session ignores, and never one at the path itself, which a pulled file or
     link replaces.
+  - In Git mode (git: enabled), the session also ignores what .gitignore
+    files at every level and the root repository's .git/info/exclude ignore,
+    which each endpoint reads from its own copy of the tree, case-sensitively
+    (global excludes and files above the root don't count). The session's
+    ignore patterns take precedence, so a pattern such as !.env synchronizes
+    a file that a rule ignores. Entries named .git, files as well as
+    directories, are never synchronized and can't be unignored. remote
+    --ignores lists these sources and says which one ignores a path, and
+    --pull copies what they ignore. A rule added later doesn't delete files
+    that were synchronized. Files that Git tracks but rules ignore aren't
+    synchronized: remote warns and suggests the pattern that unignores them.
+  - In Git mode, nested repositories are synchronized as directories, without
+    their .git, so their commits and branches stay on the endpoint that has
+    them.
   - --pull preserves regular files' modification times, including files in
     directories, truncated to whole seconds, so copies are never newer than
     their sources. Times use the executing endpoint's clock; clock skew is
