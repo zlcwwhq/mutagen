@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1540,5 +1541,176 @@ func TestGitModeSymbolicLinkReplaced(t *testing.T) {
 			}
 			session.expectMissing(session.beta, "other/file.txt")
 		})
+	}
+}
+
+// gitModeRuleReplacements are the ways of replacing a rule file with something
+// that doesn't provide rules, given the file's path, which has been removed.
+var gitModeRuleReplacements = []struct {
+	name    string
+	replace func(*testing.T, string)
+}{
+	{"symbolic link", func(t *testing.T, path string) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symbolic links may require privileges")
+		} else if err := os.Symlink("keep", path); err != nil {
+			t.Fatal(err)
+		}
+	}},
+	{"directory", func(t *testing.T, path string) {
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		} else if err := os.WriteFile(filepath.Join(path, "file"), []byte("file"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}},
+	{"directory with rules", func(t *testing.T, path string) {
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		} else if err := os.WriteFile(filepath.Join(path, "file"), []byte("file"), 0600); err != nil {
+			t.Fatal(err)
+		} else if err := os.WriteFile(filepath.Join(path, ".gitignore"), []byte("*.bin\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}},
+}
+
+// TestGitModeRuleReplacedWithDeletion tests that replacing a rule file counts
+// as removing it. Removing a rule that kept a path from being ignored by a less
+// specific rule ignores that path, which has to take effect on the opposite
+// endpoint before anything else can happen there. Otherwise, a deletion of the
+// path from the same cycle would delete the opposite endpoint's copy, which is
+// what a rule's removal doesn't do.
+func TestGitModeRuleReplacedWithDeletion(t *testing.T) {
+	for _, replacement := range gitModeRuleReplacements {
+		for _, mode := range gitModeSynchronizationModes {
+			for _, side := range gitModeRuleSides {
+				unidirectional := mode == core.SynchronizationMode_SynchronizationModeOneWaySafe ||
+					mode == core.SynchronizationMode_SynchronizationModeOneWayReplica
+				if unidirectional && !side.alphaGetsRule {
+					continue
+				}
+				t.Run(replacement.name+"/"+mode.Description()+"/"+side.name, func(t *testing.T) {
+					session := newGitModeSession(t, gitModeOptions{mode: mode, alpha: map[string]string{
+						".gitignore":     "*.log\n",
+						"keep":           "keep",
+						"sub/.gitignore": "!kept.log\n",
+						"sub/kept.log":   "log",
+					}})
+					session.flush()
+					session.expect(session.beta, map[string]string{"sub/kept.log": "log"})
+
+					// Delete the file and replace the rule that unignored it,
+					// both before the next cycle.
+					ruleRoot, oppositeRoot := side.roots(session)
+					session.remove(ruleRoot, "sub/kept.log")
+					session.remove(ruleRoot, "sub/.gitignore")
+					replacement.replace(t, filepath.Join(ruleRoot, "sub", ".gitignore"))
+					for i := 0; i < 2; i++ {
+						session.flush()
+						session.expect(oppositeRoot, map[string]string{"sub/kept.log": "log"})
+						session.expectMissing(ruleRoot, "sub/kept.log")
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestGitModeRuleReplaced tests that a single flush synchronizes the content
+// that replacing a rule file exposes, in either direction, without warning about
+// the opposite endpoint's rules, as it does for the removal of a rule file. It
+// also tests that the replacement itself is synchronized.
+func TestGitModeRuleReplaced(t *testing.T) {
+	for _, replacement := range gitModeRuleReplacements {
+		for _, side := range gitModeRuleSides {
+			t.Run(replacement.name+"/"+side.name, func(t *testing.T) {
+				session := newGitModeSession(t, gitModeOptions{alpha: map[string]string{
+					".gitignore": "data/\n",
+					"keep":       "keep",
+				}})
+				session.flush()
+				ruleRoot, oppositeRoot := side.roots(session)
+				session.write(ruleRoot, map[string]string{"data/file": "data"})
+				session.flush()
+				session.expectMissing(oppositeRoot, "data")
+
+				// Replace the rule file.
+				rulePath := filepath.Join(ruleRoot, ".gitignore")
+				session.remove(ruleRoot, ".gitignore")
+				replacement.replace(t, rulePath)
+				session.flush()
+				session.expect(oppositeRoot, map[string]string{"data/file": "data"})
+
+				// The replacement arrives as well, so the endpoints agree.
+				expected, err := os.Lstat(rulePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				actual, err := os.Lstat(filepath.Join(oppositeRoot, ".gitignore"))
+				if err != nil {
+					t.Fatal(err)
+				} else if actual.Mode().Type() != expected.Mode().Type() {
+					t.Errorf("replacement not synchronized: %v != %v", actual.Mode().Type(), expected.Mode().Type())
+				}
+				state := session.state()
+				for _, problems := range [][]*core.Problem{state.AlphaState.TransitionProblems, state.BetaState.TransitionProblems} {
+					if len(problems) != 0 {
+						t.Errorf("unexpected transition problems: %v", problems)
+					}
+				}
+				if len(state.Conflicts) != 0 {
+					t.Errorf("unexpected conflicts: %v", state.Conflicts)
+				}
+			})
+		}
+	}
+}
+
+// TestGitModeRuleReplacedByDirectoryWithRules tests that a single flush also
+// covers replacing a rule file with a directory that contains rule files of its
+// own. A flush is only held for a single cycle that only delivers rules, and this
+// session has nothing else to trigger a cycle, so that replacement has to fit
+// into one such cycle for the flush to promise what it does.
+func TestGitModeRuleReplacedByDirectoryWithRules(t *testing.T) {
+	// The second set of rules applies to the directory that replaces the rule
+	// file. It keeps that directory from being written, but not its rule files,
+	// which would otherwise be delivered in every cycle, at the expense of
+	// everything else.
+	for _, rules := range []string{"data/\n", "data/\n.gitignore/\n"} {
+		for _, side := range gitModeRuleSides {
+			t.Run(strconv.Quote(rules)+"/"+side.name, func(t *testing.T) {
+				session := newGitModeSession(t, gitModeOptions{alpha: map[string]string{
+					".gitignore": rules,
+					"keep":       "keep",
+				}})
+				session.flush()
+				ruleRoot, oppositeRoot := side.roots(session)
+				session.write(ruleRoot, map[string]string{"data/file": "data"})
+				session.flush()
+				session.expectMissing(oppositeRoot, "data")
+
+				// Replace the rule file, and make an unrelated change that's
+				// dropped from any cycle that only delivers rules.
+				session.remove(ruleRoot, ".gitignore")
+				expected := map[string]string{
+					".gitignore/.gitignore":     "*.bin\n",
+					".gitignore/file":           "file",
+					".gitignore/sub/.gitignore": "*.tmp\n",
+					".gitignore/sub/file":       "sub",
+					"plain":                     "plain",
+				}
+				session.write(ruleRoot, expected)
+				expected["data/file"] = "data"
+
+				// A single flush synchronizes all of it, without any problems,
+				// and the rules are in effect.
+				session.flush()
+				session.expect(oppositeRoot, expected)
+				session.write(ruleRoot, map[string]string{".gitignore/weights.bin": "weights"})
+				session.flush()
+				session.expectMissing(oppositeRoot, ".gitignore/weights.bin")
+			})
+		}
 	}
 }
