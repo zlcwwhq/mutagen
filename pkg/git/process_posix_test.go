@@ -18,7 +18,7 @@ import (
 // handling that Command provides, until it has created a file named ready, and
 // then cancels it, waits for it, and returns the directory. Its output goes to a
 // buffer rather than to a file, as it does for commands that Mutagen runs, which
-// means that waiting for it covers the processes that have inherited its output.
+// means that waiting for it also waits for the output to close.
 func runUntilCancelled(t *testing.T, script string) string {
 	t.Helper()
 	directory := t.TempDir()
@@ -72,8 +72,7 @@ func TestCommandCancellationAllowsCleanup(t *testing.T) {
 // TestCommandCancellationWaitsForHelper tests that cancellation reaches helper
 // processes, and that waiting for a command covers the cleanup of a helper that
 // outlives the command itself, because the caller may move or remove what it was
-// working on as soon as waiting returns. Git's clones are helpers of this sort
-// when they're run for submodules.
+// working on as soon as waiting returns.
 func TestCommandCancellationWaitsForHelper(t *testing.T) {
 	directory := runUntilCancelled(t, `
 		(
@@ -81,6 +80,26 @@ func TestCommandCancellationWaitsForHelper(t *testing.T) {
 			touch ready
 			while :; do sleep 0.05; done
 		) &
+		trap 'exit 0' TERM
+		wait
+	`)
+	verifyCleanedUp(t, directory, "cleaned")
+}
+
+// TestCommandCancellationWaitsForHelperWithOwnOutput tests that waiting for a
+// command covers the cleanup of a helper that outlives the command and doesn't
+// have its output, so that the command's output closing says nothing about the
+// helper. Git's clones are helpers of this sort when they're run for submodules,
+// because Git captures their output. This also catches any change to
+// exec.Cmd.Wait not returning before the command's Cancel function does, which
+// configureProcess relies on.
+func TestCommandCancellationWaitsForHelperWithOwnOutput(t *testing.T) {
+	directory := runUntilCancelled(t, `
+		(
+			trap 'sleep 0.3; echo cleaned > cleaned; exit 0' TERM
+			touch ready
+			while :; do sleep 0.05; done
+		) > /dev/null 2>&1 &
 		trap 'exit 0' TERM
 		wait
 	`)

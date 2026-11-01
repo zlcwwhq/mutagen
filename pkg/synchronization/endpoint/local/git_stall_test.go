@@ -114,6 +114,20 @@ func useShortStallDurations(e *endpoint, timeout, backoff time.Duration) *gitPro
 	return provider
 }
 
+// useLargeRepositoryTemplate gives the repositories that Git creates from now on
+// a large number of files, so that a clone that's stopped takes a while to remove
+// what it has created, rather than the moment that it would otherwise take.
+func useLargeRepositoryTemplate(t *testing.T) {
+	t.Helper()
+	template := realTemporaryDirectory(t)
+	files := make(map[string]string, 1000)
+	for f := 0; f < 1000; f++ {
+		files[fmt.Sprintf("filler/file-%d", f)] = "filler"
+	}
+	writeTree(t, template, files)
+	t.Setenv("GIT_TEMPLATE_DIR", template)
+}
+
 // TestEndpointGitModeCloneStallBackoff tests that a clone that shows no
 // progress is stopped without any effect on existing content, that its URL is
 // avoided for a while (without any delay), and that it's tried again after
@@ -407,7 +421,10 @@ func TestEndpointGitModeCloneCancellation(t *testing.T) {
 // nothing behind. A clone that's killed would leave a .git file with an absolute
 // path into the temporary clone, which stops working once that's moved into
 // place and which breaks every later checkout, and a repository without commits,
-// which Git won't clone again.
+// which Git won't clone again. The same goes for a clone that's still removing
+// what it created when the temporary clone is moved, since it does so using
+// absolute paths and doesn't share the output of the command that started it, so
+// this makes that take a while.
 func TestEndpointGitModeNestedStall(t *testing.T) {
 	// Create an upstream that records two nested submodules, the first of which
 	// never responds. Git doesn't let us add that one in the usual way, because
@@ -424,9 +441,11 @@ func TestEndpointGitModeNestedStall(t *testing.T) {
 	upstream.commitAll("add submodules")
 
 	// The clone goes ahead, but the update stops at the first nested submodule.
+	// The stall timeout has to leave room for the large template to be copied.
+	useLargeRepositoryTemplate(t)
 	root := newGitRoot(t, nil)
 	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
-	provider := useShortStallDurations(e, 250*time.Millisecond, time.Hour)
+	provider := useShortStallDurations(e, 2*time.Second, time.Hour)
 	ctx := context.Background()
 	first := upstream.entry(upstream.head)
 	results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", New: first})
@@ -473,8 +492,9 @@ func TestEndpointGitModeNestedStall(t *testing.T) {
 
 	// Once the URL works and the backoff has ended, the next commit brings all
 	// of the nested submodules in, since the clone that stalled isn't in the
-	// way.
+	// way. Nothing should stall now, even on a busy system.
 	transport.recover(t, nested.bare)
+	provider.stallTimeout = time.Minute
 	provider.backoffsLock.Lock()
 	clear(provider.backoffs)
 	provider.backoffsLock.Unlock()

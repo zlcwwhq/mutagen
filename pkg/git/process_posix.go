@@ -11,10 +11,9 @@ import (
 const (
 	// terminationGracePeriod is the amount of time that a Git command and its
 	// helper processes have to exit after being asked to, before they're
-	// killed. It's shorter than waitDelay, so that when waiting on a command
-	// returns, none of them are still running. Git only has to remove a few
-	// temporary files, so this only matters on a filesystem that's stopped
-	// responding, or if a helper process doesn't respond to the request.
+	// killed. Git only has to remove a few temporary files, so this only matters
+	// on a filesystem that's stopped responding, or if a helper process doesn't
+	// respond to the request.
 	terminationGracePeriod = 3 * time.Second
 	// terminationPollInterval is the interval at which a process group is
 	// checked during terminationGracePeriod.
@@ -37,7 +36,17 @@ const (
 // file that can stop working, since it has an absolute path to that repository
 // until the clone completes. Interrupted commands can also leave lock files in
 // the user's repositories. A group that's still around after a grace period gets
-// killed, which is still bounded by the command's wait delay.
+// killed.
+//
+// Cancellation isn't complete until the group is gone, and because exec.Cmd.Wait
+// reports the result of Cancel, waiting on the command doesn't return before that
+// either. This is what allows a caller to move or remove what the command was
+// working on as soon as waiting returns. The command having exited and its output
+// having closed isn't enough to allow that: Git captures the output of the clones
+// that it runs for submodules, and it exits as soon as it's signaled, without
+// waiting for them to remove what they've created. They do that using absolute
+// paths, so moving a temporary clone at that point leaves what they haven't
+// removed yet in the clone's new location.
 func configureProcess(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.Cancel = func() error {
@@ -54,16 +63,20 @@ func configureProcess(command *exec.Cmd) {
 		// been continued.
 		syscall.Kill(group, syscall.SIGCONT)
 
-		// Make sure that the group goes away.
-		go killAfterGracePeriod(group)
+		// Wait for the group to go away, and make sure that it does.
+		killAfterGracePeriod(group)
 		return nil
 	}
 }
 
-// killAfterGracePeriod kills a process group unless it goes away during
-// terminationGracePeriod. A group's identifier can't be reused while the group
-// has members, and we stop looking at it as soon as it has none, so there's no
-// meaningful risk of signaling an unrelated group.
+// killAfterGracePeriod waits for a process group to go away, and kills it if it
+// doesn't do so during terminationGracePeriod. It doesn't wait after that, since
+// killed processes don't clean up, and those that can't be killed could take any
+// amount of time. A group's identifier can't be reused while the group has
+// members, and we stop looking at it as soon as it has none, so there's no
+// meaningful risk of signaling an unrelated group. Unreaped zombies count as
+// members on Linux, so if nothing reaps orphaned processes (as in a container
+// without an init process), then this takes the whole grace period.
 func killAfterGracePeriod(group int) {
 	for deadline := time.Now().Add(terminationGracePeriod); time.Now().Before(deadline); {
 		time.Sleep(terminationPollInterval)

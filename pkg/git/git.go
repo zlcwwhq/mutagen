@@ -20,11 +20,11 @@ import (
 
 const (
 	// waitDelay is the time that a command created by Command has to
-	// close its I/O pipes after it exits or its context is canceled, before
-	// waiting on it is abandoned. Killing Git can leave helper processes (such
-	// as those of remote transports) behind, and they keep the pipes open and
-	// would otherwise keep waiting on the command from returning. The same can
-	// happen if a command succeeds, e.g. if ssh leaves a connection master
+	// close its I/O pipes after it exits or after its cancellation is complete,
+	// before waiting on it is abandoned. Killing Git can leave helper processes
+	// (such as those of remote transports) behind, and they keep the pipes open
+	// and would otherwise keep waiting on the command from returning. The same
+	// can happen if a command succeeds, e.g. if ssh leaves a connection master
 	// behind that inherited its standard error.
 	waitDelay = 5 * time.Second
 	// probeTimeout is the maximum amount of time that the Git commands of a
@@ -166,10 +166,10 @@ func environment(directory string) []string {
 //
 // The command is stopped when ctx is canceled, along with its helper processes
 // where the platform supports that, which includes giving them a moment to
-// clean up where the platform supports that (see configureProcess), and waiting
-// on it doesn't block for more than a few seconds after that on processes that
-// are still running. The command is returned unstarted, so callers can set up
-// its I/O.
+// clean up, and waiting on the command covering that, where the platform supports
+// that (see configureProcess). Waiting on it doesn't block for more than a few
+// seconds after that on processes that are still running. The command is returned
+// unstarted, so callers can set up its I/O.
 func Command(ctx context.Context, directory string, args ...string) *exec.Cmd {
 	// Prepend Git's global options. They must come before the subcommand.
 	arguments := make([]string, 0, len(args)+5)
