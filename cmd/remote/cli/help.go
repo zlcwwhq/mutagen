@@ -417,6 +417,12 @@ alongside Error.
     whose conflicts were resolved some other way or ended by a change after
     checkout. Conflict operations accept several paths, with options before
     them.
+  - remote --conflicts exits with status 0 whenever it produces a listing,
+    with or without conflicts. If it has nothing to list, it prints
+    "No conflicts.", unless content couldn't be synchronized, which can hide
+    conflicts: it then warns about that content and prints "Conflicts can't be
+    ruled out, because some content couldn't be synchronized (see the
+    warnings).".
   - Before checking out, stop anything that writes the conflicting paths on
     either endpoint, and leave them unchanged until apply finishes; changing
     them meanwhile isn't supported. Apply fails without writing a copy that
