@@ -756,14 +756,21 @@ func TestPathsThatLeaveRoot(t *testing.T) {
 	// in the paths below, and rules inside of the root that don't.
 	parent := t.TempDir()
 	root := filepath.Join(parent, "root")
-	writeTree(t, parent, map[string]string{
+	tree := map[string]string{
 		".gitignore":          "secret\n",
 		"outside/.gitignore":  "secret\n",
 		"root/.gitignore":     "public\n",
 		"root/a/b/file":       "file",
 		"root/..x/.gitignore": "secret\n",
-		"root/.../.gitignore": "secret\n",
-	})
+	}
+	dotted := []string{"..x/secret"}
+
+	// Windows doesn't have directories whose names consist of dots.
+	if runtime.GOOS != "windows" {
+		tree["root/.../.gitignore"] = "secret\n"
+		dotted = append(dotted, ".../secret")
+	}
+	writeTree(t, parent, tree)
 
 	// Nothing but the root's rules apply to these, whatever they refer to.
 	separator := string(filepath.Separator)
@@ -792,7 +799,7 @@ func TestPathsThatLeaveRoot(t *testing.T) {
 	}
 
 	// Names that merely begin with dots are ordinary names.
-	for _, path := range []string{"..x/secret", ".../secret"} {
+	for _, path := range dotted {
 		if excluded, err := ignore.Excluded(NewIgnorer(root, nil), path, false); err != nil {
 			t.Errorf("path %q: unable to evaluate: %v", path, err)
 		} else if excluded != path {

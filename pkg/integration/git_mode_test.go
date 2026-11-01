@@ -1819,9 +1819,8 @@ func testGitSubmoduleNoHotLoop(t *testing.T, transport gitSubmoduleTransport, wa
 	// temporary directory in a directory that can be watched, which has to be
 	// disregarded.
 	if clone {
-		if err := os.RemoveAll(f.follower); err != nil {
-			t.Fatal(err)
-		} else if err := os.Mkdir(f.follower, 0700); err != nil {
+		removeDirectoryInUse(t, f.follower)
+		if err := os.Mkdir(f.follower, 0700); err != nil {
 			t.Fatal(err)
 		}
 		before := state.SuccessfulCycles
@@ -1846,6 +1845,24 @@ func testGitSubmoduleNoHotLoop(t *testing.T, transport gitSubmoduleTransport, wa
 	gitModePush(t, f.leader, "main")
 	f.flush()
 	f.verifyFollowing(unpushed)
+}
+
+// removeDirectoryInUse removes a directory that a running session is working in.
+// On Windows, a directory can't be removed while it's the working directory of a
+// process, such as a Git command that the session has started, so this keeps
+// trying for a while.
+func removeDirectoryInUse(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		err := os.RemoveAll(path)
+		if err == nil {
+			return
+		} else if runtime.GOOS != "windows" || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // gitSubmoduleWatchModes describes the watch modes for tests with sessions that
