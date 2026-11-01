@@ -1116,7 +1116,17 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 			listed.RemotePending[p] = l.local(path)
 		}
 		return json.NewEncoder(output).Encode(&listed)
-	} else if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 && len(listing.Problems) == 0 {
+	}
+	// Problems other than warnings may hide a conflict, so the listing doesn't
+	// say that there are none when there are any (the problems themselves were
+	// printed above). Warnings don't count, as in unsettled, because they
+	// describe content that isn't synchronized by design, such as paths that an
+	// endpoint's own rules exclude, and can persist for as long as a session
+	// runs, so they say nothing about conflicts.
+	failed := slices.ContainsFunc(listing.Problems, func(problem remote.Problem) bool {
+		return !problem.Warning
+	})
+	if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 && !failed {
 		_, err := fmt.Fprintln(output, "No conflicts.")
 		return err
 	}

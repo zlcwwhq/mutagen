@@ -239,6 +239,72 @@ func TestSubmoduleConflict(t *testing.T) {
 	}
 }
 
+func TestNoConflictsWithWarnings(t *testing.T) {
+	// The listing says that there are no conflicts, which agents and scripts
+	// look for, unless something else may hide one. Warnings describe content
+	// that isn't synchronized by design, such as paths that an endpoint's own
+	// rules exclude, and can persist for as long as a session runs, so they
+	// don't suppress it. Other problems do, since an unreadable path may hide a
+	// conflict, and the listing doesn't say that there are none then.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	root := t.TempDir()
+	target := &remote.Target{SourceSession: "session", SourceAlpha: true, Session: "session", Alpha: true, Root: root, Contained: true}
+	warning := remote.Problem{Alpha: true, Path: "ignored", Error: "tracked by Git, but ignored", Warning: true}
+	problem := remote.Problem{Path: "unreadable", Error: "permission denied"}
+	conflict := remote.ConflictRoot{
+		Path:         "file",
+		Files:        true,
+		AlphaChanges: []remote.Change{{Path: "file", Old: "file", New: "file"}},
+		BetaChanges:  []remote.Change{{Path: "file", Old: "file", New: "file"}},
+	}
+	const none = "No conflicts.\n"
+	for _, test := range []struct {
+		description string
+		listing     *remote.Listing
+		// reported indicates whether the listing says that there are no
+		// conflicts.
+		reported bool
+		// conflicts indicates whether the listing describes the conflict.
+		conflicts bool
+		// problems are the problems that the warnings on the error output
+		// must include.
+		problems []remote.Problem
+	}{
+		{"nothing", &remote.Listing{}, true, false, nil},
+		{"warning", &remote.Listing{Problems: []remote.Problem{warning}}, true, false, nil},
+		{"warnings on both endpoints", &remote.Listing{Problems: []remote.Problem{warning, {Path: "ignored", Error: "ignored too", Warning: true}}}, true, false, nil},
+		{"problem", &remote.Listing{Problems: []remote.Problem{problem}}, false, false, []remote.Problem{problem}},
+		{"warning and problem", &remote.Listing{Problems: []remote.Problem{warning, problem}}, false, false, []remote.Problem{problem}},
+		{"problem and warning", &remote.Listing{Problems: []remote.Problem{problem, warning}}, false, false, []remote.Problem{problem}},
+		{"conflict", &remote.Listing{Conflicts: []remote.ConflictRoot{conflict}}, false, true, nil},
+		{"warning and conflict", &remote.Listing{Conflicts: []remote.ConflictRoot{conflict}, Problems: []remote.Problem{warning}}, false, true, nil},
+		{"warning, problem, and conflict", &remote.Listing{Conflicts: []remote.ConflictRoot{conflict}, Problems: []remote.Problem{warning, problem}}, false, true, []remote.Problem{problem}},
+	} {
+		var output, errorOutput strings.Builder
+		if err := renderConflicts(ctx, root, &options{}, &output, &errorOutput, test.listing, target); err != nil {
+			t.Fatalf("%s: unable to list conflicts: %v", test.description, err)
+		}
+		if test.reported {
+			if output.String() != none {
+				t.Errorf("%s: no conflicts not reported: %q", test.description, output.String())
+			}
+		} else if strings.Contains(output.String(), none) {
+			t.Errorf("%s: no conflicts reported: %q", test.description, output.String())
+		}
+		if described := strings.Contains(output.String(), "file: "); described != test.conflicts {
+			t.Errorf("%s: conflict described: %t, listing: %q", test.description, described, output.String())
+		}
+		// Problems are never dropped from the text listing: they're warned
+		// about on the error output.
+		for _, listed := range test.problems {
+			if !strings.Contains(errorOutput.String(), listed.Path) || !strings.Contains(errorOutput.String(), listed.Error) {
+				t.Errorf("%s: problem not warned about: %q", test.description, errorOutput.String())
+			}
+		}
+	}
+}
+
 func TestConflictOptions(t *testing.T) {
 	for _, args := range [][]string{
 		{"--conflicts", "--json"},
