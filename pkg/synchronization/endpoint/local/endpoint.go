@@ -1268,55 +1268,21 @@ func (e *endpoint) Stage(paths []string, digests [][]byte) ([]string, []*rsync.S
 		return nil, nil, nil, nil
 	}
 
-	// Grab the scan lock. We'll need this to generate the reverse lookup map.
-	e.lockScanLock(context.Background())
-
 	// Verify that we've performed a scan since the last staging operation. If
-	// we haven't, then the controller is either malfunctioning or malicious.
+	// we haven't, then the controller is either malfunctioning or malicious,
+	// and it doesn't get to cause any of the work below.
 	if !e.scannedSinceLastStageCall {
-		e.unlockScanLock()
 		return nil, nil, nil, errors.New("multiple staging operations performed without scan")
 	}
 	e.scannedSinceLastStageCall = false
-
-	// Verify that the number of paths provided doesn't exceed the maximum
-	// number of allowed entries. Each staged path becomes a file entry, so a
-	// set of changes that requires staging more paths than that can never be
-	// applied.
-	//
-	// We don't check the number of paths against the capacity remaining after
-	// the last scan, because staged paths don't necessarily correspond to new
-	// entries: they also include content updates to existing files, and the
-	// changes that require them may remove other entries (e.g. by deleting one
-	// file and creating another in the same synchronization cycle). We're only
-	// provided with paths and digests, so we can't compute the resulting entry
-	// count here. Instead, Transition enforces the maximum for each change: it
-	// applies changes that can't increase the entry count first, then admits
-	// the remaining changes only while the resulting entry count stays within
-	// the maximum, and reports a problem for each change that it refuses. The
-	// stager is finalized either way, so refused changes don't leave staged
-	// files behind, and they're staged again in a later synchronization cycle.
-	if e.maximumEntryCount != 0 && uint64(len(paths)) > e.maximumEntryCount {
-		e.unlockScanLock()
-		return nil, nil, nil, errors.New("staging would exceed allowed entry count")
-	}
-
-	// Generate a reverse lookup map from the cache, which we'll use shortly to
-	// detect renames and copies.
-	reverseLookupMap, err := e.cache.GenerateReverseLookupMap()
-	if err != nil {
-		e.unlockScanLock()
-		return nil, nil, nil, fmt.Errorf("unable to generate reverse lookup map: %w", err)
-	}
-
-	// Release the scan lock.
-	e.unlockScanLock()
 
 	// In Git mode, don't transfer files that this endpoint won't write, either
 	// because its own rules exclude them or because they can't be evaluated,
 	// including those for paths that don't exist yet. Transition reports these
 	// paths, one by one, and this mustn't fail for them, because that would end
-	// the synchronization cycle for every other path.
+	// the synchronization cycle for every other path. This doesn't require the
+	// scan lock, which watching Goroutines shouldn't have to wait for while
+	// rule files are read.
 	if e.gitMode {
 		ignorer := gitignore.NewIgnorer(e.root, e.ignorer)
 		var receivablePaths []string
@@ -1328,6 +1294,41 @@ func (e *endpoint) Stage(paths []string, digests [][]byte) ([]string, []*rsync.S
 			}
 		}
 		paths, digests = receivablePaths, receivableDigests
+	}
+
+	// Verify that the number of paths to stage doesn't exceed the maximum
+	// number of allowed entries. Each staged path becomes a file entry, so a
+	// set of changes that requires staging more paths than that can never be
+	// applied. In Git mode, we only count the paths that remain after
+	// filtering, because the others will never be entries here. This doesn't
+	// give a controller that provides too many paths anything that it couldn't
+	// get by providing them over several cycles: filtering only reads rule
+	// files, and nothing has been staged or prepared for staging at this point.
+	//
+	// We don't check the number of paths against the capacity remaining after
+	// the last scan, because staged paths don't necessarily correspond to new
+	// entries: they also include content updates to existing files, and the
+	// changes that require them may remove other entries (e.g. by deleting one
+	// file and creating another in the same synchronization cycle). We're only
+	// provided with paths and digests, so we can't compute the resulting entry
+	// count here. Instead, Transition enforces the maximum for each change (in
+	// Git mode, for the part of it that may be written): it applies changes
+	// that can't increase the entry count first, then admits the remaining
+	// changes only while the resulting entry count stays within the maximum,
+	// and reports a problem for each change that it refuses. The stager is
+	// finalized either way, so refused changes don't leave staged files behind,
+	// and they're staged again in a later synchronization cycle.
+	if e.maximumEntryCount != 0 && uint64(len(paths)) > e.maximumEntryCount {
+		return nil, nil, nil, errors.New("staging would exceed allowed entry count")
+	}
+
+	// Generate a reverse lookup map from the cache, which we'll use shortly to
+	// detect renames and copies. This requires the scan lock.
+	e.lockScanLock(context.Background())
+	reverseLookupMap, err := e.cache.GenerateReverseLookupMap()
+	e.unlockScanLock()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("unable to generate reverse lookup map: %w", err)
 	}
 
 	// Inform the stager that we're about to begin staging and transition
@@ -1412,25 +1413,14 @@ func (e *endpoint) Supply(paths []string, signatures []*rsync.Signature, receive
 
 // transition performs transitions on the synchronization root using the
 // endpoint's transition parameters. It returns the results of core.Transition.
-// It doesn't require the scan lock (see Transition).
+// In Git mode, the transitions must be limited to what the endpoint may write
+// (see applyTransitions). It doesn't require the scan lock (see Transition).
 func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool) {
 	if e.gitMode {
-		// Limit the changes to what this endpoint may write according to its
-		// rules as they are now, before anything on disk changes, so that a
-		// refused change's old content stays in place.
-		pruned, problems := pruneGitTransitions(gitignore.NewIgnorer(e.root, e.ignorer), transitions)
-		applicable := make([]*core.Change, 0, len(pruned))
-		for _, change := range pruned {
-			if change != nil {
-				applicable = append(applicable, change)
-			}
-		}
-
-		// Apply the remaining changes.
-		applied, transitionProblems, missing := core.TransitionGitMode(
+		return core.TransitionGitMode(
 			ctx,
 			e.root,
-			applicable,
+			transitions,
 			e.lastReturnedScanCache,
 			e.transitionHasher,
 			e.symbolicLinkMode,
@@ -1441,18 +1431,6 @@ func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) (
 			e.stager,
 			e.gitProvider,
 		)
-
-		// There has to be a result for each of the original transitions, and
-		// applied has one for each applicable change, in the same order.
-		results := make([]*core.Entry, len(transitions))
-		for t, change := range pruned {
-			if change == nil {
-				results[t] = transitions[t].Old
-			} else {
-				results[t], applied = applied[0], applied[1:]
-			}
-		}
-		return results, append(problems, transitionProblems...), missing
 	}
 	return core.Transition(
 		ctx,
@@ -1477,6 +1455,11 @@ func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) (
 // transitions remove. Like core.Transition, it returns results in the order of
 // the transitions, problems, and whether or not the stager was missing files.
 // It doesn't require the scan lock (see Transition).
+//
+// In Git mode, the new content of these transitions is what the endpoint would
+// actually write (see applyTransitions), so that's what this function counts,
+// classifies, and charges. Transitions that were refused as a whole aren't
+// among them, and thus their old content simply stays part of the entry count.
 //
 // core.Transition handles each transition either by swapping file contents in
 // place or by removing the old content at its path and, only if that removal
@@ -1581,6 +1564,94 @@ func (e *endpoint) transitionWithinMaximumEntryCount(
 	return results, problems, stagerMissingFiles
 }
 
+// applyTransitions determines what to apply for each of the transitions and
+// applies it, keeping the root within the maximum number of allowed entries.
+// The specified entry count is the root's entry count before the transitions,
+// which must be at least the total number of entries that the transitions
+// remove. Like core.Transition, it returns one result for each transition, in
+// the order of the transitions, problems, and whether or not the stager was
+// missing files. It doesn't require the scan lock (see Transition).
+func (e *endpoint) applyTransitions(
+	ctx context.Context,
+	transitions []*core.Change,
+	entryCount uint64,
+) ([]*core.Entry, []*core.Problem, bool) {
+	// In Git mode, limit the changes to what this endpoint may write according
+	// to its rules as they are now, before anything on disk changes, so that a
+	// refused change's old content stays in place. Pruning comes before any
+	// counting, so that everything below only considers what would actually be
+	// written, and it only happens once, with a single pruner, so that the
+	// phases of transitionWithinMaximumEntryCount all use the same rules and
+	// can't report an excluded path more than once.
+	applicable := transitions
+	var pruned []*core.Change
+	var problems []*core.Problem
+	if e.gitMode {
+		pruned, problems = pruneGitTransitions(gitignore.NewIgnorer(e.root, e.ignorer), transitions)
+		applicable = make([]*core.Change, 0, len(pruned))
+		for _, change := range pruned {
+			if change != nil {
+				applicable = append(applicable, change)
+			}
+		}
+	}
+
+	// Compute the sum of the amounts by which the changes might increase the
+	// entry count (see transitionWithinMaximumEntryCount). As in Transition, we
+	// don't worry too much about overflow here for the same reasons as in
+	// Entry.Count.
+	var maximumIncrease uint64
+	for _, change := range applicable {
+		if removed, created := change.Old.Count(), change.New.Count(); created > removed {
+			maximumIncrease += created - removed
+		}
+	}
+
+	// Determine whether or not we need to restrict changes to keep the entry
+	// count within the maximum number of allowed entries. If the entry count
+	// can accommodate the sum of the increases computed above, then the changes
+	// can't exceed the maximum (even if every removal fails), and we can
+	// perform them as requested, which in practice is always the case at the
+	// default maximum. Otherwise, we have to enforce the maximum on a
+	// per-change basis, taking into account what the changes actually change on
+	// disk.
+	restrict := e.maximumEntryCount != 0 &&
+		(entryCount > e.maximumEntryCount ||
+			maximumIncrease > e.maximumEntryCount-entryCount)
+
+	// Perform the changes.
+	var results []*core.Entry
+	var transitionProblems []*core.Problem
+	var stagerMissingFiles bool
+	if restrict {
+		results, transitionProblems, stagerMissingFiles = e.transitionWithinMaximumEntryCount(
+			ctx, applicable, entryCount,
+		)
+	} else {
+		results, transitionProblems, stagerMissingFiles = e.transition(ctx, applicable)
+	}
+	problems = append(problems, transitionProblems...)
+
+	// In Git mode, there has to be a result for each of the original
+	// transitions, and we only have one for each applicable change, in the same
+	// order. A transition that was refused as a whole leaves its old content in
+	// place.
+	if e.gitMode {
+		applied := results
+		results = make([]*core.Entry, len(transitions))
+		for t, change := range pruned {
+			if change == nil {
+				results[t] = transitions[t].Old
+			} else {
+				results[t], applied = applied[0], applied[1:]
+			}
+		}
+	}
+
+	// Done.
+	return results, problems, stagerMissingFiles
+}
+
 // Transition implements the Transition method for local endpoints.
 func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool, error) {
 	// If we're in a read-only mode, we shouldn't be performing transitions.
@@ -1611,34 +1682,19 @@ func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) (
 	// the content that they expect to find there, so the entries that they
 	// remove can't outnumber the snapshot's entries unless the controller is
 	// malfunctioning. This also guarantees that the entry count computations in
-	// transitionWithinMaximumEntryCount can't underflow. While we're at it,
-	// compute the sum of the amounts by which transitions might increase the
-	// entry count (see transitionWithinMaximumEntryCount). Again, we don't
-	// worry too much about overflow here for the same reasons as in
-	// Entry.Count.
-	var removedEntryCount, maximumIncrease uint64
+	// transitionWithinMaximumEntryCount can't underflow, since it's only ever
+	// given some of these transitions, with the same old content. We validate
+	// all of them, without regard for what the endpoint would refuse in Git
+	// mode, and before reading any rules, since old content doesn't depend on
+	// those. Again, we don't worry too much about overflow here for the same
+	// reasons as in Entry.Count.
+	var removedEntryCount uint64
 	for _, transition := range transitions {
-		removed, created := transition.Old.Count(), transition.New.Count()
-		removedEntryCount += removed
-		if created > removed {
-			maximumIncrease += created - removed
-		}
+		removedEntryCount += transition.Old.Count()
 	}
 	if removedEntryCount > lastScanEntryCount {
 		return nil, nil, false, errors.New("transition requires removing more entries than exist")
 	}
-
-	// Determine whether or not we need to restrict transitions to keep the
-	// entry count within the maximum number of allowed entries. If the entry
-	// count can accommodate the sum of the increases computed above, then the
-	// transitions can't exceed the maximum (even if every removal fails), and
-	// we can perform them as requested, which in practice is always the case at
-	// the default maximum. Otherwise, we have to enforce the maximum on a
-	// per-transition basis, taking into account what the transitions actually
-	// change on disk.
-	restrict := e.maximumEntryCount != 0 &&
-		(lastScanEntryCount > e.maximumEntryCount ||
-			maximumIncrease > e.maximumEntryCount-lastScanEntryCount)
 
 	// Perform the transition. We release the scan lock around this operation
 	// because we want watching Goroutines to be able to pick up events, or at
@@ -1649,16 +1705,7 @@ func (e *endpoint) Transition(ctx context.Context, transitions []*core.Change) (
 	// because these aren't updated concurrently and thus don't fall under the
 	// scope of the scan lock.
 	e.unlockScanLock()
-	var results []*core.Entry
-	var problems []*core.Problem
-	var stagerMissingFiles bool
-	if restrict {
-		results, problems, stagerMissingFiles = e.transitionWithinMaximumEntryCount(
-			ctx, transitions, lastScanEntryCount,
-		)
-	} else {
-		results, problems, stagerMissingFiles = e.transition(ctx, transitions)
-	}
+	results, problems, stagerMissingFiles := e.applyTransitions(ctx, transitions, lastScanEntryCount)
 	e.lockScanLock(context.Background())
 
 	// Determine whether or not the transition made any changes on disk.
