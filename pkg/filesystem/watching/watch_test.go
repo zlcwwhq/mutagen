@@ -140,6 +140,66 @@ func TestRecursiveWatcherRootEvent(t *testing.T) {
 	verifyWatchEvent(t, watcher, map[string]bool{fileName: true})
 }
 
+// TestRecursiveWatcherDirectoryModifications tests that changes to the entries
+// of a directory are only reported under the names of those entries, which isn't
+// what Windows does by itself, including for the watch root. A hot loop could
+// otherwise result from a temporary file coming and going in a directory.
+func TestRecursiveWatcherDirectoryModifications(t *testing.T) {
+	// Skip this test unless the platform needs this to be handled.
+	if runtime.GOOS != "windows" {
+		t.Skip("only Windows reports directories for changes to their entries")
+	}
+
+	// Create a directory that exists before the watch does, and establish it.
+	directory := t.TempDir()
+	if err := os.Mkdir(filepath.Join(directory, "subdirectory"), 0700); err != nil {
+		t.Fatal("unable to create subdirectory:", err)
+	}
+	watcher, err := NewRecursiveWatcher(directory)
+	if err != nil {
+		t.Fatal("unable to establish watch:", err)
+	}
+	defer watcher.Terminate()
+
+	// Create and remove a file in each directory.
+	for _, name := range []string{"file", "subdirectory/file"} {
+		path := filepath.Join(directory, filepath.FromSlash(name))
+		if err := os.WriteFile(path, nil, 0600); err != nil {
+			t.Fatal("unable to create file:", err)
+		} else if err := os.Remove(path); err != nil {
+			t.Fatal("unable to remove file:", err)
+		}
+	}
+
+	// Collect what's reported for a while, since we're looking for an absence.
+	reported := make(map[string]bool)
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+Collection:
+	for {
+		select {
+		case path := <-watcher.Events():
+			reported[path] = true
+		case err := <-watcher.Errors():
+			t.Fatal("watcher error:", err)
+		case <-deadline.C:
+			break Collection
+		}
+	}
+
+	// Verify that the files were reported and that their directories weren't.
+	for _, name := range []string{"file", "subdirectory/file"} {
+		if !reported[name] {
+			t.Errorf("file not reported: %q: %v", name, reported)
+		}
+	}
+	for _, name := range []string{"", "subdirectory"} {
+		if reported[name] {
+			t.Errorf("directory reported: %q: %v", name, reported)
+		}
+	}
+}
+
 // TestRecursiveWatcherNestedCreation tests that creating a deeply
 // nested directory tree and writing a file at depth produces events
 // for intermediate directories and the leaf file. This verifies that

@@ -196,6 +196,20 @@ func (w *recursiveWatcher) run(ctx context.Context, watchRoot string, initialWat
 				return ErrWatchInternalOverflow
 			}
 
+			// Disregard modifications of directories. Windows reports these when
+			// entries are created or removed within a directory, and it reports
+			// those entries under their own names, for which accelerated scans
+			// take care of the directories containing them. If these were
+			// forwarded, then activity that's otherwise disregarded, such as a
+			// temporary file coming and going, would seem to be a change to its
+			// directory. A directory that's created or renamed is a different
+			// kind of event, so it's still reported.
+			if event.Mask&winfsnotify.FS_MODIFY != 0 {
+				if metadata, err := os.Lstat(event.Name); err == nil && metadata.IsDir() {
+					continue
+				}
+			}
+
 			// Extract the path.
 			path := event.Name
 
