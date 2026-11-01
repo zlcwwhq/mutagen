@@ -12,12 +12,13 @@ import (
 // gitReceivableFile determines whether or not an endpoint in Git mode should
 // accept a file for a path, given the rules on its own filesystem. A file for a
 // path that can't be evaluated isn't accepted, and neither is one for a path
-// that's excluded, unless it provides ignore rules (see gitTransitionPruner).
-// This is the decision that gitTransitionPruner makes for files, which it
-// reports on, whereas this only determines what's worth transferring.
+// that's excluded, unless it's a rule file that can be delivered (see
+// gitignore.IsDeliverableRuleFile and gitTransitionPruner). This is the
+// decision that gitTransitionPruner makes for files, which it reports on,
+// whereas this only determines what's worth transferring.
 func gitReceivableFile(ignorer ignore.DirectoryIgnorer, path string) bool {
 	excluded, err := ignore.Excluded(ignorer, path, false)
-	return err == nil && (excluded == "" || gitignore.IsRulePath(path))
+	return err == nil && (excluded == "" || gitignore.IsDeliverableRuleFile(path))
 }
 
 // gitTransitionPruner computes the part of a change's new content that an
@@ -35,15 +36,29 @@ func gitReceivableFile(ignorer ignore.DirectoryIgnorer, path string) bool {
 // rules to deliver don't do anything else (see ruleOnlyTransitions in the
 // synchronization package). Once delivered, the excluded directory that
 // contains them is Untracked on this endpoint, which ends any further
-// reconciliation of it.
+// reconciliation of it. None of this applies at or beneath a Git entry, which
+// isn't content that a session could ever need to deliver, and which is never
+// written (see refuseGitEntry).
 type gitTransitionPruner struct {
 	// ignorer evaluates this endpoint's rules.
 	ignorer ignore.DirectoryIgnorer
 	// problems are the problems reported so far.
 	problems []*core.Problem
-	// warned records the excluded paths that have been reported, since many
-	// paths in a change can be excluded by the same parent.
-	warned map[string]bool
+	// reported records the paths that have been reported by reportOnce, since
+	// many paths in a change can be left out because of the same parent.
+	reported map[string]bool
+}
+
+// reportOnce records a problem, unless one has already been recorded by this
+// method for its path.
+func (p *gitTransitionPruner) reportOnce(problem *core.Problem) {
+	if p.reported[problem.Path] {
+		return
+	} else if p.reported == nil {
+		p.reported = make(map[string]bool)
+	}
+	p.reported[problem.Path] = true
+	p.problems = append(p.problems, problem)
 }
 
 // warn reports an excluded path, once, which should be the shallowest excluded
@@ -51,19 +66,25 @@ type gitTransitionPruner struct {
 // ignored (.git/info/exclude isn't synchronized, for example), so this is
 // content that isn't synchronized by design.
 func (p *gitTransitionPruner) warn(excluded string) {
-	if p.warned[excluded] {
-		return
-	} else if p.warned == nil {
-		p.warned = make(map[string]bool)
-	}
-	p.warned[excluded] = true
-	p.problems = append(p.problems, &core.Problem{
+	p.reportOnce(&core.Problem{
 		Path: excluded,
 		Error: fmt.Sprintf(
 			"ignored by this endpoint's own rules, so it isn't written here; add %q to ignore.paths to synchronize it",
 			"!"+excluded,
 		),
 		Warning: true,
+	})
+}
+
+// refuseGitEntry reports a change at or beneath a Git entry, once, which should
+// be the shallowest one. Unlike an exclusion, this isn't by design: scans don't
+// represent what's in a Git entry, on any endpoint, so the change can't have
+// come from reconciling them. It thus isn't a warning, and since no pattern can
+// unignore a Git entry, it doesn't suggest one.
+func (p *gitTransitionPruner) refuseGitEntry(entry string) {
+	p.reportOnce(&core.Problem{
+		Path:  entry,
+		Error: "refused a change to Git metadata, which is never synchronized; scans don't produce such changes, so the daemon may be malfunctioning or compromised",
 	})
 }
 
@@ -80,6 +101,13 @@ func (p *gitTransitionPruner) fail(path string, err error) {
 // cost of creating an entry on disk, and which ensures that this always agrees
 // with gitReceivableFile.
 func (p *gitTransitionPruner) prune(path string, entry *core.Entry) *core.Entry {
+	// Nothing at or beneath a Git entry can be written, and it's the Git entry
+	// that's worth reporting, even if a parent is excluded too.
+	if gitEntry := gitignore.ShallowestGitEntry(path); gitEntry != "" {
+		p.refuseGitEntry(gitEntry)
+		return nil
+	}
+
 	// Evaluate the path.
 	directory := entry.Kind == core.EntryKind_Directory
 	excluded, err := ignore.Excluded(p.ignorer, path, directory)
@@ -90,7 +118,7 @@ func (p *gitTransitionPruner) prune(path string, entry *core.Entry) *core.Entry 
 
 	// Anything other than a directory is either written in full or not at all.
 	if !directory {
-		if excluded != "" && !(entry.Kind == core.EntryKind_File && gitignore.IsRulePath(path)) {
+		if excluded != "" && !(entry.Kind == core.EntryKind_File && gitignore.IsDeliverableRuleFile(path)) {
 			p.warn(excluded)
 			return nil
 		}

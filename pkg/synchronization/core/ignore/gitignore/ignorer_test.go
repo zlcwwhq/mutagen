@@ -63,35 +63,107 @@ func expectIgnored(t *testing.T, ignorer ignore.Ignorer, path string, directory,
 	}
 }
 
-// TestIsRulePath tests that IsRulePath behaves as expected.
-func TestIsRulePath(t *testing.T) {
+// TestRuleFilePredicates tests AffectsIgnoreEvaluation and
+// IsDeliverableRuleFile. They only disagree about the root repository's exclude
+// file, which affects ignore evaluation, but which is inside a Git directory.
+func TestRuleFilePredicates(t *testing.T) {
 	tests := []struct {
-		path     string
-		expected bool
+		path        string
+		affects     bool
+		deliverable bool
 	}{
-		{".gitignore", true},
-		{"a/.gitignore", true},
-		{"a/b/.gitignore", true},
-		{".git/info/exclude", true},
-		{"", false},
-		{"a", false},
-		{"gitignore", false},
-		{".Gitignore", false},
-		{".gitignore2", false},
-		{"x.gitignore", false},
-		{"a/x.gitignore", false},
-		{".gitignore/x", false},
-		{".git", false},
-		{".git/info", false},
-		{".git/info/Exclude", false},
-		{".git/info/exclude/x", false},
-		{".git/config", false},
-		{"a/.git/info/exclude", false},
-		{"a/.gitignore/.git/info/exclude", false},
+		// Rule files, including beneath names that merely resemble a Git entry.
+		{".gitignore", true, true},
+		{"a/.gitignore", true, true},
+		{"a/b/.gitignore", true, true},
+		{".gitignore/.gitignore", true, true},
+		{".gitx/.gitignore", true, true},
+		{"x.git/.gitignore", true, true},
+		{"git/.gitignore", true, true},
+		{".git2/hooks/.gitignore", true, true},
+
+		// The exclude file, which only exists in this form at the root.
+		{".git/info/exclude", true, false},
+
+		// Anything else beneath a Git entry, whatever its name.
+		{".git/.gitignore", false, false},
+		{".git/hooks/.gitignore", false, false},
+		{".git/info/.gitignore", false, false},
+		{"a/.git/.gitignore", false, false},
+		{"a/.git/x/.gitignore", false, false},
+		{".gitignore/.git/.gitignore", false, false},
+		{".GIT/.gitignore", false, false},
+		{".Git/hooks/.gitignore", false, false},
+		{"a/.gIt/.gitignore", false, false},
+		{".git/hooks/pre-commit", false, false},
+		{".git/config", false, false},
+		{".git/info", false, false},
+		{".git/info/Exclude", false, false},
+		{".git/info/exclude/x", false, false},
+		{".GIT/info/exclude", false, false},
+		{"a/.git/info/exclude", false, false},
+		{"a/.gitignore/.git/info/exclude", false, false},
+		{".git", false, false},
+
+		// Anything else.
+		{"", false, false},
+		{"a", false, false},
+		{"gitignore", false, false},
+		{".Gitignore", false, false},
+		{".gitignore2", false, false},
+		{"x.gitignore", false, false},
+		{"a/x.gitignore", false, false},
+		{".gitignore/x", false, false},
+		{"exclude", false, false},
+		{"info/exclude", false, false},
 	}
 	for _, test := range tests {
-		if IsRulePath(test.path) != test.expected {
-			t.Errorf("path %q: result did not match expected: %v != %v", test.path, !test.expected, test.expected)
+		if result := AffectsIgnoreEvaluation(test.path); result != test.affects {
+			t.Errorf("path %q: AffectsIgnoreEvaluation did not match expected: %v != %v", test.path, result, test.affects)
+		}
+		if result := IsDeliverableRuleFile(test.path); result != test.deliverable {
+			t.Errorf("path %q: IsDeliverableRuleFile did not match expected: %v != %v", test.path, result, test.deliverable)
+		}
+	}
+}
+
+// TestShallowestGitEntry tests ShallowestGitEntry, along with the fact that the
+// ignorer agrees about which entries are Git entries.
+func TestShallowestGitEntry(t *testing.T) {
+	ignorer := NewIgnorer(t.TempDir(), nil)
+	tests := []struct {
+		path     string
+		expected string
+	}{
+		{"", ""},
+		{"a", ""},
+		{"a/b", ""},
+		{".gitignore", ""},
+		{".gitx/a", ""},
+		{"x.git/a", ""},
+		{"git/a", ""},
+		{".gi/a", ""},
+		{".git /a", ""},
+		{" .git/a", ""},
+		{".git", ".git"},
+		{".GIT", ".GIT"},
+		{".Git", ".Git"},
+		{".gIt/a", ".gIt"},
+		{".git/a", ".git"},
+		{".git/a/b", ".git"},
+		{".git/.git/a", ".git"},
+		{"a/.git", "a/.git"},
+		{"a/.git/b", "a/.git"},
+		{"a/b/.Git/c/d", "a/b/.Git"},
+	}
+	for _, test := range tests {
+		if result := ShallowestGitEntry(test.path); result != test.expected {
+			t.Errorf("path %q: result did not match expected: %q != %q", test.path, result, test.expected)
+		}
+		if excluded, err := ignore.Excluded(ignorer, test.path, false); err != nil {
+			t.Errorf("path %q: unable to evaluate: %v", test.path, err)
+		} else if excluded != test.expected {
+			t.Errorf("path %q: ignorer did not agree: %q != %q", test.path, excluded, test.expected)
 		}
 	}
 }
