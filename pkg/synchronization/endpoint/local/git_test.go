@@ -1634,6 +1634,23 @@ func TestEndpointGitModePollDetectsCommit(t *testing.T) {
 				t.Fatalf("incorrect initial entry: %v", initial)
 			}
 
+			// Wait for wake ups to stop. A recursive watcher signals the end of its
+			// baseline scan, which stays pending until it's polled for, and it can
+			// report what happened just before it started some time later.
+			for {
+				settled, cancel := context.WithTimeout(context.Background(), time.Second)
+				err := e.Poll(settled)
+				timedOut := settled.Err() != nil
+				cancel()
+				if err != nil {
+					t.Fatal("polling failed:", err)
+				} else if timedOut {
+					break
+				} else if time.Now().After(deadline) {
+					t.Fatal("timed out waiting for wake ups to stop")
+				}
+			}
+
 			// Verify that a fetch doesn't result in a wake up.
 			mustGit(t, directory, "fetch", "--quiet", "--no-write-fetch-head", "origin")
 			quiet, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
