@@ -986,7 +986,7 @@ WatchEstablishment:
 				// otherwise wake the session in a loop.
 				ignore := strings.HasPrefix(path, filesystem.TemporaryNamePrefix) ||
 					strings.HasPrefix(fastpath.Base(path), filesystem.TemporaryNamePrefix) ||
-					(e.gitMode && !gitModeEventRelevant(path))
+					(e.gitMode && (!gitModeEventRelevant(path) || gitDirectoryEventForDirectory(e.root, path)))
 				if ignore {
 					logger.Tracef("Ignoring event path: \"%s\"", path)
 					continue

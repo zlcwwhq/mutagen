@@ -698,6 +698,21 @@ func gitModeEventRelevant(path string) bool {
 	return false
 }
 
+// gitDirectoryEventForDirectory determines whether or not a filesystem event from
+// a recursive watcher is for a directory within a Git directory. The path can't
+// tell a directory beneath refs from a reference with the same name, so this has
+// to look. Windows reports a directory when entries are created or removed within
+// it, which a fetch does with a lock file, whereas everything that's relevant is
+// reported under its own name, so such an event doesn't add anything. A path that
+// can't be examined, because it's gone, for example, doesn't count as a directory.
+func gitDirectoryEventForDirectory(root, path string) bool {
+	if !slices.ContainsFunc(strings.Split(path, "/"), gitignore.IsGitEntry) {
+		return false
+	}
+	metadata, err := os.Lstat(filepath.Join(root, filepath.FromSlash(path)))
+	return err == nil && metadata.IsDir()
+}
+
 // gitWarnings computes warnings about the content of a snapshot in Git mode,
 // such as content that's missing from synchronization despite being part of a
 // repository. It's called for each synchronization cycle. Warnings are

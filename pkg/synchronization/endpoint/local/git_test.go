@@ -207,6 +207,48 @@ func TestGitModeEventRelevant(t *testing.T) {
 	}
 }
 
+// TestGitDirectoryEventForDirectory tests gitDirectoryEventForDirectory.
+func TestGitDirectoryEventForDirectory(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		".git/HEAD":                     "ref: refs/heads/main\n",
+		".git/refs/heads/main":          "commit",
+		".git/refs/remotes/origin/main": "commit",
+		"sub/.git/refs/heads/main":      "commit",
+		"directory/file":                "file",
+	})
+	tests := []struct {
+		path     string
+		expected bool
+	}{
+		// A directory in a Git directory is what this is looking for.
+		{".git/refs", true},
+		{".git/refs/remotes/origin", true},
+		{"sub/.git/refs/heads", true},
+
+		// References aren't directories.
+		{".git/HEAD", false},
+		{".git/refs/heads/main", false},
+		{".git/refs/remotes/origin/main", false},
+		{"sub/.git/refs/heads/main", false},
+
+		// Something that's gone might have been anything.
+		{".git/refs/heads/feature", false},
+		{"missing/.git/refs", false},
+
+		// Directories elsewhere are content.
+		{"", false},
+		{"directory", false},
+		{"directory/file", false},
+		{"sub", false},
+	}
+	for _, test := range tests {
+		if result := gitDirectoryEventForDirectory(root, test.path); result != test.expected {
+			t.Errorf("incorrect result for %q: %t != %t", test.path, result, test.expected)
+		}
+	}
+}
+
 // TestContainsGitRulePath tests containsGitRulePath, which unlike what's
 // delivered has to include the exclude file, since local edits to it change
 // what's ignored.
