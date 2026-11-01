@@ -118,6 +118,37 @@ func TestReporter(t *testing.T) {
 	}
 }
 
+func TestReporterWarnings(t *testing.T) {
+	// Content that isn't synchronized by design isn't described as content that
+	// couldn't be synchronized, and neither heading appears without any content.
+	report := func(problems []remote.Problem, excluded uint64) string {
+		var output strings.Builder
+		newReporter(&output, &remote.Target{Root: t.TempDir(), Alpha: true, Contained: true}, "remote").print(&remote.Report{Problems: problems, ExcludedProblems: excluded})
+		return output.String()
+	}
+	const failed = "remote: warning: this content couldn't be synchronized:\n"
+	const byDesign = "remote: warning: this content isn't synchronized, by design:\n"
+	problem := remote.Problem{Alpha: true, Path: "unreadable", Error: "permission denied"}
+	warning := remote.Problem{Path: "ignored", Error: "ignored by this endpoint's own rules", Warning: true}
+	problemLine := "remote:   unreadable (local): permission denied\n"
+	warningLine := "remote:   ignored (remote): ignored by this endpoint's own rules\n"
+	for _, test := range []struct {
+		description string
+		problems    []remote.Problem
+		excluded    uint64
+		expected    string
+	}{
+		{"problem", []remote.Problem{problem}, 0, failed + problemLine},
+		{"warning", []remote.Problem{warning}, 0, byDesign + warningLine},
+		{"both", []remote.Problem{warning, problem}, 0, failed + problemLine + byDesign + warningLine},
+		{"omitted problems", []remote.Problem{warning}, 2, failed + "remote:   ...and 2 more problems\n" + byDesign + warningLine},
+	} {
+		if output := report(test.problems, test.excluded); output != test.expected {
+			t.Errorf("%s: incorrect report:\n%s\nexpected:\n%s", test.description, output, test.expected)
+		}
+	}
+}
+
 func TestTruncatedConflict(t *testing.T) {
 	conflict := remote.Conflict{
 		Root:            "d",

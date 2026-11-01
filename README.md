@@ -196,7 +196,9 @@ ordinary file and not interpreted.
 **Warnings.** What Git mode doesn't synchronize is reported by
 `mutagen sync list`, and `remote` prints it after each flush without preventing
 commands: tracked files or incoming paths that rules ignore (see above). What's
-left out by design is listed as a warning rather than a problem.
+left out by design is listed as a warning rather than a problem, which `remote`
+reports under its own heading (`this content isn't synchronized, by design`) and
+which doesn't affect what `remote --conflicts` says about conflicts.
 
 **Requirements and limitations.**
 

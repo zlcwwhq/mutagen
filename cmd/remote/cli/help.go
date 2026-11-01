@@ -145,8 +145,9 @@ between a star's center and one of its nodes:
   - After synchronizing, remote warns about conflicts (files modified on both
     endpoints, which stay unsynchronized until resolved; see
     remote --help conflicts) and other content that couldn't be synchronized,
-    such as because of permission errors. Ignored paths are never synchronized
-    and aren't reported.
+    such as because of permission errors. In Git mode, it also warns about
+    content that isn't synchronized by design, separately from that (see
+    below). Ignored paths are never synchronized and aren't reported.
   - Files that a detached job writes arrive through the session's regular
     synchronization, which remote --wait performs once the job ends, and
     remote --flush on demand.
@@ -442,7 +443,8 @@ alongside Error.
     "No conflicts.", unless content couldn't be synchronized, which can hide
     conflicts: it then warns about that content and prints "Conflicts can't be
     ruled out, because some content couldn't be synchronized (see the
-    warnings).".
+    warnings).". Content that isn't synchronized by design doesn't affect
+    this. --json lists both in Problems, and sets Warning for the latter.
   - Before checking out, stop anything that writes the conflicting paths on
     either endpoint, and leave them unchanged until apply finishes; changing
     them meanwhile isn't supported. Apply fails without writing a copy that

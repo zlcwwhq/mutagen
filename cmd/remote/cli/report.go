@@ -123,19 +123,26 @@ func (r *reporter) print(report *remote.Report) {
 		heading = fmt.Sprintf("these conflicts aren't synchronized until resolved (see %s --diff and remote --help conflicts):", r.followUp)
 	}
 	r.section(heading, conflicts)
-	var problems []string
+	var problems, byDesign []string
 	for _, problem := range report.Problems {
 		side := "remote"
 		if problem.Alpha == r.alpha {
 			side = "local"
 		}
-		problems = append(problems, fmt.Sprintf("%s (%s): %s",
-			r.locator.display(problem.Path), side, terminal.NeutralizeControlCharacters(problem.Error)))
+		line := fmt.Sprintf("%s (%s): %s",
+			r.locator.display(problem.Path), side, terminal.NeutralizeControlCharacters(problem.Error))
+		if problem.Warning {
+			byDesign = append(byDesign, line)
+		} else {
+			problems = append(problems, line)
+		}
 	}
+	// What's been omitted could be anything, so it doesn't count as by design.
 	if report.ExcludedProblems > 0 {
 		problems = append(problems, fmt.Sprintf("...and %d more problems", report.ExcludedProblems))
 	}
 	r.section("this content couldn't be synchronized:", problems)
+	r.section("this content isn't synchronized, by design:", byDesign)
 }
 
 // section prints a warning followed by the lines that haven't been printed.

@@ -1494,7 +1494,7 @@ func TestRemoteConflictAutomaticTakeDuplicate(t *testing.T) {
 
 // TestRemoteConflictsWithProblems tests that a listing that can't rule out
 // conflicts, because content couldn't be synchronized, says so on its standard
-// output.
+// output, and that it tells apart problems and warnings on its standard error.
 func TestRemoteConflictsWithProblems(t *testing.T) {
 	if runtime.GOOS == "windows" || os.Getuid() == 0 {
 		t.Skip("permissions aren't enforced")
@@ -1545,7 +1545,7 @@ func TestRemoteConflictsWithProblems(t *testing.T) {
 		t.Fatal(err)
 	} else if len(result.Edges) != 1 || len(result.Edges[0].Listing.Conflicts) != 0 {
 		t.Fatalf("incorrect JSON listing: %s", output)
-	} else if problems := result.Edges[0].Listing.Problems; len(problems) != 1 || problems[0].Path != "unreadable" {
+	} else if problems := result.Edges[0].Listing.Problems; len(problems) != 1 || problems[0].Path != "unreadable" || problems[0].Warning {
 		t.Errorf("incorrect problems: %+v", problems)
 	}
 
