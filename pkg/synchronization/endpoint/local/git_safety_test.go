@@ -1110,3 +1110,48 @@ func TestEndpointGitModeRemovalsFromGitEntries(t *testing.T) {
 		t.Errorf("incorrect problems: %v != %v", reported, expected)
 	}
 }
+
+// TestEndpointGitModePathsOutsideRoot tests that a crafted path that leads out
+// of the root doesn't reveal anything about the rules there, and that it doesn't
+// affect anything there.
+func TestEndpointGitModePathsOutsideRoot(t *testing.T) {
+	// Create rules outside of the root that exclude what the changes create.
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	writeTree(t, parent, map[string]string{".gitignore": "secret\n", "root/public": "public"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	scanEndpoint(t, e, true)
+
+	// Perform the changes.
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	changes := []*core.Change{
+		{Path: "../secret", New: file},
+		{Path: "../other", New: &core.Entry{Kind: core.EntryKind_Directory}},
+		{Path: "../secret/file", New: file},
+	}
+	results, problems, _, err := e.Transition(context.Background(), changes)
+	if err != nil {
+		t.Fatal("transition failed:", err)
+	}
+
+	// All of them are refused, as failures that don't depend on any rules.
+	for c, result := range results {
+		if result != nil {
+			t.Errorf("change %d applied: %v", c, result)
+		}
+	}
+	reported := make(map[string]bool)
+	for _, problem := range problems {
+		reported[problem.Path] = true
+		if problem.Warning {
+			t.Error("rules outside of the root used to warn:", problem)
+		}
+	}
+	for _, change := range changes {
+		if !reported[change.Path] {
+			t.Errorf("no problem for %s: %v", change.Path, problems)
+		}
+	}
+	verifyAbsent(t, parent, "secret")
+	verifyAbsent(t, parent, "other")
+}
