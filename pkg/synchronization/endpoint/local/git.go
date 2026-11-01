@@ -172,9 +172,11 @@ func gitCommand(ctx context.Context, directory string, args ...string) *exec.Cmd
 
 // containsGitRulePath determines whether or not any of the specified re-check
 // paths identifies a file whose contents affect ignore evaluation in Git mode.
+// This includes the exclude file, for which gitModeEventRelevant lets events
+// through, and which isn't synchronized, but which local edits can change.
 func containsGitRulePath(recheckPaths map[string]bool) bool {
 	for path := range recheckPaths {
-		if gitignore.IsRulePath(path) {
+		if gitignore.AffectsIgnoreEvaluation(path) {
 			return true
 		}
 	}

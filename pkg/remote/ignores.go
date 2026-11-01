@@ -130,7 +130,7 @@ func (i *Ignores) ExclusionSource(path string, directory bool) ExclusionSource {
 		return ExcludedBySession
 	}
 	for _, component := range strings.Split(path, "/") {
-		if isGitEntry(component) {
+		if gitignore.IsGitEntry(component) {
 			return ExcludedByGitEntry
 		}
 	}
@@ -141,13 +141,6 @@ func (i *Ignores) ExclusionSource(path string, directory bool) ExclusionSource {
 		return ExcludedByGitRules
 	}
 	return ExcludedBySession
-}
-
-// isGitEntry returns true if the name is that of Git's own entry, which Git
-// mode never synchronizes. Names are compared case-insensitively, as the
-// ignorer of Git mode does (see gitignore.NewIgnorer).
-func isGitEntry(name string) bool {
-	return len(name) == len(".git") && strings.EqualFold(name, ".git")
 }
 
 // gitEntryIgnorer is the ignorer of Git mode when the root is unknown, so that
@@ -161,7 +154,7 @@ type gitEntryIgnorer struct {
 
 // Ignore implements ignore.Ignorer.Ignore.
 func (i gitEntryIgnorer) Ignore(path string, directory bool) (ignore.IgnoreStatus, bool) {
-	if isGitEntry(path[strings.LastIndexByte(path, '/')+1:]) {
+	if gitignore.IsGitEntry(path[strings.LastIndexByte(path, '/')+1:]) {
 		return ignore.IgnoreStatusIgnored, false
 	}
 	return i.session.Ignore(path, directory)
