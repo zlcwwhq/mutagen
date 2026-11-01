@@ -64,7 +64,9 @@ follow the code and update this file.
   rules for Git mode (`git: enabled`, see `GitModeEnabled`) and is
   the only place that evaluates them. `pkg/remote/ignores.go` uses it
   so that `remote` sees the same ignores as scans, reading the rules
-  and nested repositories from its own system's copy of the tree.
+  and nested repositories from its own system's copy of the tree. `pkg/git`
+  provides the hardened Git commands and the repository examination that
+  scans and `remote` share, so that they agree about nested repositories.
 - `pkg/forwarding` contains the forwarding engine and its endpoints.
 - `pkg/forwarding/protocols` and `pkg/synchronization/protocols`
   register transport-specific endpoint handlers.

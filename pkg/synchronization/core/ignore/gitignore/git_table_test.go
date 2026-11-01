@@ -25,6 +25,9 @@ func TestGitMatchTable(t *testing.T) {
 	root := t.TempDir()
 	h.initialize(root)
 
+	// Older versions of Git can't be compared for some patterns.
+	omitPrefixedAsterisks := h.predatesPrefixedAsterisksFix()
+
 	// Create a scenario for each test that can be represented on disk and
 	// collect the paths to check, including those of every parent.
 	var paths []string
@@ -35,6 +38,11 @@ func TestGitMatchTable(t *testing.T) {
 	}
 	var checks []check
 	for i, test := range matchTests {
+		// Skip rules that can't be compared.
+		if omitPrefixedAsterisks && rulesHavePrefixedAsterisks(test.rules) {
+			continue
+		}
+
 		// Skip paths that can't exist.
 		components := strings.Split(test.path, "/")
 		if contains(components, "") || contains(components, ".") || contains(components, "..") {

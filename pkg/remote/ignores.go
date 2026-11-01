@@ -1,12 +1,14 @@
 package remote
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"golang.org/x/text/unicode/norm"
 
+	"github.com/mutagen-io/mutagen/pkg/git"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 	dockerignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/docker"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/gitignore"
@@ -106,18 +108,15 @@ func (i *Ignores) ExcludedInAnyForm(path string, directory bool) string {
 // exclude it, even on filesystems on which the other forms name distinct
 // entries.
 //
-// In Git mode, content beneath a directory that contains an entry named .git
-// (a directory, or the file that worktrees and submodules use), other than the
-// root, is also excluded, whatever the rules say, as the entry directly
-// beneath that directory: the session synchronizes the directory as a
-// submodule, by commit, rather than the files in it. Whether a directory is
-// one is determined from the filesystem on this system, with a lookup of
-// .git in each parent of the path, so only paths that exist beneath existing
-// directories can be excluded this way. Directories that contain .git but
-// aren't submodules because they have no origin or commits are synchronized
-// as plain directories, without their .git, which this method can't tell
-// without inspecting the repository, so it treats all of them as submodules.
-// The directory itself is not excluded, so that writes can't replace a
+// In Git mode, content beneath a submodule is also excluded, whatever the rules
+// say, as the entry directly beneath the submodule's directory, since the
+// session synchronizes a submodule by commit, rather than the files in it. A
+// directory is a submodule if git.Probe finds a commit and an origin in the
+// repository that it contains, which is how scans determine this too, on this
+// system's copy of the tree. So other nested repositories are ordinary
+// directories whose content isn't excluded, and neither is the content of one
+// for which git.Probe fails, which errs towards reporting it as synchronized.
+// The directory itself isn't excluded, so that writes can't replace a
 // submodule's own .git with another copy of it.
 func (i *Ignores) ExcludedInEveryForm(path string, directory bool) string {
 	return i.excluded(path, directory, true)
@@ -230,13 +229,13 @@ func (i *Ignores) ignorer() ignore.Ignorer {
 }
 
 // submoduleContent returns the number of components of the path to the entry
-// that a nested repository excludes from the entry with the specified path
-// components, which is the entry directly beneath the shallowest parent that
-// contains a .git entry, or zero if there is none (or the ignores aren't in Git
-// mode or don't know their root). The root is never a nested repository, and
-// neither is the entry itself, since only content beneath one is excluded. Only
-// existence is checked, with one lookup for each parent, and failing lookups
-// count as absence, so that errors don't exclude anything.
+// that a submodule excludes from the entry with the specified path components,
+// which is the entry directly beneath the shallowest parent that's a submodule,
+// or zero if there is none (or the ignores aren't in Git mode or don't know
+// their root). The root is never a submodule, and neither is the entry itself,
+// since only content beneath one is excluded. Failing lookups count as the
+// absence of a .git entry, and a repository that can't be examined stops the
+// search, so that errors don't exclude anything.
 func (i *Ignores) submoduleContent(components []string) int {
 	if !i.Git || i.root == "" {
 		return 0
@@ -248,7 +247,17 @@ func (i *Ignores) submoduleContent(components []string) int {
 		}
 		directory = filepath.Join(directory, components[c])
 		if _, err := os.Lstat(filepath.Join(directory, ".git")); err == nil {
-			return c + 2
+			commit, _, err := git.Probe(context.Background(), directory)
+			if err == nil && len(commit) > 0 {
+				return c + 2
+			}
+
+			// Scans don't look beneath a repository that can't be examined
+			// either, but that's no reason to exclude its content, which they
+			// may synchronize once the failure has been dealt with.
+			if err != nil {
+				return 0
+			}
 		}
 	}
 	return 0
@@ -282,7 +291,17 @@ func (i *Ignores) excluded(path string, directory, every bool) string {
 	// excluded entry is excluded too.
 	result := 0
 	for _, form := range []string{path, norm.NFC.String(path), norm.NFD.String(path)} {
-		depth := excludedDepth(ignorer, strings.Split(form, "/"), directory)
+		excluded, err := ignore.Excluded(ignorer, form, directory)
+		if err != nil {
+			// Rules that can't be read don't exclude anything, which errs
+			// towards reporting the path as synchronized, and thus towards
+			// refusing writes. Scans report the failure for the subtree.
+			return ""
+		}
+		depth := 0
+		if excluded != "" {
+			depth = strings.Count(excluded, "/") + 1
+		}
 		if submodule > 0 && (depth == 0 || submodule < depth) {
 			depth = submodule
 		}
@@ -298,31 +317,4 @@ func (i *Ignores) excluded(path string, directory, every bool) string {
 		return ""
 	}
 	return strings.Join(components[:result], "/")
-}
-
-// excludedDepth returns the number of components of the path to the entry that
-// keeps the entry with the specified path components, which is a directory if
-// directory is true, from being synchronized in the form in which they're
-// given (see Ignores.ExcludedInAnyForm), or zero if there's none. Ignorers
-// never direct traversal of entries other than directories, so those are
-// excluded whenever they're ignored or masked.
-func excludedDepth(ignorer ignore.Ignorer, components []string, directory bool) int {
-	masked := false
-	for c := range components {
-		status, traverse := ignorer.Ignore(strings.Join(components[:c+1], "/"), directory || c < len(components)-1)
-		switch status {
-		case ignore.IgnoreStatusIgnored:
-			if !traverse {
-				return c + 1
-			}
-			masked = true
-		case ignore.IgnoreStatusUnignored:
-			masked = false
-		default:
-			if masked && !traverse {
-				return c + 1
-			}
-		}
-	}
-	return 0
 }

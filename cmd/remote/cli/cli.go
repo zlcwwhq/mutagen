@@ -156,7 +156,8 @@ type options struct {
 	// pull indicates that the ignored paths specified by arguments should be
 	// copied from the opposite endpoint. In Git mode, that includes content
 	// that .gitignore rules ignore and content beneath submodules, but not the
-	// submodules themselves.
+	// submodules themselves. Repositories without a commit or a usable origin
+	// aren't submodules, so this doesn't apply to their content.
 	pull bool
 	// help indicates that usage information was requested, for the topic
 	// specified as an argument, if any.
@@ -233,7 +234,7 @@ func parse(arguments []string) (*options, error) {
 	flags.StringVar(&result.kill, "kill", "", "Terminate job `ID` without synchronizing")
 	flags.BoolVar(&result.diff, "diff", false, "Sync, then compare paths or conflicts")
 	flags.BoolVar(&result.ignores, "ignores", false, "Show ignore rules or check given paths")
-	flags.BoolVar(&result.pull, "pull", false, "Pull ignored paths, preserving file mtime")
+	flags.BoolVar(&result.pull, "pull", false, "Pull ignored paths or submodule content, preserving file mtime")
 	flags.BoolVar(&result.deprecatedSessions, "sessions", false, "Deprecated; use --nodes")
 	flags.MarkHidden("session")
 	flags.MarkHidden("sessions")

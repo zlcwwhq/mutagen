@@ -567,6 +567,16 @@ func (s *scanner) directory(
 		return entry, nil
 	}
 
+	// If the rules that apply to this directory's contents can't be read, then
+	// there's no telling what's ignored in it. Report the directory as
+	// problematic, even if it's empty, so that reconciliation won't populate it
+	// from the other endpoint either.
+	if ignorer, ok := s.ignorer.(ignore.DirectoryIgnorer); ok {
+		if err := ignorer.EnsureDirectory(path); err != nil {
+			return &Entry{Kind: EntryKind_Problematic, Problem: err.Error()}, nil
+		}
+	}
+
 	// RACE: There is technically a race condition here between the listing of
 	// directory contents and their processing. This is an inherent reality of
 	// our non-atomic synchronization cycles. The worst case fallout is missing

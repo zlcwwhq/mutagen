@@ -105,6 +105,10 @@ func TestPrintIgnoresGitMode(t *testing.T) {
 		"sub/.git":       "gitdir: ../.git/modules/sub\n",
 		"sub/src/main.c": "",
 	})
+	if err := os.Remove(filepath.Join(root, "sub", ".git")); err != nil {
+		t.Fatal(err)
+	}
+	initializePullRepository(t, filepath.Join(root, "sub"), true, "https://example.org/repo.git")
 	ignores := (&remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"!.env", "/secret"}, VCS: true, Git: true}).WithRoot(root)
 	target := &remote.Target{Session: "sync_x", Name: "gpu", Root: root, Contained: true, Ignores: ignores}
 
@@ -120,7 +124,7 @@ func TestPrintIgnoresGitMode(t *testing.T) {
 		"  VCS directories (.git, .svn, .hg, .bzr, and _darcs)\n" +
 		"  Git rules: .gitignore files at every level and .git/info/exclude, case-sensitively; the patterns above take precedence, so they can also unignore\n" +
 		"  .git files and directories, which are never synchronized\n" +
-		"  Content of submodules (directories that contain .git, other than the root), which the session synchronizes by commit; commands can still run there\n" +
+		"  Content of submodules (nested repositories with a commit and usable origin), which the session synchronizes by commit; commands can still run there\n" +
 		"Ignored paths aren't synchronized; remote --ignores <path> checks a path, and remote --pull <path> copies ignored paths from the opposite endpoint.\n"
 	if output.String() != expected {
 		t.Fatalf("incorrect listing:\n%s", output.String())

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mutagen-io/mutagen/pkg/git"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 )
@@ -440,6 +442,16 @@ func TestPullGitMode(t *testing.T) {
 	alpha, pullPaths := setupPullSessionsIgnoring(t, local, remoteFiles,
 		&remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"!.env"}, VCS: true, Git: true})
 
+	// Classification requires a real repository with a commit and origin.
+	if err := os.Remove(filepath.Join(alpha, "sub", ".git")); err != nil {
+		t.Fatal(err)
+	}
+	initializePullRepository(t, filepath.Join(alpha, "sub"), true, "https://example.org/repo.git")
+	gitFile, err := os.ReadFile(filepath.Join(alpha, "sub", ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// Content that rules ignore is pulled, and content that they don't isn't.
 	for _, path := range []string{"data/big.bin", "run.log"} {
 		if output, err := pullPaths(path); err != nil || !strings.Contains(output, "remote: pulled "+path+" (1 added") {
@@ -476,7 +488,7 @@ func TestPullGitMode(t *testing.T) {
 	} else if after := readTree(t, filepath.Join(alpha, "sub")); len(after) != len(before) {
 		t.Error("refused pull changed the submodule")
 	}
-	if contents, err := os.ReadFile(filepath.Join(alpha, "sub", ".git")); err != nil || string(contents) != "gitdir: ../.git/modules/sub\n" {
+	if contents, err := os.ReadFile(filepath.Join(alpha, "sub", ".git")); err != nil || string(contents) != string(gitFile) {
 		t.Errorf("submodule's .git changed: %q, %v", contents, err)
 	}
 
@@ -487,5 +499,63 @@ func TestPullGitMode(t *testing.T) {
 		t.Errorf("parent of unsynchronized content created: %q, %v", output, err)
 	} else if _, err := os.Lstat(filepath.Join(alpha, "newsub")); err == nil {
 		t.Error("missing parent created")
+	}
+}
+
+// initializePullRepository creates a repository with a separate Git directory,
+// exercising the .git pointer form used by submodules and linked worktrees.
+func initializePullRepository(t *testing.T, directory string, committed bool, origin string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("Git is not available")
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_AUTHOR_NAME", "test")
+	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.org")
+	t.Setenv("GIT_COMMITTER_NAME", "test")
+	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.org")
+	run := func(args ...string) {
+		t.Helper()
+		if output, err := git.Command(context.Background(), directory, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s: %v", args, output, err)
+		}
+	}
+	run("init", "--quiet", "--separate-git-dir", filepath.Join(t.TempDir(), "gitdir"))
+	if committed {
+		run("commit", "--quiet", "--allow-empty", "--no-gpg-sign", "-m", "initial")
+	}
+	if origin != "" {
+		run("config", "remote.origin.url", origin)
+	}
+}
+
+func TestPullGitModeOrdinaryRepository(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		committed bool
+		origin    string
+	}{
+		{"no origin", true, ""},
+		{"no commits", false, "https://example.org/repo.git"},
+		{"unusable origin", true, "../repo.git"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			alpha, pullPaths := setupPullSessionsIgnoring(t,
+				map[string]string{"nested/file": "local"}, map[string]string{"nested/file": "remote", "nested/new/file": "remote"},
+				&remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Git: true})
+			initializePullRepository(t, filepath.Join(alpha, "nested"), test.committed, test.origin)
+			for _, path := range []string{"nested/file", "nested/new/file"} {
+				if output, err := pullPaths(path); err == nil {
+					t.Errorf("pull accepted synchronized path %s: %s", path, output)
+				}
+			}
+			if data, err := os.ReadFile(filepath.Join(alpha, "nested", "file")); err != nil || string(data) != "local" {
+				t.Fatalf("local file overwritten: %s, %v", data, err)
+			}
+			if _, err := os.Stat(filepath.Join(alpha, "nested", "new")); !os.IsNotExist(err) {
+				t.Fatal("synchronized parent created:", err)
+			}
+		})
 	}
 }

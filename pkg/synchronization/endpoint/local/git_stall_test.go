@@ -383,3 +383,54 @@ func TestEndpointGitModeCloneCancellation(t *testing.T) {
 		t.Error("URL is being avoided after cancellation")
 	}
 }
+
+// TestEndpointGitModeNestedStall tests that a nested submodule that shows no
+// progress stops the update of the others, whose URLs are unknown and thus
+// avoided as a group, and that the group is avoided for later updates, while the
+// submodule that contains them still ends up in place.
+func TestEndpointGitModeNestedStall(t *testing.T) {
+	// Create an upstream that records two nested submodules, the first of which
+	// never responds. Git doesn't let us add that one in the usual way, because
+	// that would have to contact it.
+	sibling := newGitUpstream(t, "sibling")
+	upstream := newGitUpstream(t, "upstream")
+	transport := newHangingTransport(t)
+	for path, url := range map[string]string{"a-hanging": transport.url, "b-sibling": sibling.url} {
+		mustGit(t, upstream.work, "config", "--file", ".gitmodules", "submodule."+path+".path", path)
+		mustGit(t, upstream.work, "config", "--file", ".gitmodules", "submodule."+path+".url", url)
+		mustGit(t, upstream.work, "update-index", "--add", "--cacheinfo", "160000,"+sibling.head+","+path)
+	}
+	mustGit(t, upstream.work, "add", "--", ".gitmodules")
+	upstream.commitAll("add submodules")
+
+	// The clone goes ahead, but the update stops at the first nested submodule.
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	useShortStallDurations(e, 250*time.Millisecond, time.Hour)
+	ctx := context.Background()
+	first := upstream.entry(upstream.head)
+	results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", New: first})
+	if results[0] != first {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleProblem(t, problems, "sub", "unable to update nested submodules", "a-hanging:", "no progress")
+	transport.verifyExited(t)
+	verifyAbsent(t, root, "sub/b-sibling/file")
+	if count := transport.count(t); count != 1 {
+		t.Errorf("incorrect number of attempts: %d", count)
+	}
+
+	// Trying again doesn't contact the group, and doesn't take any time.
+	provider := e.gitProvider.(*gitProvider)
+	start := time.Now()
+	err := provider.UpdateNested(ctx, filepath.Join(root, "sub"), first.Url)
+	if err == nil || !strings.Contains(err.Error(), "a-hanging:") || !strings.Contains(err.Error(), "not contacting") {
+		t.Error("incorrect error during backoff:", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Error("update was delayed:", elapsed)
+	}
+	if count := transport.count(t); count != 1 {
+		t.Errorf("URL was contacted during backoff: %d", count)
+	}
+}

@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -123,6 +125,93 @@ func (h *gitHarness) explain(root, path string) string {
 	command.Env = h.environment
 	output, _ := command.CombinedOutput()
 	return strings.TrimSpace(string(output))
+}
+
+// gitVersionFormat matches the output of git version, whose major and minor
+// version numbers are the only parts of it with a consistent form. What follows
+// them differs between platforms, such as in "2.39.5 (Apple Git-154)".
+var gitVersionFormat = regexp.MustCompile(`^git version (\d+)\.(\d+)`)
+
+// parseGitVersion extracts the major and minor version numbers from the output
+// of git version, returning false if they can't be determined.
+func parseGitVersion(output string) (int, int, bool) {
+	match := gitVersionFormat.FindStringSubmatch(output)
+	if match == nil {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	minor, err := strconv.Atoi(match[2])
+	if err != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
+
+// gitPredatesPrefixedAsterisksFix returns true if a version of Git treats a run
+// of asterisks directly after a pattern's literal prefix as a complete path
+// component, whatever precedes it, so that "foo**/bar" matches "foobar". This
+// was corrected in Git 2.52, and this package follows the corrected behavior,
+// so older versions can't be compared with it for those patterns (see
+// patternHasPrefixedAsterisks).
+func gitPredatesPrefixedAsterisksFix(major, minor int) bool {
+	return major < 2 || (major == 2 && minor < 52)
+}
+
+// patternHasPrefixedAsterisks returns true if a line of a rule file has a
+// pattern that versions of Git before 2.52 treat differently from this package
+// (see gitPredatesPrefixedAsterisksFix). That's an anchored pattern whose first
+// wildcard is a run of two or more asterisks following literal text that
+// doesn't end in a slash. It's deliberately narrow, so that as much as possible
+// is still compared with older versions.
+func patternHasPrefixedAsterisks(line string) bool {
+	// Reduce the line to what parseRule would compile. Comments don't count.
+	if line == "" || line[0] == '#' {
+		return false
+	}
+	pattern := strings.TrimPrefix(trimTrailingSpaces(line), "!")
+	pattern = strings.TrimSuffix(pattern, "/")
+
+	// The pattern has to be anchored, because Git otherwise only matches it
+	// against base names, without treating asterisks specially.
+	if !strings.Contains(pattern, "/") {
+		return false
+	}
+	pattern = strings.TrimPrefix(pattern, "/")
+
+	// Check what the first wildcard is and what precedes it.
+	first := strings.IndexAny(pattern, "*?[\\")
+	return first > 0 && pattern[first-1] != '/' && strings.HasPrefix(pattern[first:], "**")
+}
+
+// rulesHavePrefixedAsterisks returns true if any line of a rule file has a
+// pattern for which patternHasPrefixedAsterisks returns true. It splits lines
+// in the same way as parseRules.
+func rulesHavePrefixedAsterisks(contents string) bool {
+	contents = strings.TrimPrefix(contents, "\xef\xbb\xbf")
+	for _, line := range strings.Split(contents, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if null := strings.IndexByte(line, 0); null >= 0 {
+			line = line[:null]
+		}
+		if patternHasPrefixedAsterisks(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// predatesPrefixedAsterisksFix returns true if the git executable can't be
+// compared with this package for rule files for which
+// rulesHavePrefixedAsterisks returns true. A version that can't be determined
+// is compared, so that any difference is reported.
+func (h *gitHarness) predatesPrefixedAsterisksFix() bool {
+	h.t.Helper()
+	output, _ := h.run("", nil, "version")
+	major, minor, ok := parseGitVersion(string(output))
+	return ok && gitPredatesPrefixedAsterisksFix(major, minor)
 }
 
 // fixtureEntries describes the tree of entries that's created for each
@@ -856,9 +945,159 @@ func TestGitDifferential(t *testing.T) {
 	seed, count := fuzzParameters(t, 1, 300)
 	scenarios = append(scenarios, randomScenarios(rand.New(rand.NewSource(seed)), count, "r")...)
 
+	// Older versions of Git can't be compared for some patterns.
+	if h.predatesPrefixedAsterisksFix() {
+		scenarios = slices.DeleteFunc(scenarios, func(s scenario) bool {
+			for _, contents := range s.files {
+				if rulesHavePrefixedAsterisks(contents) {
+					return true
+				}
+			}
+			return false
+		})
+	}
+
 	// Write the scenarios and compare.
 	writeScenarios(t, root, scenarios)
 	if compare(t, h, root, NewIgnorer(root, nil), describeScenarios(scenarios)) == 0 {
 		t.Error("git did not ignore anything")
+	}
+}
+
+// TestParseGitVersion tests parseGitVersion.
+func TestParseGitVersion(t *testing.T) {
+	tests := []struct {
+		output string
+		major  int
+		minor  int
+		ok     bool
+	}{
+		{"git version 2.53.0\n", 2, 53, true},
+		{"git version 2.43.0\n", 2, 43, true},
+		{"git version 2.39.5 (Apple Git-154)\n", 2, 39, true},
+		{"git version 2.43.0.windows.1\n", 2, 43, true},
+		{"git version 2.52.0.rc1\n", 2, 52, true},
+		{"git version 3.0\n", 3, 0, true},
+		{"git version 2\n", 0, 0, false},
+		{"git version unknown\n", 0, 0, false},
+		{"version 2.53.0\n", 0, 0, false},
+		{"", 0, 0, false},
+		{"git version 99999999999999999999.1\n", 0, 0, false},
+	}
+	for _, test := range tests {
+		major, minor, ok := parseGitVersion(test.output)
+		if major != test.major || minor != test.minor || ok != test.ok {
+			t.Errorf("incorrect result for %q: %d, %d, %v", test.output, major, minor, ok)
+		}
+	}
+}
+
+// TestGitPredatesPrefixedAsterisksFix tests the version in which Git's
+// treatment of these patterns changed.
+func TestGitPredatesPrefixedAsterisksFix(t *testing.T) {
+	tests := []struct {
+		major    int
+		minor    int
+		expected bool
+	}{
+		{1, 99, true},
+		{2, 0, true},
+		{2, 43, true},
+		{2, 51, true},
+		{2, 52, false},
+		{2, 53, false},
+		{3, 0, false},
+	}
+	for _, test := range tests {
+		if result := gitPredatesPrefixedAsterisksFix(test.major, test.minor); result != test.expected {
+			t.Errorf("incorrect result for %d.%d: %v", test.major, test.minor, result)
+		}
+	}
+}
+
+// TestPatternHasPrefixedAsterisks tests patternHasPrefixedAsterisks.
+func TestPatternHasPrefixedAsterisks(t *testing.T) {
+	tests := []struct {
+		line     string
+		expected bool
+	}{
+		// Runs of asterisks directly after literal text in anchored patterns.
+		{"foo**/bar", true},
+		{"foo***/bar", true},
+		{"/foo**", true},
+		{"a/b**", true},
+		{"a/b**/c", true},
+		{"a/b**c", true},
+		{"!foo**/bar", true},
+		{"foo**/bar/", true},
+		{"foo**/bar  ", true},
+		{"/foo**/", true},
+		{"d/foo**/bar*", true},
+
+		// Patterns that aren't anchored only match base names.
+		{"foo**", false},
+		{"foo**bar", false},
+		{"foo**/", false},
+
+		// Asterisks that form a path component mean the same in all versions,
+		// as do those without literal text in front of them.
+		{"**/a", false},
+		{"/**/a", false},
+		{"a/**", false},
+		{"a/**/b", false},
+		{"a/**b", false},
+		{"**a/b", false},
+		{"***/a", false},
+
+		// A single asterisk doesn't have a special meaning.
+		{"foo*/bar", false},
+		{"a/b*", false},
+
+		// Only the first wildcard is affected.
+		{"a/*/**", false},
+		{"a/*b**", false},
+		{"a/?**", false},
+		{"a/b?**/c", false},
+		{"[a]**/b", false},
+		{"b/[a]**/b", false},
+
+		// Escapes are wildcards as far as the literal prefix is concerned.
+		{"a\\**/b", false},
+		{"a\\/**", false},
+
+		// Patterns without wildcards and lines without patterns.
+		{"a/b", false},
+		{"", false},
+		{"#foo**/bar", false},
+	}
+	for _, test := range tests {
+		if result := patternHasPrefixedAsterisks(test.line); result != test.expected {
+			t.Errorf("incorrect result for %q: %v", test.line, result)
+		}
+	}
+}
+
+// TestRulesHavePrefixedAsterisks tests that rulesHavePrefixedAsterisks
+// considers every line of a rule file, split in the same way as parseRules.
+func TestRulesHavePrefixedAsterisks(t *testing.T) {
+	tests := []struct {
+		contents string
+		expected bool
+	}{
+		{"", false},
+		{"a\nb/c\n", false},
+		{"foo**/bar\n", true},
+		{"foo**/bar", true},
+		{"a\nfoo**/bar\nb\n", true},
+		{"a\r\nfoo**/bar\r\n", true},
+		{"\xef\xbb\xbffoo**/bar\n", true},
+		{"foo**/bar\x00\n", true},
+		{"a\x00foo**/bar\n", false},
+		{"# foo**/bar\n", false},
+	}
+	for _, test := range tests {
+		if result := rulesHavePrefixedAsterisks(test.contents); result != test.expected {
+			t.Errorf("incorrect result for %q: %v", test.contents, result)
+		}
 	}
 }

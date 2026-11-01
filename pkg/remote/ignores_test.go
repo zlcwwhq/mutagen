@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/mutagen-io/mutagen/pkg/git"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 )
 
@@ -177,7 +179,7 @@ func gitModeIgnores(root string) *Ignores {
 
 func TestIgnoresGitMode(t *testing.T) {
 	root := resolveSymbolicLinks(t.TempDir())
-	writeTestFiles(t, root, gitModeFiles)
+	writeGitModeTree(t, root)
 	ignores := gitModeIgnores(root)
 	for _, test := range []struct {
 		path       string
@@ -258,18 +260,18 @@ func TestIgnoresGitModeRuleChanges(t *testing.T) {
 		t.Error("removed rules still applied")
 	}
 
-	// A directory becomes a submodule once it contains .git, and stops being
-	// one once it doesn't.
+	// A directory becomes a submodule once it has a commit and origin, and
+	// stops being one when its repository is removed.
 	if ignores.ExcludedInEveryForm("a/b", false) != "" {
 		t.Error("directory without .git excluded")
 	}
-	writeTestFiles(t, root, map[string]string{"a/.git": "gitdir: elsewhere\n"})
+	initializeIgnoreRepository(t, filepath.Join(root, "a"), true, "https://example.org/repo.git", "")
 	if ignores.ExcludedInEveryForm("a/b", false) != "a/b" {
 		t.Error("content of a new submodule not excluded")
 	} else if ignores.ExcludedInEveryForm("a", true) != "" {
 		t.Error("submodule's directory excluded")
 	}
-	if err := os.Remove(filepath.Join(root, "a", ".git")); err != nil {
+	if err := os.RemoveAll(filepath.Join(root, "a", ".git")); err != nil {
 		t.Fatal(err)
 	} else if ignores.ExcludedInEveryForm("a/b", false) != "" {
 		t.Error("content of a former submodule still excluded")
@@ -278,7 +280,7 @@ func TestIgnoresGitModeRuleChanges(t *testing.T) {
 
 func TestIgnoresGitModeOtherModes(t *testing.T) {
 	root := resolveSymbolicLinks(t.TempDir())
-	writeTestFiles(t, root, gitModeFiles)
+	writeGitModeTree(t, root)
 
 	// Sessions that aren't in Git mode ignore neither rule files nor nested
 	// repositories, and a .git file, as used by worktrees and submodules, is
@@ -333,7 +335,7 @@ func TestIgnoresGitModeWire(t *testing.T) {
 
 func TestIgnoresExclusionSource(t *testing.T) {
 	root := resolveSymbolicLinks(t.TempDir())
-	writeTestFiles(t, root, gitModeFiles)
+	writeGitModeTree(t, root)
 	ignores := gitModeIgnores(root)
 	for _, test := range []struct {
 		path       string
@@ -366,7 +368,7 @@ func TestIgnoresExclusionSource(t *testing.T) {
 func TestDialGitMode(t *testing.T) {
 	useTestRegistry(t)
 	root := resolveSymbolicLinks(t.TempDir())
-	writeTestFiles(t, root, gitModeFiles)
+	writeGitModeTree(t, root)
 	mkdirs(t, filepath.Join(root, "build"), filepath.Join(root, "sub", "build"), filepath.Join(root, "src", "tmp"))
 	var lock sync.Mutex
 	var accepted []string
@@ -406,7 +408,7 @@ func TestDialGitMode(t *testing.T) {
 func TestResolvedRouteIgnoresKnowRoot(t *testing.T) {
 	useTestRegistry(t)
 	root := resolveSymbolicLinks(t.TempDir())
-	writeTestFiles(t, root, gitModeFiles)
+	writeGitModeTree(t, root)
 
 	// The daemon sends the ignores of the selected edge with the route, and
 	// they are as the registration's, so they need the root too.
@@ -450,7 +452,7 @@ func TestResolvedRouteIgnoresKnowRoot(t *testing.T) {
 func TestSynchronizingGitMode(t *testing.T) {
 	useTestRegistry(t)
 	root := resolveSymbolicLinks(t.TempDir())
-	writeTestFiles(t, root, gitModeFiles)
+	writeGitModeTree(t, root)
 	writeTestFiles(t, root, map[string]string{"app.log": "", "other.txt": ""})
 	registerScopeTest(t, "sync_repo", true, root, &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, VCS: true, Git: true})
 
@@ -479,5 +481,97 @@ func TestSynchronizingGitMode(t *testing.T) {
 		} else if strings.Join(sessions, ", ") != strings.Join(test.sessions, ", ") {
 			t.Errorf("incorrect sessions synchronizing %s (directory: %t): %v", test.path, test.directory, sessions)
 		}
+	}
+}
+
+// initializeIgnoreRepository creates an actual repository for classification
+// tests, isolating Git from the user's configuration.
+func initializeIgnoreRepository(t *testing.T, directory string, committed bool, origin, gitDirectory string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("Git is not available")
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_AUTHOR_NAME", "test")
+	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.org")
+	t.Setenv("GIT_COMMITTER_NAME", "test")
+	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.org")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		if output, err := git.Command(context.Background(), directory, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s: %v", args, output, err)
+		}
+	}
+	args := []string{"init", "--quiet"}
+	if gitDirectory != "" {
+		args = append(args, "--separate-git-dir", gitDirectory)
+	}
+	run(args...)
+	if committed {
+		run("commit", "--quiet", "--allow-empty", "--no-gpg-sign", "-m", "initial")
+	}
+	if origin != "" {
+		run("config", "remote.origin.url", origin)
+	}
+}
+
+// writeGitModeTree includes a real repository with a .git pointer file.
+func writeGitModeTree(t *testing.T, root string) {
+	t.Helper()
+	writeTestFiles(t, root, gitModeFiles)
+	if err := os.Remove(filepath.Join(root, "sub", ".git")); err != nil {
+		t.Fatal(err)
+	}
+	initializeIgnoreRepository(t, filepath.Join(root, "sub"), true, "https://example.org/repo.git", filepath.Join(t.TempDir(), "gitdir"))
+}
+
+func TestIgnoresGitModeRepositoryClassification(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		committed bool
+		origin    string
+		excluded  bool
+	}{
+		{"no commits", false, "https://example.org/repo.git", false},
+		{"no origin", true, "", false},
+		{"neither", false, "", false},
+		{"relative origin", true, "../repo.git", false},
+		{"submodule", true, "https://example.org/repo.git", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := resolveSymbolicLinks(t.TempDir())
+			initializeIgnoreRepository(t, filepath.Join(root, "nested"), test.committed, test.origin, "")
+			ignores := gitModeIgnores(root)
+			for _, path := range []string{"nested/file", "nested/missing/file"} {
+				if actual := ignores.ExcludedInEveryForm(path, false); (actual != "") != test.excluded {
+					t.Errorf("%s: exclusion %q", path, actual)
+				}
+			}
+		})
+	}
+}
+
+func TestIgnoresGitModeUnreadableRules(t *testing.T) {
+	root := resolveSymbolicLinks(t.TempDir())
+	writeTestFiles(t, root, map[string]string{".gitignore": "secret.env\n"})
+	path := filepath.Join(root, ".gitignore")
+	if err := os.Chmod(path, 0); err != nil {
+		t.Skip(err)
+	}
+	t.Cleanup(func() { os.Chmod(path, 0600) })
+	if file, err := os.Open(path); err == nil {
+		file.Close()
+		t.Skip("process can read permission-denied files")
+	}
+	ignores := gitModeIgnores(root)
+	if ignores.ExcludedInEveryForm("secret.env", false) != "" {
+		t.Error("unknown rules authorized a write")
+	}
+	if ignores.ExcludedInAnyForm("secret.env", false) != "" {
+		t.Error("unknown rules reported an exclusion")
 	}
 }

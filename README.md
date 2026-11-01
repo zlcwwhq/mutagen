@@ -176,7 +176,18 @@ endpoints, and every other change waits for the next cycle. Content that the new
 rules ignore, such as a `data/` directory that you prepared on a server, is thus
 neither copied back nor deleted before the rules arrive. If a rule file can't be
 written, the session reports the problem, and nothing else synchronizes until
-it's fixed.
+it's fixed. If a rule file can't be read, then the session reports the problem
+and doesn't synchronize its directory until it's fixed.
+
+An endpoint also applies its own rules to what it receives, including paths
+that it doesn't have yet, so a `.git/info/exclude` on one endpoint keeps the
+other endpoint's copies of what it excludes away. An excluded path isn't written
+and is reported as a warning, while the rest of its directory still is written:
+if `*.log` excludes `pkg/debug.log`, then `pkg/a.go` still arrives. Rule files
+themselves are still delivered, even into an excluded directory. If the endpoint
+already has the excluded path, then there's nothing to warn about, since the
+session simply doesn't track it. A pattern such as `!pkg/debug.log` in
+`ignore.paths` overrides the exclusion.
 
 **Submodules.** A directory other than the root that contains a `.git` entry
 and whose repository has an origin and at least one commit is a submodule:
@@ -190,29 +201,32 @@ checked out on beta, and in two-way modes, a commit checked out on either
 endpoint is checked out on the other, which leaves a detached HEAD. Each
 endpoint obtains the commit itself, from the `origin` URL of its own repository
 and then from the one that the other endpoint reports (without credentials),
-and checks it out with `git checkout --detach`, leaving changes that would
-conflict to Git to refuse. Plain content that a submodule replaces is only
-removed once a clone succeeds, in a temporary directory next to it; if the
-clone fails, the content stays and the session reports a problem. An empty
-directory isn't a conflict: it's filled by cloning, so `git submodule deinit`
-on one endpoint is undone (a one-way session leaves an empty directory on alpha
-alone). Submodules nested in a submodule are updated recursively as part of
-its checkout and aren't compared separately. A submodule is never removed
-automatically: if it's gone from one endpoint, the session reports a problem
-and you remove it from the other by hand. Conflicts that involve a submodule,
-such as both endpoints checking out different new commits, or a submodule on
-one endpoint and a file on the other, are listed by `mutagen sync list` and by
-`remote`, which can't resolve them: check out the same commit on both
-endpoints, or delete the submodule on one.
+and checks it out with `git checkout --detach --no-overwrite-ignore`, leaving
+changes that would conflict, including ignored local files, to Git to refuse.
+Plain content that a submodule replaces is only removed once a clone succeeds,
+in a temporary directory next to it; if the clone fails, the content stays and
+the session reports a problem. An empty directory isn't a conflict: it's filled
+by cloning, so `git submodule deinit` on one endpoint is undone (a one-way
+session leaves an empty directory on alpha alone). Submodules nested in a
+submodule are updated recursively as part of its checkout, one by one and with
+the same kind of checkout, whichever update strategy they're configured with,
+unless that's `none`, and they aren't compared separately. A submodule is never
+removed automatically: if it's gone from one
+endpoint, the session reports a problem and you remove it from the other by
+hand. Conflicts that involve a submodule, such as both endpoints checking out
+different new commits, or a submodule on one endpoint and a file on the other,
+are listed by `mutagen sync list` and by `remote`, which can't resolve them:
+check out the same commit on both endpoints, or delete the submodule on one.
 
-**Warnings.** What Git mode doesn't synchronize is reported as problems by
-`mutagen sync list`, and `remote` prints them after each flush without
-preventing commands: submodules with uncommitted changes (the other endpoint
-only gets their commit), commits that the other endpoint can't fetch, such as
-unpushed ones (push them, and the next synchronization fetches them), failed
-fetches, a `.git` that isn't a valid repository or an endpoint without `git`
-(the directory then isn't synchronized at all, until you fix it or remove it),
-and tracked files that rules ignore (see above).
+**Warnings.** What Git mode doesn't synchronize is reported by
+`mutagen sync list`, and `remote` prints it after each flush without preventing
+commands: submodules with uncommitted changes (the other endpoint only gets
+their commit), commits that the other endpoint can't fetch, such as unpushed
+ones (push them, and the next synchronization fetches them), failed fetches, a
+`.git` that isn't a valid repository or an endpoint without `git` (the directory
+then isn't synchronized at all, until you fix it or remove it), and tracked
+files or incoming paths that rules ignore (see above). What's left out by design
+is listed as a warning rather than a problem.
 
 **Requirements and limitations.**
 
@@ -242,16 +256,22 @@ and tracked files that rules ignore (see above).
   can take up to the watch polling interval (10 seconds by default) where
   recursive watching isn't available, since submodules' directories aren't
   watched individually.
-- A failure to update the submodules nested in a submodule is reported once,
-  since the submodule's commit is in place by then, and isn't tried again until
-  its commit changes: run `git submodule update --init --recursive` there.
+- A failure to update the submodules nested in a submodule, including because
+  an ignored local file is in the way, is reported once, since the submodule's
+  commit is in place by then, and isn't tried again until its commit changes:
+  run `git submodule update --init --recursive` there, but only after moving any
+  such file, because that command overwrites ignored files. A nested submodule
+  whose name in `.gitmodules` contains `=` is always left for you to update,
+  because Mutagen has no way to protect its ignored files.
 - If the system or the agent stops abruptly during a clone, then a directory
   named `.mutagen-temporary-submodule-*` can remain next to the submodule. It's
   neither synchronized nor reused, so remove it by hand.
 - If the other endpoint already has a directory without a `.gitignore`, the
   first scan hashes all of its content, but doesn't transfer it. While a
   `.gitignore` itself is in conflict, each endpoint applies its own copy, so
-  content that only one copy ignores can be transferred.
+  neither writes content that its copy ignores.
+- Rules follow Git 2.52 and later; older versions of Git treat patterns like
+  `foo**/bar` differently, so they can disagree with the session about them.
 - A flush waits for one further cycle after delivering rule files. If relaxing a
   rule exposes another rule file, the content behind it needs a second flush or
   the next filesystem event.
@@ -279,8 +299,11 @@ that rules ignore require an explicit `--cwd`. Content beneath a submodule isn't
 synchronized file by file, so `remote --pull sub/build/output` copies it (and
 creates missing directories beneath an existing submodule), while
 `remote --pull sub` is refused: the session synchronizes the submodule, and
-pulling it would merge two `.git` directories. `remote` can't tell whether a
-directory with a `.git` is a submodule, so it treats every one as such.
+pulling it would merge two `.git` directories. A nested repository without a
+commit or origin is synchronized as a plain directory, so `--pull` refuses to
+write into it. If Git can't examine a repository, its origin isn't usable, or a
+rule file can't be read, then `--pull` refuses too, since it can't tell whether
+the session synchronizes the path.
 
 ## Star workspaces
 

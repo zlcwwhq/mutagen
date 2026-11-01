@@ -16,6 +16,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/integration/protocols/netpipe"
 	"github.com/mutagen-io/mutagen/pkg/logging"
 	"github.com/mutagen-io/mutagen/pkg/project"
+	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/selection"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
@@ -261,6 +262,56 @@ func (s *gitModeSession) expectMissing(root string, names ...string) {
 		} else if !os.IsNotExist(err) {
 			s.t.Errorf("unable to query %s: %v", name, err)
 		}
+	}
+}
+
+// waitForRemoteCommands waits for beta to be advertised as available for remote
+// commands, whose channel connects separately from synchronization.
+func (s *gitModeSession) waitForRemoteCommands() {
+	s.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for {
+		available := false
+		connection, _, err := (&remote.Selection{Workspace: true}).Submit(ctx, s.alpha, &remote.Submission{Operation: remote.OperationNodes})
+		if err == nil {
+			if graph, err := remote.ListNodes(ctx, connection); err == nil {
+				for _, node := range graph.Nodes {
+					available = available || node.Name == "beta" && node.Available
+				}
+			}
+		}
+		if available {
+			return
+		} else if ctx.Err() != nil {
+			s.t.Fatal("remote command channel did not connect:", ctx.Err())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// waitForIdle waits for a session that's watching for changes to stop
+// performing synchronization cycles, which takes longer than the polling
+// interval. There's no way to observe idleness directly, so this watches the
+// number of cycles, and there's only a limited number of them to allow before
+// deciding that the session isn't going to become idle. It then verifies that
+// the session stays that way.
+func (s *gitModeSession) waitForIdle() {
+	s.t.Helper()
+	idleWindow := 2500 * time.Millisecond
+	cycles := s.state().SuccessfulCycles
+	for attempts, settled := 0, false; !settled; attempts++ {
+		if attempts == 4 {
+			s.t.Fatalf("session isn't becoming idle: %d cycles after %d", s.state().SuccessfulCycles, cycles)
+		}
+		time.Sleep(idleWindow)
+		current := s.state().SuccessfulCycles
+		settled = current == cycles
+		cycles = current
+	}
+	time.Sleep(idleWindow)
+	if current := s.state().SuccessfulCycles; current != cycles {
+		s.t.Errorf("session woken while idle: %d cycles after %d", current, cycles)
 	}
 }
 
@@ -1222,6 +1273,11 @@ func (f *gitSubmoduleFixture) verifyRemote(transport gitSubmoduleTransport, repo
 	if !transport.commands {
 		return
 	}
+
+	// Synchronization can finish before the separate command channel connects,
+	// especially when a scan problem prevents a clone from delaying the test.
+	f.waitForRemoteCommands()
+
 	code, output, diagnostics := runRemote(f.t, f.alpha, "--timeout", "30s", "cat", "top")
 	if code != 0 || output != "top" {
 		f.t.Errorf("command failed: %d: %q: %s", code, output, diagnostics)
@@ -1718,28 +1774,9 @@ func testGitSubmoduleNoHotLoop(t *testing.T, transport gitSubmoduleTransport, wa
 		})
 	}
 
-	// Wait for the session to become idle, which takes longer than the polling
-	// interval. We can't observe idleness directly, so we watch the number of
-	// synchronization cycles, and there's only a limited number of them to
-	// allow before deciding that the session isn't going to become idle.
-	idleWindow := 2500 * time.Millisecond
-	cycles := state.SuccessfulCycles
-	for attempts, settled := 0, false; !settled; attempts++ {
-		if attempts == 4 {
-			t.Fatalf("session isn't becoming idle after a failure: %d cycles after %d", f.state().SuccessfulCycles, state.SuccessfulCycles)
-		}
-		time.Sleep(idleWindow)
-		current := f.state().SuccessfulCycles
-		settled = current == cycles
-		cycles = current
-	}
-
-	// Verify that it stays that way.
-	time.Sleep(idleWindow)
+	// Wait for the session to become idle.
+	f.waitForIdle()
 	state = f.state()
-	if state.SuccessfulCycles != cycles {
-		t.Errorf("session woken after a failure: %d cycles after %d", state.SuccessfulCycles, cycles)
-	}
 	if !reported(state) {
 		t.Error("problem is no longer reported:", state.BetaState.TransitionProblems)
 	}
@@ -1790,6 +1827,206 @@ func runGitSubmoduleNoHotLoop(t *testing.T, transport gitSubmoduleTransport) {
 			})
 		}
 	}
+}
+
+// excludeOnBeta returns a prepare hook for a session that makes beta's root a
+// repository whose .git/info/exclude has the specified rules. That file isn't
+// synchronized, so these rules only ever apply on beta.
+func excludeOnBeta(rules string) func(*gitModeSession) {
+	return func(s *gitModeSession) {
+		runGitInRepository(s.t, s.beta, "init", "--quiet")
+		s.write(s.beta, map[string]string{".git/info/exclude": rules})
+	}
+}
+
+// verifyExclusionWarning verifies that a session's only problem is a warning on
+// beta about the specified path, which its rules exclude.
+func verifyExclusionWarning(t *testing.T, state *synchronization.State, path string) {
+	t.Helper()
+	if len(state.Conflicts) != 0 {
+		t.Errorf("unexpected conflicts: %v", state.Conflicts)
+	}
+	if len(state.AlphaState.TransitionProblems) != 0 {
+		t.Errorf("unexpected alpha transition problems: %v", state.AlphaState.TransitionProblems)
+	}
+	if len(state.AlphaState.ScanProblems) != 0 || len(state.BetaState.ScanProblems) != 0 {
+		t.Errorf("unexpected scan problems: %v, %v", state.AlphaState.ScanProblems, state.BetaState.ScanProblems)
+	}
+	if len(state.BetaState.TransitionProblems) != 1 {
+		t.Fatalf("incorrect beta transition problems: %v", state.BetaState.TransitionProblems)
+	}
+	problem := gitModeProblem(t, state.BetaState.TransitionProblems, path, "ignored by this endpoint's own rules", `"!`+path+`"`)
+	if !problem.Warning {
+		t.Error("exclusion not reported as a warning:", problem)
+	}
+}
+
+// TestGitModeExcludedRuleFile tests that a rule file for a directory that the
+// other endpoint excludes doesn't hold up the session, which it would otherwise
+// do in every cycle, since cycles with rules to deliver only do that. It's
+// delivered, after which the directory is simply untracked on that endpoint.
+func TestGitModeExcludedRuleFile(t *testing.T) {
+	isolateGitMode(t)
+	for _, mode := range gitModeSynchronizationModes {
+		t.Run(mode.Description(), func(t *testing.T) {
+			session := newGitModeSession(t, gitModeOptions{
+				mode:    mode,
+				alpha:   map[string]string{"outputs/.gitignore": "*.tmp\n", "outputs/data": "data", "public": "public"},
+				prepare: excludeOnBeta("outputs/\n"),
+			})
+
+			// The first flush delivers everything, including what the rule file
+			// was holding up, without anything to report. Nothing changes after
+			// that, and nothing else is written to the excluded directory.
+			for i := 0; i < 3; i++ {
+				session.flush()
+				session.expect(session.beta, map[string]string{"outputs/.gitignore": "*.tmp\n", "public": "public"})
+				session.expectMissing(session.beta, "outputs/data")
+				session.expect(session.alpha, map[string]string{"outputs/.gitignore": "*.tmp\n", "outputs/data": "data", "public": "public"})
+				state := session.state()
+				if len(state.AlphaState.ScanProblems) != 0 || len(state.BetaState.ScanProblems) != 0 {
+					t.Errorf("unexpected scan problems: %v, %v", state.AlphaState.ScanProblems, state.BetaState.ScanProblems)
+				}
+			}
+
+			// Other changes continue to be synchronized.
+			session.write(session.alpha, map[string]string{"later": "later"})
+			session.flush()
+			session.expect(session.beta, map[string]string{"later": "later"})
+		})
+	}
+}
+
+// TestGitModeExcludedSibling tests that a path that the receiving endpoint
+// excludes doesn't keep the rest of a new directory from arriving, and that
+// it's reported as a warning, by every cycle, on the path itself.
+func TestGitModeExcludedSibling(t *testing.T) {
+	isolateGitMode(t)
+	for _, mode := range gitModeSynchronizationModes {
+		t.Run(mode.Description(), func(t *testing.T) {
+			alphaContent := map[string]string{"pkg/a.go": "a", "pkg/b.go": "b", "pkg/debug.log": "log"}
+			session := newGitModeSession(t, gitModeOptions{mode: mode, alpha: alphaContent, prepare: excludeOnBeta("*.log\n")})
+			for i := 0; i < 3; i++ {
+				verifyExclusionWarning(t, session.flushAllowingProblems(), "pkg/debug.log")
+				session.expect(session.beta, map[string]string{"pkg/a.go": "a", "pkg/b.go": "b"})
+				session.expectMissing(session.beta, "pkg/debug.log")
+				session.expect(session.alpha, alphaContent)
+			}
+
+			// Other changes in the directory continue to be synchronized.
+			session.write(session.alpha, map[string]string{"pkg/c.go": "c", "pkg/a.go": "changed"})
+			verifyExclusionWarning(t, session.flushAllowingProblems(), "pkg/debug.log")
+			session.expect(session.beta, map[string]string{"pkg/a.go": "changed", "pkg/c.go": "c"})
+
+			// The warning goes away with the path that it's about.
+			session.remove(session.alpha, "pkg/debug.log")
+			session.flush()
+		})
+	}
+}
+
+// TestGitModeExclusionSkew tests the treatment of a file that only one endpoint
+// excludes: it isn't copied to that endpoint, for which there's a warning if it
+// doesn't have the file, and there's nothing to report if it does.
+func TestGitModeExclusionSkew(t *testing.T) {
+	isolateGitMode(t)
+	for _, mode := range gitModeSynchronizationModes {
+		t.Run(mode.Description(), func(t *testing.T) {
+			t.Run("absent", func(t *testing.T) {
+				session := newGitModeSession(t, gitModeOptions{
+					mode:    mode,
+					alpha:   map[string]string{"secret.env": "secret", "public": "public"},
+					prepare: excludeOnBeta("secret.env\n"),
+				})
+				for i := 0; i < 2; i++ {
+					verifyExclusionWarning(t, session.flushAllowingProblems(), "secret.env")
+					session.expect(session.alpha, map[string]string{"secret.env": "secret"})
+					session.expect(session.beta, map[string]string{"public": "public"})
+					session.expectMissing(session.beta, "secret.env")
+				}
+			})
+			t.Run("present", func(t *testing.T) {
+				session := newGitModeSession(t, gitModeOptions{
+					mode:    mode,
+					alpha:   map[string]string{"secret.env": "secret", "public": "public"},
+					beta:    map[string]string{"secret.env": "other"},
+					prepare: excludeOnBeta("secret.env\n"),
+				})
+				for i := 0; i < 2; i++ {
+					session.flush()
+					state := session.state()
+					if len(state.AlphaState.ScanProblems) != 0 || len(state.BetaState.ScanProblems) != 0 {
+						t.Errorf("unexpected scan problems: %v, %v", state.AlphaState.ScanProblems, state.BetaState.ScanProblems)
+					}
+					session.expect(session.alpha, map[string]string{"secret.env": "secret"})
+					session.expect(session.beta, map[string]string{"public": "public", "secret.env": "other"})
+				}
+			})
+		})
+	}
+}
+
+// TestGitModeExclusionNoHotLoop tests that a refused path and a delivered rule
+// file don't result in further synchronization cycles, without any changes, in
+// a session that's watching for changes, which is noticed by cycles being
+// counted.
+func TestGitModeExclusionNoHotLoop(t *testing.T) {
+	isolateGitMode(t)
+	for _, mode := range gitSubmoduleWatchModes {
+		t.Run(mode.name, func(t *testing.T) {
+			if mode.mode == synchronization.WatchMode_WatchModePortable && mode.recursive != watching.RecursiveWatchingSupported {
+				t.Skip("this kind of watching isn't what this system uses")
+			}
+			session := newGitModeSession(t, gitModeOptions{
+				watch:     true,
+				watchMode: mode.mode,
+				alpha:     map[string]string{"outputs/.gitignore": "*.tmp\n", "pkg/a.go": "a", "pkg/debug.log": "log"},
+				prepare:   excludeOnBeta("outputs/\n*.log\n"),
+			})
+
+			// The session wakes up on its own. Wait for all of the paths to
+			// have been handled, then for it to stop.
+			session.waitForState(func(state *synchronization.State) bool {
+				return len(state.BetaState.TransitionProblems) == 1 && state.BetaState.TransitionProblems[0].Path == "pkg/debug.log"
+			})
+			session.waitForIdle()
+			verifyExclusionWarning(t, session.state(), "pkg/debug.log")
+			session.expect(session.beta, map[string]string{"outputs/.gitignore": "*.tmp\n", "pkg/a.go": "a"})
+			session.expectMissing(session.beta, "pkg/debug.log")
+
+			// It isn't stuck, though.
+			session.write(session.alpha, map[string]string{"pkg/b.go": "b"})
+			session.flushAllowingProblems()
+			session.expect(session.beta, map[string]string{"pkg/b.go": "b"})
+		})
+	}
+}
+
+// TestGitModeExclusionThroughRemote tests the same behavior between an endpoint
+// and an agent, and that the remote command line reports a warning without
+// preventing commands, whatever endpoint it's reported by.
+func TestGitModeExclusionThroughRemote(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("commands require a POSIX shell")
+	}
+	isolateGitMode(t)
+	session := newGitModeSession(t, gitModeOptions{
+		remoteBeta: true,
+		commands:   synchronization.RemoteCommandMode_RemoteCommandModeBeta,
+		alpha:      map[string]string{"pkg/a.go": "a", "pkg/debug.log": "log"},
+		prepare:    excludeOnBeta("*.log\n"),
+	})
+	session.waitForRemoteCommands()
+	code, output, diagnostics := runRemote(t, session.alpha, "--timeout", "30s", "cat", "pkg/a.go")
+	if code != 0 || output != "a" {
+		t.Errorf("command failed: %d: %q: %s", code, output, diagnostics)
+	}
+	for _, content := range []string{"remote: warning:", "pkg/debug.log (remote): ignored by this endpoint's own rules"} {
+		if !strings.Contains(diagnostics, content) {
+			t.Errorf("command's diagnostics don't contain %q: %s", content, diagnostics)
+		}
+	}
+	session.expectMissing(session.beta, "pkg/debug.log")
 }
 
 // TestGitModeSubmodules runs the scenarios for submodules between local
@@ -2150,4 +2387,49 @@ func TestGitModeTrackedIgnoredWarnings(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestGitModeSymbolicLinkReplaced tests that a session in a one-way replica mode
+// replaces a symbolic link with the directory that alpha has at its path, on the
+// first flush, without reading rules through the link, which can't work if it's
+// a cycle, and which would otherwise apply the rules at the link's target.
+func TestGitModeSymbolicLinkReplaced(t *testing.T) {
+	isolateGitMode(t)
+	for _, test := range []struct {
+		// name is the name of the test.
+		name string
+		// target is the target of the symbolic link.
+		target string
+		// content is the content that alpha has beneath the path.
+		content map[string]string
+	}{
+		{"cycle", "pkg", map[string]string{"pkg/file.txt": "content"}},
+		{"cycle with rules", "pkg", map[string]string{"pkg/.gitignore": "*.tmp\n", "pkg/file.txt": "content"}},
+		{"rules at target", "other", map[string]string{"pkg/file.txt": "content"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rules := map[string]string{"other/.gitignore": "file.txt\n"}
+			alpha := map[string]string{"other/.gitignore": "file.txt\n"}
+			for path, contents := range test.content {
+				alpha[path] = contents
+			}
+			session := newGitModeSession(t, gitModeOptions{
+				mode:  core.SynchronizationMode_SynchronizationModeOneWayReplica,
+				alpha: alpha,
+				beta:  rules,
+				prepare: func(s *gitModeSession) {
+					if err := os.Symlink(test.target, filepath.Join(s.beta, "pkg")); err != nil {
+						s.t.Skip("unable to create symbolic link:", err)
+					}
+				},
+			})
+			session.flush()
+			session.flush()
+			session.expect(session.beta, test.content)
+			if info, err := os.Lstat(filepath.Join(session.beta, "pkg")); err != nil || !info.IsDir() {
+				t.Errorf("symbolic link not replaced: %v, %v", info, err)
+			}
+			session.expectMissing(session.beta, "other/file.txt")
+		})
+	}
 }

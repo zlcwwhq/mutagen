@@ -149,7 +149,7 @@ func printIgnores(router *router, paths []string, output io.Writer) (int, error)
 		if ignores.Git {
 			fmt.Fprintln(output, "  Git rules: .gitignore files at every level and .git/info/exclude, case-sensitively; the patterns above take precedence, so they can also unignore")
 			fmt.Fprintln(output, "  .git files and directories, which are never synchronized")
-			fmt.Fprintln(output, "  Content of submodules (directories that contain .git, other than the root), which the session synchronizes by commit; commands can still run there")
+			fmt.Fprintln(output, "  Content of submodules (nested repositories with a commit and usable origin), which the session synchronizes by commit; commands can still run there")
 		}
 		fmt.Fprintf(output, "Ignored paths aren't synchronized; %[1]s --ignores <path> checks a path, and %[1]s --pull <path> copies ignored paths from the opposite endpoint.\n", router.followUp())
 		return 0, nil

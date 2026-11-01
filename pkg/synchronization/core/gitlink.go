@@ -36,7 +36,11 @@ type GitProvider interface {
 	Update(ctx context.Context, directory, url string, commit []byte) error
 	// UpdateNested updates the submodules nested within the repository in a
 	// directory, if it has any, to the commits that the repository records for
-	// them. The URL identifies the repository in messages.
+	// them, at every depth. It leaves changes that would conflict, including
+	// ignored local files, for Git to refuse, as Update does, and a submodule
+	// that can't be updated doesn't stop the others from being updated, with
+	// the returned error describing each failure. The URL identifies the
+	// repository in messages.
 	UpdateNested(ctx context.Context, directory, url string) error
 }
 
