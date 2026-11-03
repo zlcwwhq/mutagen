@@ -1185,6 +1185,25 @@ func isolateGitMode(t *testing.T) {
 // signing commits.
 func gitModeRun(t *testing.T, directory string, args ...string) string {
 	t.Helper()
+	output, err := gitModeTry(directory, args...)
+	if err != nil {
+		t.Fatalf("unable to run Git with arguments %v in %s: %v", args, directory, err)
+	}
+	return output
+}
+
+// gitModeTry runs Git in a directory in the same way as gitModeRun, but it
+// returns any failure, along with Git's error output, rather than failing the
+// test. It's for use while a session may be operating on the repository, such
+// as when waiting for it to do so.
+func gitModeTry(directory string, args ...string) (string, error) {
+	output, err := gitModeOutput(directory, args...)
+	return strings.TrimSpace(output), err
+}
+
+// gitModeOutput runs Git in a directory in the same way as gitModeTry, but it
+// returns the output as is, which matters where leading whitespace does.
+func gitModeOutput(directory string, args ...string) (string, error) {
 	command := exec.Command("git", args...)
 	command.Dir = directory
 	for _, entry := range os.Environ() {
@@ -1201,9 +1220,9 @@ func gitModeRun(t *testing.T, directory string, args ...string) string {
 	command.Stderr = &errorOutput
 	output, err := command.Output()
 	if err != nil {
-		t.Fatalf("unable to run Git with arguments %v in %s: %v: %s", args, directory, err, errorOutput.String())
+		return "", fmt.Errorf("%w: %s", err, errorOutput.String())
 	}
-	return strings.TrimSpace(string(output))
+	return string(output), nil
 }
 
 // gitModeProblem returns the problem at the specified path, failing the test if
