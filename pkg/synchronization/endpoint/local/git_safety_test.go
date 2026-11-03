@@ -637,6 +637,15 @@ func TestPruneGitTransitions(t *testing.T) {
 		return &core.Entry{Kind: core.EntryKind_Directory, Contents: contents}
 	}
 	long := strings.Repeat("d", 300)
+	gitLink := &core.Entry{Kind: core.EntryKind_GitLink, Digest: []byte{1}, Url: "https://example.org/repository.git"}
+	moved := &core.Entry{Kind: core.EntryKind_GitLink, Digest: []byte{2}, Url: "https://example.org/repository.git"}
+	submodule := func(contents map[string]*core.Entry) *core.Entry {
+		result := directory(map[string]*core.Entry{core.GitLinkName: gitLink})
+		for name, content := range contents {
+			result.Contents[name] = content
+		}
+		return result
+	}
 
 	// Define test cases. If the expected new content is nil, then that means
 	// that the change should be refused, and a change is expected not to be
@@ -862,6 +871,70 @@ func TestPruneGitTransitions(t *testing.T) {
 			expected: []*core.Entry{nil, file},
 			warnings: warnings{".gitx"},
 		},
+		{
+			name:     "submodule Git entries attached and followed",
+			rules:    "*.log\n",
+			changes:  []*core.Change{{Path: "sub/.git", New: gitLink}, {Path: "a/b/.git", Old: gitLink, New: moved}},
+			expected: []*core.Entry{gitLink, moved},
+		},
+		{
+			name:     "submodule Git entries in excluded directories",
+			rules:    "excluded/\n",
+			changes:  []*core.Change{{Path: "excluded/.git", New: gitLink}, {Path: "excluded/sub/.git", Old: gitLink, New: moved}, {Path: "public", New: file}},
+			expected: []*core.Entry{nil, nil, file},
+			warnings: warnings{"excluded"},
+		},
+		{
+			name: "submodule Git entries where there can't be any",
+			changes: []*core.Change{
+				{Path: ".git", New: gitLink},
+				{Path: "a/.git/b/.git", New: gitLink},
+				{Path: "b/.GIT", New: gitLink},
+				{Path: "c/.git/x", New: gitLink},
+				{Path: "d/.git", Old: directory(nil), New: gitLink},
+			},
+			expected: []*core.Entry{nil, nil, nil, nil, nil},
+			failures: failures{".git", "a/.git", "b/.GIT", "c/.git", "d/.git"},
+		},
+		{
+			name:     "other content at submodule Git entries",
+			changes:  []*core.Change{{Path: "a/.git", New: file}, {Path: "b/.git", Old: gitLink, New: directory(nil)}, {Path: "c/.git/HEAD", New: file}},
+			expected: []*core.Entry{nil, nil, nil},
+			failures: failures{"a/.git", "b/.git", "c/.git"},
+		},
+		{
+			name:     "submodule created whole",
+			rules:    "*.log\nbuild/\n",
+			changes:  []*core.Change{{Path: "sub", New: submodule(map[string]*core.Entry{"a.log": file, "b": file, "build": directory(map[string]*core.Entry{"x": file})})}},
+			expected: []*core.Entry{submodule(map[string]*core.Entry{"a.log": file, "b": file, "build": directory(map[string]*core.Entry{"x": file})})},
+		},
+		{
+			name:     "submodule replacing other content",
+			rules:    "*.log\n",
+			changes:  []*core.Change{{Path: "sub", Old: directory(map[string]*core.Entry{"file": file}), New: submodule(map[string]*core.Entry{"a.log": file})}},
+			expected: []*core.Entry{submodule(map[string]*core.Entry{"a.log": file})},
+		},
+		{
+			name:     "submodule created within a directory",
+			rules:    "*.log\n",
+			changes:  []*core.Change{{Path: "pkg", New: directory(map[string]*core.Entry{"c.log": file, "sub": submodule(map[string]*core.Entry{"a.log": file})})}},
+			expected: []*core.Entry{directory(map[string]*core.Entry{"sub": submodule(map[string]*core.Entry{"a.log": file})})},
+			warnings: warnings{"pkg/c.log"},
+		},
+		{
+			name:     "excluded submodules",
+			rules:    "sub/\npkg/\n",
+			changes:  []*core.Change{{Path: "sub", New: submodule(nil)}, {Path: "pkg/inner", New: submodule(nil)}, {Path: "public", New: file}},
+			expected: []*core.Entry{nil, nil, file},
+			warnings: warnings{"sub", "pkg"},
+		},
+		{
+			name:     "submodule in excluded directory with rule files",
+			rules:    "outputs/\n",
+			changes:  []*core.Change{{Path: "outputs", New: directory(map[string]*core.Entry{".gitignore": file, "sub": submodule(nil)})}},
+			expected: []*core.Entry{directory(map[string]*core.Entry{".gitignore": file})},
+			warnings: warnings{"outputs"},
+		},
 	}
 
 	// Process test cases.
@@ -977,9 +1050,11 @@ func TestEndpointGitModeSymbolicLinkReplacement(t *testing.T) {
 }
 
 // TestPruneGitTransitionsOldContent tests that pruneGitTransitions refuses
-// changes that would remove a Git entry or anything beneath one, which only a
-// malfunctioning or compromised controller could request, since neither the
-// ancestor nor the synchronizable part of a scan has Git entries.
+// changes that would remove a Git entry or anything beneath one. The only Git
+// entries that the ancestor or the synchronizable part of a scan can have are
+// the GitLink entries of submodules, which are never removed, but which can be
+// attached to a directory or moved to another commit. Anything else could only
+// be requested by a malfunctioning or compromised controller.
 func TestPruneGitTransitionsOldContent(t *testing.T) {
 	// Create the entries for tests.
 	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
@@ -988,6 +1063,9 @@ func TestPruneGitTransitionsOldContent(t *testing.T) {
 	directory := func(contents map[string]*core.Entry) *core.Entry {
 		return &core.Entry{Kind: core.EntryKind_Directory, Contents: contents}
 	}
+	gitLink := &core.Entry{Kind: core.EntryKind_GitLink, Digest: []byte{1}, Url: "https://example.org/repository.git"}
+	moved := &core.Entry{Kind: core.EntryKind_GitLink, Digest: []byte{2}, Url: "https://example.org/repository.git"}
+	submodule := directory(map[string]*core.Entry{".git": gitLink, "file": file})
 
 	// Define test cases.
 	tests := []struct {
@@ -1010,6 +1088,16 @@ func TestPruneGitTransitionsOldContent(t *testing.T) {
 		{"untracked Git entry in deletion", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{".git": untracked, "b": file})}, true, []string{"a/.git"}},
 		{"names that resemble a Git entry", &core.Change{Path: ".gitx", Old: directory(map[string]*core.Entry{"x.git": file, ".git2": link})}, false, nil},
 		{"unrelated deletion", &core.Change{Path: "a", Old: file}, false, nil},
+		{"submodule Git entry", &core.Change{Path: "sub/.git", Old: gitLink}, true, []string{"sub/.git"}},
+		{"submodule Git entry replaced", &core.Change{Path: "sub/.git", Old: gitLink, New: file}, true, []string{"sub/.git"}},
+		{"submodule in deletion", &core.Change{Path: "sub", Old: submodule}, true, []string{"sub/.git"}},
+		{"submodule deep in deletion", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{"b": submodule})}, true, []string{"a/b/.git"}},
+		{"submodule in type change", &core.Change{Path: "sub", Old: submodule, New: file}, true, []string{"sub/.git"}},
+		{"submodule replaced by submodule", &core.Change{Path: "sub", Old: submodule, New: directory(map[string]*core.Entry{".git": moved})}, true, []string{"sub/.git"}},
+		{"Git entry replaced by submodule Git entry", &core.Change{Path: "sub/.git", Old: directory(nil), New: gitLink}, true, []string{"sub/.git"}},
+		{"untracked Git entry replaced by submodule Git entry", &core.Change{Path: "sub/.git", Old: untracked, New: gitLink}, true, []string{"sub/.git"}},
+		{"submodule Git entry attached", &core.Change{Path: "sub/.git", New: gitLink}, false, nil},
+		{"submodule Git entry followed", &core.Change{Path: "sub/.git", Old: gitLink, New: moved}, false, nil},
 	}
 
 	// Process test cases. Each is accompanied by a change that's unaffected.
@@ -1036,6 +1124,40 @@ func TestPruneGitTransitionsOldContent(t *testing.T) {
 				t.Errorf("incorrect failures: %v != %v", failures, test.failures)
 			}
 		})
+	}
+}
+
+// TestPruneGitTransitionsSubmoduleMessages tests that refusing to remove a
+// submodule, which is expected, says what to do about it, rather than treating
+// it as a sign of a malfunction, as other changes to Git entries are.
+func TestPruneGitTransitionsSubmoduleMessages(t *testing.T) {
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	gitLink := &core.Entry{Kind: core.EntryKind_GitLink, Digest: []byte{1}, Url: "https://example.org/repository.git"}
+	submodule := &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{".git": gitLink}}
+	_, problems := pruneGitTransitions(gitignore.NewIgnorer(t.TempDir(), nil), []*core.Change{
+		{Path: "a/.git", Old: gitLink},
+		{Path: "b", Old: submodule, New: file},
+		{Path: "c/.git", Old: gitLink, New: file},
+		{Path: "d/.git", New: file},
+		{Path: "e/.git", Old: &core.Entry{Kind: core.EntryKind_Directory}, New: gitLink},
+	})
+	expected := []struct {
+		path      string
+		submodule bool
+	}{{"a/.git", true}, {"b/.git", true}, {"c/.git", true}, {"d/.git", false}, {"e/.git", false}}
+	if len(problems) != len(expected) {
+		t.Fatal("incorrect problems:", problems)
+	}
+	for p, problem := range problems {
+		if problem.Path != expected[p].path {
+			t.Errorf("incorrect path for problem %d: %s", p, problem.Path)
+		} else if problem.Warning {
+			t.Error("refusal reported as a warning:", problem)
+		} else if expected[p].submodule != strings.Contains(problem.Error, "submodule isn't removed automatically") {
+			t.Error("incorrect message:", problem)
+		} else if expected[p].submodule == strings.Contains(problem.Error, "compromised") {
+			t.Error("incorrect message:", problem)
+		}
 	}
 }
 
