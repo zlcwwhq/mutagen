@@ -46,6 +46,11 @@ type Snapshot struct {
 	// TotalFileSize is the total size of all synchronizable files referenced by
 	// the snapshot.
 	TotalFileSize uint64 `protobuf:"varint,7,opt,name=totalFileSize,proto3" json:"totalFileSize,omitempty"`
+	// Warnings are problems with the endpoint's content that the scan itself
+	// doesn't represent. They're informational: they don't affect
+	// synchronization, and they aren't part of the snapshot's identity, so they
+	// don't participate in snapshot equality.
+	Warnings      []*Problem `protobuf:"bytes,8,rep,name=warnings,proto3" json:"warnings,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -129,11 +134,18 @@ func (x *Snapshot) GetTotalFileSize() uint64 {
 	return 0
 }
 
+func (x *Snapshot) GetWarnings() []*Problem {
+	if x != nil {
+		return x.Warnings
+	}
+	return nil
+}
+
 var File_synchronization_core_snapshot_proto protoreflect.FileDescriptor
 
 const file_synchronization_core_snapshot_proto_rawDesc = "" +
 	"\n" +
-	"#synchronization/core/snapshot.proto\x12\x04core\x1a synchronization/core/entry.proto\"\x9b\x02\n" +
+	"#synchronization/core/snapshot.proto\x12\x04core\x1a synchronization/core/entry.proto\x1a\"synchronization/core/problem.proto\"\xc6\x02\n" +
 	"\bSnapshot\x12%\n" +
 	"\acontent\x18\x01 \x01(\v2\v.core.EntryR\acontent\x126\n" +
 	"\x16preservesExecutability\x18\x02 \x01(\bR\x16preservesExecutability\x12,\n" +
@@ -141,7 +153,8 @@ const file_synchronization_core_snapshot_proto_rawDesc = "" +
 	"\vdirectories\x18\x04 \x01(\x04R\vdirectories\x12\x14\n" +
 	"\x05files\x18\x05 \x01(\x04R\x05files\x12$\n" +
 	"\rsymbolicLinks\x18\x06 \x01(\x04R\rsymbolicLinks\x12$\n" +
-	"\rtotalFileSize\x18\a \x01(\x04R\rtotalFileSizeB8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"
+	"\rtotalFileSize\x18\a \x01(\x04R\rtotalFileSize\x12)\n" +
+	"\bwarnings\x18\b \x03(\v2\r.core.ProblemR\bwarningsB8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"
 
 var (
 	file_synchronization_core_snapshot_proto_rawDescOnce sync.Once
@@ -159,14 +172,16 @@ var file_synchronization_core_snapshot_proto_msgTypes = make([]protoimpl.Message
 var file_synchronization_core_snapshot_proto_goTypes = []any{
 	(*Snapshot)(nil), // 0: core.Snapshot
 	(*Entry)(nil),    // 1: core.Entry
+	(*Problem)(nil),  // 2: core.Problem
 }
 var file_synchronization_core_snapshot_proto_depIdxs = []int32{
 	1, // 0: core.Snapshot.content:type_name -> core.Entry
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	2, // 1: core.Snapshot.warnings:type_name -> core.Problem
+	2, // [2:2] is the sub-list for method output_type
+	2, // [2:2] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_core_snapshot_proto_init() }
@@ -175,6 +190,7 @@ func file_synchronization_core_snapshot_proto_init() {
 		return
 	}
 	file_synchronization_core_entry_proto_init()
+	file_synchronization_core_problem_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

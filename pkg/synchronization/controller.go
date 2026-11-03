@@ -1184,13 +1184,13 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.state.AlphaState.Files = αSnapshot.Files
 		c.state.AlphaState.SymbolicLinks = αSnapshot.SymbolicLinks
 		c.state.AlphaState.TotalFileSize = αSnapshot.TotalFileSize
-		c.state.AlphaState.ScanProblems = αContent.Problems()
+		c.state.AlphaState.ScanProblems = append(αContent.Problems(), αSnapshot.Warnings...)
 		c.state.BetaState.Scanned = true
 		c.state.BetaState.Directories = βDirectoryCount
 		c.state.BetaState.Files = βSnapshot.Files
 		c.state.BetaState.SymbolicLinks = βSnapshot.SymbolicLinks
 		c.state.BetaState.TotalFileSize = βSnapshot.TotalFileSize
-		c.state.BetaState.ScanProblems = βContent.Problems()
+		c.state.BetaState.ScanProblems = append(βContent.Problems(), βSnapshot.Warnings...)
 		c.state.Status = Status_Reconciling
 		c.stateLock.Unlock()
 

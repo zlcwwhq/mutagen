@@ -64,6 +64,10 @@ type Problem struct {
 	Path string
 	// Error describes the problem.
 	Error string
+	// Warning indicates that the problem describes content that isn't
+	// synchronized by design rather than a failure, so it doesn't call into
+	// question whether or not anything else has been synchronized.
+	Warning bool `json:",omitempty"`
 }
 
 // boundReport makes a report fit into a flush response, without modifying the

@@ -13,4 +13,8 @@ message Problem {
     string path = 1;
     // Error is a human-readable summary of the problem.
     string error = 2;
+    // Warning indicates that the problem describes content that isn't
+    // synchronized by design rather than a failure. Warnings don't call into
+    // question whether or not anything else has been synchronized.
+    bool warning = 3;
 }

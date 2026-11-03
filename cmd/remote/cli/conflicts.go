@@ -1876,7 +1876,9 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 // concurrent change created, if there's one. Problems may leave the copies
 // unsynchronized without a conflict, such as a symbolic link whose target
 // can't be synchronized portably, or content that an endpoint can't read or
-// write.
+// write. Warnings don't count, because they describe content that isn't
+// synchronized by design rather than a failure, so they say nothing about the
+// resolution, even if they're inside of the conflict root.
 func (a *application) unsettled(listing *remote.Listing) error {
 	for _, conflict := range listing.Conflicts {
 		if overlaps(conflict.Path, a.w.Path) {
@@ -1884,7 +1886,7 @@ func (a *application) unsettled(listing *remote.Listing) error {
 		}
 	}
 	for _, problem := range listing.Problems {
-		if overlaps(problem.Path, a.w.Path) {
+		if !problem.Warning && overlaps(problem.Path, a.w.Path) {
 			side := sideRemote
 			if problem.Alpha == a.target.Alpha {
 				side = sideLocal

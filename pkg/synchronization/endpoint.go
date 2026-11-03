@@ -29,7 +29,9 @@ type Endpoint interface {
 	// The function returns the scan result, any error that occurred while
 	// trying to perform the scan, and a boolean indicating whether or not to
 	// re-try the scan if an error occurred. Any non-fatal problems encountered
-	// during the scan can be extracted from the resulting content.
+	// during the scan can be extracted from the resulting content, and any
+	// other problems with the endpoint's content are in the snapshot's
+	// warnings.
 	Scan(ctx context.Context, ancestor *core.Entry, full bool) (*core.Snapshot, error, bool)
 
 	// Stage performs file staging on the endpoint. It accepts a list of file
