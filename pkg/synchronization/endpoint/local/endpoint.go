@@ -511,6 +511,13 @@ func NewEndpoint(
 	if gitMode {
 		endpoint.gitProvider = newGitProvider(
 			logger.Sublogger("git"),
+			root,
+			sessionIdentifier,
+			ignorer,
+			hasherFactory,
+			probeMode,
+			symbolicLinkMode,
+			permissionsMode,
 			endpoint.pollSignal.Strobe,
 		)
 		gitFetcherDone := make(chan struct{})
@@ -1117,16 +1124,25 @@ func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, seeds []string, full
 		return nil, err, tryAgain
 	}
 
-	// In Git mode, attach warnings about the content of the snapshot. Doing
-	// this here means that it happens once per synchronization cycle and not
-	// for the watching Goroutines' scans. We've released the scan lock by this
-	// point so that running Git doesn't get in the way of the watching
-	// Goroutines. Since the snapshot may be the baseline of the next scan, and
-	// it's compared with previous snapshots by poll-based watching, it stays
-	// free of warnings, and we only return a copy of it that has them.
+	// In Git mode, process the records of submodule populations, and attach
+	// warnings about the content of the snapshot. Doing this here means that
+	// it happens once per synchronization cycle and not for the watching
+	// Goroutines' scans. We've released the scan lock by this point so that
+	// running Git doesn't get in the way of the watching Goroutines. Since the
+	// snapshot may be the baseline of the next scan, and it's compared with
+	// previous snapshots by poll-based watching, it stays free of seeds and
+	// warnings, and we only return a copy of it that has them.
 	if e.gitMode {
-		if warnings := e.gitWarnings(ctx, snapshot); len(warnings) > 0 {
+		populations, warnings, err := e.gitProvider.populations(snapshot.Content, seeds)
+		if err != nil {
+			return nil, err, true
+		}
+		warnings = append(warnings, e.gitWarnings(ctx, snapshot)...)
+		if len(warnings) > 0 {
 			snapshot = snapshot.WithWarnings(warnings)
+		}
+		if len(populations) > 0 {
+			snapshot = snapshot.WithSeeds(populations)
 		}
 	}
 

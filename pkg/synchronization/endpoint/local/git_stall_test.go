@@ -3,6 +3,7 @@
 package local
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 )
 
 // hangingTransport is a remote that never responds, because it runs a command
@@ -105,6 +108,12 @@ func (h *hangingTransport) verifyExited(t *testing.T) {
 	}
 }
 
+// gitTransportStallTimeout is the stall timeout for tests that count attempts
+// to contact a transport. Git has to get as far as running the transport within
+// this time, since an attempt that's stopped earlier isn't recorded, and that
+// takes a while on a busy system.
+const gitTransportStallTimeout = 2 * time.Second
+
 // useShortStallDurations makes stall detection use the specified durations for
 // an endpoint. Git waits two seconds before it first reports progress, which is
 // nothing compared to the default stall timeout, but which would be a stall for
@@ -116,6 +125,190 @@ func useShortStallDurations(t *testing.T, e *endpoint, timeout, backoff time.Dur
 	provider.stallTimeout = timeout
 	provider.stallBackoff = backoff
 	return provider
+}
+
+// TestEndpointGitModePopulateStallBackoff tests that a clone that shows no
+// progress is stopped without any effect on existing content, that it's
+// throttled like any other failure, that its URL is then avoided for a while
+// (without any delay), and that it's tried again after that.
+func TestEndpointGitModePopulateStallBackoff(t *testing.T) {
+	transport := newHangingTransport(t)
+	root := newGitRoot(t, map[string]string{"sub/file": "precious"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	provider := useShortStallDurations(t, e, gitTransportStallTimeout, 3*time.Second)
+	old := entryAt(scanEndpoint(t, e, true), "sub")
+	link := &core.Entry{Kind: core.EntryKind_GitLink, Digest: make([]byte, 20), Url: transport.url}
+	change := &core.Change{Path: "sub", Old: old, New: submodule(link, nil)}
+	key := gitRetryKey{url: transport.url, commit: strings.Repeat("00", 20)}
+	ctx := context.Background()
+
+	// verifyUnchanged verifies that the transition had no effect.
+	verifyUnchanged := func(results []*core.Entry) {
+		t.Helper()
+		if results[0] != old {
+			t.Error("incorrect result:", results[0])
+		}
+		verifyContents(t, root, "sub/file", "precious")
+		verifyAbsent(t, root, "sub/.git")
+	}
+
+	// The first attempt stalls, which is the end of the transport and of the
+	// clone. The transport would otherwise take much longer than the limit used
+	// here.
+	start := time.Now()
+	results, problems := transitionEndpoint(t, ctx, e, change)
+	if elapsed := time.Since(start); elapsed < gitTransportStallTimeout {
+		t.Errorf("clone stopped before stall timeout: %s", elapsed)
+	} else if elapsed > time.Minute {
+		t.Errorf("clone stopped long after stall timeout: %s", elapsed)
+	}
+	verifyUnchanged(results)
+	verifySingleFailure(t, problems, "sub", "no progress", transport.url)
+	if count := transport.count(t); count != 1 {
+		t.Errorf("incorrect number of attempts: %d", count)
+	}
+	transport.verifyExited(t)
+	if provider.backoffRemaining(transport.url) <= 0 {
+		t.Error("URL not avoided following stall")
+	}
+
+	// The next attempt is throttled, and so it doesn't even get as far as the
+	// backoff.
+	results, problems = transitionEndpoint(t, ctx, e, change)
+	verifyUnchanged(results)
+	verifySingleFailure(t, problems, "sub", "no progress", "tried again in")
+
+	// Once the throttling has ended, the backoff still keeps attempts from
+	// reaching the URL, and the problem says what's happening.
+	provider.cloneRetries.expire(key)
+	results, problems = transitionEndpoint(t, ctx, e, change)
+	verifyUnchanged(results)
+	verifySingleFailure(t, problems, "sub", "not contacting", transport.url, "tried again")
+	if count := transport.count(t); count != 1 {
+		t.Errorf("URL was contacted while being avoided: %d", count)
+	}
+
+	// Once both have ended, it's tried again.
+	for provider.backoffRemaining(transport.url) > 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	provider.cloneRetries.expire(key)
+	results, problems = transitionEndpoint(t, ctx, e, change)
+	verifyUnchanged(results)
+	verifySingleFailure(t, problems, "sub", "no progress")
+	if count := transport.count(t); count != 2 {
+		t.Errorf("URL not contacted after backoff: %d", count)
+	}
+	transport.verifyExited(t)
+}
+
+// TestEndpointGitModePopulateProgressIsNotStall tests that output keeps a
+// command from being treated as stalled, so that a large clone can take as long
+// as it needs to, by running a transport that takes much longer than the stall
+// timeout to make a clone fail, but that always reports what it's doing.
+func TestEndpointGitModePopulateProgressIsNotStall(t *testing.T) {
+	isolateGit(t)
+	t.Setenv("GIT_ALLOW_PROTOCOL", "ext:file")
+	base := realTemporaryDirectory(t)
+	script := filepath.Join(base, "transport.sh")
+	contents := "#!/bin/sh\n" +
+		"for i in 1 2 3 4; do echo progress >&2; sleep 1; done\n"
+	if err := os.WriteFile(script, []byte(contents), 0700); err != nil {
+		t.Fatal("unable to create transport:", err)
+	}
+	url := "ext::" + script
+	root := newGitRoot(t, map[string]string{"kept": "kept"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	provider := useShortStallDurations(t, e, 2500*time.Millisecond, time.Hour)
+	link := &core.Entry{Kind: core.EntryKind_GitLink, Digest: make([]byte, 20), Url: url}
+
+	// The clone fails, because this isn't really a transport, but not because
+	// of the stall timeout, which is shorter than the transport's lifetime.
+	start := time.Now()
+	results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{Path: "sub", New: submodule(link, nil)})
+	if elapsed := time.Since(start); elapsed < 3*time.Second {
+		t.Errorf("transport stopped early: %s", elapsed)
+	}
+	if results[0] != nil {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleFailure(t, problems, "sub", "unable to clone")
+	if strings.Contains(problems[0].Error, "no progress") {
+		t.Error("command with progress treated as stalled:", problems[0].Error)
+	}
+	if provider.backoffRemaining(url) > 0 {
+		t.Error("URL is being avoided without a stall")
+	}
+	verifyAbsent(t, root, "sub")
+}
+
+// TestEndpointGitModePopulateCancellation tests that cancellation during a
+// clone stops it, including its transport, removes the temporary clone, and
+// leaves existing content in place. The clone would not otherwise end.
+// Cancellation isn't a failure of the clone, so it's neither throttled nor a
+// reason to avoid the URL.
+func TestEndpointGitModePopulateCancellation(t *testing.T) {
+	transport := newHangingTransport(t)
+	root := newGitRoot(t, map[string]string{"sub/file": "precious"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	old := entryAt(scanEndpoint(t, e, true), "sub")
+	link := &core.Entry{Kind: core.EntryKind_GitLink, Digest: make([]byte, 20), Url: transport.url}
+
+	// Start the transition.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct {
+		results  []*core.Entry
+		problems []*core.Problem
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		results, problems, _, err := e.Transition(ctx, []*core.Change{{Path: "sub", Old: old, New: submodule(link, nil)}})
+		done <- result{results, problems, err}
+	}()
+
+	// Wait until the clone has reached the transport, and verify that it's
+	// happening in a temporary location next to the existing content.
+	transport.waitForAttempts(t, 1)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal("unable to read root:", err)
+	}
+	var temporary bool
+	for _, entry := range entries {
+		temporary = temporary || strings.HasPrefix(entry.Name(), filesystem.TemporaryNamePrefix)
+	}
+	if !temporary {
+		t.Error("no temporary directory for clone:", entries)
+	}
+
+	// Cancel it.
+	cancel()
+	var outcome result
+	select {
+	case outcome = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for clone to stop")
+	}
+	if outcome.err != nil {
+		t.Fatal("transition failed:", outcome.err)
+	}
+
+	// Verify the results.
+	if outcome.results[0] != old {
+		t.Error("incorrect result:", outcome.results[0])
+	}
+	verifySingleFailure(t, outcome.problems, "sub", "cancelled")
+	verifyNoTemporaryContent(t, root)
+	verifyContents(t, root, "sub/file", "precious")
+	transport.verifyExited(t)
+	if e.gitProvider.backoffRemaining(transport.url) > 0 {
+		t.Error("URL is being avoided after cancellation")
+	}
+	if state := e.gitProvider.cloneRetries.state(gitRetryKey{url: transport.url, commit: strings.Repeat("00", 20)}); state != nil {
+		t.Errorf("cancellation recorded as failure: %+v", state)
+	}
 }
 
 // TestEndpointGitModeFetchStall tests that a background fetch whose origin

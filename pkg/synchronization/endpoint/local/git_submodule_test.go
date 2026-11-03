@@ -16,6 +16,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/mutagen-io/mutagen/pkg/encoding"
+	"github.com/mutagen-io/mutagen/pkg/git"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 )
@@ -47,6 +49,19 @@ func cloneUpstream(t *testing.T, u *gitUpstream, root, path string) string {
 	}
 	mustGit(t, filepath.Dir(directory), "clone", "--quiet", "--", u.url, directory)
 	return directory
+}
+
+// submodule creates the entry for a submodule's directory, with the specified
+// GitLink entry as its Git entry, in addition to the specified contents.
+func submodule(link *core.Entry, contents map[string]*core.Entry) *core.Entry {
+	result := &core.Entry{
+		Kind:     core.EntryKind_Directory,
+		Contents: map[string]*core.Entry{core.GitLinkName: link},
+	}
+	for name, content := range contents {
+		result.Contents[name] = content
+	}
+	return result
 }
 
 // gitLinkAt returns the GitLink entry of the submodule at the specified path
@@ -94,11 +109,51 @@ func verifyDetachedAt(t *testing.T, directory, commit string) {
 	}
 }
 
+// scanWithSeeds performs a full scan that must succeed, with the specified
+// seeds as those that the session's ancestor carries, and verifies that the
+// resulting snapshot is valid.
+func scanWithSeeds(t *testing.T, e *endpoint, seeds []string) *core.Snapshot {
+	t.Helper()
+	snapshot, err, _ := e.Scan(context.Background(), nil, seeds, true)
+	if err != nil {
+		t.Fatal("scan failed:", err)
+	} else if err := snapshot.EnsureValid(); err != nil {
+		t.Fatal("invalid snapshot:", err)
+	}
+	return snapshot
+}
+
+// seedRecordPath returns the path of the record of a population of the
+// submodule at the specified path.
+func seedRecordPath(e *endpoint, path, seed string) string {
+	return e.gitProvider.seedPath(filepath.Join(e.root, filepath.FromSlash(path)), seed)
+}
+
+// loadSeedRecord loads the record of a population of the submodule at the
+// specified path.
+func loadSeedRecord(t *testing.T, e *endpoint, path, seed string) *core.Entry {
+	t.Helper()
+	record := &core.Entry{}
+	if err := encoding.LoadAndUnmarshalProtobuf(seedRecordPath(e, path, seed), record); err != nil {
+		t.Fatal("unable to load population record:", err)
+	}
+	return record
+}
+
 // useIntervals sets the retry intervals of a throttle.
 func (r *gitRetries) useIntervals(minimum, maximum time.Duration) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	r.minimumInterval, r.maximumInterval = minimum, maximum
+}
+
+// expire ends the current retry interval of a key, as if it had passed.
+func (r *gitRetries) expire(key gitRetryKey) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if state := r.states[key]; state != nil {
+		state.last = time.Now().Add(-state.interval)
+	}
 }
 
 // state returns a copy of the failure history of a key, or nil if there's
@@ -359,6 +414,491 @@ func TestGitProviderProbe(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
 		verifyProblematic(t, root, "git isn't installed")
 	})
+}
+
+// TestEndpointGitModePopulate tests that a transition that creates a
+// submodule populates it with a clone, and that its result is what the clone
+// contains, as far as the endpoint synchronizes it, rather than the new content
+// of the change. The result's GitLink entry carries a new seed, whose record is
+// kept in the clone and reported by scans until the session's ancestor carries
+// the seed, at which point it's removed.
+func TestEndpointGitModePopulate(t *testing.T) {
+	// Create an upstream whose commit tracks files that the clone's own rules
+	// and the session's ignores exclude.
+	upstream := newGitUpstream(t, "upstream")
+	head := upstream.commitFiles("more files", map[string]string{
+		".gitignore":     "*.log\n",
+		"tracked.log":    "tracked but ignored",
+		"secret.txt":     "ignored by the session",
+		"directory/file": "nested",
+	})
+	upstream.push()
+	root := newGitRoot(t, map[string]string{"kept": "kept"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch, "secret.txt")
+	ctx := context.Background()
+
+	// Perform the population. The change's new content differs from what the
+	// clone has, since it comes from the other endpoint, and it's only the
+	// GitLink entry that matters.
+	target := upstream.entry(head)
+	change := &core.Change{Path: "sub", New: submodule(target, map[string]*core.Entry{
+		"other": {Kind: core.EntryKind_File, Digest: []byte{1}},
+	})}
+	results, problems := transitionEndpoint(t, ctx, e, change)
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	}
+	result := results[0]
+
+	// Verify the clone on disk, which has everything that the commit tracks.
+	directory := filepath.Join(root, "sub")
+	verifyCheckout(t, directory, head)
+	verifyContents(t, root, "sub/tracked.log", "tracked but ignored")
+	verifyContents(t, root, "sub/secret.txt", "ignored by the session")
+	verifyContents(t, root, "sub/directory/file", "nested")
+	verifyAbsent(t, root, "sub/other")
+	verifyContents(t, root, "kept", "kept")
+	if runtime.GOOS != "windows" {
+		if info, err := os.Lstat(directory); err != nil {
+			t.Error("unable to query clone:", err)
+		} else if info.Mode().Perm() != os.FileMode(e.defaultDirectoryMode&0777) {
+			t.Errorf("incorrect directory permissions: %v", info.Mode().Perm())
+		}
+	}
+
+	// Verify the result, which is the synchronizable part of the clone, and
+	// whose GitLink entry carries a new seed.
+	if err := result.EnsureValid(true); err != nil {
+		t.Fatal("invalid result:", err)
+	}
+	expected := []string{"", ".git", ".gitignore", "directory", "directory/file", "file"}
+	if names := entryNames(result); !slices.Equal(names, expected) {
+		t.Errorf("incorrect result contents: %v != %v", names, expected)
+	}
+	link := result.Contents[core.GitLinkName]
+	if link.Kind != core.EntryKind_GitLink || hex.EncodeToString(link.Digest) != head || link.Url != upstream.url {
+		t.Errorf("incorrect GitLink entry: %v", link)
+	} else if len(link.Seed) != 32 {
+		t.Errorf("incorrect seed: %q", link.Seed)
+	}
+	seed := link.Seed
+
+	// The record of the population is that content.
+	if record := loadSeedRecord(t, e, "sub", seed); !record.Equal(result, true) {
+		t.Errorf("incorrect record: %v != %v", record, result)
+	} else if record.Contents[core.GitLinkName].Seed != seed {
+		t.Error("record doesn't carry seed")
+	}
+
+	// The next scan agrees with the result, and it reports the record, since
+	// the scan doesn't have the seed as one that the ancestor carries.
+	snapshot := scanWithSeeds(t, e, nil)
+	if scanned := gitLinkAt(t, snapshot, "sub"); scanned.Seed != seed || !scanned.Equal(link, true) || scanned.Url != upstream.url {
+		t.Errorf("incorrect scanned GitLink entry: %v", scanned)
+	}
+	resultSnapshot := &core.Snapshot{Content: &core.Entry{
+		Kind:     core.EntryKind_Directory,
+		Contents: map[string]*core.Entry{"sub": result},
+	}}
+	for _, path := range []string{"sub/file", "sub/.gitignore", "sub/directory/file"} {
+		if scanned, resulting := entryAt(snapshot, path), entryAt(resultSnapshot, path); !scanned.Equal(resulting, true) {
+			t.Errorf("scan disagrees with result at %s: %v != %v", path, scanned, resulting)
+		}
+	}
+	verifyKinds(t, snapshot, map[string]core.EntryKind{
+		"sub/tracked.log": core.EntryKind_Untracked,
+		"sub/secret.txt":  core.EntryKind_Untracked,
+	})
+	if len(snapshot.Seeds) != 1 || !snapshot.Seeds["sub"].Equal(result, true) {
+		t.Errorf("incorrect seeds: %v", snapshot.Seeds)
+	} else if snapshot.Seeds["sub"].Contents[core.GitLinkName].Seed != seed {
+		t.Error("reported seed doesn't carry seed")
+	}
+	if len(e.snapshot.Seeds) != 0 {
+		t.Error("seeds stored in the endpoint's snapshot")
+	}
+
+	// Seeds that the ancestor carries for other populations don't matter.
+	if snapshot := scanWithSeeds(t, e, []string{"other"}); len(snapshot.Seeds) != 1 {
+		t.Errorf("incorrect seeds: %v", snapshot.Seeds)
+	}
+
+	// Once the ancestor carries the seed, the record is removed, and the
+	// scan after that doesn't find a seed at all.
+	if snapshot := scanWithSeeds(t, e, []string{"other", seed}); len(snapshot.Seeds) != 0 {
+		t.Errorf("seeds reported for absorbed population: %v", snapshot.Seeds)
+	}
+	verifyAbsent(t, root, "sub/.git/mutagen/"+gitSeedFilePrefix+gitModeSession+"-"+seed)
+	snapshot = scanWithSeeds(t, e, []string{seed})
+	if link := gitLinkAt(t, snapshot, "sub"); link.Seed != "" {
+		t.Error("seed reported without record:", link.Seed)
+	} else if len(snapshot.Seeds) != 0 {
+		t.Errorf("unexpected seeds: %v", snapshot.Seeds)
+	}
+	verifyCheckout(t, directory, head)
+
+	// The only warning is about the file that the clone tracks despite its
+	// own rules.
+	if paths := warningPaths(snapshot); !slices.Equal(paths, []string{"sub/tracked.log"}) {
+		t.Errorf("incorrect warnings: %v", snapshot.Warnings)
+	}
+}
+
+// TestEndpointGitModePopulationRecords tests the handling of records of
+// populations that can't be used, and of records that belong to other sessions.
+func TestEndpointGitModePopulationRecords(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{
+		Path: "sub",
+		New:  submodule(upstream.entry(upstream.head), nil),
+	})
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	}
+	seed := results[0].Contents[core.GitLinkName].Seed
+	if snapshot := scanWithSeeds(t, e, []string{seed}); len(snapshot.Seeds) != 0 {
+		t.Fatal("seeds reported for absorbed population:", snapshot.Seeds)
+	}
+	records := filepath.Join(root, "sub", ".git", gitSeedDirectoryName)
+
+	// Records of other sessions, which can share the directory, aren't read.
+	writeTree(t, records, map[string]string{
+		gitSeedFilePrefix + "sync_other-0123": "not a record",
+		gitSeedFilePrefix + gitModeSession:    "not a record either",
+	})
+	snapshot := scanWithSeeds(t, e, nil)
+	if link := gitLinkAt(t, snapshot, "sub"); link.Seed != "" || len(snapshot.Seeds) != 0 || len(snapshot.Warnings) != 0 {
+		t.Errorf("records of other sessions read: %q, %v, %v", link.Seed, snapshot.Seeds, snapshot.Warnings)
+	}
+
+	// A corrupt record is a warning, which leaves the content to be reconciled
+	// without a merge base, and it's still removed once the ancestor carries
+	// its seed.
+	corrupt := gitSeedFilePrefix + gitModeSession + "-corrupt"
+	writeTree(t, records, map[string]string{corrupt: "\xff\xff\xff"})
+	snapshot = scanWithSeeds(t, e, nil)
+	if link := gitLinkAt(t, snapshot, "sub"); link.Seed != "corrupt" {
+		t.Error("incorrect seed:", link.Seed)
+	}
+	if len(snapshot.Seeds) != 0 {
+		t.Error("corrupt record reported:", snapshot.Seeds)
+	}
+	verifySingleWarning(t, snapshot.Warnings, "sub", "unable to read the record", corrupt)
+	scanWithSeeds(t, e, []string{"corrupt"})
+	verifyAbsent(t, root, "sub/.git/mutagen/"+corrupt)
+
+	// So is a record whose content isn't a population with its seed.
+	for name, record := range map[string]*core.Entry{
+		"mismatch": submodule(&core.Entry{Kind: core.EntryKind_GitLink, Digest: []byte{1}, Url: upstream.url, Seed: "other"}, nil),
+		"invalid":  {Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"x": {Kind: core.EntryKind_Untracked}}},
+		"file":     {Kind: core.EntryKind_File, Digest: []byte{1}},
+	} {
+		path := filepath.Join(records, gitSeedFilePrefix+gitModeSession+"-"+name)
+		if err := encoding.MarshalAndSaveProtobuf(path, record); err != nil {
+			t.Fatal("unable to write record:", err)
+		}
+		snapshot := scanWithSeeds(t, e, nil)
+		if len(snapshot.Seeds) != 0 {
+			t.Errorf("invalid record %s reported: %v", name, snapshot.Seeds)
+		}
+		verifySingleWarning(t, snapshot.Warnings, "sub", "record of this submodule's population is invalid")
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestEndpointGitModePopulateExisting tests that a submodule replaces existing
+// content, either an empty directory or a directory with files, and that the
+// files are only removed if they're unchanged since the scan, in which case
+// the clone isn't moved into place.
+func TestEndpointGitModePopulateExisting(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	target := submodule(upstream.entry(upstream.head), nil)
+	ctx := context.Background()
+
+	t.Run("empty directory", func(t *testing.T) {
+		root := newGitRoot(t, nil)
+		if err := os.Mkdir(filepath.Join(root, "sub"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+		old := entryAt(scanEndpoint(t, e, true), "sub")
+		results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: old, New: target})
+		if len(problems) != 0 {
+			t.Fatal("unexpected problems:", problems)
+		} else if !results[0].IsSubmodule() {
+			t.Fatal("incorrect result:", results[0])
+		}
+		verifyCheckout(t, filepath.Join(root, "sub"), upstream.head)
+	})
+
+	t.Run("files", func(t *testing.T) {
+		root := newGitRoot(t, map[string]string{"sub/file": "precious"})
+		e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+		old := entryAt(scanEndpoint(t, e, true), "sub")
+		results, problems := transitionEndpoint(t, ctx, e, &core.Change{Path: "sub", Old: old, New: target})
+		if len(problems) != 0 {
+			t.Fatal("unexpected problems:", problems)
+		} else if !results[0].IsSubmodule() {
+			t.Fatal("incorrect result:", results[0])
+		}
+		verifyCheckout(t, filepath.Join(root, "sub"), upstream.head)
+	})
+
+	t.Run("modified files", func(t *testing.T) {
+		root := newGitRoot(t, map[string]string{"sub/file": "precious"})
+		e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+		old := entryAt(scanEndpoint(t, e, true), "sub")
+		writeTree(t, root, map[string]string{"sub/file": "modified"})
+		results, problems, _, err := e.Transition(ctx, []*core.Change{{Path: "sub", Old: old, New: target}})
+		if err != nil {
+			t.Fatal("transition failed:", err)
+		}
+		if !results[0].Equal(old, true) {
+			t.Error("incorrect result:", results[0])
+		}
+		verifySingleFailure(t, problems, "sub/file")
+		verifyContents(t, root, "sub/file", "modified")
+		verifyAbsent(t, root, "sub/.git")
+		verifyNoTemporaryContent(t, root)
+	})
+}
+
+// TestEndpointGitModePopulateFallback tests that a commit that can't be
+// obtained, because it hasn't been pushed, leads to a clone of the default
+// branch, with a warning, which the result reflects.
+func TestEndpointGitModePopulateFallback(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	pushed := upstream.head
+	unpushed := upstream.commit("second", "second")
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{
+		Path: "sub",
+		New:  submodule(upstream.entry(unpushed), map[string]*core.Entry{"second": {Kind: core.EntryKind_File, Digest: []byte{1}}}),
+	})
+	verifySingleWarning(t, problems, "sub", "default branch", gitShortCommit(pushed), gitShortCommit(unpushed), upstream.url)
+	link := results[0].Contents[core.GitLinkName]
+	if hex.EncodeToString(link.Digest) != pushed || link.Seed == "" {
+		t.Errorf("incorrect GitLink entry: %v", link)
+	}
+	if names := entryNames(results[0]); !slices.Equal(names, []string{"", ".git", "file"}) {
+		t.Error("incorrect result contents:", names)
+	}
+	verifyCheckout(t, filepath.Join(root, "sub"), pushed)
+	verifyAbsent(t, root, "sub/second")
+	if !loadSeedRecord(t, e, "sub", link.Seed).Equal(results[0], true) {
+		t.Error("incorrect record")
+	}
+}
+
+// TestEndpointGitModePopulateWithoutFilters tests that a checkout that fails
+// because of a required filter is performed again without filters, with a
+// warning, and that the attributes that disable them don't stay behind.
+func TestEndpointGitModePopulateWithoutFilters(t *testing.T) {
+	// Create an upstream whose attributes ask for a filter. Its commits are
+	// created without any configuration for the filter.
+	upstream := newGitUpstream(t, "upstream")
+	head := upstream.commitFiles("filtered", map[string]string{
+		".gitattributes": "* filter=x\n",
+		"stored":         "stored bytes",
+	})
+	upstream.push()
+
+	// Configure the filter as required, with a smudge command that fails, the
+	// way Git LFS behaves without access to its server.
+	configuration := filepath.Join(realTemporaryDirectory(t), "config")
+	writeTree(t, filepath.Dir(configuration), map[string]string{
+		"config": "[filter \"x\"]\n\trequired = true\n\tsmudge = false\n",
+	})
+	t.Setenv("GIT_CONFIG_GLOBAL", configuration)
+
+	// Populate the submodule.
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{
+		Path: "sub",
+		New:  submodule(upstream.entry(head), nil),
+	})
+	verifySingleWarning(t, problems, "sub", "without filters")
+	if !results[0].IsSubmodule() || hex.EncodeToString(results[0].Contents[core.GitLinkName].Digest) != head {
+		t.Fatal("incorrect result:", results[0])
+	}
+	if names := entryNames(results[0]); !slices.Equal(names, []string{"", ".git", ".gitattributes", "file", "stored"}) {
+		t.Error("incorrect result contents:", names)
+	}
+	verifyDetachedAt(t, filepath.Join(root, "sub"), head)
+	verifyContents(t, root, "sub/stored", "stored bytes")
+	verifyAbsent(t, root, "sub/.git/info/attributes")
+}
+
+// TestEndpointGitModePopulateThrottled tests that a clone that fails leaves
+// existing content in place, and that it isn't attempted again until the retry
+// interval has passed, without the URL being avoided as it would after a stall.
+func TestEndpointGitModePopulateThrottled(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	root := newGitRoot(t, map[string]string{"sub/file": "precious"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	provider := e.gitProvider
+	ctx := context.Background()
+
+	// Attempt to populate from a URL where there's no repository yet.
+	missing := filepath.Join(filepath.Dir(upstream.bare), "missing.git")
+	url := fileURL(missing)
+	target := submodule(&core.Entry{Kind: core.EntryKind_GitLink, Digest: upstream.entry(upstream.head).Digest, Url: url}, nil)
+	old := entryAt(scanEndpoint(t, e, true), "sub")
+	change := &core.Change{Path: "sub", Old: old, New: target}
+	verifyUnchanged := func(results []*core.Entry) {
+		t.Helper()
+		if results[0] != old {
+			t.Error("incorrect result:", results[0])
+		}
+		verifyContents(t, root, "sub/file", "precious")
+		verifyAbsent(t, root, "sub/.git")
+	}
+	results, problems := transitionEndpoint(t, ctx, e, change)
+	verifyUnchanged(results)
+	verifySingleFailure(t, problems, "sub", "unable to clone "+url)
+	if provider.backoffRemaining(url) > 0 {
+		t.Error("URL is being avoided after a clone failed")
+	}
+
+	// Create the repository. The next attempt within the retry interval
+	// doesn't run Git, since it would succeed otherwise, and it reports the
+	// failure, along with when it will be tried again.
+	mustGit(t, filepath.Dir(missing), "clone", "--quiet", "--bare", "--", upstream.url, missing)
+	results, problems = transitionEndpoint(t, ctx, e, change)
+	verifyUnchanged(results)
+	verifySingleFailure(t, problems, "sub", "unable to clone "+url, "tried again in")
+
+	// Once the interval has passed, it's attempted again.
+	key := gitRetryKey{url: url, commit: upstream.head}
+	if state := provider.cloneRetries.state(key); state == nil || state.interval != gitMinimumRetryInterval {
+		t.Fatalf("incorrect retry state: %+v", state)
+	}
+	provider.cloneRetries.expire(key)
+	results, problems = transitionEndpoint(t, ctx, e, change)
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	} else if !results[0].IsSubmodule() {
+		t.Fatal("incorrect result:", results[0])
+	}
+	verifyCheckout(t, filepath.Join(root, "sub"), upstream.head)
+	if state := provider.cloneRetries.state(key); state != nil {
+		t.Errorf("retry state retained after success: %+v", state)
+	}
+}
+
+// TestEndpointGitModePopulateCheckoutFailure tests that a clone whose checkout
+// fails, with and without filters, is a failure that leaves existing content
+// in place, and that it's throttled like a failure to clone, since the next
+// attempt would have to clone the repository again.
+func TestEndpointGitModePopulateCheckoutFailure(t *testing.T) {
+	// Create a commit with a path that Git refuses to check out on any system,
+	// which it only accepts in a tree that's constructed by hand.
+	upstream := newGitUpstream(t, "upstream")
+	blob := mustGit(t, upstream.work, "rev-parse", "HEAD:file")
+	tree := mustGitInput(t, upstream.work, fmt.Sprintf("100644 blob %s\t.GIT\n100644 blob %s\tfile\n", blob, blob), "mktree")
+	commit := mustGit(t, upstream.work, "commit-tree", "-m", "invalid", "-p", "HEAD", tree)
+	mustGit(t, upstream.work, "push", "--quiet", "origin", commit+":refs/heads/main")
+
+	// Attempt the population.
+	root := newGitRoot(t, map[string]string{"sub/file": "precious"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	old := entryAt(scanEndpoint(t, e, true), "sub")
+	change := &core.Change{Path: "sub", Old: old, New: submodule(upstream.entry(commit), nil)}
+	results, problems := transitionEndpoint(t, context.Background(), e, change)
+	if results[0] != old {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleFailure(t, problems, "sub", "unable to check out commit "+gitShortCommit(commit))
+	verifyContents(t, root, "sub/file", "precious")
+	verifyAbsent(t, root, "sub/.git")
+
+	// The next attempt is throttled.
+	results, problems = transitionEndpoint(t, context.Background(), e, change)
+	if results[0] != old {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleFailure(t, problems, "sub", "unable to check out commit "+gitShortCommit(commit), "tried again in")
+	if state := e.gitProvider.cloneRetries.state(gitRetryKey{url: upstream.url, commit: commit}); state == nil {
+		t.Error("checkout failure not recorded")
+	}
+}
+
+// mustGitInput runs a Git command that must succeed with the specified
+// standard input and returns its trimmed output.
+func mustGitInput(t *testing.T, directory, input string, args ...string) string {
+	t.Helper()
+	command := git.Command(context.Background(), directory, args...)
+	command.Stdin = strings.NewReader(input)
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("unable to run Git with arguments %v: %v", args, err)
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// TestEndpointGitModePopulateProblematic tests that content of a clone that
+// can't be synchronized is reported as a problem of the transition, at its path
+// within the root, and left out of the result, without failing the population.
+func TestEndpointGitModePopulateProblematic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links may require privileges")
+	}
+	upstream := newGitUpstream(t, "upstream")
+	if err := os.Symlink("/absolute", filepath.Join(upstream.work, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, upstream.work, "add", "--", "escape")
+	head := upstream.commit("other", "other")
+	upstream.push()
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{
+		Path: "sub",
+		New:  submodule(upstream.entry(head), nil),
+	})
+	verifySingleFailure(t, problems, "sub/escape")
+	if err := results[0].EnsureValid(true); err != nil {
+		t.Error("invalid result:", err)
+	} else if names := entryNames(results[0]); !slices.Equal(names, []string{"", ".git", "file", "other"}) {
+		t.Error("incorrect result contents:", names)
+	}
+	verifyCheckout(t, filepath.Join(root, "sub"), head)
+	if !loadSeedRecord(t, e, "sub", results[0].Contents[core.GitLinkName].Seed).Equal(results[0], true) {
+		t.Error("incorrect record")
+	}
+}
+
+// TestEndpointGitModePopulateLineEndings tests that a clone uses the line
+// ending settings of the GitLink entry, so that its content is the same as
+// the other endpoint's checkout, and that the next scan carries them over.
+func TestEndpointGitModePopulateLineEndings(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	head := upstream.commitFiles("text", map[string]string{"text.txt": "a\nb\n"})
+	upstream.push()
+	root := newGitRoot(t, nil)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	link := upstream.entry(head)
+	link.AutoCRLF = "true"
+	results, problems := transitionEndpoint(t, context.Background(), e, &core.Change{
+		Path: "sub",
+		New:  submodule(link, nil),
+	})
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	} else if result := results[0].Contents[core.GitLinkName]; result.AutoCRLF != "true" || result.Eol != "" {
+		t.Errorf("incorrect line ending settings in result: %q %q", result.AutoCRLF, result.Eol)
+	}
+	verifyContents(t, root, "sub/text.txt", "a\r\nb\r\n")
+	verifyCheckout(t, filepath.Join(root, "sub"), head)
+	if scanned := gitLinkAt(t, scanEndpoint(t, e, true), "sub"); scanned.AutoCRLF != "true" {
+		t.Errorf("line ending setting not carried over: %q", scanned.AutoCRLF)
+	}
 }
 
 // TestEndpointGitModeAttach tests that a transition that creates the Git entry
