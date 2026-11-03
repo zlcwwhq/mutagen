@@ -55,3 +55,17 @@ type IgnoreCacheValue struct {
 
 // IgnoreCache provides an efficient mechanism to avoid recomputing ignores.
 type IgnoreCache map[IgnoreCacheKey]IgnoreCacheValue
+
+// NonUTF8Ignorer is an ignorer that can evaluate paths whose last component
+// isn't valid UTF-8. The specifications of other ignorers are valid UTF-8 and
+// aren't meant to match such names, so scans don't evaluate content with such
+// names with them, and they record it as problematic content (unless it's
+// ignore masked), since its name can't be synchronized. Rules that match bytes
+// rather than characters, as gitignore rules do, can ignore such content, which
+// scans then record as untracked, like any other ignored content.
+type NonUTF8Ignorer interface {
+	Ignorer
+	// EvaluatesNonUTF8 returns true if Ignore can evaluate paths whose last
+	// component isn't valid UTF-8.
+	EvaluatesNonUTF8() bool
+}

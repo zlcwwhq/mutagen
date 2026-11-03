@@ -145,6 +145,14 @@ func (i *ignorer) Ignore(path string, directory bool) (ignore.IgnoreStatus, bool
 	return ignore.IgnoreStatusNominal, continueTraversal
 }
 
+// EvaluatesNonUTF8 implements ignore.NonUTF8Ignorer.EvaluatesNonUTF8. Rules
+// match bytes, as Git matches them, so they apply to names that aren't valid
+// UTF-8 just as they apply to any other. The session ignorer, which takes
+// precedence, is given such names as well.
+func (i *ignorer) EvaluatesNonUTF8() bool {
+	return true
+}
+
 // rulesFor returns the chain of rule sets that apply to the entries in a
 // directory, specified by its root-relative path (which is empty for the
 // synchronization root).

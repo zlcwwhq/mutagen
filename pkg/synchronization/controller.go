@@ -913,7 +913,8 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 	}
 
 	// Determine whether or not the session is in Git mode and select the
-	// corresponding reconciliation behavior.
+	// corresponding reconciliation behavior. In Git mode, ignore rules are read
+	// separately on each endpoint, which reconciliation has to account for.
 	gitMode := GitModeEnabled(c.session.Configuration, c.session.Version)
 	reconcile := core.Reconcile
 	if gitMode {

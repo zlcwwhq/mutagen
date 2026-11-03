@@ -336,6 +336,22 @@ func (s *scanner) symbolicLink(
 	}, nil
 }
 
+// ignoresNonUTF8 determines whether or not the ignorer ignores content whose name
+// isn't valid UTF-8, given its path and metadata. That's only possible for an
+// ignorer that can evaluate such names (see ignore.NonUTF8Ignorer), for which
+// the evaluation is the same as for any other name, except that an ignored
+// directory can't be traversed, because its contents couldn't be represented
+// either, so they're never unignored.
+func (s *scanner) ignoresNonUTF8(path string, metadata *filesystem.Metadata) bool {
+	ignorer, ok := s.ignorer.(ignore.NonUTF8Ignorer)
+	if !ok || !ignorer.EvaluatesNonUTF8() {
+		return false
+	}
+	directory := metadata.Mode&filesystem.ModeTypeMask == filesystem.ModeTypeDirectory
+	status, _ := ignorer.Ignore(path, directory)
+	return status == ignore.IgnoreStatusIgnored
+}
+
 // recordNonUTF8Contents records entries for directory content with names that
 // aren't valid UTF-8 in the directory's content map. The content map must
 // already contain entries for all other content in the directory. Since these
@@ -510,7 +526,7 @@ func (s *scanner) directory(
 	// Compute the entries for the content map, deferring the recording of
 	// content with non-UTF-8 names.
 	contents := make(map[string]*Entry, len(directoryContents))
-	var nonUTF8ContentNames []string
+	var nonUTF8ContentNames, ignoredNonUTF8ContentNames []string
 	for _, contentMetadata := range directoryContents {
 		// Check for cancellation.
 		select {
@@ -537,7 +553,10 @@ func (s *scanner) directory(
 		// non-UTF-8-named entry to be the sole trigger that reified a phantom
 		// directory into existence, and even if other content were to trigger a
 		// phantom directory into existence, we wouldn't care about the
-		// non-UTF-8-named entry because it would be ignore masked out.
+		// non-UTF-8-named entry because it would be ignore masked out. The
+		// exception is an ignorer whose rules match bytes, such as that of Git
+		// mode, whose rules can ignore such content (see ignoresNonUTF8), in
+		// which case it's untracked, like any other ignored content.
 		//
 		// UTF-8 enforcement is important for both (a) ensuring that comparisons
 		// are performed using a common encoding and (b) allowing the name to be
@@ -548,7 +567,11 @@ func (s *scanner) directory(
 		// recorded so that derivative names can't displace content with valid
 		// names (see recordNonUTF8Contents).
 		if !utf8.ValidString(contentName) {
-			nonUTF8ContentNames = append(nonUTF8ContentNames, contentName)
+			if !ignoreMask && s.ignoresNonUTF8(contentPathPrefix+contentName, contentMetadata) {
+				ignoredNonUTF8ContentNames = append(ignoredNonUTF8ContentNames, contentName)
+			} else {
+				nonUTF8ContentNames = append(nonUTF8ContentNames, contentName)
+			}
 			continue
 		}
 
@@ -744,8 +767,13 @@ func (s *scanner) directory(
 	// Record content with non-UTF-8 names. At this point, the content map holds
 	// entries under the real names of all other content (excluding temporary
 	// files and content that disappeared during the scan, neither of which we
-	// need to avoid colliding with).
-	if err := s.recordNonUTF8Contents(contents, nonUTF8ContentNames, ignoreMask); err != nil {
+	// need to avoid colliding with). Content that the ignorer ignores is
+	// recorded like content that's ignore masked, and first, so that the names
+	// that it's recorded under don't depend on whether or not there's other
+	// content with similar names.
+	if err := s.recordNonUTF8Contents(contents, ignoredNonUTF8ContentNames, true); err != nil {
+		return nil, err
+	} else if err := s.recordNonUTF8Contents(contents, nonUTF8ContentNames, ignoreMask); err != nil {
 		return nil, err
 	}
 

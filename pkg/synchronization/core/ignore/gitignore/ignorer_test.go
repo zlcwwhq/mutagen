@@ -127,6 +127,23 @@ func TestIgnoreGitMetadata(t *testing.T) {
 	}
 }
 
+// TestIgnoreNonUTF8 tests that the ignorer evaluates names that aren't valid
+// UTF-8, whose bytes rules match as they match any others.
+func TestIgnoreNonUTF8(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{".gitignore": "*.log\nd\xff/\n[!a]\xe9\n"})
+	ignorer := NewIgnorer(root, nil)
+	if evaluator, ok := ignorer.(ignore.NonUTF8Ignorer); !ok || !evaluator.EvaluatesNonUTF8() {
+		t.Fatal("ignorer doesn't evaluate names that aren't valid UTF-8")
+	}
+	expectIgnored(t, ignorer, "caf\xe9.log", false, true)
+	expectIgnored(t, ignorer, "caf\xe9.txt", false, false)
+	expectIgnored(t, ignorer, "d\xff", true, true)
+	expectIgnored(t, ignorer, "d\xff", false, false)
+	expectIgnored(t, ignorer, "b\xe9", false, true)
+	expectIgnored(t, ignorer, "a\xe9", false, false)
+}
+
 // TestIgnoreRoot tests that the root is never ignored.
 func TestIgnoreRoot(t *testing.T) {
 	root := t.TempDir()
