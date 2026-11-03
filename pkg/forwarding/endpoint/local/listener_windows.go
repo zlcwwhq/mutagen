@@ -8,6 +8,8 @@ import (
 	"syscall"
 
 	"github.com/Microsoft/go-winio"
+
+	"github.com/mutagen-io/mutagen/pkg/ipc"
 )
 
 // listenWindowsNamedPipe attempts to create a named pipe listener on Windows.
@@ -49,7 +51,7 @@ func listenWindowsNamedPipe(address string) (net.Listener, error) {
 	}
 
 	// Attempt to create the listener.
-	return winio.ListenPipe(address, configuration)
+	return ipc.ListenPipe(address, configuration)
 }
 
 const (

@@ -112,7 +112,7 @@ func NewListener(path string) (net.Listener, error) {
 	}()
 
 	// Create the named pipe listener.
-	rawListener, err := winio.ListenPipe(pipeName, configuration)
+	rawListener, err := ListenPipe(pipeName, configuration)
 	if err != nil {
 		return nil, err
 	}
