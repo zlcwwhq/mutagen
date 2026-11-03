@@ -321,6 +321,14 @@ func relaySession(t *testing.T, session string, alpha, beta string, ignores *rem
 // session from there, returning the output.
 func setupPullSessions(t *testing.T, local, remoteFiles map[string]string) (string, func(...string) (string, error)) {
 	t.Helper()
+	return setupPullSessionsIgnoring(t, local, remoteFiles, &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"results"}})
+}
+
+// setupPullSessionsIgnoring is like setupPullSessions, but for a session with
+// the specified ignores, which may be in Git mode, in which case the rule
+// files are those of the local files.
+func setupPullSessionsIgnoring(t *testing.T, local, remoteFiles map[string]string, ignores *remote.Ignores) (string, func(...string) (string, error)) {
+	t.Helper()
 
 	// Avoid the test name and nested directory added by t.TempDir: combined
 	// with macOS's long temporary root, they exceed Unix socket path limits.
@@ -339,7 +347,6 @@ func setupPullSessions(t *testing.T, local, remoteFiles map[string]string) (stri
 	writeFiles(t, beta, remoteFiles)
 
 	// Connect the session and register its scopes.
-	ignores := &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"results"}}
 	relaySession(t, "sync_outer", alpha, beta, ignores)
 	for _, root := range []string{alpha, beta} {
 		registerScope(t, "sync_outer", root == alpha, root, ignores)
@@ -404,5 +411,56 @@ func TestPullParentSynchronizedByOtherSession(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(alpha, "results", "run1")); err == nil {
 		t.Error("parent created in content that another session synchronizes")
+	}
+}
+
+func TestPullGitMode(t *testing.T) {
+	// The ignores carry the mode, while the rule files are those of the local
+	// copy of the root.
+	local := map[string]string{
+		".gitignore":     "data/\n*.log\n.env\n",
+		"keep.txt":       "local\n",
+		"sub/.git":       "gitdir: ../.git/modules/sub\n",
+		"sub/src/main.c": "local\n",
+	}
+	remoteFiles := map[string]string{
+		"keep.txt":       "remote\n",
+		"data/big.bin":   "remote\n",
+		"run.log":        "remote\n",
+		".env":           "remote\n",
+		"sub/.git":       "gitdir: ../.git/modules/sub\n",
+		"sub/src/main.c": "remote\n",
+	}
+	alpha, pullPaths := setupPullSessionsIgnoring(t, local, remoteFiles,
+		&remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"!.env"}, VCS: true, Git: true})
+
+	// Content that rules ignore is pulled, and content that they don't isn't.
+	for _, path := range []string{"data/big.bin", "run.log"} {
+		if output, err := pullPaths(path); err != nil || !strings.Contains(output, "remote: pulled "+path+" (1 added") {
+			t.Errorf("content ignored by rules not pulled: %q, %v", output, err)
+		}
+	}
+	if output, err := pullPaths("keep.txt"); err == nil || !strings.Contains(output, "keep.txt: the session synchronizes it, so remote doesn't write it") {
+		t.Errorf("synchronized content pulled: %q, %v", output, err)
+	}
+
+	// The session's patterns take precedence over rules: they unignore .env,
+	// which a rule ignores, so it's synchronized.
+	if output, err := pullPaths(".env"); err == nil || !strings.Contains(output, ".env: the session synchronizes it, so remote doesn't write it") {
+		t.Errorf("content unignored by the session pulled: %q, %v", output, err)
+	}
+
+	// A nested repository is an ordinary directory, whose files the session
+	// synchronizes.
+	if output, err := pullPaths("sub/src/main.c"); err == nil || !strings.Contains(output, "sub/src/main.c: the session synchronizes it, so remote doesn't write it") {
+		t.Errorf("content of a nested repository pulled: %q, %v", output, err)
+	}
+
+	// A parent that doesn't exist locally is left to synchronization, since the
+	// session synchronizes it, so nothing is created in its place.
+	if output, err := pullPaths("newsub/out.log"); err == nil || !strings.Contains(output, "newsub doesn't exist locally, but the session synchronizes it") {
+		t.Errorf("parent of unsynchronized content created: %q, %v", output, err)
+	} else if _, err := os.Lstat(filepath.Join(alpha, "newsub")); err == nil {
+		t.Error("missing parent created")
 	}
 }

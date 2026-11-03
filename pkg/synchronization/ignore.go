@@ -54,10 +54,17 @@ func effectiveIgnores(configuration *Configuration, version Version) (ignore.Syn
 // fully merged) session configuration, as effectiveIgnores computes them, in
 // the form that remote uses to determine the paths that the session
 // synchronizes. Ignores can't be endpoint-specific, so either endpoint's
-// merged configuration yields the same ones.
+// merged configuration yields the same ones. In Git mode, the ignores only
+// carry the mode: the rules are files in the synchronized tree, which remote
+// reads from its system's copy of it.
 func EffectiveIgnores(configuration *Configuration, version Version) *remote.Ignores {
 	syntax, patterns, vcs := effectiveIgnores(configuration, version)
-	return &remote.Ignores{Syntax: syntax, Patterns: patterns, VCS: vcs}
+	return &remote.Ignores{
+		Syntax:   syntax,
+		Patterns: patterns,
+		VCS:      vcs,
+		Git:      GitModeEnabled(configuration, version),
+	}
 }
 
 // NewIgnorer creates the ignorer specified by a final (i.e. fully merged)

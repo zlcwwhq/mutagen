@@ -7,6 +7,7 @@ import (
 
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 	dockerignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/docker"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/gitignore"
 	mutagenignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/mutagen"
 )
 
@@ -22,6 +23,35 @@ type Ignores struct {
 	Patterns []string
 	// VCS indicates whether VCS directories are ignored.
 	VCS bool
+	// Git indicates whether the session is in Git mode, in which the rules of
+	// .gitignore files and of the root repository's .git/info/exclude apply
+	// beneath the patterns above and entries named .git (files as well as
+	// directories) are never synchronized. Those rules aren't part of the
+	// session's configuration: they're files in the synchronized tree,
+	// which each endpoint reads from its own copy, so they're evaluated on the
+	// system that evaluates the ignores, beneath the root that it has for the
+	// session (see WithRoot). Ignores that don't know their root can only tell
+	// that entries named .git are excluded.
+	Git bool `json:",omitempty"`
+	// root is the session's synchronization root on this system, with symbolic
+	// links resolved, beneath which Git mode reads rule files. It says where the
+	// ignores are evaluated rather than what the session ignores, so it isn't
+	// serialized with them: loading a registration binds it (see WithRoot).
+	root string
+}
+
+// WithRoot returns a copy of the ignores that evaluates Git mode beneath the
+// session's synchronization root on this system, which should have its
+// symbolic links resolved, since the paths that the ignores evaluate are
+// relative to it. Ignores that aren't in Git mode never read the filesystem.
+// It returns nil for nil ignores.
+func (i *Ignores) WithRoot(root string) *Ignores {
+	if i == nil {
+		return nil
+	}
+	bound := *i
+	bound.root = root
+	return &bound
 }
 
 // ExcludedInAnyForm returns the slash-separated path, relative to the
@@ -37,6 +67,10 @@ type Ignores struct {
 // that isn't unignored is excluded once nothing beneath it can be. Ignores
 // that can't be compiled exclude nothing, since sessions validate their
 // ignores.
+//
+// In Git mode, the rules of .gitignore files and .git/info/exclude apply as
+// scans apply them (see gitignore.NewIgnorer), and are read from disk each
+// time, so changes to them take effect immediately.
 //
 // Scans needn't see a path in the form given: they recompose names on
 // filesystems that decompose them, and filesystems that look up names
@@ -68,12 +102,77 @@ func (i *Ignores) ExcludedInEveryForm(path string, directory bool) string {
 	return i.excluded(path, directory, true)
 }
 
-// excluded implements ExcludedInAnyForm and, if every is true,
-// ExcludedInEveryForm.
-func (i *Ignores) excluded(path string, directory, every bool) string {
-	if i == nil || path == "" {
-		return ""
+// ExclusionSource identifies what excludes an entry from being synchronized
+// in Git mode, so that diagnostics can say where an exclusion comes from.
+type ExclusionSource uint8
+
+const (
+	// ExcludedBySession indicates the session's own patterns and VCS
+	// directories. It's also the source of every exclusion outside Git mode.
+	ExcludedBySession ExclusionSource = iota
+	// ExcludedByGitRules indicates a rule of a .gitignore file or of the root
+	// repository's .git/info/exclude.
+	ExcludedByGitRules
+	// ExcludedByGitEntry indicates an entry named .git, which Git mode never
+	// synchronizes, whether it's a file or a directory.
+	ExcludedByGitEntry
+)
+
+// ExclusionSource determines what keeps the entry at the specified path, which
+// is a directory if directory is true and another kind of entry otherwise,
+// from being synchronized, given that ExcludedInEveryForm or ExcludedInAnyForm
+// reported it as the excluded entry. Where several things exclude the entry,
+// .git entries take precedence, since nothing can unignore them, then the
+// session's own ignores, then rules, so that the source is the one that would
+// still exclude the entry if the sources that follow it were removed.
+func (i *Ignores) ExclusionSource(path string, directory bool) ExclusionSource {
+	if i == nil || !i.Git {
+		return ExcludedBySession
 	}
+	for _, component := range strings.Split(path, "/") {
+		if isGitEntry(component) {
+			return ExcludedByGitEntry
+		}
+	}
+	session := &Ignores{Syntax: i.Syntax, Patterns: i.Patterns, VCS: i.VCS}
+	if session.ExcludedInAnyForm(path, directory) != "" {
+		return ExcludedBySession
+	} else if i.excluded(path, directory, false) != "" {
+		return ExcludedByGitRules
+	}
+	return ExcludedBySession
+}
+
+// isGitEntry returns true if the name is that of Git's own entry, which Git
+// mode never synchronizes. Names are compared case-insensitively, as the
+// ignorer of Git mode does (see gitignore.NewIgnorer).
+func isGitEntry(name string) bool {
+	return len(name) == len(".git") && strings.EqualFold(name, ".git")
+}
+
+// gitEntryIgnorer is the ignorer of Git mode when the root is unknown, so that
+// no rule files can be read: it only ignores entries named .git, like the
+// ignorer of Git mode does before anything else, and defers to the session's
+// ignorer for everything else.
+type gitEntryIgnorer struct {
+	// session is the session's ignorer.
+	session ignore.Ignorer
+}
+
+// Ignore implements ignore.Ignorer.Ignore.
+func (i gitEntryIgnorer) Ignore(path string, directory bool) (ignore.IgnoreStatus, bool) {
+	if isGitEntry(path[strings.LastIndexByte(path, '/')+1:]) {
+		return ignore.IgnoreStatusIgnored, false
+	}
+	return i.session.Ignore(path, directory)
+}
+
+// ignorer creates the ignorer that scans use for the ignores, as far as the
+// ignores determine it, or returns nil if they can't be compiled or their
+// syntax is unresolved. In Git mode, the ignorer reads rule files as it
+// evaluates paths and retains what it reads, so it's created for each use,
+// rather than kept, since it wouldn't observe later changes to rule files.
+func (i *Ignores) ignorer() ignore.Ignorer {
 	var ignorer ignore.Ignorer
 	var err error
 	switch i.Syntax {
@@ -82,12 +181,34 @@ func (i *Ignores) excluded(path string, directory, every bool) string {
 	case ignore.Syntax_SyntaxDocker:
 		ignorer, err = dockerignore.NewIgnorer(i.Patterns)
 	default:
-		return ""
+		return nil
 	}
 	if err != nil {
-		return ""
+		return nil
 	} else if i.VCS {
 		ignorer = ignore.IgnoreVCS(ignorer)
+	}
+
+	// The VCS ignorer only matches directories, whereas Git mode also never
+	// synchronizes the .git files of worktrees and submodules. Without a root,
+	// there are no rule files to read, and only those entries are known.
+	if i.Git && i.root != "" {
+		ignorer = gitignore.NewIgnorer(i.root, ignorer)
+	} else if i.Git {
+		ignorer = gitEntryIgnorer{ignorer}
+	}
+	return ignorer
+}
+
+// excluded implements ExcludedInAnyForm and, if every is true,
+// ExcludedInEveryForm.
+func (i *Ignores) excluded(path string, directory, every bool) string {
+	if i == nil || path == "" {
+		return ""
+	}
+	ignorer := i.ignorer()
+	if ignorer == nil {
+		return ""
 	}
 
 	// Determine the depth at which each form is excluded. Normalization
