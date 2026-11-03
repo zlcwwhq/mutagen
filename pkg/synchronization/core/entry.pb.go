@@ -146,9 +146,9 @@ type Entry struct {
 	// two endpoints may reach the same repository through different URLs.
 	Url string `protobuf:"bytes,16,opt,name=url,proto3" json:"url,omitempty"`
 	// Seed identifies the record that an endpoint keeps of having populated a
-	// submodule with a clone. It must only be set for GitLink entries and
-	// isn't part of the entry's identity. An ancestor whose GitLink carries a
-	// seed has absorbed the content of that population.
+	// submodule with a clone (see Snapshot.seeds). It must only be set for
+	// GitLink entries and isn't part of the entry's identity. An ancestor whose
+	// GitLink carries a seed has absorbed the content of that population.
 	Seed string `protobuf:"bytes,17,opt,name=seed,proto3" json:"seed,omitempty"`
 	// AutoCRLF and EOL are the values of the core.autocrlf and core.eol
 	// settings that apply to a GitLink entry's repository, or empty if they're

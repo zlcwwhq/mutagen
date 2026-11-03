@@ -51,7 +51,18 @@ type Snapshot struct {
 	// isn't synchronized. They're informational: they don't affect
 	// synchronization, and they aren't part of the snapshot's identity, so they
 	// don't participate in snapshot equality.
-	Warnings      []*Problem `protobuf:"bytes,8,rep,name=warnings,proto3" json:"warnings,omitempty"`
+	Warnings []*Problem `protobuf:"bytes,8,rep,name=warnings,proto3" json:"warnings,omitempty"`
+	// Seeds maps the paths of submodules that this endpoint populated with a
+	// clone, and whose populations the ancestor hasn't yet absorbed, to the
+	// content of the clone (the synchronizable content that the population
+	// yielded, including the Git entry, whose seed identifies the record that
+	// the endpoint keeps of it). A population yields a transition result like
+	// any other, but if the session stops before saving the ancestor, then
+	// that content is lost, along with the knowledge that the submodule's
+	// content came from a clone rather than from changes on this endpoint.
+	// The session uses it in place of the ancestor at those paths. Like
+	// warnings, seeds aren't part of the snapshot's identity.
+	Seeds         map[string]*Entry `protobuf:"bytes,9,rep,name=seeds,proto3" json:"seeds,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -142,11 +153,18 @@ func (x *Snapshot) GetWarnings() []*Problem {
 	return nil
 }
 
+func (x *Snapshot) GetSeeds() map[string]*Entry {
+	if x != nil {
+		return x.Seeds
+	}
+	return nil
+}
+
 var File_synchronization_core_snapshot_proto protoreflect.FileDescriptor
 
 const file_synchronization_core_snapshot_proto_rawDesc = "" +
 	"\n" +
-	"#synchronization/core/snapshot.proto\x12\x04core\x1a synchronization/core/entry.proto\x1a\"synchronization/core/problem.proto\"\xc6\x02\n" +
+	"#synchronization/core/snapshot.proto\x12\x04core\x1a synchronization/core/entry.proto\x1a\"synchronization/core/problem.proto\"\xbe\x03\n" +
 	"\bSnapshot\x12%\n" +
 	"\acontent\x18\x01 \x01(\v2\v.core.EntryR\acontent\x126\n" +
 	"\x16preservesExecutability\x18\x02 \x01(\bR\x16preservesExecutability\x12,\n" +
@@ -155,7 +173,12 @@ const file_synchronization_core_snapshot_proto_rawDesc = "" +
 	"\x05files\x18\x05 \x01(\x04R\x05files\x12$\n" +
 	"\rsymbolicLinks\x18\x06 \x01(\x04R\rsymbolicLinks\x12$\n" +
 	"\rtotalFileSize\x18\a \x01(\x04R\rtotalFileSize\x12)\n" +
-	"\bwarnings\x18\b \x03(\v2\r.core.ProblemR\bwarningsB8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"
+	"\bwarnings\x18\b \x03(\v2\r.core.ProblemR\bwarnings\x12/\n" +
+	"\x05seeds\x18\t \x03(\v2\x19.core.Snapshot.SeedsEntryR\x05seeds\x1aE\n" +
+	"\n" +
+	"SeedsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12!\n" +
+	"\x05value\x18\x02 \x01(\v2\v.core.EntryR\x05value:\x028\x01B8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"
 
 var (
 	file_synchronization_core_snapshot_proto_rawDescOnce sync.Once
@@ -169,20 +192,23 @@ func file_synchronization_core_snapshot_proto_rawDescGZIP() []byte {
 	return file_synchronization_core_snapshot_proto_rawDescData
 }
 
-var file_synchronization_core_snapshot_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_synchronization_core_snapshot_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_synchronization_core_snapshot_proto_goTypes = []any{
 	(*Snapshot)(nil), // 0: core.Snapshot
-	(*Entry)(nil),    // 1: core.Entry
-	(*Problem)(nil),  // 2: core.Problem
+	nil,              // 1: core.Snapshot.SeedsEntry
+	(*Entry)(nil),    // 2: core.Entry
+	(*Problem)(nil),  // 3: core.Problem
 }
 var file_synchronization_core_snapshot_proto_depIdxs = []int32{
-	1, // 0: core.Snapshot.content:type_name -> core.Entry
-	2, // 1: core.Snapshot.warnings:type_name -> core.Problem
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	2, // 0: core.Snapshot.content:type_name -> core.Entry
+	3, // 1: core.Snapshot.warnings:type_name -> core.Problem
+	1, // 2: core.Snapshot.seeds:type_name -> core.Snapshot.SeedsEntry
+	2, // 3: core.Snapshot.SeedsEntry.value:type_name -> core.Entry
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_core_snapshot_proto_init() }
@@ -198,7 +224,7 @@ func file_synchronization_core_snapshot_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_synchronization_core_snapshot_proto_rawDesc), len(file_synchronization_core_snapshot_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   1,
+			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
