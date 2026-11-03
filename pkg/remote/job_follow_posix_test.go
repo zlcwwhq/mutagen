@@ -103,6 +103,25 @@ func followInBackground(ctx context.Context, root, id string, options *WaitOptio
 	return cancel, outcome
 }
 
+// startFollowing performs waits with the specified options, abandoning each of
+// them as a lost connection would, until one has reported where following
+// starts, which is unobservable for a follower that starts at the log's end
+// until more is appended. A wait with the same options then resumes there.
+func startFollowing(t *testing.T, ctx context.Context, root, id string, options *WaitOptions) {
+	t.Helper()
+	for timeout := 50 * time.Millisecond; !options.Follow.started; timeout *= 2 {
+		if timeout > 10*time.Second {
+			t.Fatal("following didn't start")
+		}
+		attempt, cancel := context.WithTimeout(ctx, timeout)
+		job, _, err := WaitJobWithOptions(attempt, jobRoute(attempt, root), id, options)
+		cancel()
+		if err == nil {
+			t.Fatalf("job ended while following started: %+v", job)
+		}
+	}
+}
+
 // waitOutcome is the result of a wait started by followInBackground.
 type waitOutcome struct {
 	// job is the job returned by the wait, if any.
@@ -167,11 +186,15 @@ func TestWaitJobFollowTail(t *testing.T) {
 	appendLog(t, job.Log, "1\n2\n3\n4\n")
 
 	// Following starts with the requested final lines, or at the log's end for
-	// zero lines, and long tails are limited to 1 MiB, with a warning.
+	// zero lines, and long tails are limited to 1 MiB, with a warning. Since a
+	// follower that starts at the log's end shows nothing until more is
+	// appended, its start is awaited first, or it could start after that.
 	var two, zero, all syncBuffer
 	var warnings warningRecorder
 	_, twoOutcome := followInBackground(ctx, root, job.ID, &WaitOptions{Follow: &LogFollower{Output: &two, Lines: 2}, Warn: warnings.warn})
-	_, zeroOutcome := followInBackground(ctx, root, job.ID, &WaitOptions{Follow: &LogFollower{Output: &zero, Lines: 0}, Warn: warnings.warn})
+	zeroOptions := &WaitOptions{Follow: &LogFollower{Output: &zero, Lines: 0}, Warn: warnings.warn}
+	startFollowing(t, ctx, root, job.ID, zeroOptions)
+	_, zeroOutcome := followInBackground(ctx, root, job.ID, zeroOptions)
 	two.waitFor(t, "3\n4\n")
 	appendLog(t, job.Log, "5\n")
 	two.waitFor(t, "3\n4\n5\n")
