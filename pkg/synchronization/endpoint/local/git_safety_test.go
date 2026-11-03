@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -271,6 +272,247 @@ func TestEndpointGitModeIncomingRuleFiles(t *testing.T) {
 	})
 }
 
+// TestEndpointGitModeNestedRepositoryRuleFiles checks that the rule files of a
+// nested repository without an origin, which is synchronized as a plain
+// directory, are delivered like any others, including into a directory that the
+// receiver excludes, while its .git entry stays where it is.
+func TestEndpointGitModeNestedRepositoryRuleFiles(t *testing.T) {
+	isolateGit(t)
+	for _, test := range []struct{ name, rules, excluded string }{
+		{name: "not excluded"},
+		{name: "excluded", rules: "nested/\n", excluded: "nested"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sourceRoot := newGitRoot(t, nil)
+			initializeRepository(t, filepath.Join(sourceRoot, "nested"))
+			writeTree(t, sourceRoot, map[string]string{
+				"nested/.gitignore":     "*.tmp\n",
+				"nested/data":           "data",
+				"nested/sub/.gitignore": "*.log\n",
+			})
+			targetRoot := newGitRoot(t, map[string]string{".git/info/exclude": test.rules})
+			source := newGitModeEndpoint(t, sourceRoot, synchronization.WatchMode_WatchModeNoWatch)
+			target := newGitModeEndpoint(t, targetRoot, synchronization.WatchMode_WatchModeNoWatch)
+			snapshot := scanEndpoint(t, source, true)
+			verifyKinds(t, snapshot, map[string]core.EntryKind{
+				"nested":      core.EntryKind_Directory,
+				"nested/.git": core.EntryKind_Untracked,
+			})
+
+			// Use the changes that reconciliation computes, whose new content
+			// doesn't include untracked entries, unlike propagateChanges.
+			_, _, changes, conflicts := core.ReconcileGitMode(nil, snapshot.Content, scanEndpoint(t, target, true).Content, core.SynchronizationMode_SynchronizationModeTwoWaySafe)
+			if len(conflicts) != 0 || len(changes) != 1 {
+				t.Fatalf("incorrect reconciliation: %v, %v", changes, conflicts)
+			}
+			paths, digests := core.TransitionDependencies(changes)
+			filtered, signatures, receiver, err := target.Stage(paths, digests)
+			if err != nil {
+				t.Fatal("staging failed:", err)
+			} else if err := source.Supply(filtered, signatures, receiver); err != nil {
+				t.Fatal(err)
+			}
+			_, problems, missing, err := target.Transition(context.Background(), changes)
+			if err != nil {
+				t.Fatal("transition failed:", err)
+			} else if missing {
+				t.Error("staged files missing")
+			}
+			verifyContents(t, targetRoot, "nested/.gitignore", "*.tmp\n")
+			verifyContents(t, targetRoot, "nested/sub/.gitignore", "*.log\n")
+			verifyAbsent(t, targetRoot, "nested/.git")
+			if test.excluded != "" {
+				verifyExclusionWarning(t, problems, test.excluded)
+				verifyAbsent(t, targetRoot, "nested/data")
+			} else {
+				if len(problems) != 0 {
+					t.Error("unexpected problems:", problems)
+				}
+				verifyContents(t, targetRoot, "nested/data", "data")
+			}
+		})
+	}
+}
+
+// TestEndpointGitModeGitEntriesRefused checks changes at or beneath entries
+// named .git, which scans never produce, but which a malfunctioning or hostile
+// controller could construct. There's no exception for rule files there, so
+// nothing is requested or written, however a change is shaped. The refusals are
+// failures that don't suggest anything that couldn't work, and they don't
+// affect anything else.
+func TestEndpointGitModeGitEntriesRefused(t *testing.T) {
+	isolateGit(t)
+	const contents = "*.tmp\n"
+	directory := func(contents map[string]*core.Entry) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: contents}
+	}
+
+	// setup creates a source and a target. The target's Git directories have
+	// the parents of everything that the changes below try to write, since
+	// they'd fail for lack of a parent otherwise, whether or not they're
+	// refused. It also returns an entry for a file that the source can supply.
+	setup := func(t *testing.T) (*endpoint, *endpoint, *core.Entry) {
+		sourceRoot := newGitRoot(t, map[string]string{"public": contents})
+		targetRoot := newGitRoot(t, map[string]string{"other/file": "file"})
+		initializeRepository(t, targetRoot, "--template=")
+		initializeRepository(t, filepath.Join(targetRoot, "nested"), "--template=")
+		writeTree(t, targetRoot, map[string]string{
+			".GIT/sample":          "sample",
+			".git/hooks/sample":    "sample",
+			".git/info/sample":     "sample",
+			".git/x/sample":        "sample",
+			"nested/.git/x/sample": "sample",
+		})
+		source := newGitModeEndpoint(t, sourceRoot, synchronization.WatchMode_WatchModeNoWatch)
+		target := newGitModeEndpoint(t, targetRoot, synchronization.WatchMode_WatchModeNoWatch)
+		file := entryAt(scanEndpoint(t, source, true), "public")
+		scanEndpoint(t, target, true)
+		return source, target, file
+	}
+
+	// apply stages the content of changes, which the source has for every path,
+	// and transitions the target, verifying that it only requests some of the
+	// paths and that its refusals are the expected failures.
+	apply := func(t *testing.T, source, target *endpoint, changes []*core.Change, requested, refused []string) []*core.Entry {
+		t.Helper()
+		paths, digests := core.TransitionDependencies(changes)
+		for _, path := range paths {
+			writeTree(t, source.root, map[string]string{path: contents})
+		}
+		filtered, signatures, receiver, err := target.Stage(paths, digests)
+		if err != nil {
+			t.Fatal("staging failed:", err)
+		}
+		if actual := slices.Sorted(slices.Values(filtered)); !slices.Equal(actual, requested) {
+			t.Errorf("incorrect paths requested: %v != %v", actual, requested)
+		}
+		if len(filtered) > 0 {
+			if err := source.Supply(filtered, signatures, receiver); err != nil {
+				t.Fatal(err)
+			}
+		}
+		results, problems, missing, err := target.Transition(context.Background(), changes)
+		if err != nil {
+			t.Fatal("transition failed:", err)
+		} else if missing {
+			t.Error("staged files missing")
+		}
+		var actual []string
+		for _, problem := range problems {
+			actual = append(actual, problem.Path)
+			if problem.Warning {
+				t.Error("refusal reported as a warning:", problem)
+			}
+			if !strings.Contains(problem.Error, "never synchronized") {
+				t.Error("incorrect refusal:", problem)
+			}
+			if strings.Contains(problem.Error, "ignore.paths") || strings.Contains(problem.Error, "!") {
+				t.Error("refusal suggests a pattern, which can't work:", problem)
+			}
+		}
+		if !slices.Equal(actual, refused) {
+			t.Errorf("incorrect refusals: %v != %v", actual, refused)
+		}
+		return results
+	}
+
+	// Staging must not request even the bytes of what would be refused. Nothing
+	// else asks for a receiver here, so there mustn't be one.
+	t.Run("staging", func(t *testing.T) {
+		_, target, file := setup(t)
+		paths := []string{
+			".GIT/.gitignore",
+			".git/.gitignore",
+			".git/hooks/.gitignore",
+			".git/hooks/pre-commit",
+			".git/info/exclude",
+			".git/x/.gitignore",
+			"nested/.git/x/.gitignore",
+		}
+		digests := make([][]byte, len(paths))
+		for p := range paths {
+			digests[p] = file.Digest
+		}
+		filtered, _, receiver, err := target.Stage(paths, digests)
+		if err != nil || len(filtered) != 0 || receiver != nil {
+			t.Fatalf("files in Git directories requested: %v, %v", filtered, err)
+		}
+	})
+
+	// Changes at the paths of individual files.
+	t.Run("files", func(t *testing.T) {
+		source, target, file := setup(t)
+		root := target.root
+		refused := []string{
+			".GIT/.gitignore",
+			".git/.gitignore",
+			".git/hooks/.gitignore",
+			".git/hooks/pre-commit",
+			".git/info/exclude",
+			".git/x/.gitignore",
+			"nested/.git/x/.gitignore",
+		}
+		var changes []*core.Change
+		for _, path := range refused {
+			changes = append(changes, &core.Change{Path: path, New: file})
+		}
+		changes = append(changes, &core.Change{Path: "nested/.gitignore", New: file}, &core.Change{Path: "public", New: file})
+		results := apply(t, source, target, changes,
+			[]string{"nested/.gitignore", "public"},
+			[]string{".GIT", ".git", "nested/.git"},
+		)
+		for c, path := range refused {
+			verifyAbsent(t, root, path)
+			if results[c] != nil {
+				t.Errorf("incorrect result for %s: %v", path, results[c])
+			}
+		}
+		verifyContents(t, root, "nested/.gitignore", contents)
+		verifyContents(t, root, "public", contents)
+		if !results[len(refused)].Equal(file, true) || !results[len(refused)+1].Equal(file, true) {
+			t.Error("incorrect results for other changes:", results[len(refused):])
+		}
+	})
+
+	// Changes that create directories, either beneath a Git entry, as a Git
+	// entry, or with a Git entry among their contents.
+	t.Run("directories", func(t *testing.T) {
+		source, target, file := setup(t)
+		root := target.root
+		rules := directory(map[string]*core.Entry{".gitignore": file})
+		results := apply(t, source, target,
+			[]*core.Change{
+				{Path: ".git/y", New: rules},
+				{Path: "new", New: directory(map[string]*core.Entry{
+					".git": directory(map[string]*core.Entry{
+						".gitignore": file,
+						"hooks":      directory(map[string]*core.Entry{".gitignore": file, "pre-commit": file}),
+						"info":       directory(map[string]*core.Entry{"exclude": file}),
+					}),
+					".gitignore": file,
+					"public":     file,
+				})},
+				{Path: "other/.git", New: rules},
+				{Path: "public", New: file},
+			},
+			[]string{"new/.gitignore", "new/public", "public"},
+			[]string{".git", "new/.git", "other/.git"},
+		)
+		for _, path := range []string{".git/y", "new/.git", "other/.git"} {
+			verifyAbsent(t, root, path)
+		}
+		verifyContents(t, root, "new/.gitignore", contents)
+		verifyContents(t, root, "new/public", contents)
+		verifyContents(t, root, "public", contents)
+		expected := []*core.Entry{nil, directory(map[string]*core.Entry{".gitignore": file, "public": file}), nil, file}
+		for r, result := range results {
+			if !result.Equal(expected[r], true) {
+				t.Errorf("incorrect result %d: %v", r, result)
+			}
+		}
+	})
+}
+
 // TestEndpointGitModeRefusalResults checks that a refusal doesn't affect the
 // results of the changes around it, which must correspond to the changes.
 func TestEndpointGitModeRefusalResults(t *testing.T) {
@@ -471,6 +713,12 @@ func TestPruneGitTransitions(t *testing.T) {
 			expected: []*core.Entry{file, file},
 		},
 		{
+			name:     "rule file replaced by a directory that only rules for directories exclude",
+			rules:    ".gitignore/\n",
+			changes:  []*core.Change{{Path: ".gitignore", Old: file, New: directory(map[string]*core.Entry{".gitignore": other, "sub": directory(map[string]*core.Entry{".gitignore": other})})}},
+			expected: []*core.Entry{directory(map[string]*core.Entry{".gitignore": other, "sub": directory(map[string]*core.Entry{".gitignore": other})})},
+		},
+		{
 			name:     "only regular files provide rules",
 			rules:    "outputs/\n",
 			changes:  []*core.Change{{Path: "outputs", New: directory(map[string]*core.Entry{".gitignore": link})}, {Path: "outputs/sub", New: directory(map[string]*core.Entry{".gitignore": directory(nil)})}},
@@ -519,13 +767,120 @@ func TestPruneGitTransitions(t *testing.T) {
 			warnings: warnings{"pkg/debug.log"},
 			failures: failures{"pkg/" + long},
 		},
+		{
+			name: "rule files in Git directories",
+			changes: []*core.Change{
+				{Path: ".git/.gitignore", New: file},
+				{Path: ".git/hooks/.gitignore", New: file},
+				{Path: ".git/info/exclude", New: file},
+				{Path: ".git/x/.gitignore", Old: other, New: file},
+				{Path: "a/.git/x/.gitignore", New: file},
+				{Path: ".GIT/.gitignore", New: file},
+				{Path: "public", New: file},
+			},
+			expected: []*core.Entry{nil, nil, nil, nil, nil, nil, file},
+			failures: failures{".git", "a/.git", ".GIT"},
+		},
+		{
+			name:     "other content in Git directories",
+			changes:  []*core.Change{{Path: ".git/hooks/pre-commit", New: file}, {Path: "a/.git/config", New: other}, {Path: ".git/hooks/link", New: link}},
+			expected: []*core.Entry{nil, nil, nil},
+			failures: failures{".git", "a/.git"},
+		},
+		{
+			name:     "Git entries of any kind",
+			changes:  []*core.Change{{Path: ".git", New: file}, {Path: "a/.git", New: link}, {Path: "b/.Git", New: file}, {Path: "c/.git", New: directory(nil)}},
+			expected: []*core.Entry{nil, nil, nil, nil},
+			failures: failures{".git", "a/.git", "b/.Git", "c/.git"},
+		},
+		{
+			name: "directory named .git with rule files",
+			changes: []*core.Change{{Path: ".git", New: directory(map[string]*core.Entry{
+				".gitignore": file,
+				"hooks":      directory(map[string]*core.Entry{".gitignore": other, "pre-commit": file}),
+				"info":       directory(map[string]*core.Entry{"exclude": file}),
+			})}},
+			expected: []*core.Entry{nil},
+			failures: failures{".git"},
+		},
+		{
+			name:     "directory beneath a Git entry with rule files",
+			changes:  []*core.Change{{Path: "a/.git/x", New: directory(map[string]*core.Entry{".gitignore": file})}},
+			expected: []*core.Entry{nil},
+			failures: failures{"a/.git"},
+		},
+		{
+			name:     "Git entry among other content",
+			changes:  []*core.Change{{Path: "pkg", New: directory(map[string]*core.Entry{".git": directory(map[string]*core.Entry{".gitignore": file}), ".gitignore": file, "a": file})}},
+			expected: []*core.Entry{directory(map[string]*core.Entry{".gitignore": file, "a": file})},
+			failures: failures{"pkg/.git"},
+		},
+		{
+			name:     "Git entry deep in other content",
+			changes:  []*core.Change{{Path: "pkg", New: directory(map[string]*core.Entry{"a": file, "sub": directory(map[string]*core.Entry{".GIT": directory(map[string]*core.Entry{".gitignore": file}), "b": file})})}},
+			expected: []*core.Entry{directory(map[string]*core.Entry{"a": file, "sub": directory(map[string]*core.Entry{"b": file})})},
+			failures: failures{"pkg/sub/.GIT"},
+		},
+		{
+			name:     "Git entry in root",
+			changes:  []*core.Change{{Path: "", New: directory(map[string]*core.Entry{".git": directory(map[string]*core.Entry{"info": directory(map[string]*core.Entry{"exclude": file})}), "a": file})}},
+			expected: []*core.Entry{directory(map[string]*core.Entry{"a": file})},
+			failures: failures{".git"},
+		},
+		{
+			name:     "Git entry in excluded directory with rule files",
+			rules:    "outputs/\n",
+			changes:  []*core.Change{{Path: "outputs", New: directory(map[string]*core.Entry{".git": directory(map[string]*core.Entry{".gitignore": other}), ".gitignore": file})}},
+			expected: []*core.Entry{directory(map[string]*core.Entry{".gitignore": file})},
+			failures: failures{"outputs/.git"},
+		},
+		{
+			name:     "Git entry in excluded directory without rule files",
+			rules:    "outputs/\n",
+			changes:  []*core.Change{{Path: "outputs", New: directory(map[string]*core.Entry{".git": directory(map[string]*core.Entry{".gitignore": other})})}},
+			expected: []*core.Entry{nil},
+			warnings: warnings{"outputs"},
+			failures: failures{"outputs/.git"},
+		},
+		{
+			name:     "rule file beneath Git entry beneath excluded path",
+			rules:    "outputs/\n",
+			changes:  []*core.Change{{Path: "outputs/.git/.gitignore", New: file}, {Path: "outputs/.gitignore", New: other}},
+			expected: []*core.Entry{nil, other},
+			failures: failures{"outputs/.git"},
+		},
+		{
+			name:     "rule files beneath names that resemble a Git entry",
+			rules:    ".gitx/\nx.git/\n",
+			changes:  []*core.Change{{Path: ".gitx/.gitignore", New: file}, {Path: "x.git/.gitignore", New: file}},
+			expected: []*core.Entry{file, file},
+		},
+		{
+			name:     "other content beneath names that resemble a Git entry",
+			rules:    ".gitx/\n",
+			changes:  []*core.Change{{Path: ".gitx/file", New: file}, {Path: "x.git/file", New: file}},
+			expected: []*core.Entry{nil, file},
+			warnings: warnings{".gitx"},
+		},
+		{
+			name: "names that filesystems can treat as a Git entry",
+			changes: []*core.Change{
+				{Path: ".git.", New: directory(map[string]*core.Entry{"config": file})},
+				{Path: "a/git~1/config", New: file},
+				{Path: "b", New: directory(map[string]*core.Entry{".git ": directory(map[string]*core.Entry{"config": file}), "c": file})},
+				{Path: "d/.git::$INDEX_ALLOCATION", New: file},
+				{Path: "e/.g\u200cit", New: link},
+			},
+			expected: []*core.Entry{nil, nil, directory(map[string]*core.Entry{"c": file}), nil, nil},
+			failures: failures{".git.", "a/git~1", "b/.git ", "d/.git::$INDEX_ALLOCATION", "e/.g\u200cit"},
+		},
 	}
 
 	// Process test cases.
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
-			if test.failures != nil {
+			if slices.ContainsFunc(test.failures, func(path string) bool { return strings.Contains(path, long) }) {
 				if _, err := os.Lstat(filepath.Join(root, long)); err == nil || os.IsNotExist(err) {
 					t.Skip("this system doesn't reject long names:", err)
 				}
@@ -631,4 +986,186 @@ func TestEndpointGitModeSymbolicLinkReplacement(t *testing.T) {
 			verifyAbsent(t, targetRoot, "other/file.txt")
 		})
 	}
+}
+
+// TestPruneGitTransitionsOldContent tests that pruneGitTransitions refuses
+// changes that would remove a Git entry or anything beneath one, which only a
+// malfunctioning or compromised controller could request, since neither the
+// ancestor nor the synchronizable part of a scan has Git entries.
+func TestPruneGitTransitionsOldContent(t *testing.T) {
+	// Create the entries for tests.
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	link := &core.Entry{Kind: core.EntryKind_SymbolicLink, Target: "target"}
+	untracked := &core.Entry{Kind: core.EntryKind_Untracked}
+	directory := func(contents map[string]*core.Entry) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: contents}
+	}
+
+	// Define test cases.
+	tests := []struct {
+		name     string
+		change   *core.Change
+		refused  bool
+		failures []string
+	}{
+		{"Git entry", &core.Change{Path: ".git", Old: directory(nil)}, true, []string{".git"}},
+		{"untracked Git entry", &core.Change{Path: ".git", Old: untracked}, true, []string{".git"}},
+		{"nested Git entry", &core.Change{Path: "a/.Git", Old: link}, true, []string{"a/.Git"}},
+		{"directory beneath Git entry", &core.Change{Path: ".git/hooks", Old: directory(nil)}, true, []string{".git"}},
+		{"symbolic link beneath Git entry", &core.Change{Path: "a/.GIT/link", Old: link}, true, []string{"a/.GIT"}},
+		{"file beneath Git entry", &core.Change{Path: ".git/HEAD", Old: file}, true, []string{".git"}},
+		{"Git entry in deletion", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{".git": directory(nil), "b": file})}, true, []string{"a/.git"}},
+		{"Git entry deep in deletion", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{"b": directory(map[string]*core.Entry{".GIT": link})})}, true, []string{"a/b/.GIT"}},
+		{"Git entry in type change", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{".git": directory(nil)}), New: file}, true, []string{"a/.git"}},
+		{"Git entry in root replacement", &core.Change{Old: directory(map[string]*core.Entry{".git": file}), New: directory(map[string]*core.Entry{"a": file})}, true, []string{".git"}},
+		{"Git entry in nothing but old content", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{".git": link}), New: directory(nil)}, true, []string{"a/.git"}},
+		{"untracked Git entry in deletion", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{".git": untracked, "b": file})}, true, []string{"a/.git"}},
+		{"name that NTFS treats as a Git entry in deletion", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{"git~1": link})}, true, []string{"a/git~1"}},
+		{"name that HFS+ treats as a Git entry", &core.Change{Path: "a/.g\u200cit/link", Old: link}, true, []string{"a/.g\u200cit"}},
+		{"names that resemble a Git entry", &core.Change{Path: ".gitx", Old: directory(map[string]*core.Entry{"x.git": file, ".git2": link})}, false, nil},
+		{"unrelated deletion", &core.Change{Path: "a", Old: file}, false, nil},
+	}
+
+	// Process test cases. Each is accompanied by a change that's unaffected.
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			unaffected := &core.Change{Path: "unaffected", New: file}
+			results, problems := pruneGitTransitions(gitignore.NewIgnorer(t.TempDir(), nil), []*core.Change{test.change, unaffected})
+			if test.refused && results[0] != nil {
+				t.Error("change not refused:", results[0])
+			} else if !test.refused && results[0] != test.change {
+				t.Error("change not left as is:", results[0])
+			}
+			if results[1] != unaffected {
+				t.Error("unaffected change not left as is:", results[1])
+			}
+			var failures []string
+			for _, problem := range problems {
+				if problem.Warning {
+					t.Error("refusal reported as a warning:", problem)
+				}
+				failures = append(failures, problem.Path)
+			}
+			if !slices.Equal(failures, test.failures) {
+				t.Errorf("incorrect failures: %v != %v", failures, test.failures)
+			}
+		})
+	}
+}
+
+// TestEndpointGitModeRemovalsFromGitEntries tests that crafted changes don't
+// remove anything from Git entries on disk, including the empty directories and
+// symbolic links that removals don't need any cached information about, and that
+// a change that's refused for this doesn't remove anything else either.
+func TestEndpointGitModeRemovalsFromGitEntries(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links may require privileges")
+	}
+
+	// Create Git entries with content that could be removed, along with enough
+	// other content for the endpoint to accept that many entries being removed.
+	isolateGit(t)
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{"a": "a", "b": "b", "c": "c", "d": "d", "e": "e", "f": "f", "plain/file": "file"})
+	initializeRepository(t, root)
+	initializeRepository(t, filepath.Join(root, "plain"))
+	for _, path := range []string{".git/refs/tags", "nested/.git/refs", "typed/.git"} {
+		if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(path)), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("HEAD", filepath.Join(root, ".git", "link")); err != nil {
+		t.Fatal(err)
+	}
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	snapshot := scanEndpoint(t, e, true)
+
+	// Create changes that would remove that content.
+	empty := &core.Entry{Kind: core.EntryKind_Directory}
+	directory := func(contents map[string]*core.Entry) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: contents}
+	}
+	refs := directory(map[string]*core.Entry{"refs": empty})
+	changes := []*core.Change{
+		{Path: ".git/refs/tags", Old: empty},
+		{Path: ".git/link", Old: &core.Entry{Kind: core.EntryKind_SymbolicLink, Target: "HEAD"}},
+		{Path: "nested", Old: directory(map[string]*core.Entry{".git": refs})},
+		{Path: "typed", Old: directory(map[string]*core.Entry{".git": empty}), New: empty},
+		{Path: "plain", Old: entryAt(snapshot, "plain")},
+	}
+
+	// Perform the changes.
+	results, problems, _, err := e.Transition(context.Background(), changes)
+	if err != nil {
+		t.Fatal("transition failed:", err)
+	}
+
+	// Everything is still there.
+	for c := range changes {
+		if !results[c].Equal(changes[c].Old, true) {
+			t.Errorf("change %d not reported as refused: %v", c, results[c])
+		}
+	}
+	for _, path := range []string{".git/refs/tags", ".git/link", "nested/.git/refs", "typed/.git", "plain/.git", "plain/file"} {
+		if _, err := os.Lstat(filepath.Join(root, filepath.FromSlash(path))); err != nil {
+			t.Errorf("%s removed or can't be checked: %v", path, err)
+		}
+	}
+
+	// The refusals are failures that describe the Git entries.
+	var reported []string
+	for _, problem := range problems {
+		reported = append(reported, problem.Path)
+		if problem.Warning {
+			t.Error("problem reported as a warning:", problem)
+		}
+	}
+	if expected := []string{".git", "nested/.git", "typed/.git", "plain/.git"}; !slices.Equal(reported, expected) {
+		t.Errorf("incorrect problems: %v != %v", reported, expected)
+	}
+}
+
+// TestEndpointGitModePathsOutsideRoot tests that a crafted path that leads out
+// of the root doesn't reveal anything about the rules there, and that it doesn't
+// affect anything there.
+func TestEndpointGitModePathsOutsideRoot(t *testing.T) {
+	// Create rules outside of the root that exclude what the changes create.
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	writeTree(t, parent, map[string]string{".gitignore": "secret\n", "root/public": "public"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	scanEndpoint(t, e, true)
+
+	// Perform the changes.
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	changes := []*core.Change{
+		{Path: "../secret", New: file},
+		{Path: "../other", New: &core.Entry{Kind: core.EntryKind_Directory}},
+		{Path: "../secret/file", New: file},
+	}
+	results, problems, _, err := e.Transition(context.Background(), changes)
+	if err != nil {
+		t.Fatal("transition failed:", err)
+	}
+
+	// All of them are refused, as failures that don't depend on any rules.
+	for c, result := range results {
+		if result != nil {
+			t.Errorf("change %d applied: %v", c, result)
+		}
+	}
+	reported := make(map[string]bool)
+	for _, problem := range problems {
+		reported[problem.Path] = true
+		if problem.Warning {
+			t.Error("rules outside of the root used to warn:", problem)
+		}
+	}
+	for _, change := range changes {
+		if !reported[change.Path] {
+			t.Errorf("no problem for %s: %v", change.Path, problems)
+		}
+	}
+	verifyAbsent(t, parent, "secret")
+	verifyAbsent(t, parent, "other")
 }

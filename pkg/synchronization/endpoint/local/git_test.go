@@ -170,6 +170,42 @@ func TestGitModeEventRelevant(t *testing.T) {
 	}
 }
 
+// TestContainsGitRulePath tests containsGitRulePath, which unlike what's
+// delivered has to include the exclude file, since local edits to it change
+// what's ignored.
+func TestContainsGitRulePath(t *testing.T) {
+	tests := []struct {
+		paths    []string
+		expected bool
+	}{
+		{nil, false},
+		{[]string{"a", "a/b"}, false},
+		{[]string{".gitignore"}, true},
+		{[]string{"a", "a/.gitignore"}, true},
+		{[]string{".git/info/exclude"}, true},
+		{[]string{"a", ".git/info/exclude"}, true},
+
+		// Other paths in Git directories that events can report, which don't
+		// provide rules, and which thus don't require a full scan.
+		{[]string{".git/HEAD", ".git/refs/heads/main"}, false},
+		{[]string{".git/.gitignore"}, false},
+		{[]string{".git/refs/.gitignore"}, false},
+		{[]string{".git/x/.gitignore"}, false},
+		{[]string{".GIT/.gitignore"}, false},
+		{[]string{"a/.git/x/.gitignore"}, false},
+		{[]string{"a/.git/info/exclude"}, false},
+	}
+	for _, test := range tests {
+		paths := make(map[string]bool, len(test.paths))
+		for _, path := range test.paths {
+			paths[path] = true
+		}
+		if result := containsGitRulePath(paths); result != test.expected {
+			t.Errorf("incorrect result for %v: %t != %t", test.paths, result, test.expected)
+		}
+	}
+}
+
 // TestShallowestUntracked tests shallowestUntracked.
 func TestShallowestUntracked(t *testing.T) {
 	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}

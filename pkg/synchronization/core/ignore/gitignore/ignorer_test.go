@@ -63,35 +63,119 @@ func expectIgnored(t *testing.T, ignorer ignore.Ignorer, path string, directory,
 	}
 }
 
-// TestIsRulePath tests that IsRulePath behaves as expected.
-func TestIsRulePath(t *testing.T) {
+// TestRuleFilePredicates tests AffectsIgnoreEvaluation and
+// IsDeliverableRuleFile. They only disagree about the root repository's exclude
+// file, which affects ignore evaluation, but which is inside a Git directory.
+func TestRuleFilePredicates(t *testing.T) {
 	tests := []struct {
-		path     string
-		expected bool
+		path        string
+		affects     bool
+		deliverable bool
 	}{
-		{".gitignore", true},
-		{"a/.gitignore", true},
-		{"a/b/.gitignore", true},
-		{".git/info/exclude", true},
-		{"", false},
-		{"a", false},
-		{"gitignore", false},
-		{".Gitignore", false},
-		{".gitignore2", false},
-		{"x.gitignore", false},
-		{"a/x.gitignore", false},
-		{".gitignore/x", false},
-		{".git", false},
-		{".git/info", false},
-		{".git/info/Exclude", false},
-		{".git/info/exclude/x", false},
-		{".git/config", false},
-		{"a/.git/info/exclude", false},
-		{"a/.gitignore/.git/info/exclude", false},
+		// Rule files, including beneath names that merely resemble a Git entry.
+		{".gitignore", true, true},
+		{"a/.gitignore", true, true},
+		{"a/b/.gitignore", true, true},
+		{".gitignore/.gitignore", true, true},
+		{".gitx/.gitignore", true, true},
+		{"x.git/.gitignore", true, true},
+		{"git/.gitignore", true, true},
+		{".git2/hooks/.gitignore", true, true},
+
+		// Rule files whose names differ in case, which provide rules on
+		// case-insensitive filesystems.
+		{".GITIGNORE", true, true},
+		{".Gitignore", true, true},
+		{"a/.GitIgnore", true, true},
+
+		// The exclude file, which only exists in this form at the root.
+		{".git/info/exclude", true, false},
+
+		// Anything else beneath a Git entry, whatever its name.
+		{".git/.gitignore", false, false},
+		{".git/hooks/.gitignore", false, false},
+		{".git/info/.gitignore", false, false},
+		{"a/.git/.gitignore", false, false},
+		{"a/.git/x/.gitignore", false, false},
+		{".gitignore/.git/.gitignore", false, false},
+		{".GIT/.gitignore", false, false},
+		{".Git/hooks/.gitignore", false, false},
+		{"a/.gIt/.gitignore", false, false},
+		{".git/hooks/pre-commit", false, false},
+		{".git/config", false, false},
+		{".git/info", false, false},
+		{".git/info/Exclude", false, false},
+		{".git/info/exclude/x", false, false},
+		{".GIT/info/exclude", false, false},
+		{"a/.git/info/exclude", false, false},
+		{"a/.gitignore/.git/info/exclude", false, false},
+		{".git", false, false},
+
+		// Anything else.
+		{"", false, false},
+		{"a", false, false},
+		{"gitignore", false, false},
+		{".gitignor\u0435", false, false},
+		{".g\u0130tignore", false, false},
+		{".GIT/.GITIGNORE", false, false},
+		{".gitignore2", false, false},
+		{"x.gitignore", false, false},
+		{"a/x.gitignore", false, false},
+		{".gitignore/x", false, false},
+		{"exclude", false, false},
+		{"info/exclude", false, false},
 	}
 	for _, test := range tests {
-		if IsRulePath(test.path) != test.expected {
-			t.Errorf("path %q: result did not match expected: %v != %v", test.path, !test.expected, test.expected)
+		if result := AffectsIgnoreEvaluation(test.path); result != test.affects {
+			t.Errorf("path %q: AffectsIgnoreEvaluation did not match expected: %v != %v", test.path, result, test.affects)
+		}
+		if result := IsDeliverableRuleFile(test.path); result != test.deliverable {
+			t.Errorf("path %q: IsDeliverableRuleFile did not match expected: %v != %v", test.path, result, test.deliverable)
+		}
+	}
+}
+
+// TestShallowestGitEntry tests ShallowestGitEntry, along with the fact that the
+// ignorer agrees about which entries are Git entries.
+func TestShallowestGitEntry(t *testing.T) {
+	ignorer := NewIgnorer(t.TempDir(), nil)
+	tests := []struct {
+		path     string
+		expected string
+	}{
+		{"", ""},
+		{"a", ""},
+		{"a/b", ""},
+		{".gitignore", ""},
+		{".gitx/a", ""},
+		{"x.git/a", ""},
+		{"git/a", ""},
+		{".gi/a", ""},
+		{" .git/a", ""},
+		{"git~2/a", ""},
+		{".git /a", ".git "},
+		{"a/git~1/b", "a/git~1"},
+		{"a/.git./.git/b", "a/.git."},
+		{"a/.g\u200cit/b", "a/.g\u200cit"},
+		{".git", ".git"},
+		{".GIT", ".GIT"},
+		{".Git", ".Git"},
+		{".gIt/a", ".gIt"},
+		{".git/a", ".git"},
+		{".git/a/b", ".git"},
+		{".git/.git/a", ".git"},
+		{"a/.git", "a/.git"},
+		{"a/.git/b", "a/.git"},
+		{"a/b/.Git/c/d", "a/b/.Git"},
+	}
+	for _, test := range tests {
+		if result := ShallowestGitEntry(test.path); result != test.expected {
+			t.Errorf("path %q: result did not match expected: %q != %q", test.path, result, test.expected)
+		}
+		if excluded, err := ignore.Excluded(ignorer, test.path, false); err != nil {
+			t.Errorf("path %q: unable to evaluate: %v", test.path, err)
+		} else if excluded != test.expected {
+			t.Errorf("path %q: ignorer did not agree: %q != %q", test.path, excluded, test.expected)
 		}
 	}
 }
@@ -122,8 +206,90 @@ func TestIgnoreGitMetadata(t *testing.T) {
 
 	// Check that similar names aren't affected.
 	ignorer := NewIgnorer(root, nil)
-	for _, path := range []string{".gitx", "x.git", "git", ".gi", ".git ", " .git", ".gitignore", "a.git/b", ".git/b"} {
+	for _, path := range []string{".gitx", "x.git", "git", ".gi", ".git.x", " .git", ".gitignore", "a.git/b", ".git/b", "git~2"} {
 		expectIgnored(t, ignorer, path, false, false)
+	}
+
+	// Check that names that filesystems can treat as ".git" are ignored too.
+	for _, path := range []string{".git.", "sub/.git ", "git~1", "sub/GIT~1", ".git::$INDEX_ALLOCATION", ".g\u200cit"} {
+		for _, directory := range []bool{false, true} {
+			if status, continueTraversal := NewIgnorer(root, session).Ignore(path, directory); status != ignore.IgnoreStatusIgnored || continueTraversal {
+				t.Errorf("path %q (directory: %v): result did not match expected: (%d, %v)", path, directory, status, continueTraversal)
+			}
+		}
+	}
+}
+
+// gitEntryTests are the test cases for IsGitEntry.
+var gitEntryTests = []struct {
+	name     string
+	expected bool
+}{
+	// Case variants.
+	{".git", true},
+	{".GIT", true},
+	{".Git", true},
+	{".gIt", true},
+
+	// NTFS: trailing dots and spaces, streams, short names, and parts of
+	// names separated by backslashes.
+	{".git.", true},
+	{".git..", true},
+	{".git ", true},
+	{".git . .", true},
+	{".git:", true},
+	{".git:stream", true},
+	{".git::$INDEX_ALLOCATION", true},
+	{".git. :x", true},
+	{"git~1", true},
+	{"GIT~1", true},
+	{"Git~1. ", true},
+	{"git~1:x", true},
+	{"x\\.git", true},
+	{".git\\x", true},
+	{"a\\b\\git~1", true},
+	{".git.x", false},
+	{".git x", false},
+	{".git.:x", true},
+	{"git~2", false},
+	{"git~10", false},
+	{"git~", false},
+	{"git1", false},
+	{"x.git", false},
+	{" .git", false},
+	{"a\\b", false},
+
+	// HFS+: ignored code points anywhere.
+	{".g\u200cit", true},
+	{".gi\u200dt", true},
+	{"\u200e.git", true},
+	{".git\u200f", true},
+	{".\u202ag\u202bi\u202ct\u202d\u202e", true},
+	{".\u206aG\u206bI\u206cT\u206d\u206e\u206f", true},
+	{"\ufeff.git", true},
+	{".g\u200bit", false},
+	{".g\u00edt", false},
+	{".git\u200cx", false},
+	{"\u200c", false},
+	{".gi\xfft", false},
+
+	// Anything else.
+	{"", false},
+	{".", false},
+	{".gi", false},
+	{"git", false},
+	{".gitx", false},
+	{".gitignore", false},
+	{".git2", false},
+}
+
+// TestIsGitEntry tests that IsGitEntry classifies names as Git does when it
+// protects ".git" on NTFS and HFS+.
+func TestIsGitEntry(t *testing.T) {
+	for _, test := range gitEntryTests {
+		if result := IsGitEntry(test.name); result != test.expected {
+			t.Errorf("name %q: result did not match expected: %v != %v", test.name, result, test.expected)
+		}
 	}
 }
 
@@ -691,4 +857,74 @@ func TestIgnorerSymbolicLinkDirectories(t *testing.T) {
 	// The rules still apply at the targets themselves.
 	expectIgnored(t, ignorer, "elsewhere/secret", false, true)
 	expectIgnored(t, ignorer, "elsewhere/sub/deep", false, true)
+}
+
+// TestPathsThatLeaveRoot tests that a path that a scan could never reach can't
+// cause rule files outside of the root to be read, and that names that merely
+// resemble the ones that do this aren't affected.
+func TestPathsThatLeaveRoot(t *testing.T) {
+	// Create rules outside of the root that would exclude the name that's used
+	// in the paths below, and rules inside of the root that don't.
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	tree := map[string]string{
+		".gitignore":          "secret\n",
+		"outside/.gitignore":  "secret\n",
+		"root/.gitignore":     "public\n",
+		"root/a/b/file":       "file",
+		"root/..x/.gitignore": "secret\n",
+	}
+	dotted := []string{"..x/secret"}
+
+	// Windows doesn't have directories whose names consist of dots.
+	if runtime.GOOS != "windows" {
+		tree["root/.../.gitignore"] = "secret\n"
+		dotted = append(dotted, ".../secret")
+	}
+	writeTree(t, parent, tree)
+
+	// Nothing but the root's rules apply to these, whatever they refer to.
+	separator := string(filepath.Separator)
+	for _, path := range []string{
+		"../secret",
+		"../outside/secret",
+		"a/../../secret",
+		"a/b/../../../secret",
+		"../../" + filepath.Base(parent) + "/secret",
+		"./../secret",
+		".." + separator + "outside/secret",
+	} {
+		ignorer := NewIgnorer(root, nil)
+		if excluded, err := ignore.Excluded(ignorer, path, false); err != nil {
+			t.Errorf("path %q: unable to evaluate: %v", path, err)
+		} else if excluded != "" {
+			t.Errorf("path %q: rules outside of the root used to exclude %q", path, excluded)
+		}
+	}
+
+	// The root's rules do apply to them.
+	if excluded, err := ignore.Excluded(NewIgnorer(root, nil), "../public", false); err != nil {
+		t.Error("unable to evaluate:", err)
+	} else if excluded != "../public" {
+		t.Error("rules of the root not used:", excluded)
+	}
+
+	// Names that merely begin with dots are ordinary names.
+	for _, path := range dotted {
+		if excluded, err := ignore.Excluded(NewIgnorer(root, nil), path, false); err != nil {
+			t.Errorf("path %q: unable to evaluate: %v", path, err)
+		} else if excluded != path {
+			t.Errorf("path %q: rules of directory not used: %q", path, excluded)
+		}
+	}
+
+	// A backslash is only special where it's a path separator.
+	if runtime.GOOS != "windows" {
+		writeTree(t, root, map[string]string{`b\c/.gitignore`: "secret\n"})
+		if excluded, err := ignore.Excluded(NewIgnorer(root, nil), `b\c/secret`, false); err != nil {
+			t.Error("unable to evaluate:", err)
+		} else if excluded != `b\c/secret` {
+			t.Error("rules of directory with a backslash in its name not used:", excluded)
+		}
+	}
 }

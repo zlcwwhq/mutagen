@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 )
@@ -17,6 +18,8 @@ const (
 	// ruleFileName is the name of the rule files that are found in directories
 	// throughout a tree.
 	ruleFileName = ".gitignore"
+	// gitEntryName is the name of Git's own entry in a directory.
+	gitEntryName = ".git"
 	// excludeFilePath is the slash-separated, root-relative path of the rule
 	// file for the root repository.
 	excludeFilePath = ".git/info/exclude"
@@ -30,15 +33,141 @@ const (
 	maximumPointerFileSize = 64 * 1024
 )
 
-// IsRulePath returns true if a root-relative, slash-separated path identifies a
-// file whose contents affect ignore evaluation. This is the case for any file
-// whose base name is ".gitignore" and for the root repository's
-// ".git/info/exclude" file.
-func IsRulePath(path string) bool {
-	if path == excludeFilePath {
-		return true
+// IsGitEntry returns true if a name is that of Git's own entry in a directory,
+// which is either a directory or a file that points to one, or if a filesystem
+// can treat it as that name. Such entries are never synchronized in Git mode
+// (see Ignore), and nothing at or beneath them is ever written. A name that's
+// an ordinary one on one endpoint can be ".git" on another, so names are
+// classified as Git classifies them when it protects ".git" from paths that
+// it checks out (as it does with core.protectNTFS, which is enabled by
+// default on every system, and with core.protectHFS), whatever the systems
+// involved: ".git" in any case, as well as the names that NTFS and HFS+ treat
+// as ".git" (see isNTFSGitEntry and isHFSGitEntry).
+func IsGitEntry(name string) bool {
+	return isNTFSGitEntry(name) || isHFSGitEntry(name)
+}
+
+// isNTFSGitEntry returns true if NTFS (as used by Windows) can treat a name as
+// ".git", as Git's is_ntfs_dotgit determines. That's the case for ".git" in any
+// case and for its short name, "git~1" (in any case), when followed by any
+// number of trailing dots and spaces, which Windows strips, and optionally by
+// a colon, which begins the name of a stream of the entry (such as
+// ".git::$INDEX_ALLOCATION"). Windows also treats a backslash as a path
+// separator, so a name containing backslashes counts if any part of it does,
+// as it does for Git.
+func isNTFSGitEntry(name string) bool {
+	for {
+		part, rest, separated := strings.Cut(name, "\\")
+		var tail string
+		if len(part) >= 4 && strings.EqualFold(part[:4], gitEntryName) {
+			tail = part[4:]
+		} else if len(part) >= 5 && strings.EqualFold(part[:3], "git") && part[3:5] == "~1" {
+			tail = part[5:]
+		} else if separated {
+			name = rest
+			continue
+		} else {
+			return false
+		}
+		for i := 0; ; i++ {
+			if i == len(tail) || tail[i] == ':' {
+				return true
+			} else if tail[i] != '.' && tail[i] != ' ' {
+				break
+			}
+		}
+		if !separated {
+			return false
+		}
+		name = rest
 	}
-	return path[strings.LastIndexByte(path, '/')+1:] == ruleFileName
+}
+
+// isHFSIgnorable returns true if HFS+ (as used by macOS) ignores a code point in
+// names, as Git's next_hfs_char determines.
+func isHFSIgnorable(r rune) bool {
+	return (r >= 0x200c && r <= 0x200f) || (r >= 0x202a && r <= 0x202e) ||
+		(r >= 0x206a && r <= 0x206f) || r == 0xfeff
+}
+
+// isHFSGitEntry returns true if HFS+ can treat a name as ".git", as Git's
+// is_hfs_dotgit determines. That's the case for ".git" in any case with any
+// code points that HFS+ ignores anywhere in it (see isHFSIgnorable). Like Git,
+// we treat invalid UTF-8 as the end of the name, which can only make more
+// names count.
+func isHFSGitEntry(name string) bool {
+	// next returns the next code point that HFS+ doesn't ignore, or zero at the
+	// end of the name or at invalid UTF-8.
+	next := func() rune {
+		for name != "" {
+			r, size := utf8.DecodeRuneInString(name)
+			if r == utf8.RuneError && size <= 1 {
+				name = ""
+				return 0
+			}
+			name = name[size:]
+			if !isHFSIgnorable(r) {
+				return r
+			}
+		}
+		return 0
+	}
+
+	// Compare the name with ".git", ignoring the case of ASCII letters.
+	for _, expected := range gitEntryName {
+		r := next()
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A'
+		}
+		if r != expected {
+			return false
+		}
+	}
+	return next() == 0
+}
+
+// ShallowestGitEntry returns the shallowest part of a root-relative,
+// slash-separated path that identifies a Git entry (see IsGitEntry), which may
+// be all of it, or an empty string if the path isn't at or beneath a Git entry.
+func ShallowestGitEntry(path string) string {
+	components := strings.Split(path, "/")
+	for c, component := range components {
+		if IsGitEntry(component) {
+			return strings.Join(components[:c+1], "/")
+		}
+	}
+	return ""
+}
+
+// IsDeliverableRuleFile returns true if a root-relative, slash-separated path
+// identifies a rule file that synchronization may deliver to an endpoint, even
+// if that endpoint's rules exclude it. This is the case for any file whose base
+// name is ".gitignore", unless it's beneath a Git entry, where such a file
+// isn't a rule file, and where nothing may be written. This is what to use to
+// decide what can be delivered or written.
+//
+// Base names are compared case-insensitively, on every system. On a
+// case-insensitive filesystem, ".GITIGNORE" provides the rules of its
+// directory, for Git and for the ignorer alike, since both look the file up as
+// ".gitignore", and an endpoint can't tell how the other endpoint's filesystem
+// treats the name. On a case-sensitive filesystem, such a file merely counts
+// as a rule file without providing rules, which costs at most a cycle that
+// only delivers it, a full scan when it changes, and its delivery into a
+// directory that the endpoint's rules exclude, like that of any rule file.
+func IsDeliverableRuleFile(path string) bool {
+	base := path[strings.LastIndexByte(path, '/')+1:]
+	return len(base) == len(ruleFileName) && strings.EqualFold(base, ruleFileName) && ShallowestGitEntry(path) == ""
+}
+
+// AffectsIgnoreEvaluation returns true if a root-relative, slash-separated path
+// identifies a file whose contents affect ignore evaluation, so that a change
+// to it on disk can change what a scan ignores. This is the case for
+// deliverable rule files (see IsDeliverableRuleFile) and for the root
+// repository's ".git/info/exclude" file. The latter is inside a Git directory
+// and belongs to its endpoint, so this doesn't say anything about what can be
+// written.
+func AffectsIgnoreEvaluation(path string) bool {
+	return path == excludeFilePath || IsDeliverableRuleFile(path)
 }
 
 // ruleSet is a list of rules that apply to a subtree, along with the rules that
@@ -129,7 +258,7 @@ func (i *ignorer) Ignore(path string, directory bool) (ignore.IgnoreStatus, bool
 
 	// Never allow Git metadata to be synchronized, regardless of any rules.
 	// This is checked before the session ignorer, so it can't be overridden.
-	if len(base) == len(".git") && strings.EqualFold(base, ".git") {
+	if IsGitEntry(base) {
 		return ignore.IgnoreStatusIgnored, false
 	}
 
@@ -246,11 +375,15 @@ func (i *ignorer) load(directory string) *ruleSet {
 // which can be anything, including a cycle or another directory's rules, has
 // nothing to do with the paths beneath the link, and rule files mustn't be read
 // through it. The root itself is always traversed, since a symbolic link there
-// is how the user has chosen to specify it.
+// is how the user has chosen to specify it. A scan also only reaches directories
+// by the names that it finds in their parents, so a name that refers to a
+// directory itself or to its parent, or that spans several directories, isn't
+// traversable. Paths that aren't from a scan can have such names, and rule files
+// outside of the root have no say about anything.
 func (i *ignorer) traversable(directory, parent string) (bool, error) {
 	if directory == "" {
 		return true, nil
-	} else if i.untraversable[parent] {
+	} else if i.untraversable[parent] || !isEntryName(directory[strings.LastIndexByte(directory, '/')+1:]) {
 		i.untraversable[directory] = true
 		return false, nil
 	}
@@ -262,6 +395,14 @@ func (i *ignorer) traversable(directory, parent string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+// isEntryName determines whether or not a path component can be the name of an
+// entry in a directory, as opposed to a reference to the directory itself or to
+// its parent, or several components according to the system's path separator.
+func isEntryName(component string) bool {
+	return component != "" && component != "." && component != ".." &&
+		!strings.ContainsRune(component, filepath.Separator)
 }
 
 // excludeRules returns the rule set for the root repository's exclude file, or
