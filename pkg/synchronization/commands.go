@@ -13,6 +13,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/logging"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/fastpath"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
 	urlpkg "github.com/mutagen-io/mutagen/pkg/url"
 )
@@ -577,6 +578,10 @@ func resolution(conflict *core.Conflict, algorithm string) remote.ConflictRoot {
 		Path: conflict.Root, AlphaChanges: remoteChanges(conflict.AlphaChanges),
 		BetaChanges: remoteChanges(conflict.BetaChanges),
 	}
+	if isSubmoduleConflict(conflict) {
+		root.Submodule = true
+		return root
+	}
 	files, directory := true, false
 	for _, changes := range [][]*core.Change{conflict.AlphaChanges, conflict.BetaChanges} {
 		if len(changes) != 1 || changes[0].Path != conflict.Root ||
@@ -610,6 +615,30 @@ func resolution(conflict *core.Conflict, algorithm string) remote.ConflictRoot {
 	root.AlphaTakable = !alphaUnsynchronizable && !betaUnreadable
 	root.BetaTakable = !betaUnsynchronizable && !alphaUnreadable
 	return root
+}
+
+// isSubmoduleConflict determines whether a conflict is one between the commits
+// that both endpoints have checked out in a submodule (see
+// remote.ConflictRoot.Submodule), which reconciliation reports in Git mode as a
+// single change of the submodule's GitLink entry on each side. In the
+// two-way-safe mode, the conflict root is the submodule's directory, since the
+// conflict holds back the synchronization of the whole submodule, while in the
+// one-way-safe mode, it's the GitLink entry itself.
+func isSubmoduleConflict(conflict *core.Conflict) bool {
+	if conflict.Root == "" {
+		return false
+	}
+	linkPath := conflict.Root
+	if fastpath.Base(linkPath) != core.GitLinkName {
+		linkPath += "/" + core.GitLinkName
+	}
+	for _, changes := range [][]*core.Change{conflict.AlphaChanges, conflict.BetaChanges} {
+		if len(changes) != 1 || changes[0].Path != linkPath ||
+			changes[0].New == nil || changes[0].New.Kind != core.EntryKind_GitLink {
+			return false
+		}
+	}
+	return true
 }
 
 // containsKind determines whether any of the new entries of a list of changes
@@ -666,7 +695,16 @@ func describeRemoteEntry(entry *core.Entry) string {
 		return "untracked content"
 	case core.EntryKind_Problematic:
 		return fmt.Sprintf("problematic content (%s)", entry.Problem)
+	case core.EntryKind_GitLink:
+		return "submodule commit " + shortCommit(entry.Digest)
 	default:
 		return "unknown content"
 	}
+}
+
+// shortCommit returns the abbreviated hexadecimal form of a commit's identifier
+// for remote reports, with the same length as the identifiers in submodule
+// warnings.
+func shortCommit(commit []byte) string {
+	return fmt.Sprintf("%x", commit[:min(len(commit), 6)])
 }
