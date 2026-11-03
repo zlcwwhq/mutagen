@@ -3,6 +3,7 @@ package local
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -748,6 +749,16 @@ func (u *gitUpstream) push() {
 	mustGit(u.t, u.work, "push", "--quiet", "origin", "HEAD:refs/heads/main")
 }
 
+// entry returns the entry for a commit of the upstream.
+func (u *gitUpstream) entry(commit string) *core.Entry {
+	u.t.Helper()
+	digest, err := hex.DecodeString(commit)
+	if err != nil {
+		u.t.Fatal("invalid commit:", err)
+	}
+	return &core.Entry{Kind: core.EntryKind_GitLink, Digest: digest, Url: u.url}
+}
+
 // transitionEndpoint performs a scan, which is what enables an endpoint to
 // perform a transition, followed by the specified transitions, and verifies
 // that no temporary content is left in the root.
@@ -775,6 +786,21 @@ func verifyNoTemporaryContent(t *testing.T, root string) {
 	})
 	if err != nil {
 		t.Error("unable to walk root:", err)
+	}
+}
+
+// verifyCheckout verifies that a repository has a commit checked out on a
+// detached HEAD, and that its working tree has the commit's content.
+func verifyCheckout(t *testing.T, directory, commit string) {
+	t.Helper()
+	if head := mustGit(t, directory, "rev-parse", "HEAD"); head != commit {
+		t.Errorf("incorrect commit checked out in %s: %s != %s", directory, head, commit)
+	}
+	if _, err := runGit(directory, "symbolic-ref", "--quiet", "HEAD"); err == nil {
+		t.Errorf("HEAD isn't detached in %s", directory)
+	}
+	if status := mustGit(t, directory, "status", "--porcelain"); status != "" {
+		t.Errorf("working tree isn't clean in %s: %s", directory, status)
 	}
 }
 

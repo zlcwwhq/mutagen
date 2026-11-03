@@ -3,6 +3,7 @@ package local
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -92,6 +93,9 @@ type gitProvider struct {
 	// backoffs maps URLs that have stalled to the time until which they won't
 	// be contacted.
 	backoffs map[string]time.Time
+	// cloneRetries throttles the clones that prepare repositories for
+	// attachment.
+	cloneRetries *gitRetries
 	// fetcher fetches commits in the background.
 	fetcher *gitFetcher
 }
@@ -104,6 +108,7 @@ func newGitProvider(logger *logging.Logger, signal func()) *gitProvider {
 		stallBackoff: gitDefaultStallBackoff,
 		logger:       logger,
 		backoffs:     make(map[string]time.Time),
+		cloneRetries: newGitRetries(),
 	}
 	provider.fetcher = newGitFetcher(provider, signal)
 	return provider
@@ -293,6 +298,20 @@ func (g *gitProvider) fetchMissing(ctx context.Context, directory, url, commit s
 	return errors.New(strings.Join(failures, "; "))
 }
 
+// head returns the hexadecimal identifier of the commit that the repository in
+// a directory has checked out.
+func (g *gitProvider) head(ctx context.Context, directory string) (string, error) {
+	output, err := git.Run(ctx, directory, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("unable to determine the commit that's checked out: %w", err)
+	}
+	commit, err := git.CommitFromOutput(output)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(commit), nil
+}
+
 // Probe implements core.GitProvider.Probe.
 func (g *gitProvider) Probe(ctx context.Context, directory, _ string) (*core.Entry, error) {
 	// Examine the repository.
@@ -313,10 +332,124 @@ func (g *gitProvider) Probe(ctx context.Context, directory, _ string) (*core.Ent
 	}, nil
 }
 
+// cloneOptions returns the options that make a clone use the line ending
+// settings that a GitLink entry carries, so that a checkout has the same
+// content as the other endpoint's. The values are validated by git.Probe on the
+// other endpoint, but we check them again before handing them to Git.
+func cloneOptions(target *core.Entry) []string {
+	var options []string
+	if git.UsableSetting(target.AutoCRLF) {
+		options = append(options, "--config", "core.autocrlf="+target.AutoCRLF)
+	}
+	if git.UsableSetting(target.Eol) {
+		options = append(options, "--config", "core.eol="+target.Eol)
+	}
+	return options
+}
+
+// cloneAndResolve clones the repository that a GitLink entry identifies into a
+// directory, without checking anything out, determines the commit to use (the
+// entry's commit if it's available, after fetching it if necessary, or
+// otherwise the commit of the origin's default branch), and then calls prepare
+// with that commit to make what the caller needs of the clone. Failures of any
+// of these steps are throttled per URL and commit (see gitRetries), since
+// trying again means cloning again, so that a repository that can't be cloned
+// isn't contacted in every synchronization cycle. It returns the hexadecimal
+// identifier of the commit and, if it isn't the entry's, a warning that says
+// so.
+func (g *gitProvider) cloneAndResolve(ctx context.Context, directory string, target *core.Entry, prepare func(commit string) error) (string, string, error) {
+	// Verify that the URL can be used and convert the commit.
+	url, err := git.UsableURL(target.Url)
+	if err != nil {
+		return "", "", fmt.Errorf("unable to clone submodule: %w", err)
+	}
+	commit := hex.EncodeToString(target.Digest)
+
+	// If this has failed recently, then don't try again yet.
+	key := gitRetryKey{url: url, commit: commit}
+	if remaining, last := g.cloneRetries.wait(key); remaining > 0 {
+		return "", "", fmt.Errorf("%w (it will be tried again in %s)", last, remaining.Round(time.Second))
+	}
+
+	// Perform the clone and the preparation, and record the outcome.
+	commit, warning, err := g.cloneAndResolveOnce(ctx, directory, url, commit, target)
+	if err == nil {
+		err = prepare(commit)
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			g.cloneRetries.failed(key, err)
+		}
+		return "", "", err
+	}
+	g.cloneRetries.succeeded(key)
+	return commit, warning, nil
+}
+
+// cloneAndResolveOnce implements cloneAndResolve without the throttling.
+func (g *gitProvider) cloneAndResolveOnce(ctx context.Context, directory, url, commit string, target *core.Entry) (string, string, error) {
+	// Clone the repository without checking anything out, since what the
+	// default branch has checked out isn't what we're after. If we've been
+	// given a URL with credentials, then we don't use them, though nothing that
+	// we report would.
+	arguments := slices.Concat([]string{"clone", "--no-checkout", "--progress"}, cloneOptions(target), []string{"--", url, "."})
+	if err := g.runNetwork(ctx, directory, url, arguments...); err != nil {
+		var stall *gitStallError
+		if errors.As(err, &stall) || ctx.Err() != nil {
+			return "", "", err
+		}
+		return "", "", fmt.Errorf("unable to clone %s: %w", url, err)
+	}
+
+	// The commit might not be reachable from any branch, in which case it may
+	// still be possible to request it.
+	if g.hasCommit(ctx, directory, commit) {
+		return commit, "", nil
+	}
+	fetchErr := g.fetchCommit(ctx, directory, "origin", url, commit)
+	if fetchErr == nil {
+		return commit, "", nil
+	} else if ctx.Err() != nil {
+		return "", "", ctx.Err()
+	}
+
+	// The commit isn't available, which is expected if it hasn't been pushed,
+	// so fall back to the commit of the origin's default branch, from which the
+	// submodule can follow the commit later (see Follow).
+	output, err := git.Run(ctx, directory, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/HEAD^{commit}")
+	if err != nil {
+		return "", "", fmt.Errorf("%w; the repository's default branch isn't available either", fetchErr)
+	}
+	fallback, err := git.CommitFromOutput(output)
+	if err != nil {
+		return "", "", err
+	}
+	warning := fmt.Sprintf(
+		"cloned with the commit of the default branch (%s), since commit %s isn't available from %s; the submodule's HEAD follows once it is, and its files are synchronized meanwhile",
+		gitShortCommit(hex.EncodeToString(fallback)), gitShortCommit(commit), url,
+	)
+	return hex.EncodeToString(fallback), warning, nil
+}
+
+// gitLinkFor creates the GitLink entry for a repository that's been cloned or
+// prepared for a GitLink entry, with the commit that it actually has.
+func gitLinkFor(target *core.Entry, commit string) (*core.Entry, error) {
+	digest, err := hex.DecodeString(commit)
+	if err != nil {
+		return nil, fmt.Errorf("invalid commit identifier: %w", err)
+	}
+	return &core.Entry{
+		Kind:     core.EntryKind_GitLink,
+		Digest:   digest,
+		Url:      target.Url,
+		AutoCRLF: target.AutoCRLF,
+		Eol:      target.Eol,
+	}, nil
+}
+
 // errGitUnsupported is the error of the operations that populate submodules,
-// attach repositories to them, and move their HEAD, which the provider doesn't
-// support yet.
-var errGitUnsupported = errors.New("submodules aren't supported by this endpoint yet")
+// which the provider doesn't support yet.
+var errGitUnsupported = errors.New("populating submodules isn't supported by this endpoint yet")
 
 // Clone implements core.GitProvider.Clone.
 func (g *gitProvider) Clone(context.Context, string, *core.Entry) (*core.Entry, []string, error) {
@@ -334,18 +467,140 @@ func (g *gitProvider) RecordSeed(context.Context, string, *core.Entry) error {
 }
 
 // PrepareAttach implements core.GitProvider.PrepareAttach.
-func (g *gitProvider) PrepareAttach(context.Context, string, *core.Entry) (*core.Entry, []string, error) {
-	return nil, nil, errGitUnsupported
+func (g *gitProvider) PrepareAttach(ctx context.Context, directory string, target *core.Entry) (*core.Entry, []string, error) {
+	// Clone the repository, determine the commit to use, then detach HEAD at
+	// the commit and make the index match it, without a working tree. Unlike a
+	// checkout, neither of these can fail because of the files in the working
+	// tree that the repository will have, and neither writes any, which is why
+	// a checkout can't be used. If the session stops before the Git directory
+	// is moved into place, then nothing's changed.
+	commit, warning, err := g.cloneAndResolve(ctx, directory, target, func(commit string) error {
+		if _, err := git.Run(ctx, directory, "update-ref", "--no-deref", "-m", "mutagen: attach", "HEAD", commit); err != nil {
+			return fmt.Errorf("unable to set commit: %w", err)
+		} else if _, err := git.Run(ctx, directory, "read-tree", commit); err != nil {
+			return fmt.Errorf("unable to set index: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	var warnings []string
+	if warning != "" {
+		warnings = []string{warning}
+	}
+
+	// Create the result.
+	link, err := gitLinkFor(target, commit)
+	if err != nil {
+		return nil, nil, err
+	}
+	return link, warnings, nil
 }
 
 // Refresh implements core.GitProvider.Refresh.
-func (g *gitProvider) Refresh(context.Context, string) error {
-	return errGitUnsupported
+func (g *gitProvider) Refresh(ctx context.Context, directory string) error {
+	_, err := git.Run(ctx, directory, "reset", "-q", "--mixed", "--no-recurse-submodules")
+	return err
 }
 
 // Follow implements core.GitProvider.Follow.
-func (g *gitProvider) Follow(context.Context, string, *core.Entry, *core.Entry) error {
-	return errGitUnsupported
+func (g *gitProvider) Follow(ctx context.Context, directory string, old, target *core.Entry) error {
+	// Determine what's checked out. If that's already the target commit, then
+	// there's nothing to do. If it's neither that nor the expected commit, then
+	// something has happened since the scan, and the next cycle has to look at
+	// it.
+	oldCommit, targetCommit := hex.EncodeToString(old.Digest), hex.EncodeToString(target.Digest)
+	head, err := g.head(ctx, directory)
+	if err != nil {
+		return fmt.Errorf("HEAD didn't follow commit %s: %w", gitShortCommit(targetCommit), err)
+	} else if head == targetCommit {
+		g.fetcher.cancel(directory)
+		return nil
+	} else if head != oldCommit {
+		return fmt.Errorf("HEAD didn't follow commit %s, because it changed since the scan", gitShortCommit(targetCommit))
+	}
+
+	// If the commit isn't available, then have it fetched in the background,
+	// which wakes the session if it succeeds, so that the next cycle can move
+	// HEAD. Fetching here would hold up the synchronization of everything
+	// else, because the next cycle can't start until this transition is
+	// complete, and that would repeat in every cycle until the commit is
+	// pushed, which can take arbitrarily long.
+	if !g.hasCommit(ctx, directory, targetCommit) {
+		status := g.fetcher.request(directory, target.Url, targetCommit)
+		return fmt.Errorf("HEAD didn't follow commit %s, which isn't available on this endpoint yet (%s); the submodule's files are synchronized regardless", gitShortCommit(targetCommit), status)
+	}
+	g.fetcher.cancel(directory)
+
+	// Detach HEAD where it is, which also verifies that it's still the
+	// expected commit, and then move it and the index to the target commit.
+	// Neither command writes to the working tree, unlike checkout, which can
+	// remove files (e.g. in a sparse checkout, those outside of its patterns),
+	// and neither moves the branch that was checked out. The index isn't
+	// refreshed, because that runs filters, which can fail and would keep HEAD
+	// from ever following; without refreshing, the paths that differ between
+	// the commits merely lack cached file information. The reset writes the
+	// index before it moves HEAD, so if it's interrupted, then HEAD is detached
+	// at the old commit, which is consistent, and the next cycle tries again.
+	if _, err := git.Run(ctx, directory, "update-ref", "--no-deref", "-m", "mutagen: follow", "HEAD", oldCommit, oldCommit); err != nil {
+		return fmt.Errorf("HEAD didn't follow commit %s: %w", gitShortCommit(targetCommit), err)
+	} else if err := resetWithoutRefresh(ctx, directory, targetCommit); err != nil {
+		if ctx.Err() != nil || !replaceIndex(ctx, directory, oldCommit, targetCommit) {
+			return fmt.Errorf("HEAD didn't follow commit %s: %w", gitShortCommit(targetCommit), err)
+		}
+	}
+
+	// Success.
+	return nil
+}
+
+// replaceIndex moves HEAD and the index of the repository in a directory from
+// one commit to another by replacing the index with the target commit's tree,
+// rather than by a reset, which is what Follow falls back to if the reset fails.
+// Even without refreshing the index, Git compares the contents of index entries
+// that are racily clean (whose files were written within the same second as
+// the index) whenever it writes the index, which runs the clean filters. That's
+// the state of every index right after a checkout, such as that of a clone that
+// populated a submodule, and if a required clean filter fails (e.g. one that's
+// configured, but whose program is missing), then the reset fails until
+// something else writes the index. Reading the tree instead doesn't compare
+// anything, because the new entries don't have any cached file information. That
+// makes Git examine every file the next time that it compares the working tree
+// with the index, which is why it's only a fallback. The index is replaced
+// before HEAD moves, which only happens if HEAD is still at the old commit, so
+// if this is interrupted or HEAD changes, then the next cycle sees HEAD at the
+// commit where it was and tries again. It returns whether or not it succeeded,
+// leaving the reset's failure to be reported otherwise.
+func replaceIndex(ctx context.Context, directory, oldCommit, targetCommit string) bool {
+	if _, err := git.Run(ctx, directory, "read-tree", "--no-recurse-submodules", targetCommit); err != nil {
+		return false
+	} else if _, err := git.Run(ctx, directory, "update-ref", "--no-deref", "-m", "mutagen: follow", "HEAD", targetCommit, oldCommit); err != nil {
+		return false
+	}
+	return true
+}
+
+// gitUsageExitCode is the exit code with which Git reports that it's been
+// invoked incorrectly, such as with an option that it doesn't know.
+const gitUsageExitCode = 129
+
+// resetWithoutRefresh moves HEAD and the index of the repository in a
+// directory to a commit, without touching the working tree and without
+// refreshing the index (see Follow). Git 2.36 introduced --no-refresh, and from
+// then on, only that option skips the refresh. Earlier versions, including
+// those from 2.29 (the oldest that submodules support, see git.Probe) to 2.35,
+// don't know the option, but -q skips the refresh by itself. So if Git rejects
+// the command as invalid, then we try again without the option. We recognize
+// that by the exit code, rather than by the message, because Git follows the
+// message with its usage, and error messages only retain the last few lines of
+// output.
+func resetWithoutRefresh(ctx context.Context, directory, commit string) error {
+	_, err := git.Run(ctx, directory, "reset", "-q", "--no-refresh", "--mixed", "--no-recurse-submodules", commit)
+	if err != nil && ctx.Err() == nil && git.ExitedWith(err, gitUsageExitCode) {
+		_, err = git.Run(ctx, directory, "reset", "-q", "--mixed", "--no-recurse-submodules", commit)
+	}
+	return err
 }
 
 // containsGitRulePath determines whether or not any of the specified re-check
@@ -370,7 +625,7 @@ func containsGitRulePath(recheckPaths map[string]bool) bool {
 //
 // The contents of temporary directories are never relevant, wherever they are
 // in the hierarchy, because they aren't scanned. Their contents may have
-// arbitrary names and can be numerous.
+// arbitrary names and can be numerous (e.g. those of a temporary clone).
 //
 // The contents of Git directories are never synchronized and most of their
 // contents change constantly, even as a result of commands that fail or don't
