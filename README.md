@@ -605,6 +605,10 @@ A side that can't be taken, or `--executable` for copies that aren't both
 files, is refused before anything is checked out. Plain merged-file apply and
 `--delete` require an explicit checkout. Text listings describe at most five
 changes per side for each conflict and count the rest; `--json` includes more.
+`remote --conflicts` exits with status 0 whenever it produces a listing. With
+nothing to list, it prints `No conflicts.`, unless content couldn't be
+synchronized, which can hide conflicts: it then warns about that content and
+says that conflicts can't be ruled out.
 
 Stop writers on both endpoints until apply finishes. A checkout belongs to one
 endpoint, and an existing workspace may be another person's work; only apply

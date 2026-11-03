@@ -1491,3 +1491,70 @@ func TestRemoteConflictAutomaticTakeDuplicate(t *testing.T) {
 		}
 	}
 }
+
+// TestRemoteConflictsWithProblems tests that a listing that can't rule out
+// conflicts, because content couldn't be synchronized, says so on its standard
+// output.
+func TestRemoteConflictsWithProblems(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+		t.Skip("permissions aren't enforced")
+	}
+
+	// Create a session with an unreadable file, which is a problem on alpha.
+	roots := createConflictSession(t, true, core.SynchronizationMode_SynchronizationModeTwoWaySafe)
+	unreadable := filepath.Join(roots[0], "unreadable")
+	writeFile(t, unreadable, "unreadable")
+	if err := os.Chmod(unreadable, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(unreadable, 0600) })
+
+	// Wait for the session's command channels, and have it report the problem.
+	if report, err := flushRemote(roots[0]); err != nil {
+		t.Fatal(err)
+	} else if len(report.Problems) != 1 {
+		t.Fatalf("incorrect report: %+v", report)
+	}
+
+	// The listing succeeds, and it isn't empty.
+	code, output, diagnostic := runRemote(t, roots[0], "--conflicts")
+	if code != 0 {
+		t.Fatalf("listing failed: %d: %s", code, diagnostic)
+	} else if output != "Conflicts can't be ruled out, because some content couldn't be synchronized (see the warnings).\n" {
+		t.Errorf("incorrect listing: %q", output)
+	} else if !strings.Contains(diagnostic, "remote: warning: this content couldn't be synchronized:\n") ||
+		!strings.Contains(diagnostic, "unreadable (local)") {
+		t.Errorf("problem not reported: %q", diagnostic)
+	}
+
+	// The same goes for JSON, which has the problem and which doesn't have any
+	// conflicts.
+	code, output, diagnostic = runRemote(t, roots[0], "--conflicts", "--json")
+	if code != 0 {
+		t.Fatalf("JSON listing failed: %d: %s", code, diagnostic)
+	}
+	var result struct {
+		Edges []struct {
+			Listing struct {
+				Conflicts []json.RawMessage
+				Problems  []remote.Problem
+			}
+		}
+	}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatal(err)
+	} else if len(result.Edges) != 1 || len(result.Edges[0].Listing.Conflicts) != 0 {
+		t.Fatalf("incorrect JSON listing: %s", output)
+	} else if problems := result.Edges[0].Listing.Problems; len(problems) != 1 || problems[0].Path != "unreadable" {
+		t.Errorf("incorrect problems: %+v", problems)
+	}
+
+	// Once the problem is gone, there aren't any conflicts.
+	if err := os.Chmod(unreadable, 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, output, diagnostic = runRemote(t, roots[0], "--conflicts")
+	if code != 0 || output != "No conflicts.\n" || diagnostic != "" {
+		t.Errorf("incorrect listing without problems: %d: %q: %q", code, output, diagnostic)
+	}
+}
