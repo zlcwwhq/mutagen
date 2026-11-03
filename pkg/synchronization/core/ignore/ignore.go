@@ -35,6 +35,20 @@ type Ignorer interface {
 	Ignore(path string, directory bool) (IgnoreStatus, bool)
 }
 
+// DirectoryIgnorer is an ignorer that loads rules from directories, which can
+// fail. Callers have to use it to check a directory before processing the
+// directory's contents, including when it's empty or doesn't exist yet.
+type DirectoryIgnorer interface {
+	Ignorer
+	// EnsureDirectory loads the rules that apply to the contents of a directory
+	// (specified by its root-relative path) and returns an error if they can't
+	// be read. It isn't an error for the directory not to exist, or for
+	// something else to be at its path that it would replace, such as a symbolic
+	// link, which isn't followed. An error means that there's no telling what's
+	// ignored in the directory's subtree, so it mustn't be synchronized.
+	EnsureDirectory(path string) error
+}
+
 // IgnoreCacheKey represents a key in an ignore cache.
 type IgnoreCacheKey struct {
 	// Path is the path used for testing ignore status.

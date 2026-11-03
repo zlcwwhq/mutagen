@@ -51,6 +51,9 @@ func (l sortableProblemList) Len() int {
 
 // Less implements sort.Interface.Less.
 func (l sortableProblemList) Less(i, j int) bool {
+	if l[i].Warning != l[j].Warning {
+		return l[j].Warning
+	}
 	return fastpath.Less(l[i].Path, l[j].Path)
 }
 
@@ -59,7 +62,10 @@ func (l sortableProblemList) Swap(i, j int) {
 	l[i], l[j] = l[j], l[i]
 }
 
-// SortProblems sorts a list of conflicts based on their problem paths.
-func SortProblems(conflicts []*Problem) {
-	sort.Sort(sortableProblemList(conflicts))
+// SortProblems sorts a list of problems based on their paths, with warnings
+// following all other problems. Lists of problems are often truncated after
+// sorting, and an endpoint can have many warnings about content that isn't
+// synchronized by design, which mustn't crowd out actual failures.
+func SortProblems(problems []*Problem) {
+	sort.Sort(sortableProblemList(problems))
 }
