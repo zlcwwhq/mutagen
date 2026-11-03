@@ -49,6 +49,22 @@ type GitProvider interface {
 	// is what Probe reports a seed for, and what the endpoint reports in its
 	// snapshots until the session has absorbed it.
 	RecordSeed(ctx context.Context, directory string, content *Entry) error
+	// PrepareAttach creates a Git directory in an empty directory, with the
+	// commit of a GitLink entry (or, if that isn't available, the commit of the
+	// origin's default branch) as a detached HEAD and as the index, but without
+	// a working tree. It returns the GitLink entry for the result, without a
+	// seed, along with warnings about how the result differs from what was
+	// requested. The caller moves the Git directory into place.
+	PrepareAttach(ctx context.Context, directory string, target *Entry) (*Entry, []string, error)
+	// Refresh refreshes the index of the repository in a directory, whose Git
+	// entry was just attached, which is only an optimization.
+	Refresh(ctx context.Context, directory string) error
+	// Follow moves the detached HEAD and the index of the repository in a
+	// directory from the commit of one GitLink entry to that of another,
+	// without touching the working tree. If the target commit isn't available
+	// locally, then it doesn't use the network to get it, but leaves that to
+	// happen in the background, and fails with an explanation.
+	Follow(ctx context.Context, directory string, old, target *Entry) error
 }
 
 // gitLink returns the GitLink entry of a directory, if it has one.

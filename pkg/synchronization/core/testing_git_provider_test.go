@@ -75,9 +75,9 @@ type testingGitCall struct {
 
 // testingGitProvider is a fake implementation of GitProvider for tests. Each
 // method records its call, then invokes the hook configured for it (if any),
-// and then fails with the error configured for it (if any). Clone creates a
-// Git directory, which is all that a repository amounts to here, while the
-// other methods operate only on the provider's own fields.
+// and then fails with the error configured for it (if any). Clone and
+// PrepareAttach create a Git directory, which is all that a repository amounts
+// to here, while the other methods operate only on the provider's own fields.
 type testingGitProvider struct {
 	// lock serializes access to the provider's fields, since scans and
 	// transitions may run concurrently with tests that inspect them.
@@ -93,6 +93,8 @@ type testingGitProvider struct {
 	cloneFiles map[string]string
 	// cloneWarnings are the warnings that Clone returns.
 	cloneWarnings []string
+	// attachWarnings are the warnings that PrepareAttach returns.
+	attachWarnings []string
 	// scanned is the entry that ScanClone returns, if non-nil. Otherwise,
 	// ScanClone scans the clone with ignored as the ignorer.
 	scanned *Entry
@@ -237,6 +239,31 @@ func (p *testingGitProvider) RecordSeed(_ context.Context, directory string, con
 	defer p.lock.Unlock()
 	p.recorded = content
 	return nil
+}
+
+// PrepareAttach implements GitProvider.PrepareAttach. If it fails, then it
+// leaves a partial Git directory behind.
+func (p *testingGitProvider) PrepareAttach(_ context.Context, directory string, target *Entry) (*Entry, []string, error) {
+	if err := p.run("PrepareAttach", directory, ""); err != nil {
+		os.Mkdir(filepath.Join(directory, GitLinkName), 0700)
+		return nil, nil, err
+	}
+	if err := testingCreateGitDirectory(directory); err != nil {
+		return nil, nil, err
+	}
+	link := target.Copy(EntryCopyBehaviorSlim)
+	link.Seed = ""
+	return link, p.attachWarnings, nil
+}
+
+// Refresh implements GitProvider.Refresh.
+func (p *testingGitProvider) Refresh(_ context.Context, directory string) error {
+	return p.run("Refresh", directory, "")
+}
+
+// Follow implements GitProvider.Follow.
+func (p *testingGitProvider) Follow(_ context.Context, directory string, _, _ *Entry) error {
+	return p.run("Follow", directory, "")
 }
 
 // testingWriteContent creates files and directories within a directory. The
