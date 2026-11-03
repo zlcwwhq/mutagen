@@ -100,6 +100,10 @@ type endpoint struct {
 	// gitMode indicates whether or not the session is in Git mode. This field
 	// is static and thus safe for concurrent reads.
 	gitMode bool
+	// gitProvider is the provider used to operate on submodules, which is only
+	// set in Git mode. This field is static and the provider is safe for
+	// concurrent usage.
+	gitProvider *gitProvider
 	// scope is the registration of the content that the endpoint synchronizes
 	// (see remote.RegisterScope), or nil if it couldn't be registered. This
 	// field is static and thus safe for concurrent reads.
@@ -122,6 +126,11 @@ type endpoint struct {
 	// that returns indicates closure. This field is static and thus safe for
 	// concurrent receive operations.
 	watchDone <-chan struct{}
+	// gitFetcherDone is closed when the Goroutine that fetches commits for
+	// submodules in the background (see gitFetcher) has exited. It's only set
+	// in Git mode. This field is static and thus safe for concurrent receive
+	// operations.
+	gitFetcherDone <-chan struct{}
 	// pollSignal is the coalescer used to signal Poll callers. This field is
 	// static and thus safe for concurrent usage.
 	pollSignal *state.Coalescer
@@ -494,6 +503,22 @@ func NewEndpoint(
 			hasherFactory,
 		),
 		transitionHasher: hasherFactory(),
+	}
+
+	// In Git mode, create the provider used to operate on submodules and start
+	// the Goroutine that fetches commits for them in the background, which
+	// wakes the session when it's fetched something.
+	if gitMode {
+		endpoint.gitProvider = newGitProvider(
+			logger.Sublogger("git"),
+			endpoint.pollSignal.Strobe,
+		)
+		gitFetcherDone := make(chan struct{})
+		endpoint.gitFetcherDone = gitFetcherDone
+		go func() {
+			endpoint.gitProvider.fetcher.run(workerCtx)
+			close(gitFetcherDone)
+		}()
 	}
 
 	// Start the cache saving Goroutine.
@@ -1764,6 +1789,9 @@ func (e *endpoint) Shutdown() error {
 	// Wait for background worker Goroutines to terminate.
 	<-e.saveCacheDone
 	<-e.watchDone
+	if e.gitFetcherDone != nil {
+		<-e.gitFetcherDone
+	}
 
 	// Terminate the polling coalescer.
 	e.pollSignal.Terminate()

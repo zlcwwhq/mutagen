@@ -620,6 +620,21 @@ func TestGitWarningsUnusualNames(t *testing.T) {
 	}
 }
 
+// gitUpstream is a bare repository for tests to clone and fetch from using a
+// file URL, along with a working copy for creating commits in it.
+type gitUpstream struct {
+	// t is the test.
+	t *testing.T
+	// bare is the path to the bare repository.
+	bare string
+	// url is the URL of the bare repository.
+	url string
+	// work is the path to the working copy.
+	work string
+	// head is the hexadecimal identifier of the commit most recently created.
+	head string
+}
+
 // isolateGit sets up the environment of Git commands for a test, enabling the
 // file transport and insulating them from the user's configuration, such as
 // commit signing.
@@ -633,6 +648,62 @@ func isolateGit(t *testing.T) {
 	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.org")
 	t.Setenv("GIT_COMMITTER_NAME", "test")
 	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.org")
+}
+
+// mustGit runs a Git command that must succeed and returns its trimmed output.
+func mustGit(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	output, err := runGit(directory, args...)
+	if err != nil {
+		t.Fatalf("unable to run Git with arguments %v: %v", args, err)
+	}
+	return output
+}
+
+// fileURL returns the file URL for a path.
+func fileURL(path string) string {
+	path = filepath.ToSlash(path)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return "file://" + path
+}
+
+// newGitUpstream creates an upstream repository with a single commit that has
+// been pushed. The name distinguishes it from other upstreams in the same test.
+func newGitUpstream(t *testing.T, name string) *gitUpstream {
+	t.Helper()
+	isolateGit(t)
+	base := filepath.Join(realTemporaryDirectory(t), name)
+	u := &gitUpstream{
+		t:    t,
+		bare: filepath.Join(base, "upstream.git"),
+		work: filepath.Join(base, "work"),
+	}
+	u.url = fileURL(u.bare)
+	initializeRepository(t, u.bare, "--bare", "--initial-branch=main")
+	initializeRepository(t, u.work, "--initial-branch=main")
+	mustGit(t, u.work, "remote", "add", "origin", u.url)
+	u.commit("file", "first")
+	u.push()
+	return u
+}
+
+// commit creates a commit in the upstream's working copy that hasn't been
+// pushed and returns its identifier.
+func (u *gitUpstream) commit(name, contents string) string {
+	u.t.Helper()
+	writeTree(u.t, u.work, map[string]string{name: contents})
+	mustGit(u.t, u.work, "add", "--", name)
+	mustGit(u.t, u.work, "commit", "--quiet", "--no-gpg-sign", "-m", "commit "+name)
+	u.head = mustGit(u.t, u.work, "rev-parse", "HEAD")
+	return u.head
+}
+
+// push pushes the upstream's working copy.
+func (u *gitUpstream) push() {
+	u.t.Helper()
+	mustGit(u.t, u.work, "push", "--quiet", "origin", "HEAD:refs/heads/main")
 }
 
 // transitionEndpoint performs a scan, which is what enables an endpoint to
