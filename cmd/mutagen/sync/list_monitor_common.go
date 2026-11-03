@@ -74,6 +74,8 @@ func formatEntry(entry *core.Entry) string {
 		return fmt.Sprintf("File (%x)", entry.Digest)
 	} else if entry.Kind == core.EntryKind_SymbolicLink {
 		return fmt.Sprintf("Symbolic Link (%s)", entry.Target)
+	} else if entry.Kind == core.EntryKind_GitLink {
+		return fmt.Sprintf("Submodule (%x)", entry.Digest)
 	} else if entry.Kind == core.EntryKind_Untracked {
 		return "Untracked content"
 	} else if entry.Kind == core.EntryKind_Problematic {
@@ -202,43 +204,54 @@ func printEndpoint(name string, url *urlpkg.URL, configuration *synchronization.
 		)
 	}
 
-	// Print scan problems, if any.
-	if len(state.ScanProblems) > 0 {
-		if mode == common.SessionDisplayModeList {
-			color.Red("\tScan problems: %d\n",
-				uint64(len(state.ScanProblems))+state.ExcludedScanProblems,
-			)
-		} else if mode == common.SessionDisplayModeListLong {
-			color.Red("\tScan problems:\n")
-			for _, p := range state.ScanProblems {
-				color.Red("\t\t%s: %v\n",
-					terminal.NeutralizeControlCharacters(formatPath(p.Path)),
-					terminal.NeutralizeControlCharacters(p.Error),
-				)
-			}
-			if state.ExcludedScanProblems > 0 {
-				color.Red("\t\t...+%d more...\n", state.ExcludedScanProblems)
-			}
+	// Print scan and transition problems, if any.
+	printProblems("Scan", state.ScanProblems, state.ExcludedScanProblems, mode)
+	printProblems("Transition", state.TransitionProblems, state.ExcludedTransitionProblems, mode)
+}
+
+// printProblems prints the problems reported by a stage of synchronization for
+// an endpoint, along with the number of problems excluded from the list.
+// Warnings describe content that isn't synchronized by design rather than
+// failures, so they're listed separately. Problems are sorted with warnings
+// last (see core.SortProblems), so if the list includes a warning, then the
+// problems that have been excluded from it are warnings too. Otherwise, they
+// could be anything, so they're taken to be failures.
+func printProblems(stage string, problems []*core.Problem, excluded uint64, mode common.SessionDisplayMode) {
+	var failures, warnings []*core.Problem
+	for _, problem := range problems {
+		if problem.Warning {
+			warnings = append(warnings, problem)
+		} else {
+			failures = append(failures, problem)
 		}
 	}
+	excludedFailures, excludedWarnings := excluded, uint64(0)
+	if len(warnings) > 0 {
+		excludedFailures, excludedWarnings = 0, excluded
+	}
+	printProblemList(color.Red, stage+" problems", failures, excludedFailures, mode)
+	printProblemList(color.Yellow, stage+" warnings", warnings, excludedWarnings, mode)
+}
 
-	// Print transition problems, if any.
-	if len(state.TransitionProblems) > 0 {
-		if mode == common.SessionDisplayModeList {
-			color.Red("\tTransition problems: %d\n",
-				uint64(len(state.TransitionProblems))+state.ExcludedTransitionProblems,
+// printProblemList prints a list of problems with the specified title, if it
+// isn't empty, using the specified function for printing, as a count or in full
+// depending on the display mode.
+func printProblemList(printer func(string, ...any), title string, problems []*core.Problem, excluded uint64, mode common.SessionDisplayMode) {
+	if len(problems) == 0 {
+		return
+	}
+	if mode == common.SessionDisplayModeList {
+		printer("\t%s: %d\n", title, uint64(len(problems))+excluded)
+	} else if mode == common.SessionDisplayModeListLong {
+		printer("\t%s:\n", title)
+		for _, p := range problems {
+			printer("\t\t%s: %v\n",
+				terminal.NeutralizeControlCharacters(formatPath(p.Path)),
+				terminal.NeutralizeControlCharacters(p.Error),
 			)
-		} else if mode == common.SessionDisplayModeListLong {
-			color.Red("\tTransition problems:\n")
-			for _, p := range state.TransitionProblems {
-				color.Red("\t\t%s: %v\n",
-					terminal.NeutralizeControlCharacters(formatPath(p.Path)),
-					terminal.NeutralizeControlCharacters(p.Error),
-				)
-			}
-			if state.ExcludedTransitionProblems > 0 {
-				color.Red("\t\t...+%d more...\n", state.ExcludedTransitionProblems)
-			}
+		}
+		if excluded > 0 {
+			printer("\t\t...+%d more...\n", excluded)
 		}
 	}
 }
