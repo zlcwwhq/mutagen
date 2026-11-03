@@ -1,11 +1,35 @@
 package core
 
 import (
+	"context"
 	"sort"
 	"strings"
 
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/fastpath"
 )
+
+// GitProvider defines the interface that scanning uses to
+// operate on the repositories of submodules, which keeps this package free of
+// any knowledge of how Git is executed. A submodule is a directory (other than
+// the synchronization root) whose Git entry (its content named .git) belongs to
+// a repository that has a commit checked out and an origin that the other
+// endpoint can fetch from. Its working tree is synchronized like any other
+// directory, and only its Git entry is special: it's represented by a GitLink
+// entry, which identifies the commit, and whose own contents are never
+// synchronized. All directories are absolute paths on the filesystem of the
+// synchronization root, and all paths are root-relative and slash-separated.
+// Implementations must return promptly when their context is cancelled.
+type GitProvider interface {
+	// Probe examines the repository in a directory that has a Git entry, at the
+	// specified path. If the directory is a submodule, then it returns the
+	// GitLink entry for its Git entry, which carries the seed of any record of
+	// the endpoint having populated it that the session hasn't yet absorbed. If
+	// it's a repository without commits or without an origin, then it returns
+	// nil, and the directory is an ordinary directory. In any other case it
+	// returns an error whose message tells the user what to do about it,
+	// because the directory's content can't be classified.
+	Probe(ctx context.Context, directory, path string) (*Entry, error)
+}
 
 // gitLink returns the GitLink entry of a directory, if it has one.
 func (e *Entry) gitLink() *Entry {
