@@ -1087,3 +1087,376 @@ func TestReconcilePanicWithInvalidSynchronizationMode(t *testing.T) {
 	}()
 	Reconcile(nil, tF1, nil, SynchronizationMode(-1))
 }
+
+// TestReconcileGitMode tests ReconcileGitMode, in particular that a rule that
+// has reached one endpoint only (and is thus making content untracked on that
+// endpoint only) doesn't result in the deletion of content on the other.
+func TestReconcileGitMode(t *testing.T) {
+	// Define helper variables. The ancestor and endpoints in these test cases
+	// are all directories, as is the case for a synchronization root.
+	rules := nested(".gitignore", tF2)
+	withRules := func(name string, entry *Entry) *Entry {
+		return &Entry{Contents: map[string]*Entry{".gitignore": tF2, name: entry}}
+	}
+	pkg := func(entry *Entry) *Entry {
+		return nested("pkg", nested("build", entry))
+	}
+
+	// Define test cases.
+	var tests = []struct {
+		// description is a human readable description of the test case.
+		description string
+		// modes are the synchronization modes for which the test case should
+		// apply.
+		modes []SynchronizationMode
+		// ancestor is the root ancestor entry.
+		ancestor *Entry
+		// alpha is the root alpha entry.
+		alpha *Entry
+		// beta is the root beta entry.
+		beta *Entry
+		// expectedAncestorChanges are the expected ancestor changes.
+		expectedAncestorChanges []*Change
+		// expectedAlphaChanges are the expected alpha changes.
+		expectedAlphaChanges []*Change
+		// expectedBetaChanges are the expected beta changes.
+		expectedBetaChanges []*Change
+		// expectedConflicts are the expected conflicts.
+		expectedConflicts []*Conflict
+	}{
+		// A rule has been added on one side, with the other side unchanged. In
+		// non-Git-mode reconciliation, these propagate a deletion.
+		{
+			description:             "file untracked on alpha, unchanged on beta",
+			modes:                   allModes,
+			ancestor:                nested("file", tF1),
+			alpha:                   nested("file", tU),
+			beta:                    nested("file", tF1),
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+		},
+		{
+			description:             "file unchanged on alpha, untracked on beta",
+			modes:                   allModes,
+			ancestor:                nested("file", tF1),
+			alpha:                   nested("file", tF1),
+			beta:                    nested("file", tU),
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+		},
+		{
+			description:             "directory untracked on alpha, unchanged on beta",
+			modes:                   allModes,
+			ancestor:                nested("data", tD1),
+			alpha:                   nested("data", tU),
+			beta:                    nested("data", tD1),
+			expectedAncestorChanges: []*Change{{Path: "data"}},
+		},
+		{
+			description:             "directory unchanged on alpha, untracked on beta",
+			modes:                   allModes,
+			ancestor:                nested("data", tD1),
+			alpha:                   nested("data", tD1),
+			beta:                    nested("data", tU),
+			expectedAncestorChanges: []*Change{{Path: "data"}},
+		},
+		{
+			description:             "nested directory untracked on alpha, unchanged on beta",
+			modes:                   allModes,
+			ancestor:                pkg(tD1),
+			alpha:                   pkg(tU),
+			beta:                    pkg(tD1),
+			expectedAncestorChanges: []*Change{{Path: "pkg/build"}},
+		},
+		{
+			description:             "nested directory unchanged on alpha, untracked on beta",
+			modes:                   allModes,
+			ancestor:                pkg(tD1),
+			alpha:                   pkg(tD1),
+			beta:                    pkg(tU),
+			expectedAncestorChanges: []*Change{{Path: "pkg/build"}},
+		},
+		{
+			description:             "file within directory untracked on alpha, unchanged on beta",
+			modes:                   allModes,
+			ancestor:                nested("directory", tD1),
+			alpha:                   nested("directory", nested("file", tU)),
+			beta:                    nested("directory", tD1),
+			expectedAncestorChanges: []*Change{{Path: "directory/file"}},
+		},
+
+		// The rule that made content untracked is itself being propagated.
+		{
+			description:             "file untracked on alpha along with new rules",
+			modes:                   allModes,
+			ancestor:                nested("file", tF1),
+			alpha:                   withRules("file", tU),
+			beta:                    nested("file", tF1),
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+			expectedBetaChanges:     []*Change{{Path: ".gitignore", New: tF2}},
+		},
+		{
+			description:             "file untracked on beta along with new rules",
+			modes:                   twoWayModes,
+			ancestor:                nested("file", tF1),
+			alpha:                   nested("file", tF1),
+			beta:                    withRules("file", tU),
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+			expectedAlphaChanges:    []*Change{{Path: ".gitignore", New: tF2}},
+		},
+		{
+			description:             "file untracked on beta along with new rules",
+			modes:                   oneWaySafeMode,
+			ancestor:                nested("file", tF1),
+			alpha:                   nested("file", tF1),
+			beta:                    withRules("file", tU),
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+		},
+		{
+			description:             "file untracked on beta along with new rules",
+			modes:                   oneWayReplicaMode,
+			ancestor:                nested("file", tF1),
+			alpha:                   nested("file", tF1),
+			beta:                    withRules("file", tU),
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+			expectedBetaChanges:     []*Change{{Path: ".gitignore", Old: tF2}},
+		},
+
+		// The other side has changes, which would usually be propagated, or
+		// result in a conflict, but which aren't and don't.
+		{
+			description:             "file untracked on alpha, modified on beta",
+			modes:                   allModes,
+			ancestor:                nested("file", tF1),
+			alpha:                   nested("file", tU),
+			beta:                    nested("file", tF2),
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+		},
+		{
+			description:             "file modified on alpha, untracked on beta",
+			modes:                   allModes,
+			ancestor:                nested("file", tF1),
+			alpha:                   nested("file", tF2),
+			beta:                    nested("file", tU),
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+		},
+		{
+			description: "new file opposite untracked content on beta",
+			modes:       allModes,
+			ancestor:    tD0,
+			alpha:       nested("file", tF1),
+			beta:        nested("file", tU),
+		},
+		{
+			description: "new file opposite untracked content on alpha",
+			modes:       allModes,
+			ancestor:    tD0,
+			alpha:       nested("file", tU),
+			beta:        nested("file", tF1),
+		},
+		{
+			description: "new directory opposite untracked content on beta",
+			modes:       allModes,
+			ancestor:    tD0,
+			alpha:       nested("data", tD1),
+			beta:        nested("data", tU),
+		},
+		{
+			description: "new directory opposite untracked content on alpha",
+			modes:       allModes,
+			ancestor:    tD0,
+			alpha:       nested("data", tU),
+			beta:        nested("data", tD1),
+		},
+		{
+			description: "new nested directory opposite untracked content on beta",
+			modes:       allModes,
+			ancestor:    nested("pkg", tD0),
+			alpha:       pkg(tD1),
+			beta:        pkg(tU),
+		},
+		{
+			description: "new nested directory opposite untracked content on alpha",
+			modes:       allModes,
+			ancestor:    nested("pkg", tD0),
+			alpha:       pkg(tU),
+			beta:        pkg(tD1),
+		},
+		{
+			description:             "file replaced by directory opposite untracked content",
+			modes:                   allModes,
+			ancestor:                nested("path", tF1),
+			alpha:                   nested("path", tD1),
+			beta:                    nested("path", tU),
+			expectedAncestorChanges: []*Change{{Path: "path"}},
+		},
+
+		// Both sides lack tracked content at the path.
+		{
+			description:             "untracked on both sides",
+			modes:                   allModes,
+			ancestor:                nested("file", tF1),
+			alpha:                   nested("file", tU),
+			beta:                    nested("file", tU),
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+		},
+		{
+			description:             "untracked on alpha, deleted on beta",
+			modes:                   allModes,
+			ancestor:                nested("file", tF1),
+			alpha:                   nested("file", tU),
+			beta:                    tD0,
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+		},
+		{
+			description:             "deleted on alpha, untracked on beta",
+			modes:                   allModes,
+			ancestor:                nested("file", tF1),
+			alpha:                   tD0,
+			beta:                    nested("file", tU),
+			expectedAncestorChanges: []*Change{{Path: "file"}},
+		},
+
+		// Problematic content takes precedence and leaves the ancestor alone.
+		{
+			description: "untracked on alpha, problematic on beta",
+			modes:       allModes,
+			ancestor:    nested("file", tF1),
+			alpha:       nested("file", tU),
+			beta:        nested("file", tP1),
+		},
+		{
+			description: "problematic on alpha, untracked on beta",
+			modes:       allModes,
+			ancestor:    nested("file", tF1),
+			alpha:       nested("file", tP1),
+			beta:        nested("file", tU),
+		},
+
+		// Real deletions, where the content is gone rather than untracked,
+		// continue to be propagated.
+		{
+			description:         "file deleted on alpha",
+			modes:               allModes,
+			ancestor:            nested("file", tF1),
+			alpha:               tD0,
+			beta:                nested("file", tF1),
+			expectedBetaChanges: []*Change{{Path: "file", Old: tF1}},
+		},
+		{
+			description:          "file deleted on beta",
+			modes:                twoWayModes,
+			ancestor:             nested("file", tF1),
+			alpha:                nested("file", tF1),
+			beta:                 tD0,
+			expectedAlphaChanges: []*Change{{Path: "file", Old: tF1}},
+		},
+		{
+			description:         "file deleted on beta",
+			modes:               oneWayModes,
+			ancestor:            nested("file", tF1),
+			alpha:               nested("file", tF1),
+			beta:                tD0,
+			expectedBetaChanges: []*Change{{Path: "file", New: tF1}},
+		},
+		{
+			description:         "directory deleted on alpha",
+			modes:               allModes,
+			ancestor:            nested("data", tD1),
+			alpha:               tD0,
+			beta:                nested("data", tD1),
+			expectedBetaChanges: []*Change{{Path: "data", Old: tD1}},
+		},
+		{
+			description:         "nested directory deleted on alpha",
+			modes:               allModes,
+			ancestor:            pkg(tD1),
+			alpha:               nested("pkg", tD0),
+			beta:                pkg(tD1),
+			expectedBetaChanges: []*Change{{Path: "pkg/build", Old: tD1}},
+		},
+		{
+			description:         "new rules on alpha with a deletion alongside them",
+			modes:               allModes,
+			ancestor:            nested("file", tF1),
+			alpha:               rules,
+			beta:                nested("file", tF1),
+			expectedBetaChanges: []*Change{{Path: ".gitignore", New: tF2}, {Path: "file", Old: tF1}},
+		},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		// Test each mode.
+		for _, mode := range test.modes {
+			// Perform reconciliation.
+			ancestorChanges, alphaChanges, betaChanges, conflicts := ReconcileGitMode(
+				test.ancestor, test.alpha, test.beta, mode,
+			)
+
+			// Verify the ancestor changes.
+			if !testingChangeListsEqual(ancestorChanges, test.expectedAncestorChanges) {
+				t.Errorf("%s (%s): ancestor changes do not match expected: %v != %v",
+					test.description, mode.Description(), ancestorChanges, test.expectedAncestorChanges,
+				)
+			}
+
+			// Verify the alpha changes.
+			if !testingChangeListsEqual(alphaChanges, test.expectedAlphaChanges) {
+				t.Errorf("%s (%s): alpha changes do not match expected: %v != %v",
+					test.description, mode.Description(), alphaChanges, test.expectedAlphaChanges,
+				)
+			}
+
+			// Verify the beta changes.
+			if !testingChangeListsEqual(betaChanges, test.expectedBetaChanges) {
+				t.Errorf("%s (%s): beta changes do not match expected: %v != %v",
+					test.description, mode.Description(), betaChanges, test.expectedBetaChanges,
+				)
+			}
+
+			// Verify the conflicts.
+			if !testingConflictListsEqual(conflicts, test.expectedConflicts) {
+				t.Errorf("%s (%s): conflicts do not match expected: %v != %v",
+					test.description, mode.Description(), conflicts, test.expectedConflicts,
+				)
+			}
+		}
+	}
+}
+
+// TestReconcileGitModeWithoutUntrackedContent tests that ReconcileGitMode
+// behaves identically to Reconcile unless an endpoint has untracked content at
+// a path, and that Reconcile continues to propagate deletions of untracked
+// content.
+func TestReconcileGitModeWithoutUntrackedContent(t *testing.T) {
+	// Exhaustively compare the functions for a selection of entries that don't
+	// have any untracked content.
+	ancestors := []*Entry{nil, tF1, tF2, tSR, tD0, tD1, tD2, tDD0, tDM}
+	sides := append(ancestors[:len(ancestors):len(ancestors)], tP1, tDP1)
+	for _, mode := range allModes {
+		for _, ancestor := range ancestors {
+			for _, alpha := range sides {
+				for _, beta := range sides {
+					ancestorChanges, alphaChanges, betaChanges, conflicts := Reconcile(ancestor, alpha, beta, mode)
+					gitAncestorChanges, gitAlphaChanges, gitBetaChanges, gitConflicts := ReconcileGitMode(ancestor, alpha, beta, mode)
+					if !testingChangeListsEqual(gitAncestorChanges, ancestorChanges) ||
+						!testingChangeListsEqual(gitAlphaChanges, alphaChanges) ||
+						!testingChangeListsEqual(gitBetaChanges, betaChanges) ||
+						!testingConflictListsEqual(gitConflicts, conflicts) {
+						t.Errorf("results differ for ancestor %v, alpha %v, beta %v (%s)",
+							ancestor, alpha, beta, mode.Description(),
+						)
+					}
+				}
+			}
+		}
+	}
+
+	// Verify that Reconcile still sees untracked content on one side and
+	// unchanged content on the other as a deletion in two-way modes.
+	for _, mode := range twoWayModes {
+		_, _, betaChanges, _ := Reconcile(nested("file", tF1), nested("file", tU), nested("file", tF1), mode)
+		if !testingChangeListsEqual(betaChanges, []*Change{{Path: "file", Old: tF1}}) {
+			t.Errorf("unexpected beta changes (%s): %v", mode.Description(), betaChanges)
+		}
+	}
+}

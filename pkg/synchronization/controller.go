@@ -912,6 +912,14 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		ignoreSyntax = c.session.Version.DefaultIgnoreSyntax()
 	}
 
+	// Determine whether or not the session is in Git mode and select the
+	// corresponding reconciliation behavior.
+	gitMode := GitModeEnabled(c.session.Configuration, c.session.Version)
+	reconcile := core.Reconcile
+	if gitMode {
+		reconcile = core.ReconcileGitMode
+	}
+
 	// Compute the effective permissions mode.
 	permissionsMode := c.session.Configuration.PermissionsMode
 	if permissionsMode.IsDefault() {
@@ -1205,7 +1213,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		// synchronization root. In any case, we switch to a halted state and
 		// wait for the user to either manually propagate the deletion and
 		// resume the session, recreate the session, or reset the session.
-		if oneEndpointEmptiedRoot(ancestor, αContent, βContent) {
+		if oneEndpointEmptiedRoot(ancestor, αContent, βContent, gitMode) {
 			c.stateLock.Lock()
 			c.state.Status = Status_HaltedOnRootEmptied
 			c.stateLock.Unlock()
@@ -1214,7 +1222,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 
 		// Perform reconciliation.
 		c.logger.Debug("Performing reconciliation")
-		ancestorChanges, αTransitions, βTransitions, conflicts := core.Reconcile(
+		ancestorChanges, αTransitions, βTransitions, conflicts := reconcile(
 			ancestor,
 			αContent,
 			βContent,
