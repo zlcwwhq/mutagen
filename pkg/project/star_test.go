@@ -237,6 +237,61 @@ star:
 	}
 }
 
+// TestStarGitMode verifies that Git mode reaches every edge of a star through
+// the shared configuration, from the star's own settings or from the
+// synchronization defaults, with the star's settings taking precedence, and
+// that nodes can't set it individually.
+func TestStarGitMode(t *testing.T) {
+	t.Chdir(t.TempDir())
+	nodes := "center: a\n  nodes:\n    a: {endpoint: ./a}\n    b: {endpoint: ./b}\n    c: {endpoint: ./c}\n"
+	for _, test := range []struct {
+		name, yaml string
+		expected   synchronization.GitMode
+	}{
+		{"unspecified", "star:\n  " + nodes, synchronization.GitMode_GitModeDefault},
+		{"shared", "star:\n  sync: {git: enabled}\n  " + nodes, synchronization.GitMode_GitModeEnabled},
+		{"defaults", "sync: {defaults: {git: enabled}}\nstar:\n  " + nodes, synchronization.GitMode_GitModeEnabled},
+		{"override", "sync: {defaults: {git: enabled}}\nstar:\n  sync: {git: disabled}\n  " + nodes, synchronization.GitMode_GitModeDisabled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			specifications := testSpecifications(t, test.yaml)
+			if len(specifications.Synchronization) != 2 {
+				t.Fatal("incorrect edge count")
+			}
+			for _, specification := range specifications.Synchronization {
+				if mode := specification.Configuration.GitMode; mode != test.expected {
+					t.Errorf("%s: incorrect Git mode: %s", specification.Name, mode)
+				} else if !specification.ConfigurationAlpha.GitMode.IsDefault() || !specification.ConfigurationBeta.GitMode.IsDefault() {
+					t.Errorf("%s: Git mode set for an endpoint", specification.Name)
+				}
+			}
+		})
+	}
+
+	// Git mode contradicts an explicit request to propagate VCS directories,
+	// whether the star or the defaults make it.
+	for name, yaml := range map[string]string{
+		"shared":   "star:\n  sync: {git: enabled, ignore: {vcs: false}}\n  " + nodes,
+		"defaults": "sync: {defaults: {ignore: {vcs: false}}}\nstar:\n  sync: {git: enabled}\n  " + nodes,
+	} {
+		t.Run("propagation-"+name, func(t *testing.T) {
+			if _, err := NewSessionSpecifications(testConfiguration(t, yaml), nil, "project", false); err == nil {
+				t.Fatal("contradictory star configuration accepted")
+			}
+		})
+	}
+
+	// Nodes have no settings of their own for it, so a project file that gives
+	// one is rejected when it's loaded.
+	path := filepath.Join(t.TempDir(), DefaultConfigurationFileName)
+	contents := "star: {center: a, nodes: {a: {endpoint: ./a}, b: {endpoint: ./b, git: enabled}}}"
+	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	} else if _, err := LoadConfiguration(path); err == nil {
+		t.Fatal("node Git mode accepted")
+	}
+}
+
 // TestStarOverlappingEndpoints checks that overlapping remote paths are
 // rejected during planning, before any synchronization session can start
 // copying files.

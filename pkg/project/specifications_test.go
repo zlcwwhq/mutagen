@@ -181,6 +181,71 @@ sync:
 	}
 }
 
+// TestSessionSpecificationsGitMode verifies that Git mode can be enabled in
+// project files, is layered like other session-wide settings, and is rejected
+// when it can't apply.
+func TestSessionSpecificationsGitMode(t *testing.T) {
+	t.Chdir(t.TempDir())
+	specifications := testSpecifications(t, `
+sync:
+  defaults:
+    alpha: ./alpha
+    beta: ./beta
+    git: enabled
+  disabled: {git: disabled}
+  inherited: {}
+`)
+	expected := map[string]synchronization.GitMode{
+		"disabled":  synchronization.GitMode_GitModeDisabled,
+		"inherited": synchronization.GitMode_GitModeEnabled,
+	}
+	for _, s := range specifications.Synchronization {
+		if s.Configuration.GitMode != expected[s.Name] {
+			t.Errorf("incorrect Git mode for %s: %s", s.Name, s.Configuration.GitMode)
+		}
+	}
+
+	// Unspecified modes remain unspecified so that sessions resolve them
+	// according to their versions.
+	specifications = testSpecifications(t, "sync:\n  example: {alpha: ./alpha, beta: ./beta}\n")
+	if mode := specifications.Synchronization[0].Configuration.GitMode; !mode.IsDefault() {
+		t.Errorf("unspecified Git mode resolved to %s", mode)
+	}
+
+	// Unknown values are rejected when the file is loaded.
+	path := filepath.Join(t.TempDir(), DefaultConfigurationFileName)
+	for _, value := range []string{"true", "false", "both", "Enabled"} {
+		contents := "sync:\n  example: {alpha: ./alpha, beta: ./beta, git: " + value + "}\n"
+		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		} else if _, err := LoadConfiguration(path); err == nil {
+			t.Errorf("invalid Git mode accepted: %s", value)
+		}
+	}
+
+	// An explicit request to propagate VCS directories contradicts the mode,
+	// even if the two come from different layers, but disabling the mode
+	// removes the contradiction.
+	for name, test := range map[string]struct {
+		contents string
+		valid    bool
+	}{
+		"same layer":      {"sync:\n  example: {alpha: ./alpha, beta: ./beta, git: enabled, ignore: {vcs: false}}\n", false},
+		"defaults":        {"sync:\n  defaults: {ignore: {vcs: false}}\n  example: {alpha: ./alpha, beta: ./beta, git: enabled}\n", false},
+		"disabled":        {"sync:\n  example: {alpha: ./alpha, beta: ./beta, git: disabled, ignore: {vcs: false}}\n", true},
+		"explicit ignore": {"sync:\n  example: {alpha: ./alpha, beta: ./beta, git: enabled, ignore: {vcs: true}}\n", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewSessionSpecifications(testConfiguration(t, test.contents), nil, "project", false)
+			if test.valid && err != nil {
+				t.Fatal("valid configuration rejected:", err)
+			} else if !test.valid && err == nil {
+				t.Fatal("invalid configuration accepted")
+			}
+		})
+	}
+}
+
 // TestSessionSpecificationsInvalid verifies that configuration that the daemon
 // would reject is detected before any sessions are modified.
 func TestSessionSpecificationsInvalid(t *testing.T) {
@@ -190,6 +255,7 @@ func TestSessionSpecificationsInvalid(t *testing.T) {
 		"missing URL":              "sync:\n  example: {alpha: ./alpha}\n",
 		"endpoint-specific mode":   "sync:\n  example: {alpha: ./alpha, beta: ./beta, configurationBeta: {mode: two-way-safe}}\n",
 		"endpoint-specific remote": "sync:\n  example: {alpha: ./alpha, beta: ./beta, configurationAlpha: {remote: true}}\n",
+		"endpoint-specific git":    "sync:\n  example: {alpha: ./alpha, beta: ./beta, configurationBeta: {git: enabled}}\n",
 		"Mutagen-style ignores":    "sync:\n  example: {alpha: ./alpha, beta: ./beta, ignore: {paths: ['!']}}\n",
 		"Docker-style ignores":     "sync:\n  example: {alpha: ./alpha, beta: ./beta, ignore: {syntax: docker, paths: ['!']}}\n",
 		"default ignores":          "sync:\n  defaults: {ignore: {paths: ['!']}}\n  example: {alpha: ./alpha, beta: ./beta}\n",

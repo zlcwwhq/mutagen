@@ -85,6 +85,25 @@ func TestGitModeSubmoduleNoHotLoopFakeSSH(t *testing.T) {
 	runGitSubmoduleNoHotLoop(t, newFakeSSHTransport(t, system, manager))
 }
 
+// TestGitModeSubmoduleStarFakeSSH tests submodules in a star whose nodes are
+// reached through the SSH transport, sharing a fake remote system, which
+// requires that their clones, temporary directories, and population records
+// don't interfere with each other.
+func TestGitModeSubmoduleStarFakeSSH(t *testing.T) {
+	isolateGitMode(t)
+	system := newFakeSSHSystem(t)
+	manager := newFakeSSHManager(t)
+	testGitSubmoduleStar(t, gitSubmoduleStarOptions{
+		manager:   manager,
+		base:      system.base,
+		endpoints: map[string]string{"server": "server:server", "gpu": "gpu:gpu"},
+		roots: map[string]string{
+			"server": filepath.Join(system.home, "server"),
+			"gpu":    filepath.Join(system.home, "gpu"),
+		},
+	})
+}
+
 // gitModeFilesContain indicates whether any file beneath a directory contains
 // the specified text.
 func gitModeFilesContain(t *testing.T, directory, text string) bool {

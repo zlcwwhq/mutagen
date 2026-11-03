@@ -82,8 +82,9 @@ disables execution there fail with 125.
     --node NAME. Session identifiers are internal synchronization handles.
   - Relative directories map from source root to target root. --cwd (-C)
     overrides the mapped directory; absolute and quoted ~ paths belong to the
-    target system. Ignored directories require an explicit --cwd, and ignored
-    content isn't synchronized. --ignores without --node inspects local rules.
+    target system. Ignored directories (in Git mode, also those that .gitignore
+    rules ignore) require an explicit --cwd, and ignored content isn't
+    synchronized. --ignores without --node inspects local rules.
   - Every operation crosses exactly one edge, which is an ordinary pair
     session, and behaves as for a pair: commands, scripts, detached jobs,
     --flush, --no-flush, --pull, --diff, --ignores, and conflicts (see
@@ -144,8 +145,9 @@ between a star's center and one of its nodes:
   - After synchronizing, remote warns about conflicts (files modified on both
     endpoints, which stay unsynchronized until resolved; see
     remote --help conflicts) and other content that couldn't be synchronized,
-    such as because of permission errors. Ignored paths are never synchronized
-    and aren't reported.
+    such as because of permission errors. In Git mode, it also warns about
+    content that isn't synchronized by design, separately from that (see
+    below). Ignored paths are never synchronized and aren't reported.
   - Files that a detached job writes arrive through the session's regular
     synchronization, which remote --wait performs once the job ends, and
     remote --flush on demand.
@@ -160,12 +162,52 @@ between a star's center and one of its nodes:
     replacing local files that differ but never deleting local content. It
     refuses the root, paths that the session synchronizes, which
     synchronization updates instead, and directories with synchronized
-    content beneath them. Both options count a path as ignored only if the
+    content beneath them. It never writes inside a .git entry, and only adds
+    one where none exists locally, since repositories can't be merged file by
+    file. Both options count a path as ignored only if the
     session ignores it in every Unicode normalization form, and, if symbolic
     links among its local parents lead elsewhere in the root, only if the
     session also ignores where they lead. --pull only follows links that the
     session ignores, and never one at the path itself, which a pulled file or
     link replaces.
+  - In Git mode (git: enabled), the session also ignores what .gitignore
+    files at every level and the root repository's .git/info/exclude ignore,
+    which each endpoint reads from its own copy of the tree, case-sensitively
+    (global excludes and files above the root don't count). The session's
+    ignore patterns take precedence, so a pattern such as !.env synchronizes
+    a file that a rule ignores. Entries named .git, files as well as
+    directories, are never synchronized and can't be unignored, and neither
+    are names that Windows or macOS treat as .git (such as .git. and git~1),
+    which Git refuses to track. remote
+    --ignores lists these sources and says which one ignores a path, and
+    --pull copies what they ignore. A rule added later doesn't delete files
+    that were synchronized. If a rule file can't be read, then its directory
+    isn't synchronized until that's fixed, and --pull refuses to write there.
+    An endpoint doesn't write a path that its own rules ignore, even if it
+    doesn't have that path yet: remote warns, and the rest of the directory,
+    including any .gitignore files, still arrives. Files that Git tracks but
+    rules ignore aren't synchronized: remote warns and suggests the pattern
+    that unignores them.
+  - In Git mode, a nested repository with a commit checked out and an origin,
+    such as a submodule, has its files synchronized like any directory's,
+    uncommitted changes included, but not its .git, so branches, stashes, and
+    unpushed commits stay on the endpoint that has them. Instead, the other
+    endpoint follows the commit that one checks out, moving its detached HEAD
+    without touching files; a commit that it lacks is fetched from origin in
+    the background, and until it's pushed, HEAD stays behind with a warning.
+    An endpoint without the repository gets a clone from origin (filled in
+    with the other endpoint's changes and nested submodules by the following
+    cycles, which flushes wait for), or a .git attached to its directory. If
+    both endpoints check out different commits, then two-way-safe sessions
+    synchronize nothing in it and list a conflict until they agree,
+    one-way-safe sessions synchronize its files but list a conflict for its
+    commit, and two-way-resolved sessions follow alpha's commit and resolve
+    files as usual. Deleting it isn't synchronized: delete it on each
+    endpoint. Other nested repositories are synchronized as
+    directories without their .git. Inside a nested repository, as for Git
+    run in it, only its own .gitignore files and exclude file apply; the
+    rules above it only decide whether its directory is ignored. An endpoint
+    where it has no .git applies the rules above it.
   - --pull preserves regular files' modification times, including files in
     directories, truncated to whole seconds, so copies are never newer than
     their sources. Times use the executing endpoint's clock; clock skew is
@@ -379,6 +421,10 @@ changed since checkout; concurrent edits during apply can be overwritten.
 Each conflict has one checkout, through one endpoint. A workspace on your
 system may belong to someone else; only apply or discard your own checkouts.
 Directories require manual resolution. Other supported types require --take.
+In Git mode, a submodule whose endpoints checked out different commits is
+listed as one conflict, which only Git resolves: check out the same commit on
+both endpoints, or delete the submodule on the endpoint to discard (beta, in
+one-way-safe sessions), which then gets a clone of the other's commit.
 
 Failed apply can leave a partial result: retry using the retained workspace.
 If a copy changed or the conflict disappeared, inspect the current files and
@@ -422,7 +468,8 @@ alongside Error.
     "No conflicts.", unless content couldn't be synchronized, which can hide
     conflicts: it then warns about that content and prints "Conflicts can't be
     ruled out, because some content couldn't be synchronized (see the
-    warnings).".
+    warnings).". Content that isn't synchronized by design doesn't affect
+    this. --json lists both in Problems, and sets Warning for the latter.
   - Before checking out, stop anything that writes the conflicting paths on
     either endpoint, and leave them unchanged until apply finishes; changing
     them meanwhile isn't supported. Apply fails without writing a copy that
