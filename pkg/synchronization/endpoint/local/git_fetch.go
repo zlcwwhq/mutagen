@@ -112,17 +112,18 @@ type gitFetchRequest struct {
 }
 
 // gitFetcher fetches the commits that submodules have to follow in the
-// background, so that synchronization never waits for the network. A request
-// is attempted as soon as the throttling allows (see gitRetries), and if the
-// attempt fails, then the request is kept and attempted again once the
-// throttling allows it, until it succeeds, until a newer request for the same
-// repository replaces it, or until it's cancelled because the commit is no
-// longer needed. The request has to be kept, because a commit that couldn't be
-// fetched usually just hasn't been pushed yet, and pushing it changes nothing
-// that a scan sees, so no synchronization cycle would request it again. The
-// throttling limits the network traffic of an idle session to an attempt per
-// maximum interval for each commit that a submodule has to follow. If a fetch
-// succeeds, then the fetcher wakes the session. It's safe for concurrent use.
+// background, so that synchronization never waits for the network (see
+// gitProvider.Follow). A request is attempted as soon as the throttling allows
+// (see gitRetries), and if the attempt fails, then the request is kept and
+// attempted again once the throttling allows it, until it succeeds, until a
+// newer request for the same repository replaces it, or until it's cancelled
+// because the commit is no longer needed. The request has to be kept, because a
+// commit that couldn't be fetched usually just hasn't been pushed yet, and
+// pushing it changes nothing that a scan sees, so no synchronization cycle
+// would request it again. The throttling limits the network traffic of an idle
+// session to an attempt per maximum interval for each commit that a submodule
+// has to follow. If a fetch succeeds, then the fetcher wakes the session, so
+// that the next cycle moves HEAD. It's safe for concurrent use.
 type gitFetcher struct {
 	// provider is the provider whose operations the fetcher uses.
 	provider *gitProvider
