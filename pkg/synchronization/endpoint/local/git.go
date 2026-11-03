@@ -35,8 +35,11 @@ const (
 
 // containsGitRulePath determines whether or not any of the specified re-check
 // paths identifies a file whose contents affect ignore evaluation in Git mode.
-// This includes the exclude file, for which gitModeEventRelevant lets events
-// through, and which isn't synchronized, but which local edits can change.
+// This includes the exclude files of the root repository and of nested
+// repositories, for which gitModeEventRelevant lets events through, and which
+// aren't synchronized, but which local edits can change. An exclude file
+// applies throughout its repository's working tree, so a change to one
+// requires a full scan, like a change to a rule file.
 func containsGitRulePath(recheckPaths map[string]bool) bool {
 	for path := range recheckPaths {
 		if gitignore.AffectsIgnoreEvaluation(path) {

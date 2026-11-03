@@ -172,8 +172,9 @@ func TestGitModeEventRelevant(t *testing.T) {
 }
 
 // TestContainsGitRulePath tests containsGitRulePath, which unlike what's
-// delivered has to include the exclude file, since local edits to it change
-// what's ignored.
+// delivered has to include the exclude files of the root repository and of
+// nested repositories, since local edits to them change what's ignored. Every
+// exclude file that gitModeEventRelevant lets through counts.
 func TestContainsGitRulePath(t *testing.T) {
 	tests := []struct {
 		paths    []string
@@ -185,6 +186,11 @@ func TestContainsGitRulePath(t *testing.T) {
 		{[]string{"a", "a/.gitignore"}, true},
 		{[]string{".git/info/exclude"}, true},
 		{[]string{"a", ".git/info/exclude"}, true},
+		{[]string{"a/.git/info/exclude"}, true},
+		{[]string{"a", "a/b/.git/info/exclude"}, true},
+		{[]string{".git/modules/sub/info/exclude"}, true},
+		{[]string{".git/modules/x/y/info/exclude"}, true},
+		{[]string{".GIT/info/exclude"}, true},
 
 		// Other paths in Git directories that events can report, which don't
 		// provide rules, and which thus don't require a full scan.
@@ -194,7 +200,12 @@ func TestContainsGitRulePath(t *testing.T) {
 		{[]string{".git/x/.gitignore"}, false},
 		{[]string{".GIT/.gitignore"}, false},
 		{[]string{"a/.git/x/.gitignore"}, false},
-		{[]string{"a/.git/info/exclude"}, false},
+		{[]string{"a/.git/info"}, false},
+		{[]string{"a/.git"}, false},
+
+		// Ordinary content that merely resembles an exclude file.
+		{[]string{"info/exclude"}, false},
+		{[]string{"a/info/exclude"}, false},
 	}
 	for _, test := range tests {
 		paths := make(map[string]bool, len(test.paths))
