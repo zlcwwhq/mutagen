@@ -20,6 +20,15 @@ type stagingPathFinder struct {
 func (f *stagingPathFinder) find(path string, entry *Entry) {
 	if entry == nil {
 		return
+	} else if entry.IsSubmodule() {
+		// A submodule that a transition creates (or that replaces other
+		// content) is populated with a clone of its repository, and the clone
+		// provides its contents, so none of them need staging. Staging them
+		// would transfer the submodule's entire working tree from the other
+		// endpoint, only for Transition to ignore it. Changes within an
+		// existing submodule don't reach this case, because their paths are
+		// beneath the submodule's directory.
+		return
 	} else if entry.Kind == EntryKind_Directory {
 		// Compute the prefix to add to content names to compute their paths.
 		var contentPathPrefix string
