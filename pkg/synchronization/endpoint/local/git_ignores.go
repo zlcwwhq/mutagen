@@ -2,6 +2,7 @@ package local
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/fastpath"
@@ -38,7 +39,11 @@ func gitReceivableFile(ignorer ignore.DirectoryIgnorer, path string) bool {
 // contains them is Untracked on this endpoint, which ends any further
 // reconciliation of it. None of this applies at or beneath a Git entry, which
 // isn't content that a session could ever need to deliver, and which is never
-// written or removed (see refuseGitEntry and removesGitContent).
+// written or removed (see refuseGitEntry and removesGitContent), with one
+// exception: a submodule's Git entry (a GitLink entry) can be attached to a
+// directory or moved to another commit, which only changes what's in it. A
+// submodule that's being created is populated by a clone, whose content is
+// what this endpoint's own rules allow, so only its directory is evaluated.
 type gitTransitionPruner struct {
 	// ignorer evaluates this endpoint's rules.
 	ignorer ignore.DirectoryIgnorer
@@ -88,18 +93,55 @@ func (p *gitTransitionPruner) refuseGitEntry(entry string) {
 	})
 }
 
-// removesGitContent determines whether or not removing a change's old content
-// would remove a Git entry or anything beneath one, reporting each Git entry
-// involved. Old content comes from the session's ancestor or the synchronizable
-// part of a scan, and neither of those has Git entries, since they're never
-// synchronized (a directory that has one on disk is left alone, as a conflict).
-// So only a malfunctioning or compromised controller can ask for this, and
+// refuseSubmoduleRemoval reports the removal of a submodule's Git entry (a
+// GitLink entry), once. Unlike other changes to Git metadata, this is expected:
+// a submodule that's deleted on the other endpoint, or whose directory is
+// replaced by something else there, would be removed here. It's refused
+// because a repository can hold work that exists nowhere else, such as
+// unpushed commits and stashes, and it isn't synchronized.
+func (p *gitTransitionPruner) refuseSubmoduleRemoval(entry string) {
+	p.reportOnce(&core.Problem{
+		Path:  entry,
+		Error: "submodule isn't removed automatically, since its repository isn't synchronized; remove it manually if it should go",
+	})
+}
+
+// isGitLinkChange determines whether or not a change at a Git entry is one
+// that may be applied to a submodule's Git entry: attaching one to a directory
+// that doesn't have one, or moving one to another commit.
+func isGitLinkChange(change *core.Change) bool {
+	return isGitLinkPath(change.Path) &&
+		change.New != nil && change.New.Kind == core.EntryKind_GitLink &&
+		(change.Old == nil || change.Old.Kind == core.EntryKind_GitLink)
+}
+
+// isGitLinkPath determines whether or not a path can be that of a submodule's
+// Git entry, which is never at or beneath another Git entry, and never the
+// root's Git entry.
+func isGitLinkPath(path string) bool {
+	directory, ok := strings.CutSuffix(path, "/"+core.GitLinkName)
+	return ok && gitignore.ShallowestGitEntry(directory) == ""
+}
+
+// removesGitContent determines whether or not a change would remove or replace
+// a Git entry or anything beneath one, reporting each Git entry involved, with
+// the exception of the changes to a submodule's Git entry that isGitLinkChange
+// allows. Old content comes from the session's ancestor or the synchronizable
+// part of a scan, and the only Git entries that those have are those of
+// submodules, which are never removed (see refuseSubmoduleRemoval). Anything
+// else can only be asked for by a malfunctioning or compromised controller, and
 // removal acts on what it's given, unlike scans, which never look inside of Git
-// entries. Files are safe from this, since they have to be in the scan's cache to
-// be removed, but symbolic links and empty directories aren't.
+// entries. Files are safe from this, since they have to be in the scan's cache
+// to be removed, but symbolic links and empty directories aren't.
 func (p *gitTransitionPruner) removesGitContent(change *core.Change) bool {
 	if gitEntry := gitignore.ShallowestGitEntry(change.Path); gitEntry != "" {
-		p.refuseGitEntry(gitEntry)
+		if gitEntry == change.Path && isGitLinkChange(change) {
+			return false
+		} else if gitEntry == change.Path && change.Old != nil && change.Old.Kind == core.EntryKind_GitLink {
+			p.refuseSubmoduleRemoval(gitEntry)
+		} else {
+			p.refuseGitEntry(gitEntry)
+		}
 		return true
 	}
 	return p.containsGitEntry(change.Path, change.Old)
@@ -113,7 +155,11 @@ func (p *gitTransitionPruner) containsGitEntry(path string, entry *core.Entry) b
 		contentPathPrefix := fastpath.Joinable(path)
 		for name, content := range entry.Contents {
 			if gitignore.IsGitEntry(name) {
-				p.refuseGitEntry(contentPathPrefix + name)
+				if content.Kind == core.EntryKind_GitLink {
+					p.refuseSubmoduleRemoval(contentPathPrefix + name)
+				} else {
+					p.refuseGitEntry(contentPathPrefix + name)
+				}
 				found = true
 			} else if p.containsGitEntry(contentPathPrefix+name, content) {
 				found = true
@@ -137,10 +183,23 @@ func (p *gitTransitionPruner) fail(path string, err error) {
 // with gitReceivableFile.
 func (p *gitTransitionPruner) prune(path string, entry *core.Entry) *core.Entry {
 	// Nothing at or beneath a Git entry can be written, and it's the Git entry
-	// that's worth reporting, even if a parent is excluded too.
+	// that's worth reporting, even if a parent is excluded too. The exception is
+	// a submodule's Git entry, which may be written, but only into a directory
+	// that isn't excluded, which is where scans would represent it.
 	if gitEntry := gitignore.ShallowestGitEntry(path); gitEntry != "" {
-		p.refuseGitEntry(gitEntry)
-		return nil
+		if gitEntry != path || entry.Kind != core.EntryKind_GitLink || !isGitLinkPath(path) {
+			p.refuseGitEntry(gitEntry)
+			return nil
+		}
+		directory := strings.TrimSuffix(path, "/"+core.GitLinkName)
+		if excluded, err := ignore.Excluded(p.ignorer, directory, true); err != nil {
+			p.fail(path, err)
+			return nil
+		} else if excluded != "" {
+			p.warn(excluded)
+			return nil
+		}
+		return entry
 	}
 
 	// Evaluate the path.
@@ -149,6 +208,18 @@ func (p *gitTransitionPruner) prune(path string, entry *core.Entry) *core.Entry 
 	if err != nil {
 		p.fail(path, err)
 		return nil
+	}
+
+	// A submodule that's being created is populated by a clone, so its contents
+	// aren't written as they are here, but are what the clone yields, which is
+	// subject to this endpoint's rules when it's scanned. Thus, it's either
+	// populated or not at all.
+	if entry.IsSubmodule() {
+		if excluded != "" {
+			p.warn(excluded)
+			return nil
+		}
+		return entry
 	}
 
 	// Anything other than a directory is either written in full or not at all.
