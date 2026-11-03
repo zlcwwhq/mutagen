@@ -2,6 +2,7 @@ package synchronization
 
 import (
 	"context"
+	"maps"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -65,6 +66,17 @@ type testingEndpoint struct {
 	// synchronization cycle performs at most one such operation on an endpoint,
 	// and only if it has transitions.
 	transitioned [][]string
+	// populations maps paths to the results of the transitions that populate
+	// submodules at them, which are what clones contain, rather than what was
+	// requested. A nil result is a failed population, which yields the old
+	// content. Transitions for other paths yield what was requested.
+	populations map[string]*core.Entry
+	// seeds are the populations that the endpoint reports in its snapshots
+	// (see core.Snapshot.Seeds). Like an endpoint's records of populations,
+	// each is discarded by the first scan that receives its seed.
+	seeds map[string]*core.Entry
+	// scanSeeds are the seeds that each scan has received, sorted.
+	scanSeeds [][]string
 }
 
 // newTestingEndpoint creates a new testing endpoint with the specified
@@ -92,12 +104,18 @@ func (e *testingEndpoint) Poll(ctx context.Context) error {
 }
 
 // Scan implements Endpoint.Scan.
-func (e *testingEndpoint) Scan(_ context.Context, _ *core.Entry, full bool) (*core.Snapshot, error, bool) {
+func (e *testingEndpoint) Scan(_ context.Context, _ *core.Entry, seeds []string, full bool) (*core.Snapshot, error, bool) {
 	e.lock.Lock()
 	defer e.lock.Unlock()
 	e.scans++
 	if full {
 		e.fullScans++
+	}
+	e.scanSeeds = append(e.scanSeeds, slices.Sorted(slices.Values(seeds)))
+	for path, population := range e.seeds {
+		if slices.Contains(seeds, population.Contents[core.GitLinkName].Seed) {
+			delete(e.seeds, path)
+		}
 	}
 	if e.rootMissing {
 		return &core.Snapshot{Warnings: e.warnings}, nil, false
@@ -109,9 +127,14 @@ func (e *testingEndpoint) Scan(_ context.Context, _ *core.Entry, full bool) (*co
 			contents[name] = &core.Entry{Kind: core.EntryKind_Untracked}
 		}
 	}
+	var reported map[string]*core.Entry
+	if len(e.seeds) > 0 {
+		reported = maps.Clone(e.seeds)
+	}
 	return &core.Snapshot{
 		Content:  &core.Entry{Kind: core.EntryKind_Directory, Contents: contents},
 		Warnings: e.warnings,
+		Seeds:    reported,
 	}, nil, false
 }
 
@@ -143,11 +166,17 @@ func (e *testingEndpoint) Transition(_ context.Context, transitions []*core.Chan
 			continue
 		}
 		results[t] = transition.New
+		if population, ok := e.populations[transition.Path]; ok && transition.New.IsSubmodule() {
+			results[t] = population
+			if population == nil {
+				results[t] = transition.Old
+			}
+		}
 		var root *core.Entry
 		if !e.rootMissing {
 			root = &core.Entry{Kind: core.EntryKind_Directory, Contents: e.contents}
 		}
-		root, err := core.Apply(root, []*core.Change{{Path: transition.Path, New: transition.New}})
+		root, err := core.Apply(root, []*core.Change{{Path: transition.Path, New: results[t]}})
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -196,10 +225,17 @@ type testingLoop struct {
 // which is terminated when the test completes.
 func startTestingLoop(t *testing.T, configuration *Configuration, alpha, beta *testingEndpoint) *testingLoop {
 	t.Helper()
+	return startTestingLoopWithAncestor(t, configuration, nil, alpha, beta)
+}
 
-	// Create an empty archive.
+// startTestingLoopWithAncestor is a variant of startTestingLoop for a session
+// whose archive already has an ancestor.
+func startTestingLoopWithAncestor(t *testing.T, configuration *Configuration, ancestor *core.Entry, alpha, beta *testingEndpoint) *testingLoop {
+	t.Helper()
+
+	// Create the archive.
 	archivePath := filepath.Join(t.TempDir(), "archive")
-	if err := encoding.MarshalAndSaveProtobuf(archivePath, &core.Archive{}); err != nil {
+	if err := encoding.MarshalAndSaveProtobuf(archivePath, &core.Archive{Content: ancestor}); err != nil {
 		t.Fatal("unable to create archive:", err)
 	}
 
@@ -275,6 +311,16 @@ func (l *testingLoop) cycles() uint64 {
 	l.controller.stateLock.Lock()
 	defer l.controller.stateLock.UnlockWithoutNotify()
 	return l.controller.state.SuccessfulCycles
+}
+
+// ancestor loads the ancestor that the loop has saved.
+func (l *testingLoop) ancestor() *core.Entry {
+	l.t.Helper()
+	archive := &core.Archive{}
+	if err := encoding.LoadAndUnmarshalProtobuf(l.controller.archivePath, archive); err != nil {
+		l.t.Fatal("unable to load archive:", err)
+	}
+	return archive.Content
 }
 
 // verifyCycles verifies the synchronization cycle count.

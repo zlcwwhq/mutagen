@@ -24,15 +24,21 @@ type Endpoint interface {
 	// ancestor is passed, then it will be used as a baseline for a deltified
 	// snapshot transfer if the endpoint is remote. The ancestor may be nil, in
 	// which case the transfer of the initial snapshot may be less than optimal.
-	// The full parameter forces the function to perform a full (but still warm)
-	// scan, avoiding any acceleration that might be available on the endpoint.
+	// The seeds are those that the ancestor's GitLink entries carry (see
+	// core.Entry.GitLinkSeeds), which tell an endpoint in Git mode which of its
+	// records of having populated submodules the ancestor has absorbed, so that
+	// it can discard them, while it reports the rest in the snapshot (see
+	// core.Snapshot.Seeds). They're passed separately because a remote endpoint
+	// doesn't receive the ancestor. The full parameter forces the function to
+	// perform a full (but still warm) scan, avoiding any acceleration that
+	// might be available on the endpoint.
 	// The function returns the scan result, any error that occurred while
 	// trying to perform the scan, and a boolean indicating whether or not to
 	// re-try the scan if an error occurred. Any non-fatal problems encountered
 	// during the scan can be extracted from the resulting content, and any
 	// other problems with the endpoint's content are in the snapshot's
 	// warnings.
-	Scan(ctx context.Context, ancestor *core.Entry, full bool) (*core.Snapshot, error, bool)
+	Scan(ctx context.Context, ancestor *core.Entry, seeds []string, full bool) (*core.Snapshot, error, bool)
 
 	// Stage performs file staging on the endpoint. It accepts a list of file
 	// paths and a separate list of desired digests corresponding to those

@@ -1067,17 +1067,23 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.state.Status = Status_Scanning
 		c.stateLock.Unlock()
 		forceFullScan := flushRequest != nil
+		// Only sessions in Git mode can have submodules, and thus seeds, and
+		// collecting them walks the whole ancestor.
+		var seeds []string
+		if gitMode {
+			seeds = ancestor.GitLinkSeeds()
+		}
 		var αSnapshot, βSnapshot *core.Snapshot
 		var αScanErr, βScanErr error
 		var αTryAgain, βTryAgain bool
 		scanDone := &sync.WaitGroup{}
 		scanDone.Add(2)
 		go func() {
-			αSnapshot, αScanErr, αTryAgain = alpha.Scan(ctx, ancestor, forceFullScan)
+			αSnapshot, αScanErr, αTryAgain = alpha.Scan(ctx, ancestor, seeds, forceFullScan)
 			scanDone.Done()
 		}()
 		go func() {
-			βSnapshot, βScanErr, βTryAgain = beta.Scan(ctx, ancestor, forceFullScan)
+			βSnapshot, βScanErr, βTryAgain = beta.Scan(ctx, ancestor, seeds, forceFullScan)
 			scanDone.Done()
 		}()
 		scanDone.Wait()
@@ -1224,6 +1230,28 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			c.state.Status = Status_HaltedOnRootEmptied
 			c.stateLock.Unlock()
 			return errHaltedForSafety
+		}
+
+		// In Git mode, an endpoint may report that it populated submodules with
+		// clones whose content the ancestor hasn't absorbed, which happens if the
+		// session stopped between a transition that populated a submodule and
+		// the saving of the ancestor that it yielded. That content is the merge
+		// base for the submodule, without which the other endpoint's changes to
+		// it (such as uncommitted edits and deletions) would conflict with the
+		// clone or be undone by it, so we put it in the ancestor before
+		// reconciling. The changes are also recorded as ancestor changes, so
+		// that the ancestor is saved at the end of this cycle, because the
+		// endpoint discards its record once a scan sees the ancestor carry it.
+		var seedChanges []*core.Change
+		if gitMode {
+			if seedChanges = core.SeedChanges(ancestor, αSnapshot.Seeds, βSnapshot.Seeds); len(seedChanges) > 0 {
+				c.logger.Debugf("Absorbing %d change(s) from unabsorbed submodule populations", len(seedChanges))
+				if seeded, err := core.Apply(ancestor, seedChanges); err != nil {
+					return fmt.Errorf("unable to absorb submodule populations: %w", err)
+				} else {
+					ancestor = seeded
+				}
+			}
 		}
 
 		// Perform reconciliation.
@@ -1441,8 +1469,19 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.state.BetaState.TransitionProblems = βProblems
 		c.stateLock.Unlock()
 
+		// Determine whether or not this cycle populated any submodules, which is
+		// the case if a transition result carries a seed that the ancestor
+		// doesn't. A population only yields the content of the clone, so the
+		// content that the other endpoint has in the submodule (such as
+		// uncommitted changes) follows in the next cycle, and so do any
+		// submodules nested within it, so another cycle is necessary.
+		populatedSubmodules := gitMode && populatesSubmodules(ancestor, αResults, βResults)
+
 		// Fold applied changes into the ancestor's change list and update the
-		// ancestor if any changes are present.
+		// ancestor if any changes are present. Any changes that absorb
+		// populations come first, since the other changes were computed against
+		// an ancestor that included them.
+		ancestorChanges = append(seedChanges, ancestorChanges...)
 		ancestorChanges = append(ancestorChanges, αChanges...)
 		ancestorChanges = append(ancestorChanges, βChanges...)
 		if len(ancestorChanges) > 0 {
@@ -1514,6 +1553,19 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			skippingPollingDueToRuleOnlyCycle = false
 		}
 
+		// If this cycle populated submodules, then skip polling and run another
+		// synchronization cycle immediately, because the content that the
+		// other endpoint has in them, and any submodules nested in them, only
+		// follow in the next cycle, and nothing else may come along to trigger
+		// it. Unlike a cycle that only delivers rules, this can't continue
+		// indefinitely: each such cycle populates submodules that the previous
+		// one didn't, and a failed population doesn't count, so the number of
+		// such cycles in a row is limited by how deeply submodules are nested.
+		if populatedSubmodules {
+			c.logger.Debug("Populated submodules, skipping polling")
+			skipPolling = true
+		}
+
 		// Increment the synchronization cycle count.
 		c.stateLock.Lock()
 		c.state.SuccessfulCycles++
@@ -1530,8 +1582,25 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		// and because polling would overwrite the request with any new one that
 		// it receives. Holding the request also keeps the next cycle's scan a
 		// full one.
+		//
+		// Likewise, a cycle that populated submodules only provided their clones,
+		// so we hold the request until a cycle that doesn't, which has
+		// synchronized the content that the other endpoint has in them and
+		// populated any nested submodules. As above, this can't continue
+		// indefinitely, so there's no limit. A population is progress, after
+		// which the next cycle may only deliver rules (such as uncommitted rule
+		// files in the submodules), so it resets the limit on holding the
+		// request for such cycles, which only applies to consecutive ones.
+		// Otherwise, a cycle that only delivered rules earlier in the same
+		// flush would make that cycle answer the request, before the rest of
+		// the submodules' content had followed. The number of such cycles is
+		// still limited by how deeply submodules are nested.
 		if flushRequest != nil {
-			if ruleOnlyCycle && !flushHeldDueToRuleOnlyCycle {
+			if populatedSubmodules {
+				c.logger.Debug("Populated submodules, holding flush request for another cycle")
+				flushHeldDueToRuleOnlyCycle = false
+				skipPolling = true
+			} else if ruleOnlyCycle && !flushHeldDueToRuleOnlyCycle {
 				c.logger.Debug("Only delivered ignore rules, holding flush request for another cycle")
 				flushHeldDueToRuleOnlyCycle = true
 				skipPolling = true
@@ -1542,4 +1611,27 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			}
 		}
 	}
+}
+
+// populatesSubmodules determines whether or not transition results include the
+// population of a submodule, which is the case if they carry a seed that the
+// ancestor (as it was before the transitions) doesn't.
+func populatesSubmodules(ancestor *core.Entry, results ...[]*core.Entry) bool {
+	var absorbed map[string]bool
+	for _, endpointResults := range results {
+		for _, result := range endpointResults {
+			for _, seed := range result.GitLinkSeeds() {
+				if absorbed == nil {
+					absorbed = make(map[string]bool)
+					for _, existing := range ancestor.GitLinkSeeds() {
+						absorbed[existing] = true
+					}
+				}
+				if !absorbed[seed] {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

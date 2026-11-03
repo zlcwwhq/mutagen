@@ -381,6 +381,71 @@ func TestRuleOnlyTransitions(t *testing.T) {
 	}
 }
 
+// TestIgnoreRuleDeliveriesSubmodules tests that rule files aren't delivered
+// into submodules that are being created, which are populated by clones that
+// provide their rule files, and which need their directories to be absent or
+// empty for that, while rule files within existing submodules are delivered
+// like any others.
+func TestIgnoreRuleDeliveriesSubmodules(t *testing.T) {
+	// Define entries.
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	directory := func(contents map[string]*core.Entry) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: contents}
+	}
+	onlyRules := directory(map[string]*core.Entry{".gitignore": file})
+	submodule := testingSubmodule(testingLink, map[string]*core.Entry{
+		".gitignore": file,
+		"a":          file,
+		"nested":     onlyRules,
+	})
+	parent := directory(map[string]*core.Entry{".gitignore": file, "sub": submodule})
+
+	// Define test cases.
+	tests := []struct {
+		// description is a human readable description of the test case.
+		description string
+		// changes are the changes.
+		changes []*core.Change
+		// expected are the expected deliveries.
+		expected []*core.Change
+	}{
+		{"created submodule", []*core.Change{{Path: "sub", New: submodule}}, nil},
+		{"populated empty directory", []*core.Change{{Path: "sub", Old: directory(nil), New: submodule}}, nil},
+		{"directory containing submodule", []*core.Change{{Path: "d", New: parent}}, []*core.Change{{Path: "d", New: onlyRules}}},
+		{"root containing submodule", []*core.Change{{New: parent}}, []*core.Change{{New: onlyRules}}},
+		{"root containing only submodule", []*core.Change{{New: directory(map[string]*core.Entry{"sub": submodule})}}, nil},
+		{"rule file replaced by submodule", []*core.Change{{Path: "d/.gitignore", Old: file, New: submodule}}, []*core.Change{{Path: "d/.gitignore", Old: file}}},
+		{"rule file within submodule", []*core.Change{{Path: "sub/.gitignore", New: file}}, []*core.Change{{Path: "sub/.gitignore", New: file}}},
+		{"directory within submodule", []*core.Change{{Path: "sub/nested", New: onlyRules}}, []*core.Change{{Path: "sub/nested", New: onlyRules}}},
+		{"submodule's Git entry", []*core.Change{{Path: "sub/.git", New: testingLink}}, nil},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		result := ignoreRuleDeliveries(test.changes)
+		if len(result) != len(test.expected) {
+			t.Errorf("%s: incorrect delivery count: %d != %d", test.description, len(result), len(test.expected))
+			continue
+		}
+		for r, delivery := range result {
+			expected := test.expected[r]
+			if delivery.Path != expected.Path || !delivery.Old.Equal(expected.Old, true) || !delivery.New.Equal(expected.New, true) {
+				t.Errorf("%s: incorrect delivery: %v != %v", test.description, delivery, expected)
+			}
+		}
+	}
+
+	// A cycle that only creates a submodule isn't limited to rules, so the
+	// submodule is created in full, on its own.
+	created := []*core.Change{{Path: "sub", New: submodule}}
+	if alpha, beta, ruleOnly := ruleOnlyTransitions(created, nil); ruleOnly || len(alpha) != 1 || alpha[0] != created[0] || beta != nil {
+		t.Errorf("submodule creation limited to rules: %v, %v, %t", alpha, beta, ruleOnly)
+	}
+	if pruned := pruneToIgnoreRules("sub", submodule); pruned != nil {
+		t.Errorf("submodule pruned to rules: %v", pruned)
+	}
+}
+
 // TestRuleOnlyCycleRemainder tests that pruned deliveries work with the parts
 // of the synchronization cycle that follow them, including staging, ancestor
 // updates and validation, and that the next cycle reconciles the remainder of

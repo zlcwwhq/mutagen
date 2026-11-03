@@ -27,6 +27,8 @@ func formatEntryForLogging(entry *core.Entry) string {
 		return fmt.Sprintf("File (Digest %x)", entry.Digest)
 	} else if entry.Kind == core.EntryKind_SymbolicLink {
 		return fmt.Sprintf("Symbolic Link (Target %s)", entry.Target)
+	} else if entry.Kind == core.EntryKind_GitLink {
+		return fmt.Sprintf("Submodule (Commit %x, URL %s)", entry.Digest, entry.Url)
 	} else if entry.Kind == core.EntryKind_Untracked {
 		return "Untracked content"
 	} else if entry.Kind == core.EntryKind_Problematic {

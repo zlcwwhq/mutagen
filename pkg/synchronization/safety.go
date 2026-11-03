@@ -100,6 +100,14 @@ func isIgnoreRuleReplacement(change *core.Change) bool {
 // relative to the synchronization root. Entries are immutable, so directories
 // are newly created and files can be shared.
 func pruneToIgnoreRules(path string, directory *core.Entry) *core.Entry {
+	// A submodule that's being created doesn't get any rule files ahead of the
+	// rest of its content, because it's populated by a clone, which requires
+	// its directory to be absent or empty (see core.Transition), and because
+	// the clone provides its rule files anyway.
+	if directory.IsSubmodule() {
+		return nil
+	}
+
 	// Compute the prefix to add to content names to compute their paths.
 	contentPathPrefix := fastpath.Joinable(path)
 
