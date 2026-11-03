@@ -19,6 +19,9 @@ type Entry struct {
 	// SymbolicLinkEntry stores fields that are only relevant to symbolic link
 	// entries. It is only non-nil if the entry is a symbolic link.
 	*SymbolicLinkEntry
+	// GitLinkEntry stores fields that are only relevant to submodule entries. It
+	// is only non-nil if the entry is a submodule.
+	*GitLinkEntry
 	// ProblematicEntry stores fields that are only relevant to problematic
 	// entries. It is only non-nil if the entry is problematic content.
 	*ProblematicEntry
@@ -42,6 +45,14 @@ type FileEntry struct {
 type SymbolicLinkEntry struct {
 	// Target is the symbolic link target.
 	Target string `json:"target"`
+}
+
+// GitLinkEntry encodes fields relevant to submodule entries.
+type GitLinkEntry struct {
+	// Commit is the hexadecimal identifier of the submodule's commit.
+	Commit string `json:"commit"`
+	// URL is the location from which the submodule's commit can be fetched.
+	URL string `json:"url"`
 }
 
 // ProblematicEntry encodes fields relevant to problematic entries.
@@ -78,6 +89,11 @@ func newEntryFromInternalEntry(entry *core.Entry) *Entry {
 		}
 	case core.EntryKind_SymbolicLink:
 		result.SymbolicLinkEntry = &SymbolicLinkEntry{Target: entry.Target}
+	case core.EntryKind_GitLink:
+		result.GitLinkEntry = &GitLinkEntry{
+			Commit: hex.EncodeToString(entry.Digest),
+			URL:    entry.Url,
+		}
 	case core.EntryKind_Untracked:
 		// There are no fields to propagate for untracked content.
 	case core.EntryKind_Problematic:

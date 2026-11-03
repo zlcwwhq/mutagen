@@ -31,6 +31,14 @@ const (
 	EntryKind_File EntryKind = 1
 	// EntryKind_SymbolicLink indicates a symbolic link.
 	EntryKind_SymbolicLink EntryKind = 2
+	// EntryKind_GitLink indicates the Git entry (.git) of a submodule, which
+	// records the commit that the submodule has checked out. Its digest holds
+	// the raw bytes of the commit identifier. It can only be the content named
+	// .git of a directory, whose other contents are synchronized like those of
+	// any other directory. The Git entry's own contents (the repository) are
+	// never synchronized: an endpoint that receives one obtains the repository
+	// for itself, from the URL that the entry carries.
+	EntryKind_GitLink EntryKind = 3
 	// EntryKind_Untracked indicates content (or the root of content) that is
 	// intentionally excluded from synchronization by Mutagen. This includes
 	// explicitly ignored content, content that is ignored due to settings (such
@@ -65,6 +73,7 @@ var (
 		0:   "Directory",
 		1:   "File",
 		2:   "SymbolicLink",
+		3:   "GitLink",
 		100: "Untracked",
 		101: "Problematic",
 		102: "PhantomDirectory",
@@ -73,6 +82,7 @@ var (
 		"Directory":        0,
 		"File":             1,
 		"SymbolicLink":     2,
+		"GitLink":          3,
 		"Untracked":        100,
 		"Problematic":      101,
 		"PhantomDirectory": 102,
@@ -117,8 +127,9 @@ type Entry struct {
 	// Contents represents a directory entry's contents. It must only be non-nil
 	// for directory entries.
 	Contents map[string]*Entry `protobuf:"bytes,5,rep,name=contents,proto3" json:"contents,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Digest represents the hash of a file entry's contents. It must only be
-	// non-nil for file entries.
+	// Digest represents the hash of a file entry's contents or the raw bytes of
+	// a GitLink entry's commit identifier. It must only be non-nil for file and
+	// GitLink entries.
 	Digest []byte `protobuf:"bytes,8,opt,name=digest,proto3" json:"digest,omitempty"`
 	// Executable indicates whether or not a file entry is marked as executable.
 	// It must only be set (if appropriate) for file entries.
@@ -128,7 +139,24 @@ type Entry struct {
 	Target string `protobuf:"bytes,12,opt,name=target,proto3" json:"target,omitempty"`
 	// Problem indicates the relevant error for problematic content. It must be
 	// non-empty if and only if the entry represents problematic content.
-	Problem       string `protobuf:"bytes,15,opt,name=problem,proto3" json:"problem,omitempty"`
+	Problem string `protobuf:"bytes,15,opt,name=problem,proto3" json:"problem,omitempty"`
+	// URL is the location from which a GitLink entry's commit can be fetched.
+	// It must be non-empty if and only if the entry is a GitLink. It isn't part
+	// of the entry's identity, because only the commit identifies a GitLink and
+	// two endpoints may reach the same repository through different URLs.
+	Url string `protobuf:"bytes,16,opt,name=url,proto3" json:"url,omitempty"`
+	// Seed identifies the record that an endpoint keeps of having populated a
+	// submodule with a clone (see Snapshot.seeds). It must only be set for
+	// GitLink entries and isn't part of the entry's identity. An ancestor whose
+	// GitLink carries a seed has absorbed the content of that population.
+	Seed string `protobuf:"bytes,17,opt,name=seed,proto3" json:"seed,omitempty"`
+	// AutoCRLF and EOL are the values of the core.autocrlf and core.eol
+	// settings that apply to a GitLink entry's repository, or empty if they're
+	// unset. An endpoint that clones the repository applies them, so that its
+	// checkout has the same line endings as the other endpoint's. They must
+	// only be set for GitLink entries and aren't part of the entry's identity.
+	AutoCRLF      string `protobuf:"bytes,18,opt,name=autoCRLF,proto3" json:"autoCRLF,omitempty"`
+	Eol           string `protobuf:"bytes,19,opt,name=eol,proto3" json:"eol,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -205,11 +233,39 @@ func (x *Entry) GetProblem() string {
 	return ""
 }
 
+func (x *Entry) GetUrl() string {
+	if x != nil {
+		return x.Url
+	}
+	return ""
+}
+
+func (x *Entry) GetSeed() string {
+	if x != nil {
+		return x.Seed
+	}
+	return ""
+}
+
+func (x *Entry) GetAutoCRLF() string {
+	if x != nil {
+		return x.AutoCRLF
+	}
+	return ""
+}
+
+func (x *Entry) GetEol() string {
+	if x != nil {
+		return x.Eol
+	}
+	return ""
+}
+
 var File_synchronization_core_entry_proto protoreflect.FileDescriptor
 
 const file_synchronization_core_entry_proto_rawDesc = "" +
 	"\n" +
-	" synchronization/core/entry.proto\x12\x04core\"\x97\x02\n" +
+	" synchronization/core/entry.proto\x12\x04core\"\xeb\x02\n" +
 	"\x05Entry\x12#\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x0f.core.EntryKindR\x04kind\x125\n" +
 	"\bcontents\x18\x05 \x03(\v2\x19.core.Entry.ContentsEntryR\bcontents\x12\x16\n" +
@@ -218,14 +274,19 @@ const file_synchronization_core_entry_proto_rawDesc = "" +
 	"executable\x18\t \x01(\bR\n" +
 	"executable\x12\x16\n" +
 	"\x06target\x18\f \x01(\tR\x06target\x12\x18\n" +
-	"\aproblem\x18\x0f \x01(\tR\aproblem\x1aH\n" +
+	"\aproblem\x18\x0f \x01(\tR\aproblem\x12\x10\n" +
+	"\x03url\x18\x10 \x01(\tR\x03url\x12\x12\n" +
+	"\x04seed\x18\x11 \x01(\tR\x04seed\x12\x1a\n" +
+	"\bautoCRLF\x18\x12 \x01(\tR\bautoCRLF\x12\x10\n" +
+	"\x03eol\x18\x13 \x01(\tR\x03eol\x1aH\n" +
 	"\rContentsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12!\n" +
-	"\x05value\x18\x02 \x01(\v2\v.core.EntryR\x05value:\x028\x01*l\n" +
+	"\x05value\x18\x02 \x01(\v2\v.core.EntryR\x05value:\x028\x01*y\n" +
 	"\tEntryKind\x12\r\n" +
 	"\tDirectory\x10\x00\x12\b\n" +
 	"\x04File\x10\x01\x12\x10\n" +
-	"\fSymbolicLink\x10\x02\x12\r\n" +
+	"\fSymbolicLink\x10\x02\x12\v\n" +
+	"\aGitLink\x10\x03\x12\r\n" +
 	"\tUntracked\x10d\x12\x0f\n" +
 	"\vProblematic\x10e\x12\x14\n" +
 	"\x10PhantomDirectory\x10fB8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"

@@ -37,4 +37,15 @@ message Snapshot {
     // synchronization, and they aren't part of the snapshot's identity, so they
     // don't participate in snapshot equality.
     repeated Problem warnings = 8;
+    // Seeds maps the paths of submodules that this endpoint populated with a
+    // clone, and whose populations the ancestor hasn't yet absorbed, to the
+    // content of the clone (the synchronizable content that the population
+    // yielded, including the Git entry, whose seed identifies the record that
+    // the endpoint keeps of it). A population yields a transition result like
+    // any other, but if the session stops before saving the ancestor, then
+    // that content is lost, along with the knowledge that the submodule's
+    // content came from a clone rather than from changes on this endpoint.
+    // The session uses it in place of the ancestor at those paths. Like
+    // warnings, seeds aren't part of the snapshot's identity.
+    map<string, Entry> seeds = 9;
 }

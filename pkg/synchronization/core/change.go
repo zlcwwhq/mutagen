@@ -27,6 +27,16 @@ func (c *Change) EnsureValid(synchronizable bool) error {
 		return fmt.Errorf("invalid new entry: %w", err)
 	}
 
+	// A submodule's Git entry can only be the content named .git of a
+	// directory other than the root, so a change involving one at the top
+	// level has to be at such a path. Its location within directories is
+	// validated by the directories.
+	if (c.Old != nil && c.Old.Kind == EntryKind_GitLink) || (c.New != nil && c.New.Kind == EntryKind_GitLink) {
+		if _, ok := gitLinkDirectory(c.Path); !ok {
+			return errors.New("submodule Git entry at invalid path")
+		}
+	}
+
 	// Success.
 	return nil
 }

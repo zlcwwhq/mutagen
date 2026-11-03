@@ -14,7 +14,8 @@ import (
 func (k EntryKind) synchronizable() bool {
 	return k == EntryKind_Directory ||
 		k == EntryKind_File ||
-		k == EntryKind_SymbolicLink
+		k == EntryKind_SymbolicLink ||
+		k == EntryKind_GitLink
 }
 
 // MarshalText implements encoding.TextMarshaler.MarshalText.
@@ -27,6 +28,8 @@ func (k EntryKind) MarshalText() ([]byte, error) {
 		result = "file"
 	case EntryKind_SymbolicLink:
 		result = "symlink"
+	case EntryKind_GitLink:
+		result = "gitlink"
 	case EntryKind_Untracked:
 		result = "untracked"
 	case EntryKind_Problematic:
@@ -52,6 +55,8 @@ func (k *EntryKind) UnmarshalText(textBytes []byte) error {
 		*k = EntryKind_File
 	case "symlink":
 		*k = EntryKind_SymbolicLink
+	case "gitlink":
+		*k = EntryKind_GitLink
 	case "untracked":
 		*k = EntryKind_Untracked
 	case "problematic":
@@ -64,6 +69,25 @@ func (k *EntryKind) UnmarshalText(textBytes []byte) error {
 
 	// Success.
 	return nil
+}
+
+// GitLinkName is the name of the content of a directory that can be a GitLink
+// entry (and the only one that can be).
+const GitLinkName = ".git"
+
+// hasGitLinkFields determines whether or not any of the fields that are only
+// valid for GitLink entries are set.
+func (e *Entry) hasGitLinkFields() bool {
+	return e.Url != "" || e.Seed != "" || e.AutoCRLF != "" || e.Eol != ""
+}
+
+// copyGitLinkFields copies the fields that are only valid for GitLink entries
+// from one entry to another.
+func (e *Entry) copyGitLinkFields(source *Entry) {
+	e.Url = source.Url
+	e.Seed = source.Seed
+	e.AutoCRLF = source.AutoCRLF
+	e.Eol = source.Eol
 }
 
 // EnsureValid ensures that Entry's invariants are respected. If synchronizable
@@ -85,6 +109,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("non-empty symbolic link target detected for directory")
 		} else if e.Problem != "" {
 			return errors.New("non-empty problem detected for directory")
+		} else if e.hasGitLinkFields() {
+			return errors.New("submodule fields detected for directory")
 		}
 
 		// Validate contents. Nil entries are not considered valid for contents.
@@ -97,6 +123,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 				return errors.New("content name contains path separator")
 			} else if entry == nil {
 				return errors.New("nil content detected")
+			} else if entry.Kind == EntryKind_GitLink && name != GitLinkName {
+				return errors.New("submodule Git entry with a name other than .git detected")
 			} else if err := entry.EnsureValid(synchronizable); err != nil {
 				return err
 			}
@@ -109,6 +137,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("non-empty symbolic link target detected for file")
 		} else if e.Problem != "" {
 			return errors.New("non-empty problem detected for file")
+		} else if e.hasGitLinkFields() {
+			return errors.New("submodule fields detected for file")
 		}
 
 		// Ensure that the digest is non-empty.
@@ -125,12 +155,37 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("executable symbolic link detected")
 		} else if e.Problem != "" {
 			return errors.New("non-empty problem detected for symbolic link")
+		} else if e.hasGitLinkFields() {
+			return errors.New("submodule fields detected for symbolic link")
 		}
 
 		// Ensure that the target is non-empty. We avoid any further validation
 		// because there's none that we can reasonably perform.
 		if e.Target == "" {
 			return errors.New("symbolic link with empty target detected")
+		}
+	} else if e.Kind == EntryKind_GitLink {
+		// Ensure that no invalid fields are set.
+		if e.Contents != nil {
+			return errors.New("non-nil submodule content map detected")
+		} else if e.Executable {
+			return errors.New("executable submodule detected")
+		} else if e.Target != "" {
+			return errors.New("non-empty symbolic link target detected for submodule")
+		} else if e.Problem != "" {
+			return errors.New("non-empty problem detected for submodule")
+		}
+
+		// Ensure that the commit and the URL are non-empty. We avoid any further
+		// validation because the commit's length depends on the repository's
+		// hash algorithm and the URL's format is up to the version control tool.
+		// The remaining fields are free-form. Where the entry may appear (only
+		// as the content named .git of a directory) is validated by the
+		// directory, since an entry doesn't know its own name.
+		if len(e.Digest) == 0 {
+			return errors.New("submodule with empty commit detected")
+		} else if e.Url == "" {
+			return errors.New("submodule with empty URL detected")
 		}
 	} else if e.Kind == EntryKind_Untracked {
 		// Verify that unsynchronizable content is allowed.
@@ -149,6 +204,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("non-empty symbolic link target detected for untracked content")
 		} else if e.Problem != "" {
 			return errors.New("non-empty problem detected for untracked content")
+		} else if e.hasGitLinkFields() {
+			return errors.New("submodule fields detected for untracked content")
 		}
 	} else if e.Kind == EntryKind_Problematic {
 		// Verify that unsynchronizable content is allowed.
@@ -165,6 +222,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("executable problematic content detected")
 		} else if e.Target != "" {
 			return errors.New("non-empty symbolic link target detected for problematic content")
+		} else if e.hasGitLinkFields() {
+			return errors.New("submodule fields detected for problematic content")
 		}
 
 		// Ensure that the problem is non-empty.
@@ -186,6 +245,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 			return errors.New("non-empty symbolic link target detected for phantom directory")
 		} else if e.Problem != "" {
 			return errors.New("non-empty problem detected for phantom directory")
+		} else if e.hasGitLinkFields() {
+			return errors.New("submodule fields detected for phantom directory")
 		}
 
 		// Validate contents. Nil entries are not considered valid for contents.
@@ -198,6 +259,8 @@ func (e *Entry) EnsureValid(synchronizable bool) error {
 				return errors.New("content name contains path separator")
 			} else if entry == nil {
 				return errors.New("nil content detected")
+			} else if entry.Kind == EntryKind_GitLink && name != GitLinkName {
+				return errors.New("submodule Git entry with a name other than .git detected")
 			} else if err := entry.EnsureValid(synchronizable); err != nil {
 				return err
 			}
@@ -309,7 +372,11 @@ func (e *Entry) Equal(other *Entry, deep bool) bool {
 		return false
 	}
 
-	// Compare all properties except for problem messages.
+	// Compare all properties except for problem messages and the fields of
+	// GitLink entries other than the commit. Only the commit (stored in the
+	// digest) identifies a GitLink entry, because two endpoints may reach the
+	// same repository through different URLs and with different settings, and
+	// a seed only records how the endpoint came to have it.
 	propertiesEquivalent := e.Kind == other.Kind &&
 		e.Executable == other.Executable &&
 		bytes.Equal(e.Digest, other.Digest) &&
@@ -398,6 +465,7 @@ func (e *Entry) Copy(behavior EntryCopyBehavior) *Entry {
 		Target:     e.Target,
 		Problem:    e.Problem,
 	}
+	result.copyGitLinkFields(e)
 
 	// If a slim copy was requested, then we're done.
 	if behavior == EntryCopyBehaviorSlim {

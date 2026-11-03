@@ -12,8 +12,16 @@ enum EntryKind {
     File = 1;
     // EntryKind_SymbolicLink indicates a symbolic link.
     SymbolicLink = 2;
+    // EntryKind_GitLink indicates the Git entry (.git) of a submodule, which
+    // records the commit that the submodule has checked out. Its digest holds
+    // the raw bytes of the commit identifier. It can only be the content named
+    // .git of a directory, whose other contents are synchronized like those of
+    // any other directory. The Git entry's own contents (the repository) are
+    // never synchronized: an endpoint that receives one obtains the repository
+    // for itself, from the URL that the entry carries.
+    GitLink = 3;
 
-    // Values 3-99 are reserved for future synchronizable entry types.
+    // Values 4-99 are reserved for future synchronizable entry types.
 
     // EntryKind_Untracked indicates content (or the root of content) that is
     // intentionally excluded from synchronization by Mutagen. This includes
@@ -61,8 +69,9 @@ message Entry {
 
     // Fields 6-7 are reserved for future directory entry data.
 
-    // Digest represents the hash of a file entry's contents. It must only be
-    // non-nil for file entries.
+    // Digest represents the hash of a file entry's contents or the raw bytes of
+    // a GitLink entry's commit identifier. It must only be non-nil for file and
+    // GitLink entries.
     bytes digest = 8;
     // Executable indicates whether or not a file entry is marked as executable.
     // It must only be set (if appropriate) for file entries.
@@ -79,4 +88,22 @@ message Entry {
     // Problem indicates the relevant error for problematic content. It must be
     // non-empty if and only if the entry represents problematic content.
     string problem = 15;
+
+    // URL is the location from which a GitLink entry's commit can be fetched.
+    // It must be non-empty if and only if the entry is a GitLink. It isn't part
+    // of the entry's identity, because only the commit identifies a GitLink and
+    // two endpoints may reach the same repository through different URLs.
+    string url = 16;
+    // Seed identifies the record that an endpoint keeps of having populated a
+    // submodule with a clone (see Snapshot.seeds). It must only be set for
+    // GitLink entries and isn't part of the entry's identity. An ancestor whose
+    // GitLink carries a seed has absorbed the content of that population.
+    string seed = 17;
+    // AutoCRLF and EOL are the values of the core.autocrlf and core.eol
+    // settings that apply to a GitLink entry's repository, or empty if they're
+    // unset. An endpoint that clones the repository applies them, so that its
+    // checkout has the same line endings as the other endpoint's. They must
+    // only be set for GitLink entries and aren't part of the entry's identity.
+    string autoCRLF = 18;
+    string eol = 19;
 }

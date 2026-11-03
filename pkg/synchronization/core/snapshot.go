@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // EnsureValid ensures that Snapshot's invariants are respected.
@@ -16,12 +17,31 @@ func (s *Snapshot) EnsureValid() error {
 	// contain unsynchronizable content.
 	if err := s.Content.EnsureValid(false); err != nil {
 		return fmt.Errorf("invalid snapshot content: %w", err)
+	} else if s.Content != nil && s.Content.Kind == EntryKind_GitLink {
+		return errors.New("invalid snapshot content: submodule Git entry at root")
 	}
 
 	// Ensure that warnings are valid.
 	for _, warning := range s.Warnings {
 		if err := warning.EnsureValid(); err != nil {
 			return fmt.Errorf("invalid snapshot warning: %w", err)
+		}
+	}
+
+	// Ensure that seeds are valid. Each must be the synchronizable content of
+	// a submodule at a path other than the root, and the snapshot must have a
+	// submodule there whose Git entry carries the same seed. Their contents
+	// otherwise needn't match, since the endpoint's content may have changed
+	// since the population.
+	for path, seed := range s.Seeds {
+		if path == "" || strings.HasPrefix(path, "/") || strings.HasSuffix(path, "/") || strings.Contains(path, "//") {
+			return errors.New("invalid seed path")
+		} else if err := seed.EnsureValid(true); err != nil {
+			return fmt.Errorf("invalid seed: %w", err)
+		} else if link := seed.gitLink(); link == nil || link.Seed == "" {
+			return errors.New("seed isn't a populated submodule")
+		} else if current := lookup(s.Content, path).gitLink(); current == nil || current.Seed != link.Seed {
+			return errors.New("seed doesn't match snapshot content")
 		}
 	}
 
@@ -40,9 +60,10 @@ func (s *Snapshot) EnsureValid() error {
 }
 
 // Equal performs an equivalence comparison between this snapshot and another.
-// It doesn't compare warnings, which don't describe the snapshot's content and
-// which aren't necessarily computed for every snapshot. In particular, a change
-// in warnings doesn't constitute a modification to be synchronized.
+// It doesn't compare warnings or seeds, which don't describe the snapshot's
+// content and which aren't necessarily computed for every snapshot. In
+// particular, a change in either doesn't constitute a modification to be
+// synchronized.
 func (s *Snapshot) Equal(other *Snapshot) bool {
 	return s.Content.Equal(other.Content, true) &&
 		s.PreservesExecutability == other.PreservesExecutability &&
@@ -52,7 +73,7 @@ func (s *Snapshot) Equal(other *Snapshot) bool {
 // WithWarnings returns a shallow copy of the snapshot with the specified
 // warnings in place of any that it has. Snapshots are immutable and may be
 // shared (e.g. as the baseline for a subsequent scan), so this is the way to
-// attach warnings to one.
+// attach warnings to one. Seeds are retained.
 func (s *Snapshot) WithWarnings(warnings []*Problem) *Snapshot {
 	return &Snapshot{
 		Content:                s.Content,
@@ -63,5 +84,15 @@ func (s *Snapshot) WithWarnings(warnings []*Problem) *Snapshot {
 		SymbolicLinks:          s.SymbolicLinks,
 		TotalFileSize:          s.TotalFileSize,
 		Warnings:               warnings,
+		Seeds:                  s.Seeds,
 	}
+}
+
+// WithSeeds returns a shallow copy of the snapshot with the specified seeds in
+// place of any that it has, for the same reason as WithWarnings. Warnings are
+// retained.
+func (s *Snapshot) WithSeeds(seeds map[string]*Entry) *Snapshot {
+	result := s.WithWarnings(s.Warnings)
+	result.Seeds = seeds
+	return result
 }

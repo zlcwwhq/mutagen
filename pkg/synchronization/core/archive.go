@@ -15,6 +15,8 @@ func (a *Archive) EnsureValid(synchronizable bool) error {
 	}
 
 	// Ensure that the archive content is valid.
+	// The content can be a submodule's Git entry, because archives also wrap
+	// the results of transitions, whose paths aren't known here.
 	if err := a.Content.EnsureValid(synchronizable); err != nil {
 		return fmt.Errorf("invalid archive content: %w", err)
 	}

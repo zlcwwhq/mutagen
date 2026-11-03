@@ -136,6 +136,7 @@ func TestSnapshotWithWarnings(t *testing.T) {
 		SymbolicLinks:          3,
 		TotalFileSize:          4,
 		Warnings:               []*Problem{{Path: "old", Error: "old warning"}},
+		Seeds:                  map[string]*Entry{"path": tD1},
 	}
 	reflected := original.ProtoReflect()
 	fields := reflected.Descriptor().Fields()
