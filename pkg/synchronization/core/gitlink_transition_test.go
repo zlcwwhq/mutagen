@@ -442,6 +442,17 @@ func TestTransitionPopulateFailures(t *testing.T) {
 				testingVerifyFile(t, root, "sub", "modified")
 			},
 		},
+		{
+			description:      "old content containing a submodule",
+			content:          map[string]string{"sub/.git/HEAD": "head"},
+			old:              testingSubmodule(tGL1, nil),
+			expectedResult:   testingSubmodule(tGL1, nil),
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: errGitLinkRemovalRefused.Error()}},
+			expectedCalls:    []string{"Clone", "ScanClone", "RecordSeed"},
+			verify: func(t *testing.T, root string) {
+				testingVerifyFile(t, root, "sub/.git/HEAD", "head")
+			},
+		},
 	}
 
 	// Process test cases.
@@ -638,6 +649,337 @@ func TestTransitionCreateDirectoryWithSubmodule(t *testing.T) {
 	testingVerifyProblems(t, problems, []*Problem{{Path: "directory/sub", Error: "clone failed"}})
 	testingVerifyMissing(t, root, "directory/sub")
 	testingVerifyFile(t, root, "directory/plain/file", tF1Content)
+}
+
+// TestTransitionAttach tests that a submodule's Git entry is attached to an
+// existing directory without touching its other contents.
+func TestTransitionAttach(t *testing.T) {
+	// Define test cases.
+	tests := []struct {
+		// description is a human readable description of the test case.
+		description string
+		// content is the content of the root.
+		content map[string]string
+		// path is the path of the Git entry to attach.
+		path string
+		// configure configures the provider.
+		configure func(*testingGitProvider, context.CancelFunc)
+		// expectedResult is the expected result.
+		expectedResult *Entry
+		// expectedProblems are the expected problems.
+		expectedProblems []*Problem
+		// expectedCalls are the names of the expected provider calls.
+		expectedCalls []string
+		// attached indicates whether or not the Git entry should be in place
+		// afterward.
+		attached bool
+	}{
+		{
+			description:    "success",
+			content:        map[string]string{"sub/a": tF1Content},
+			path:           "sub/.git",
+			expectedResult: tGL0,
+			expectedCalls:  []string{"PrepareAttach", "Refresh"},
+			attached:       true,
+		},
+		{
+			description: "fallback",
+			content:     map[string]string{"sub/a": tF1Content},
+			path:        "sub/.git",
+			configure: func(p *testingGitProvider, _ context.CancelFunc) {
+				p.attachWarnings = []string{"fell back to the default branch"}
+			},
+			expectedResult:   tGL0,
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: "fell back to the default branch", Warning: true}},
+			expectedCalls:    []string{"PrepareAttach", "Refresh"},
+			attached:         true,
+		},
+		{
+			description: "refresh failure",
+			content:     map[string]string{"sub/a": tF1Content},
+			path:        "sub/.git",
+			configure: func(p *testingGitProvider, _ context.CancelFunc) {
+				p.errors = map[string]error{"Refresh": errors.New("refresh failed")}
+			},
+			expectedResult: tGL0,
+			expectedCalls:  []string{"PrepareAttach", "Refresh"},
+			attached:       true,
+		},
+		{
+			description: "preparation failure",
+			content:     map[string]string{"sub/a": tF1Content},
+			path:        "sub/.git",
+			configure: func(p *testingGitProvider, _ context.CancelFunc) {
+				p.errors = map[string]error{"PrepareAttach": errors.New("preparation failed")}
+			},
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: "preparation failed"}},
+			expectedCalls:    []string{"PrepareAttach"},
+		},
+		{
+			description: "cancellation",
+			content:     map[string]string{"sub/a": tF1Content},
+			path:        "sub/.git",
+			configure: func(p *testingGitProvider, cancel context.CancelFunc) {
+				p.hooks = map[string]func(string){"PrepareAttach": func(string) { cancel() }}
+				p.errors = map[string]error{"PrepareAttach": context.Canceled}
+			},
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: errTransitionCancelled.Error()}},
+			expectedCalls:    []string{"PrepareAttach"},
+		},
+		{
+			description:      "existing Git entry",
+			content:          map[string]string{"sub/a": tF1Content, "sub/.git": "gitdir: elsewhere"},
+			path:             "sub/.git",
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: "unable to attach repository: unknown content exists at path"}},
+		},
+		{
+			description:      "path other than a Git entry",
+			content:          map[string]string{"sub/a": tF1Content},
+			path:             "sub/a.git",
+			expectedProblems: []*Problem{{Path: "sub/a.git", Error: "submodule Git entry requested at invalid path"}},
+		},
+		{
+			description:      "root's Git entry",
+			content:          map[string]string{"sub/a": tF1Content},
+			path:             ".git",
+			expectedProblems: []*Problem{{Path: ".git", Error: "submodule Git entry requested at invalid path"}},
+		},
+		{
+			description:      "missing directory",
+			path:             "missing/.git",
+			expectedProblems: []*Problem{{Path: "missing/.git", Error: "*"}},
+		},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			// Create the root, the context, and the provider.
+			root, cache := testingGitTransitionRoot(t, test.content)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			provider := &testingGitProvider{}
+			if test.configure != nil {
+				test.configure(provider, cancel)
+			}
+
+			// Perform the attachment and verify the results. The result doesn't
+			// carry the target's seed, which describes how the other endpoint
+			// came to have it.
+			results, problems := testingTransitionGitMode(t, ctx, root, cache, provider, nil,
+				&Change{Path: test.path, New: testingSeeded(tGL0, "alpha")},
+			)
+			if !results[0].Equal(test.expectedResult, true) {
+				t.Errorf("incorrect result: %v != %v", results[0], test.expectedResult)
+			} else if results[0] != nil && (results[0].Seed != "" || results[0].Url != tGitURL) {
+				t.Errorf("incorrect GitLink entry fields: %v", results[0])
+			}
+			testingVerifyProblems(t, problems, test.expectedProblems)
+			if methods := provider.methods(); !slices.Equal(methods, test.expectedCalls) {
+				t.Errorf("incorrect provider calls: %v != %v", methods, test.expectedCalls)
+			}
+			for _, call := range provider.calls {
+				if call.method == "PrepareAttach" {
+					testingVerifyTemporaryDirectory(t, call, filepath.Join(root, "sub"))
+				} else if call.method == "Refresh" && call.directory != filepath.Join(root, "sub") {
+					t.Errorf("refresh in incorrect directory: %s", call.directory)
+				}
+			}
+
+			// Verify the content on disk. The working tree is never touched.
+			if test.attached {
+				testingVerifyFile(t, root, "sub/.git/HEAD", "ref: refs/heads/main\n")
+			} else if test.content["sub/.git"] == "" {
+				testingVerifyMissing(t, root, "sub/.git")
+			}
+			if test.content["sub/a"] != "" {
+				testingVerifyFile(t, root, "sub/a", tF1Content)
+			}
+		})
+	}
+}
+
+// TestTransitionFollow tests that a submodule's Git entry follows another
+// commit, and that a failure to do so is only a warning.
+func TestTransitionFollow(t *testing.T) {
+	// Define test cases.
+	tests := []struct {
+		// description is a human readable description of the test case.
+		description string
+		// content is the content of the root.
+		content map[string]string
+		// path is the path of the Git entry.
+		path string
+		// configure configures the provider.
+		configure func(*testingGitProvider, context.CancelFunc)
+		// expectedResult is the expected result.
+		expectedResult *Entry
+		// expectedProblems are the expected problems.
+		expectedProblems []*Problem
+		// expectedCalls are the names of the expected provider calls.
+		expectedCalls []string
+	}{
+		{
+			description:    "success",
+			content:        map[string]string{"sub/.git/HEAD": "head", "sub/a": tF1Content},
+			path:           "sub/.git",
+			expectedResult: tGL1,
+			expectedCalls:  []string{"Follow"},
+		},
+		{
+			description: "failure",
+			content:     map[string]string{"sub/.git/HEAD": "head", "sub/a": tF1Content},
+			path:        "sub/.git",
+			configure: func(p *testingGitProvider, _ context.CancelFunc) {
+				p.errors = map[string]error{"Follow": errors.New("commit not available yet")}
+			},
+			expectedResult:   tGL0,
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: "commit not available yet", Warning: true}},
+			expectedCalls:    []string{"Follow"},
+		},
+		{
+			description: "cancellation",
+			content:     map[string]string{"sub/.git/HEAD": "head", "sub/a": tF1Content},
+			path:        "sub/.git",
+			configure: func(p *testingGitProvider, cancel context.CancelFunc) {
+				p.hooks = map[string]func(string){"Follow": func(string) { cancel() }}
+				p.errors = map[string]error{"Follow": context.Canceled}
+			},
+			expectedResult:   tGL0,
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: errTransitionCancelled.Error()}},
+			expectedCalls:    []string{"Follow"},
+		},
+		{
+			description:      "missing Git entry",
+			content:          map[string]string{"sub/a": tF1Content},
+			path:             "sub/.git",
+			expectedResult:   tGL0,
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: "*"}},
+		},
+		{
+			description:      "path other than a Git entry",
+			content:          map[string]string{"sub/a": tF1Content},
+			path:             "sub/a",
+			expectedResult:   tGL0,
+			expectedProblems: []*Problem{{Path: "sub/a", Error: "submodule Git entry requested at invalid path"}},
+		},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			// Create the root, the context, and the provider.
+			root, cache := testingGitTransitionRoot(t, test.content)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			provider := &testingGitProvider{}
+			if test.configure != nil {
+				test.configure(provider, cancel)
+			}
+
+			// Perform the transition and verify the results.
+			results, problems := testingTransitionGitMode(t, ctx, root, cache, provider, nil,
+				&Change{Path: test.path, Old: tGL0, New: tGL1},
+			)
+			if !results[0].Equal(test.expectedResult, true) {
+				t.Errorf("incorrect result: %v != %v", results[0], test.expectedResult)
+			}
+			testingVerifyProblems(t, problems, test.expectedProblems)
+			if methods := provider.methods(); !slices.Equal(methods, test.expectedCalls) {
+				t.Errorf("incorrect provider calls: %v != %v", methods, test.expectedCalls)
+			}
+			for _, call := range provider.calls {
+				if call.directory != filepath.Join(root, "sub") {
+					t.Errorf("follow in incorrect directory: %s", call.directory)
+				}
+			}
+			testingVerifyFile(t, root, "sub/a", tF1Content)
+		})
+	}
+}
+
+// TestTransitionSubmoduleRemoval tests that a submodule's Git entry is never
+// removed, whether by itself or as part of a directory, and that the provider
+// isn't involved in that. The removal of a directory containing a submodule is
+// refused as a whole, so that the submodule's working tree stays intact.
+func TestTransitionSubmoduleRemoval(t *testing.T) {
+	// Define the content on disk.
+	content := map[string]string{
+		"sub/.git/HEAD":              "head",
+		"sub/a":                      tF1Content,
+		"directory/nested/.git/HEAD": "head",
+		"directory/nested/a":         tF1Content,
+	}
+	refused := errGitLinkRemovalRefused.Error()
+
+	// Define test cases.
+	tests := []struct {
+		// description is a human readable description of the test case.
+		description string
+		// transition is the transition.
+		transition *Change
+		// expectedResult is the expected result.
+		expectedResult *Entry
+		// expectedProblems are the expected problems.
+		expectedProblems []*Problem
+	}{
+		{
+			description:      "removal of Git entry",
+			transition:       &Change{Path: "sub/.git", Old: tGL0},
+			expectedResult:   tGL0,
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: refused}},
+		},
+		{
+			description:      "replacement of Git entry",
+			transition:       &Change{Path: "sub/.git", Old: tGL0, New: tD0},
+			expectedResult:   tGL0,
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: refused}},
+		},
+		{
+			description:      "removal of submodule",
+			transition:       &Change{Path: "sub", Old: testingSubmodule(tGL0, map[string]*Entry{"a": tF1})},
+			expectedResult:   testingSubmodule(tGL0, map[string]*Entry{"a": tF1}),
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: refused}},
+		},
+		{
+			description:      "replacement of submodule",
+			transition:       &Change{Path: "sub", Old: testingSubmodule(tGL0, map[string]*Entry{"a": tF1}), New: tF1},
+			expectedResult:   testingSubmodule(tGL0, map[string]*Entry{"a": tF1}),
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: refused}},
+		},
+		{
+			description: "removal of directory containing submodule",
+			transition: &Change{Path: "directory", Old: nested("nested", testingSubmodule(tGL0, map[string]*Entry{
+				"a": tF1,
+			}))},
+			expectedResult: nested("nested", testingSubmodule(tGL0, map[string]*Entry{
+				"a": tF1,
+			})),
+			expectedProblems: []*Problem{{Path: "directory/nested/.git", Error: refused}},
+		},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			root, cache := testingGitTransitionRoot(t, content)
+			provider := &testingGitProvider{}
+			results, problems := testingTransitionGitMode(t, context.Background(), root, cache, provider, nil,
+				test.transition,
+			)
+			if !results[0].Equal(test.expectedResult, true) {
+				t.Errorf("incorrect result: %v != %v", results[0], test.expectedResult)
+			}
+			testingVerifyProblems(t, problems, test.expectedProblems)
+			if methods := provider.methods(); len(methods) != 0 {
+				t.Errorf("provider called: %v", methods)
+			}
+			testingVerifyFile(t, root, "sub/.git/HEAD", "head")
+			testingVerifyFile(t, root, "sub/a", tF1Content)
+			testingVerifyFile(t, root, "directory/nested/.git/HEAD", "head")
+			testingVerifyFile(t, root, "directory/nested/a", tF1Content)
+		})
+	}
 }
 
 // testingCreateTemporaryClone creates a directory with the name of a temporary

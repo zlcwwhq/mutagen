@@ -30,9 +30,10 @@ const (
 	crossDeviceRenameTemporaryNamePrefix = filesystem.TemporaryNamePrefix + "cross-device-rename"
 
 	// gitLinkTemporaryNamePrefix is the name prefix to use for the temporary
-	// directories in which submodules are cloned. Sessions can share a
-	// directory (e.g. the edges of a star at its center), so these names have
-	// to be unique rather than being derived from the name of the submodule.
+	// directories in which submodules are cloned and in which repositories are
+	// prepared for attachment. Sessions can share a directory (e.g. the edges
+	// of a star at its center), so these names have to be unique rather than
+	// being derived from the name of the submodule.
 	gitLinkTemporaryNamePrefix = filesystem.TemporaryNamePrefix + "submodule-"
 
 	// gitLinkSeedLength is the number of random bytes in a seed (see
@@ -75,6 +76,11 @@ const (
 var (
 	// errTransitionCancelled indicates that the transition was cancelled.
 	errTransitionCancelled = errors.New("transition cancelled")
+	// errGitLinkRemovalRefused indicates that the removal of a submodule's Git
+	// entry was refused. A submodule's repository can hold work that exists
+	// nowhere else, such as unpushed commits and stashes, and it isn't
+	// synchronized, so its removal is never performed automatically.
+	errGitLinkRemovalRefused = errors.New("submodule isn't removed automatically; remove it manually")
 )
 
 // Provider defines the interface that higher-level logic can use to provide
@@ -556,6 +562,13 @@ ContentLoop:
 				t.recordProblem(contentPath, fmt.Errorf("unable to remove symbolic link: %w", err))
 				continue
 			}
+		} else if entry.Kind == EntryKind_GitLink {
+			// This can't happen, because remove refuses to remove directories
+			// containing submodules, but if it did, then the submodule would be
+			// kept in the reduced entry, along with this directory.
+			contentRemovalFailed = true
+			t.recordProblem(contentPath, errGitLinkRemovalRefused)
+			continue
 		} else {
 			contentRemovalFailed = true
 			t.recordProblem(contentPath, errors.New("unknown entry type found in removal target"))
@@ -620,6 +633,28 @@ func (t *transitioner) remove(path string, entry *Entry) *Entry {
 	// If the entry is nil, we're done.
 	if entry == nil {
 		return nil
+	}
+
+	// Refuse to remove a submodule, leaving its entry in place. We check this
+	// before accessing the filesystem so that the refusal is unconditional.
+	if entry.Kind == EntryKind_GitLink {
+		t.recordProblem(path, errGitLinkRemovalRefused)
+		return entry
+	}
+
+	// Likewise, refuse to remove a directory that contains a submodule, as a
+	// whole. Removing the rest of its content would remove the submodule's
+	// working tree, uncommitted changes included, while leaving its Git entry,
+	// which isn't anything that either endpoint has, and which would make the
+	// endpoints disagree about the submodule's files in ways that they can only
+	// resolve by deleting it.
+	if entry.Kind == EntryKind_Directory {
+		if links := entry.GitLinkPaths(); len(links) > 0 {
+			for _, link := range links {
+				t.recordProblem(fastpath.Joinable(path)+link, errGitLinkRemovalRefused)
+			}
+			return entry
+		}
 	}
 
 	// Walk down to the parent of the target and compute the target's leaf name.
@@ -961,9 +996,9 @@ func isGitLinkTemporary(content *filesystem.Metadata) bool {
 }
 
 // removeTemporaryClone removes a temporary directory in which a submodule was
-// cloned, recording a problem if that isn't possible, because it wouldn't be
-// synchronized, and it would only go away later (see
-// removeStaleTemporaryClones).
+// cloned or a repository was prepared, recording a problem if that isn't
+// possible, because it wouldn't be synchronized, and it would only go away
+// later (see removeStaleTemporaryClones).
 func (t *transitioner) removeTemporaryClone(path, temporary string) {
 	if err := removeGitLinkTemporary(temporary); err != nil {
 		t.recordProblem(path, fmt.Errorf("unable to remove temporary clone: %w", err))
@@ -1215,7 +1250,9 @@ func (t *transitioner) populateIn(parent *filesystem.Directory, name, path strin
 
 	// Remove the old content, which verifies that it hasn't been modified. If
 	// only a portion of it can be removed, then the submodule can't go in its
-	// place. The removal has already recorded the relevant problems.
+	// place. In particular, it can be a directory containing submodules, whose
+	// Git entries are never removed. The removal has already recorded the
+	// relevant problems.
 	if reduced := t.remove(path, old); reduced != nil {
 		t.removeTemporaryClone(path, temporary)
 		return reduced
@@ -1249,6 +1286,133 @@ func (t *transitioner) populateIn(parent *filesystem.Directory, name, path strin
 
 	// Success.
 	return content
+}
+
+// attach transitions the absence of a Git entry in an existing directory to a
+// submodule's Git entry, without touching the directory's other contents, which
+// are synchronized separately. The repository is prepared in a temporary
+// directory within the directory, and its Git directory is then moved into
+// place, so a failure leaves the directory without a Git entry, and yields nil.
+func (t *transitioner) attach(parent *filesystem.Directory, name, path string, target *Entry) *Entry {
+	// Without a provider, there's no way to obtain a repository.
+	if t.gitProvider == nil {
+		t.recordProblem(path, errors.New("submodule population is unavailable"))
+		return nil
+	}
+
+	// Only scans create GitLink entries, and only as Git entries of directories
+	// other than the root, so only a malfunctioning or malicious controller
+	// could request anything else.
+	directoryPath, ok := gitLinkDirectory(path)
+	if !ok {
+		t.recordProblem(path, errors.New("submodule Git entry requested at invalid path"))
+		return nil
+	}
+
+	// Check for cancellation before starting operations that can take a long
+	// time.
+	if t.ctx.Err() != nil {
+		t.recordProblem(path, errTransitionCancelled)
+		return nil
+	}
+
+	// Verify that there's no Git entry yet.
+	if _, err := parent.ReadContentMetadata(name); err == nil {
+		t.recordProblem(path, errors.New("unable to attach repository: unknown content exists at path"))
+		return nil
+	} else if !os.IsNotExist(err) {
+		t.recordProblem(path, fmt.Errorf("unable to verify that path is available for repository: %w", err))
+		return nil
+	}
+
+	// Prepare the repository in a temporary directory.
+	temporaryName, temporary, ok := t.createTemporaryClone(parent, directoryPath, path)
+	if !ok {
+		return nil
+	}
+	link, warnings, err := t.gitProvider.PrepareAttach(t.ctx, temporary, target)
+	if err != nil {
+		t.removeTemporaryClone(path, temporary)
+		t.recordGitProblem(path, err)
+		return nil
+	}
+
+	// Move the Git directory into place.
+	if prepared, err := parent.OpenDirectory(temporaryName); err != nil {
+		t.removeTemporaryClone(path, temporary)
+		t.recordProblem(path, fmt.Errorf("unable to open prepared repository: %w", err))
+		return nil
+	} else {
+		err := filesystem.Rename(prepared, GitLinkName, parent, name, false)
+		prepared.Close()
+		if err != nil {
+			t.removeTemporaryClone(path, temporary)
+			t.recordProblem(path, fmt.Errorf("unable to move repository into place: %w", err))
+			return nil
+		}
+	}
+	t.removeTemporaryClone(path, temporary)
+
+	// Refresh the index, which only saves Git some work later. A failure
+	// doesn't change the fact that the repository is in place with the right
+	// commit and index.
+	t.gitProvider.Refresh(t.ctx, filepath.Join(t.root, filepath.FromSlash(directoryPath)))
+
+	// Report how the repository differs from what was requested.
+	for _, warning := range warnings {
+		t.recordWarning(path, errors.New(warning))
+	}
+
+	// Success.
+	return link
+}
+
+// follow transitions a submodule's Git entry from one commit to another by
+// moving the repository's HEAD and index, without touching its working tree,
+// whose contents are synchronized separately. A failure is only a warning,
+// because the working tree's contents are synchronized regardless, and it
+// yields the old entry, so that the next cycle tries again.
+func (t *transitioner) follow(path string, old, target *Entry) *Entry {
+	// Without a provider, there's no way to operate on a repository.
+	if t.gitProvider == nil {
+		t.recordProblem(path, errors.New("submodule population is unavailable"))
+		return old
+	}
+
+	// Validate the path, for the same reason as in attach.
+	directoryPath, ok := gitLinkDirectory(path)
+	if !ok {
+		t.recordProblem(path, errors.New("submodule Git entry requested at invalid path"))
+		return old
+	}
+
+	// Walk down to the parent of the Git entry, which ensures that we don't
+	// traverse symbolic links, and verify that the Git entry is still there. If
+	// we are successful, defer closure of the parent.
+	parent, name, err := t.walkToParentAndComputeLeafName(path, true)
+	if err != nil {
+		t.recordProblem(path, fmt.Errorf("unable to walk to transition root: %w", err))
+		return old
+	}
+	defer parent.Close()
+	if _, err := parent.ReadContentMetadata(name); err != nil {
+		t.recordProblem(path, fmt.Errorf("unable to query submodule Git entry: %w", err))
+		return old
+	}
+
+	// Move HEAD and the index.
+	directory := filepath.Join(t.root, filepath.FromSlash(directoryPath))
+	if err := t.gitProvider.Follow(t.ctx, directory, old, target); err != nil {
+		if t.ctx.Err() != nil {
+			t.recordProblem(path, errTransitionCancelled)
+		} else {
+			t.recordWarning(path, err)
+		}
+		return old
+	}
+
+	// Success.
+	return target
 }
 
 // createDirectory creates the target directory at the specified path. If only a
@@ -1390,6 +1554,8 @@ func (t *transitioner) create(path string, target *Entry) *Entry {
 		} else {
 			return target
 		}
+	} else if target.Kind == EntryKind_GitLink {
+		return t.attach(parent, name, path, target)
 	} else {
 		t.recordProblem(path, errors.New("creation requested for unknown entry type"))
 		return nil
@@ -1528,6 +1694,18 @@ func transition(
 			} else {
 				results = append(results, t.New)
 			}
+			continue
+		}
+
+		// Handle the special case of moving a submodule from one commit to
+		// another, which only involves its Git entry. This can't go through
+		// the removal and creation below, because a Git entry's removal is
+		// always refused.
+		gitLinkToGitLink := t.Old != nil && t.New != nil &&
+			t.Old.Kind == EntryKind_GitLink &&
+			t.New.Kind == EntryKind_GitLink
+		if gitLinkToGitLink {
+			results = append(results, transitioner.follow(t.Path, t.Old, t.New))
 			continue
 		}
 
