@@ -93,10 +93,16 @@ func TestEffectiveIgnoresGitMode(t *testing.T) {
 		{"mode enabled with VCS ignores", &Configuration{GitMode: GitMode_GitModeEnabled, IgnoreVCSMode: ignore.IgnoreVCSMode_IgnoreVCSModeIgnore}, true},
 	}
 
-	// Process test cases.
+	// Process test cases. The ignores that remote uses carry Git mode exactly
+	// when the configuration enables it, so that remote evaluates rule files
+	// and submodules for those sessions only.
 	for _, test := range tests {
-		if ignores := EffectiveIgnores(test.configuration, DefaultVersion); ignores.VCS != test.expectedVCS {
+		ignores := EffectiveIgnores(test.configuration, DefaultVersion)
+		if ignores.VCS != test.expectedVCS {
 			t.Errorf("%s: VCS ignoring (%t) does not match expected (%t)", test.description, ignores.VCS, test.expectedVCS)
+		}
+		if expectedGit := test.configuration.GitMode == GitMode_GitModeEnabled; ignores.Git != expectedGit {
+			t.Errorf("%s: Git mode (%t) does not match expected (%t)", test.description, ignores.Git, expectedGit)
 		}
 	}
 }

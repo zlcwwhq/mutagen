@@ -69,7 +69,8 @@ type Endpoint struct {
 	// Ignores are the session's ignores, which submissions from the endpoint's
 	// system use to determine whether the session synchronizes the directory
 	// corresponding to theirs (see Selection.Corresponding). If nil, then no
-	// directory is considered excluded.
+	// directory is considered excluded. In Git mode, they only carry the mode:
+	// each system reads the rule files from its own copy of the root.
 	Ignores *Ignores `json:",omitempty"`
 }
 

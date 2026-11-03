@@ -88,7 +88,9 @@ type record struct {
 	// Endpoint.SessionCreated). Scopes don't record it, since synchronization
 	// endpoints don't know it.
 	SessionCreated time.Time
-	// Ignores are the session's ignores, if known (see Endpoint.Ignores).
+	// Ignores are the session's ignores, if known (see Endpoint.Ignores). They
+	// are recorded without a root, which loading the registration binds to the
+	// recorded Root (see relateResolved).
 	Ignores *Ignores `json:",omitempty"`
 }
 
@@ -306,7 +308,9 @@ func (r *scopeRegistration) Close() error {
 // registrations. Dead scope registrations, such as those of processes that
 // terminated abruptly, are pruned in the background, so that registration
 // doesn't delay synchronization, while Synchronizing prunes those that it
-// encounters.
+// encounters. The ignores are recorded as given, without a root, so scopes
+// evaluate Git mode beneath their own roots once loaded (see
+// Ignores.WithRoot).
 func RegisterScope(session string, alpha bool, root string, ignores *Ignores) (io.Closer, error) {
 	root, err := filesystem.Normalize(root)
 	if err != nil {
@@ -453,6 +457,9 @@ type candidate struct {
 	depth int
 	// path is the slash-separated submission directory relative to the root.
 	path string
+	// root is the registration's root with symbolic links resolved, which
+	// the paths of the ignores are relative to (see Ignores.WithRoot).
+	root string
 }
 
 // filter returns the candidates that satisfy all of the specified predicates.
@@ -739,7 +746,14 @@ func relateResolved(name, directory string) ([]*candidate, []*candidate, error) 
 		if contained {
 			depth = len(root)
 		}
-		c := &candidate{r, contained, depth, path}
+
+		// Registrations record the ignores of the session without the root
+		// that Git mode evaluates them beneath, which is this system's own
+		// copy of the session's root, so bind it here, for every use of the
+		// registration: command routing, and the sessions that may synchronize
+		// a path (see Synchronizing).
+		r.Ignores = r.Ignores.WithRoot(root)
+		c := &candidate{r, contained, depth, path, root}
 		if r.Version == mutagen.Version {
 			compatible = append(compatible, c)
 		} else {
@@ -840,7 +854,10 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 		target.Node, target.SourceNode = route.Node, route.SourceNode
 		target.Star, target.Resolved, target.Revision = route.Star, true, route.Revision
 		if route.Ignores != nil {
-			target.Ignores = route.Ignores
+			// The daemon sends the selected edge's ignores without a root, since
+			// the root is this system's, so bind the registration's (see
+			// relateResolved).
+			target.Ignores = route.Ignores.WithRoot(c.root)
 		}
 	}
 	if excluded != "" {
