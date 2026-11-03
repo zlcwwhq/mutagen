@@ -32,7 +32,8 @@ message Snapshot {
     // the snapshot.
     uint64 totalFileSize = 7;
     // Warnings are problems with the endpoint's content that the scan itself
-    // doesn't represent. They're informational: they don't affect
+    // doesn't represent, such as content that a Git repository tracks but that
+    // isn't synchronized. They're informational: they don't affect
     // synchronization, and they aren't part of the snapshot's identity, so they
     // don't participate in snapshot equality.
     repeated Problem warnings = 8;

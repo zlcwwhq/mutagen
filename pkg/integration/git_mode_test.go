@@ -2,8 +2,11 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -901,6 +904,140 @@ func TestGitModeRootSafety(t *testing.T) {
 		session.expect(session.beta, content)
 		if status := session.state().Status; status == synchronization.Status_HaltedOnRootEmptied {
 			t.Error("session halted on root being hidden by rule")
+		}
+	})
+}
+
+// runGitInRepository runs Git in a directory for test setup purposes, without
+// being affected by any environment variables that may be set for a repository
+// in which the test itself is being run, such as those set by Git hooks.
+func runGitInRepository(t *testing.T, directory string, args ...string) {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = directory
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "GIT_") {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("unable to run Git with arguments %v: %v: %s", args, err, output)
+	}
+}
+
+// problemErrors returns a map from problem paths to their messages.
+func problemErrors(problems []*core.Problem) map[string]string {
+	errors := make(map[string]string, len(problems))
+	for _, problem := range problems {
+		errors[problem.Path] = problem.Error
+	}
+	return errors
+}
+
+// TestGitModeTrackedIgnoredWarnings tests that files that are tracked by Git
+// but matched by rules result in scan problems on the endpoint with the
+// repository, without preventing synchronization, including for remote
+// endpoints.
+func TestGitModeTrackedIgnoredWarnings(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("Git is not available:", err)
+	}
+	files := map[string]string{
+		".gitignore":      "*.o\nbuild/\n",
+		"main.c":          "main",
+		"tracked.o":       "tracked",
+		"untracked.o":     "untracked",
+		"build/out/first": "first",
+	}
+	setup := func(t *testing.T, session *gitModeSession, root string) {
+		t.Helper()
+		runGitInRepository(t, root, "init", "--quiet")
+		for _, name := range []string{"main.c", "tracked.o", "build/out/first"} {
+			runGitInRepository(t, root, "add", "--force", "--", name)
+		}
+	}
+	verify := func(t *testing.T, session *gitModeSession, repository, other string, repositoryProblems, otherProblems []*core.Problem) {
+		t.Helper()
+
+		// Verify the problems.
+		errors := problemErrors(repositoryProblems)
+		if len(errors) != 2 {
+			t.Errorf("incorrect number of scan problems: %v", repositoryProblems)
+		}
+		if message := errors["tracked.o"]; !strings.Contains(message, "tracked by Git") || !strings.Contains(message, `"!tracked.o"`) {
+			t.Errorf("incorrect problem for file: %q", message)
+		}
+		if message := errors["build"]; !strings.Contains(message, "tracked by Git") || !strings.Contains(message, `"!build"`) || !strings.Contains(message, "whole directory") {
+			t.Errorf("incorrect problem for directory: %q", message)
+		}
+		if len(otherProblems) != 0 {
+			t.Errorf("unexpected scan problems on endpoint without repository: %v", otherProblems)
+		}
+
+		// Verify that synchronization proceeded otherwise.
+		session.expect(other, map[string]string{".gitignore": "*.o\nbuild/\n", "main.c": "main"})
+		session.expectMissing(other, "tracked.o", "untracked.o", "build", ".git")
+	}
+
+	t.Run("alpha", func(t *testing.T) {
+		session := newGitModeSession(t, gitModeOptions{alpha: files})
+		setup(t, session, session.alpha)
+		session.flush()
+		state := session.state()
+		verify(t, session, session.alpha, session.beta, state.AlphaState.ScanProblems, state.BetaState.ScanProblems)
+	})
+
+	t.Run("beta", func(t *testing.T) {
+		session := newGitModeSession(t, gitModeOptions{beta: files})
+		setup(t, session, session.beta)
+		session.flush()
+		state := session.state()
+		verify(t, session, session.beta, session.alpha, state.BetaState.ScanProblems, state.AlphaState.ScanProblems)
+	})
+
+	t.Run("beta through remote endpoint", func(t *testing.T) {
+		session := newGitModeSession(t, gitModeOptions{remoteBeta: true, beta: files})
+		setup(t, session, session.beta)
+		session.flush()
+		state := session.state()
+		verify(t, session, session.beta, session.alpha, state.BetaState.ScanProblems, state.AlphaState.ScanProblems)
+	})
+
+	t.Run("resolved using suggestions", func(t *testing.T) {
+		session := newGitModeSession(t, gitModeOptions{ignores: []string{"!tracked.o", "!build"}, alpha: files})
+		setup(t, session, session.alpha)
+		session.flush()
+		state := session.state()
+		if len(state.AlphaState.ScanProblems) != 0 {
+			t.Errorf("unexpected scan problems: %v", state.AlphaState.ScanProblems)
+		}
+		session.expect(session.beta, map[string]string{"tracked.o": "tracked", "build/out/first": "first"})
+		session.expectMissing(session.beta, "untracked.o")
+	})
+
+	t.Run("problems are limited", func(t *testing.T) {
+		many := map[string]string{".gitignore": "*.o\n"}
+		var names []string
+		for i := 0; i < 30; i++ {
+			name := fmt.Sprintf("file%02d.o", i)
+			many[name] = "content"
+			names = append(names, name)
+		}
+		session := newGitModeSession(t, gitModeOptions{alpha: many})
+		runGitInRepository(t, session.alpha, "init", "--quiet")
+		runGitInRepository(t, session.alpha, append([]string{"add", "--force", "--"}, names...)...)
+		session.flush()
+
+		// Sessions report a limited number of problems as a matter of course.
+		state := session.state()
+		reported := uint64(len(state.AlphaState.ScanProblems)) + state.AlphaState.ExcludedScanProblems
+		if len(state.AlphaState.ScanProblems) == 0 || reported > 30 {
+			t.Errorf("incorrect scan problem count: %d", reported)
+		}
+		for _, problem := range state.AlphaState.ScanProblems {
+			if problem.Path == "" {
+				t.Errorf("problem without path: %v", problem)
+			}
 		}
 	})
 }

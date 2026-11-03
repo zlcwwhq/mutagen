@@ -32,8 +32,9 @@ type Problem struct {
 	// Error is a human-readable summary of the problem.
 	Error string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	// Warning indicates that the problem describes content that isn't
-	// synchronized by design rather than a failure. Warnings don't call into
-	// question whether or not anything else has been synchronized.
+	// synchronized by design rather than a failure, such as a path that's
+	// tracked by Git but matched by an ignore rule in Git mode. Warnings don't
+	// call into question whether or not anything else has been synchronized.
 	Warning       bool `protobuf:"varint,3,opt,name=warning,proto3" json:"warning,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -47,7 +47,8 @@ type Snapshot struct {
 	// the snapshot.
 	TotalFileSize uint64 `protobuf:"varint,7,opt,name=totalFileSize,proto3" json:"totalFileSize,omitempty"`
 	// Warnings are problems with the endpoint's content that the scan itself
-	// doesn't represent. They're informational: they don't affect
+	// doesn't represent, such as content that a Git repository tracks but that
+	// isn't synchronized. They're informational: they don't affect
 	// synchronization, and they aren't part of the snapshot's identity, so they
 	// don't participate in snapshot equality.
 	Warnings      []*Problem `protobuf:"bytes,8,rep,name=warnings,proto3" json:"warnings,omitempty"`
