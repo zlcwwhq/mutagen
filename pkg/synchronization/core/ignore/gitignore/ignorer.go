@@ -19,9 +19,10 @@ const (
 	ruleFileName = ".gitignore"
 	// gitEntryName is the name of Git's own entry in a directory.
 	gitEntryName = ".git"
-	// excludeFilePath is the slash-separated, root-relative path of the rule
-	// file for the root repository.
-	excludeFilePath = ".git/info/exclude"
+	// excludeFileSuffix is the slash-separated end of the path of a
+	// repository's exclude file, which is the rule file for the repository as a
+	// whole, within its Git directory.
+	excludeFileSuffix = "/info/exclude"
 	// maximumRuleFileSize is the maximum size of a rule file that will be read.
 	// Larger files cause an error, preventing synchronization without their
 	// rules while bounding memory consumption.
@@ -66,17 +67,30 @@ func IsDeliverableRuleFile(path string) bool {
 // AffectsIgnoreEvaluation returns true if a root-relative, slash-separated path
 // identifies a file whose contents affect ignore evaluation, so that a change
 // to it on disk can change what a scan ignores. This is the case for
-// deliverable rule files (see IsDeliverableRuleFile) and for the root
-// repository's ".git/info/exclude" file. The latter is inside a Git directory
-// and belongs to its endpoint, so this doesn't say anything about what can be
-// written.
+// deliverable rule files (see IsDeliverableRuleFile) and for the exclude files
+// of repositories: the root repository's ".git/info/exclude" and those of
+// nested repositories, which are either in their own Git directories (such as
+// "sub/.git/info/exclude") or in Git directories elsewhere that their ".git"
+// files point to (such as ".git/modules/sub/info/exclude" for a submodule).
+// Only the ".git" entries on disk say which Git directory belongs to which
+// working tree, so any path beneath a Git entry that ends in "info/exclude"
+// counts, which errs towards noticing changes. Exclude files are inside Git
+// directories and belong to their endpoint, so this doesn't say anything about
+// what can be written.
 func AffectsIgnoreEvaluation(path string) bool {
-	return path == excludeFilePath || IsDeliverableRuleFile(path)
+	if IsDeliverableRuleFile(path) {
+		return true
+	} else if !strings.HasSuffix(path, excludeFileSuffix) {
+		return false
+	}
+	gitEntry := ShallowestGitEntry(path)
+	return gitEntry != "" && len(gitEntry) <= len(path)-len(excludeFileSuffix)
 }
 
 // ruleSet is a list of rules that apply to a subtree, along with the rules that
 // apply to the tree beyond it. A rule set is a link in a chain that ends at
-// the lowest-precedence rules.
+// the lowest-precedence rules, which are those of the exclude file of the
+// repository that the subtree belongs to (see ignorer.load).
 type ruleSet struct {
 	// err is the failure to read the rules of this set or of a parent set, in
 	// which case there are no rules to evaluate.
@@ -99,7 +113,10 @@ type ignorer struct {
 	// session is the session-specific ignorer, if any.
 	session ignore.Ignorer
 	// directories maps root-relative directory paths to the chain of rule sets
-	// that apply to entries in those directories. The chain may be nil.
+	// that apply to entries in those directories. The chain may be nil. Each
+	// directory's chain is computed once, so the rule files that it reads,
+	// including the exclude files of the root repository and of any nested
+	// repositories, are only read once.
 	directories map[string]*ruleSet
 	// lastDirectory is the most recent directory that was looked up in
 	// directories. Scans tend to visit the entries in a directory in sequence,
@@ -111,10 +128,6 @@ type ignorer struct {
 	// lastValid indicates whether or not lastDirectory and lastRules are
 	// populated.
 	lastValid bool
-	// excludeLoaded indicates whether or not exclude has been populated.
-	excludeLoaded bool
-	// exclude is the rule set for the root repository's exclude file.
-	exclude *ruleSet
 	// untraversable records the root-relative paths that a scan wouldn't reach
 	// as directories. See traversable.
 	untraversable map[string]bool
@@ -133,6 +146,15 @@ type ignorer struct {
 // for them couldn't be read. Rule files are only read from directories that a
 // scan would traverse, so a path beneath anything else, including a symbolic
 // link, is only subject to the rules of its parents.
+//
+// The rules are those that Git applies in the repository that a path belongs
+// to. A directory other than the root that contains a ".git" entry is the top
+// level of a nested repository's working tree (such as a submodule's), and the
+// rules of the directories above it don't apply beneath it, where the nested
+// repository's own exclude file takes their place. Those rules still decide
+// about the directory itself, as an entry of its parent. A failure to read
+// them still applies beneath it, though, and the session ignorer and the
+// exclusion of ".git" entries apply everywhere. See load for details.
 func NewIgnorer(root string, session ignore.Ignorer) ignore.DirectoryIgnorer {
 	return &ignorer{
 		root:          root,
@@ -216,6 +238,29 @@ func (i *ignorer) rulesFor(directory string) *ruleSet {
 
 // load returns the chain of rule sets that apply to the entries in a directory,
 // reading rule files as necessary.
+//
+// A directory's own rules take precedence over those of its parent, which take
+// precedence over those of its parent in turn, up to the root, whose parent is
+// the root repository's exclude file. That's how Git evaluates the paths of a
+// repository, but Git evaluates the paths beneath a nested repository's top
+// level (such as a submodule's) for that repository alone, without the rules
+// of the directories above it, which belong to another repository. So the
+// chain of a directory other than the root that contains a ".git" entry
+// doesn't continue with its parent's: it continues with the nested
+// repository's exclude file (see repositoryRules), whose rules are relative to
+// the directory, and it ends there. The rules above the directory still decide
+// whether the directory itself is ignored, since it's evaluated as an entry of
+// its parent. Nested repositories are recognized by their ".git" entries alone,
+// without involving Git or validating their contents (see excludeFileLocation).
+//
+// A failure to read the rules of a parent (or of the root repository's
+// exclude file) applies to the whole subtree, even beneath the top level of a
+// nested repository, whose own rules would otherwise replace them, since the
+// rules that couldn't be read might ignore it entirely. A failure to determine
+// whether a directory is a nested repository's top level, or to read its
+// repository's exclude file, applies to the directory's subtree, just as a
+// failure to read the root repository's exclude file applies to the whole
+// tree.
 func (i *ignorer) load(directory string) *ruleSet {
 	// Check if we've already done this work.
 	if rules, ok := i.directories[directory]; ok {
@@ -223,12 +268,14 @@ func (i *ignorer) load(directory string) *ruleSet {
 	}
 
 	// The rules of the parent directory also apply (with lower precedence), and
-	// the root's parent is the root repository's exclude file.
+	// the root's parent is the root repository's exclude file. Whether or not
+	// the root contains a ".git" entry, it's the top level of whatever
+	// repository it's in, since rule files above it are never read.
 	var parent *ruleSet
 	var parentDirectory string
 	var prefixLength int
 	if directory == "" {
-		parent = i.excludeRules()
+		_, parent = i.repositoryRules(directory)
 	} else {
 		if slash := strings.LastIndexByte(directory, '/'); slash >= 0 {
 			parentDirectory = directory[:slash]
@@ -238,7 +285,8 @@ func (i *ignorer) load(directory string) *ruleSet {
 	}
 
 	// A failure to read a parent's rules applies to the whole subtree, whatever
-	// this directory's own rules say.
+	// this directory's own rules say, and whether or not it's the top level of
+	// a nested repository.
 	if parent != nil && parent.err != nil {
 		i.directories[directory] = parent
 		return parent
@@ -250,11 +298,28 @@ func (i *ignorer) load(directory string) *ruleSet {
 	if traversable, err := i.traversable(directory, parentDirectory); err != nil {
 		rules = &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
 	} else if traversable {
-		path := filepath.Join(i.root, filepath.FromSlash(directory), ruleFileName)
-		if contents, err := readRegularFile(path, maximumRuleFileSize); err != nil {
-			rules = &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
-		} else if parsed := parseRules(contents); len(parsed) > 0 {
-			rules = &ruleSet{rules: parsed, prefixLength: prefixLength, parent: parent}
+		// If the directory is the top level of a nested repository, then the
+		// chain restarts with that repository's exclude file. Its rules apply
+		// beneath the directory in place of the parent's, which are those of
+		// another repository, so that a rule such as "*.log" in the root
+		// doesn't hide a file that the nested repository tracks. If its rules
+		// can't be read, then neither can those of the directory.
+		base := parent
+		if directory != "" {
+			if repository, exclude := i.repositoryRules(directory); repository {
+				base = exclude
+			}
+		}
+
+		// Read the directory's own rules, which take precedence over the base.
+		rules = base
+		if base == nil || base.err == nil {
+			path := filepath.Join(i.root, filepath.FromSlash(directory), ruleFileName)
+			if contents, err := readRegularFile(path, maximumRuleFileSize); err != nil {
+				rules = &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
+			} else if parsed := parseRules(contents); len(parsed) > 0 {
+				rules = &ruleSet{rules: parsed, prefixLength: prefixLength, parent: base}
+			}
 		}
 	}
 
@@ -301,22 +366,40 @@ func isEntryName(component string) bool {
 		!strings.ContainsRune(component, filepath.Separator)
 }
 
-// excludeRules returns the rule set for the root repository's exclude file, or
-// nil if there is no such file or it contains no rules.
-func (i *ignorer) excludeRules() *ruleSet {
-	if !i.excludeLoaded {
-		i.excludeLoaded = true
-		if path, err := excludeFileLocation(i.root); err != nil {
-			i.exclude = &ruleSet{err: fmt.Errorf("unable to locate ignore rules: %w", err)}
-		} else if path != "" {
-			if contents, err := readRegularFile(path, maximumRuleFileSize); err != nil {
-				i.exclude = &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
-			} else if rules := parseRules(contents); len(rules) > 0 {
-				i.exclude = &ruleSet{rules: rules}
-			}
-		}
+// repositoryRules determines whether or not a directory, specified by its
+// root-relative path (which is empty for the synchronization root), is the top
+// level of a repository's working tree (see excludeFileLocation), and returns
+// the rule set for that repository's exclude file, whose rules are relative to
+// the directory. The rule set is nil if the directory isn't a repository's top
+// level, if its repository has no exclude file, or if that file contains no
+// rules. If the exclude file can't be located or read, including because the
+// directory's ".git" entry can't be examined, then the rule set records the
+// error, and the directory counts as a repository's top level, so that the
+// error replaces any rules that would otherwise apply beneath it. The caller is
+// responsible for retaining the result, so that the file is only read once.
+func (i *ignorer) repositoryRules(directory string) (bool, *ruleSet) {
+	// Locate the exclude file.
+	repository, path, err := excludeFileLocation(filepath.Join(i.root, filepath.FromSlash(directory)))
+	if err != nil {
+		return true, &ruleSet{err: fmt.Errorf("unable to locate ignore rules: %w", err)}
+	} else if path == "" {
+		return repository, nil
 	}
-	return i.exclude
+
+	// Read and parse the exclude file.
+	contents, err := readRegularFile(path, maximumRuleFileSize)
+	if err != nil {
+		return true, &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
+	}
+	rules := parseRules(contents)
+	if len(rules) == 0 {
+		return repository, nil
+	}
+	var prefixLength int
+	if directory != "" {
+		prefixLength = len(directory) + 1
+	}
+	return repository, &ruleSet{rules: rules, prefixLength: prefixLength}
 }
 
 // readRegularFile reads a file if (and only if) it is a regular file (i.e. not
@@ -354,52 +437,66 @@ func readRegularFile(path string, limit int64) ([]byte, error) {
 	return contents, nil
 }
 
-// excludeFileLocation determines the location of the exclude file for the
-// repository at a synchronization root. It returns an empty string if the root
-// doesn't appear to be the root of a repository. The root's ".git" entry
-// may either be a directory, in which case it contains the exclude file, or a
-// file that points to the Git directory (as is the case for submodules and
-// linked worktrees). If the Git directory in turn points to a common directory
-// (as is the case for linked worktrees), then that is where the exclude file
-// is found.
-func excludeFileLocation(root string) (string, error) {
-	// Check the type of the root's ".git" entry. We deliberately don't follow
-	// symbolic links.
-	dotGit := filepath.Join(root, ".git")
+// excludeFileLocation determines whether or not a directory appears to be the
+// top level of a repository's working tree, which is the case if it contains a
+// ".git" entry that's a directory or a regular file, and, if so, the location
+// of the repository's exclude file. The ".git" entry may either be a directory,
+// in which case it contains the exclude file, or a file that points to the Git
+// directory (as is the case for submodules and linked worktrees). If the Git
+// directory in turn points to a common directory (as is the case for linked
+// worktrees), then that is where the exclude file is found. The location is an
+// empty string if the directory doesn't appear to be a repository's top level
+// or if a ".git" file doesn't point anywhere.
+//
+// Only the ".git" entry's type matters, not whether Git would accept it, so
+// that the result doesn't depend on Git: a directory with an empty ".git"
+// directory, or with a ".git" file that doesn't point to a Git directory,
+// counts as a repository's top level, even though Git would consider it part
+// of an enclosing repository. A symbolic link named ".git" doesn't count, even
+// though Git follows it, since rule files are never read through symbolic
+// links, and the directory is then treated as an ordinary one. The entry is
+// looked up by name, so whether ".GIT" counts depends on whether the
+// filesystem distinguishes case, as it does for Git.
+func excludeFileLocation(directory string) (bool, string, error) {
+	// Check the type of the directory's ".git" entry. We deliberately don't
+	// follow symbolic links.
+	dotGit := filepath.Join(directory, gitEntryName)
 	info, err := os.Lstat(dotGit)
 	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
-		return "", nil
+		return false, "", nil
 	} else if err != nil {
-		return "", err
+		return false, "", err
 	}
 	if info.IsDir() {
-		return filepath.Join(dotGit, "info", "exclude"), nil
+		return true, filepath.Join(dotGit, "info", "exclude"), nil
 	} else if !info.Mode().IsRegular() {
-		return "", nil
+		return false, "", nil
 	}
 
-	// Read the location of the Git directory from the file.
+	// Read the location of the Git directory from the file. If the file has
+	// been replaced by something other than a regular file in the meantime,
+	// then it's treated as an empty one.
 	contents, err := readRegularFile(dotGit, maximumPointerFileSize)
 	if err != nil {
-		return "", err
+		return true, "", err
 	} else if contents == nil {
-		return "", nil
+		return true, "", nil
 	}
 	pointer, ok := parsePointer(contents, "gitdir:")
 	if !ok {
-		return "", nil
+		return true, "", nil
 	}
-	gitDirectory := resolvePath(root, pointer)
+	gitDirectory := resolvePath(directory, pointer)
 
 	// Check whether or not the Git directory points to a common directory.
 	if contents, err := readRegularFile(filepath.Join(gitDirectory, "commondir"), maximumPointerFileSize); err != nil {
-		return "", err
+		return true, "", err
 	} else if contents != nil {
 		if pointer, ok := parsePointer(contents, ""); ok {
-			return filepath.Join(resolvePath(gitDirectory, pointer), "info", "exclude"), nil
+			return true, filepath.Join(resolvePath(gitDirectory, pointer), "info", "exclude"), nil
 		}
 	}
-	return filepath.Join(gitDirectory, "info", "exclude"), nil
+	return true, filepath.Join(gitDirectory, "info", "exclude"), nil
 }
 
 // parsePointer extracts a path from the first line of a file that points to

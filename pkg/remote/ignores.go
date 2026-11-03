@@ -24,8 +24,9 @@ type Ignores struct {
 	// VCS indicates whether VCS directories are ignored.
 	VCS bool
 	// Git indicates whether the session is in Git mode, in which the rules of
-	// .gitignore files and of the root repository's .git/info/exclude apply
-	// beneath the patterns above and entries named .git (files as well as
+	// .gitignore files and of repositories' .git/info/exclude files apply
+	// beneath the patterns above (with a nested repository's rules replacing
+	// those above it within it) and entries named .git (files as well as
 	// directories) are never synchronized. Those rules aren't part of the
 	// session's configuration: they're files in the synchronized tree,
 	// which each endpoint reads from its own copy, so they're evaluated on the
@@ -110,7 +111,7 @@ const (
 	// ExcludedBySession indicates the session's own patterns and VCS
 	// directories. It's also the source of every exclusion outside Git mode.
 	ExcludedBySession ExclusionSource = iota
-	// ExcludedByGitRules indicates a rule of a .gitignore file or of the root
+	// ExcludedByGitRules indicates a rule of a .gitignore file or of a
 	// repository's .git/info/exclude.
 	ExcludedByGitRules
 	// ExcludedByGitEntry indicates an entry named .git, which Git mode never

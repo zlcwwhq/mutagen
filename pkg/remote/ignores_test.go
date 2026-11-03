@@ -220,9 +220,16 @@ func TestIgnoresGitMode(t *testing.T) {
 		{"sub/deep", true, "", ""},
 		{"sub/deep/x", false, "", ""},
 		{"sub/deep/.git/HEAD", false, "sub/deep/.git", "sub/deep/.git"},
-		// That doesn't exempt it from rules.
+		// That doesn't exempt it from its own rules, but the rules above it
+		// don't apply within it, as for Git run in it, other than to decide
+		// whether it's ignored as a whole.
 		{"sub/out/x", false, "sub/out", "sub/out"},
 		{"sub/.git/x", false, "sub/.git", "sub/.git"},
+		{"sub/x.log", false, "", ""},
+		{"sub/build", true, "", ""},
+		{"sub/deep/out", true, "", ""},
+		{"sub/deep/x.log", false, "", ""},
+		{"plain/x.log", false, "plain/x.log", "plain/x.log"},
 	} {
 		if excluded := ignores.ExcludedInAnyForm(test.path, test.directory); excluded != test.any {
 			t.Errorf("incorrect exclusion in any form of %q (directory: %t): %q", test.path, test.directory, excluded)
@@ -341,7 +348,7 @@ func TestDialGitMode(t *testing.T) {
 	useTestRegistry(t)
 	root := resolveSymbolicLinks(t.TempDir())
 	writeTestFiles(t, root, gitModeFiles)
-	mkdirs(t, filepath.Join(root, "build"), filepath.Join(root, "sub", "build"), filepath.Join(root, "src", "tmp"))
+	mkdirs(t, filepath.Join(root, "build"), filepath.Join(root, "sub", "build"), filepath.Join(root, "sub", "out"), filepath.Join(root, "src", "tmp"))
 	var lock sync.Mutex
 	var accepted []string
 	registerTest(t, &Endpoint{Session: "sync_repo", Name: "repo", Root: root, Alpha: true, Ignores: &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, VCS: true, Git: true}}, "repo", &accepted, &lock)
@@ -361,11 +368,17 @@ func TestDialGitMode(t *testing.T) {
 
 	// Directories that the rules ignore aren't synchronized, wherever the rules
 	// are.
-	for _, directory := range []string{"build", "src/tmp", "sub/build"} {
+	for _, directory := range []string{"build", "src/tmp", "sub/out"} {
 		if _, err := dialTest(&Selection{Corresponding: true}, filepath.Join(root, filepath.FromSlash(directory))); err == nil ||
 			!strings.Contains(err.Error(), directory+" is ignored by session repo") {
 			t.Errorf("ignored directory %s accepted or incorrectly refused: %v", directory, err)
 		}
+	}
+
+	// The rules above a nested repository don't apply within it, as for Git
+	// run in it, so a directory there that they would ignore is synchronized.
+	if target, err := dialTest(&Selection{Corresponding: true}, filepath.Join(root, "sub", "build")); err != nil || target.Path != "sub/build" {
+		t.Errorf("directory in a nested repository refused: %+v, %v", target, err)
 	}
 
 	// Rules are read each time.

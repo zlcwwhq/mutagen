@@ -3,8 +3,10 @@ package gitignore
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
@@ -64,8 +66,9 @@ func expectIgnored(t *testing.T, ignorer ignore.Ignorer, path string, directory,
 }
 
 // TestRuleFilePredicates tests AffectsIgnoreEvaluation and
-// IsDeliverableRuleFile. They only disagree about the root repository's exclude
-// file, which affects ignore evaluation, but which is inside a Git directory.
+// IsDeliverableRuleFile. They only disagree about the exclude files of
+// repositories, which affect ignore evaluation, but which are inside Git
+// directories.
 func TestRuleFilePredicates(t *testing.T) {
 	tests := []struct {
 		path        string
@@ -82,8 +85,19 @@ func TestRuleFilePredicates(t *testing.T) {
 		{"git/.gitignore", true, true},
 		{".git2/hooks/.gitignore", true, true},
 
-		// The exclude file, which only exists in this form at the root.
+		// The exclude files of the root repository and of nested repositories,
+		// whether in their own Git directories or in Git directories that their
+		// ".git" files point to, such as those of submodules and worktrees.
 		{".git/info/exclude", true, false},
+		{"a/.git/info/exclude", true, false},
+		{"a/b/.git/info/exclude", true, false},
+		{"a/.gitignore/.git/info/exclude", true, false},
+		{".git/modules/sub/info/exclude", true, false},
+		{".git/modules/a/modules/b/info/exclude", true, false},
+		{".git/worktrees/w/info/exclude", true, false},
+		{"a/.git/modules/b/info/exclude", true, false},
+		{".GIT/info/exclude", true, false},
+		{"a/.Git/info/exclude", true, false},
 
 		// Anything else beneath a Git entry, whatever its name.
 		{".git/.gitignore", false, false},
@@ -99,11 +113,16 @@ func TestRuleFilePredicates(t *testing.T) {
 		{".git/config", false, false},
 		{".git/info", false, false},
 		{".git/info/Exclude", false, false},
+		{".git/Info/exclude", false, false},
 		{".git/info/exclude/x", false, false},
-		{".GIT/info/exclude", false, false},
-		{"a/.git/info/exclude", false, false},
-		{"a/.gitignore/.git/info/exclude", false, false},
+		{".git/info/exclude.lock", false, false},
+		{".git/info/xexclude", false, false},
+		{".git/xinfo/exclude", false, false},
+		{".git/exclude", false, false},
+		{".git/modules/sub/info", false, false},
+		{"a/.git/info", false, false},
 		{".git", false, false},
+		{"a/.git", false, false},
 
 		// Anything else.
 		{"", false, false},
@@ -116,6 +135,10 @@ func TestRuleFilePredicates(t *testing.T) {
 		{".gitignore/x", false, false},
 		{"exclude", false, false},
 		{"info/exclude", false, false},
+		{"a/info/exclude", false, false},
+		{"git/info/exclude", false, false},
+		{".gitx/info/exclude", false, false},
+		{"a.git/info/exclude", false, false},
 	}
 	for _, test := range tests {
 		if result := AffectsIgnoreEvaluation(test.path); result != test.affects {
@@ -427,54 +450,58 @@ func TestIgnoreRuleFileTypes(t *testing.T) {
 	expectIgnored(t, NewIgnorer(filepath.Join(root, "nonexistent"), nil), "a", false, false)
 }
 
-// TestExcludeFileLocation tests that the exclude file of a repository is found
+// TestExcludeFileLocation tests that the top level of a repository's working
+// tree is recognized, and that the exclude file of its repository is found
 // correctly.
 func TestExcludeFileLocation(t *testing.T) {
-	// Create a function that sets up a root and returns the expected location.
+	// Create a function that sets up a directory and returns the expected
+	// location, along with whether or not the directory is expected to be the
+	// top level of a repository.
 	tests := []struct {
-		name  string
-		setup func(t *testing.T, root string) string
+		name       string
+		repository bool
+		setup      func(t *testing.T, root string) string
 	}{
-		{"no repository", func(t *testing.T, root string) string {
+		{"no repository", false, func(t *testing.T, root string) string {
 			return ""
 		}},
-		{"directory", func(t *testing.T, root string) string {
+		{"directory", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{".git/HEAD": ""})
 			return filepath.Join(root, ".git", "info", "exclude")
 		}},
-		{"relative Git file", func(t *testing.T, root string) string {
+		{"relative Git file", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{".git": "gitdir: modules/sub\n"})
 			return filepath.Join(root, "modules", "sub", "info", "exclude")
 		}},
-		{"relative Git file with parent reference", func(t *testing.T, root string) string {
+		{"relative Git file with parent reference", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{".git": "gitdir: ../repository/.git/modules/sub\n"})
 			return filepath.Join(filepath.Dir(root), "repository", ".git", "modules", "sub", "info", "exclude")
 		}},
-		{"absolute Git file", func(t *testing.T, root string) string {
+		{"absolute Git file", true, func(t *testing.T, root string) string {
 			target := filepath.Join(t.TempDir(), "gitdir")
 			writeTree(t, root, map[string]string{".git": "gitdir: " + filepath.ToSlash(target) + "\n"})
 			return filepath.Join(target, "info", "exclude")
 		}},
-		{"Git file with Windows line ending", func(t *testing.T, root string) string {
+		{"Git file with Windows line ending", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{".git": "gitdir: modules/sub\r\n"})
 			return filepath.Join(root, "modules", "sub", "info", "exclude")
 		}},
-		{"Git file without space", func(t *testing.T, root string) string {
+		{"Git file without space", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{".git": "gitdir:modules/sub"})
 			return filepath.Join(root, "modules", "sub", "info", "exclude")
 		}},
-		{"Git file with trailing lines", func(t *testing.T, root string) string {
+		{"Git file with trailing lines", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{".git": "gitdir: modules/sub\nsomething else\n"})
 			return filepath.Join(root, "modules", "sub", "info", "exclude")
 		}},
-		{"relative common directory", func(t *testing.T, root string) string {
+		{"relative common directory", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{
 				".git": "gitdir: repository/.git/worktrees/work\n",
 				"repository/.git/worktrees/work/commondir": "../..\n",
 			})
 			return filepath.Join(root, "repository", ".git", "info", "exclude")
 		}},
-		{"absolute common directory", func(t *testing.T, root string) string {
+		{"absolute common directory", true, func(t *testing.T, root string) string {
 			common := filepath.Join(t.TempDir(), "common")
 			writeTree(t, root, map[string]string{
 				".git":               "gitdir: git/work\n",
@@ -482,30 +509,30 @@ func TestExcludeFileLocation(t *testing.T) {
 			})
 			return filepath.Join(common, "info", "exclude")
 		}},
-		{"empty common directory", func(t *testing.T, root string) string {
+		{"empty common directory", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{".git": "gitdir: git/work\n", "git/work/commondir": "\n"})
 			return filepath.Join(root, "git", "work", "info", "exclude")
 		}},
-		{"invalid Git file", func(t *testing.T, root string) string {
+		{"invalid Git file", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{".git": "something else\n"})
 			return ""
 		}},
-		{"empty Git file", func(t *testing.T, root string) string {
+		{"empty Git file", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{".git": ""})
 			return ""
 		}},
-		{"Git file without a path", func(t *testing.T, root string) string {
+		{"Git file without a path", true, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{".git": "gitdir:\n"})
 			return ""
 		}},
-		{"Git symbolic link", func(t *testing.T, root string) string {
+		{"Git symbolic link", false, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{"elsewhere/.git/HEAD": ""})
 			if err := os.Symlink("elsewhere/.git", filepath.Join(root, ".git")); err != nil {
 				t.Skip("unable to create symbolic link:", err)
 			}
 			return ""
 		}},
-		{"nested repositories are not consulted", func(t *testing.T, root string) string {
+		{"nested repositories are not consulted", false, func(t *testing.T, root string) string {
 			writeTree(t, root, map[string]string{"sub/.git/info/exclude": "*\n"})
 			return ""
 		}},
@@ -517,8 +544,14 @@ func TestExcludeFileLocation(t *testing.T) {
 				t.Fatal("unable to create root:", err)
 			}
 			expected := test.setup(t, root)
-			if actual, err := excludeFileLocation(root); err != nil || actual != expected {
+			repository, actual, err := excludeFileLocation(root)
+			if err != nil {
+				t.Fatal("unable to locate exclude file:", err)
+			} else if actual != expected {
 				t.Errorf("location did not match expected: %q != %q", actual, expected)
+			}
+			if repository != test.repository {
+				t.Errorf("repository status did not match expected: %v != %v", repository, test.repository)
 			}
 		})
 	}
@@ -527,21 +560,27 @@ func TestExcludeFileLocation(t *testing.T) {
 // TestIgnoreExclude tests that the exclude file is read from the appropriate
 // location and applied.
 func TestIgnoreExclude(t *testing.T) {
-	// Test with a Git directory.
+	// Test with a Git directory. The exclude file applies throughout the
+	// root repository, but not in a nested repository, which has its own.
 	root := t.TempDir()
 	writeTree(t, root, map[string]string{
 		".git/info/exclude":     "# comment\n*.log\n/top\nnested/\n",
+		"plain/.gitignore":      "!keep.log\n",
 		"sub/.git/info/exclude": "*\n",
 		"sub/.gitignore":        "!keep.log\n",
 	})
 	ignorer := NewIgnorer(root, nil)
 	expectIgnored(t, ignorer, "a.log", false, true)
+	expectIgnored(t, ignorer, "plain/a.log", false, true)
+	expectIgnored(t, ignorer, "plain/keep.log", false, false)
+	expectIgnored(t, ignorer, "top", false, true)
+	expectIgnored(t, ignorer, "plain/top", false, false)
+	expectIgnored(t, ignorer, "plain/nested", true, true)
+	expectIgnored(t, ignorer, "plain/other", false, false)
+	expectIgnored(t, ignorer, "sub", true, false)
 	expectIgnored(t, ignorer, "sub/a.log", false, true)
 	expectIgnored(t, ignorer, "sub/keep.log", false, false)
-	expectIgnored(t, ignorer, "top", false, true)
-	expectIgnored(t, ignorer, "sub/top", false, false)
-	expectIgnored(t, ignorer, "sub/nested", true, true)
-	expectIgnored(t, ignorer, "sub/other", false, false)
+	expectIgnored(t, ignorer, "sub/other", false, true)
 
 	// Test with a Git file that references a common directory.
 	root = t.TempDir()
@@ -554,6 +593,493 @@ func TestIgnoreExclude(t *testing.T) {
 	ignorer = NewIgnorer(filepath.Join(root, "work"), nil)
 	expectIgnored(t, ignorer, "common", false, true)
 	expectIgnored(t, ignorer, "worktree", false, false)
+}
+
+// check is an expected result of evaluating a path.
+type check struct {
+	// path is the root-relative path.
+	path string
+	// directory indicates whether or not the path is evaluated as a directory.
+	directory bool
+	// ignored indicates whether or not the path is expected to be ignored.
+	ignored bool
+}
+
+// TestNestedRepositories tests that the rules of the directories above the top
+// level of a nested repository's working tree, which a ".git" entry
+// identifies, don't apply beneath it, and that the exclude file of the nested
+// repository applies there instead.
+func TestNestedRepositories(t *testing.T) {
+	tests := []struct {
+		name string
+		// files are the files to create.
+		files map[string]string
+		// directories are the empty directories to create.
+		directories []string
+		// checks are the expected results.
+		checks []check
+	}{
+		{
+			name: "rules above don't apply beneath a nested repository",
+			files: map[string]string{
+				".gitignore":        "*.log\n/top\nd/x\n**/deep\nsub/keep\n",
+				".git/info/exclude": "*.tmp\n",
+				"sub/.git/HEAD":     "",
+				"plain/x":           "",
+			},
+			checks: []check{
+				{"x.log", false, true},
+				{"a.tmp", false, true},
+				{"plain/x.log", false, true},
+				{"plain/a.tmp", false, true},
+				{"plain/d/deep", false, true},
+				{"sub", true, false},
+				{"sub/x.log", false, false},
+				{"sub/a.tmp", false, false},
+				{"sub/d/x.log", false, false},
+				{"sub/d/e/x.log", false, false},
+				{"sub/top", false, false},
+				{"sub/d/x", false, false},
+				{"sub/d/deep", false, false},
+				{"sub/keep", false, false},
+				{"missing/x.log", false, true},
+			},
+		},
+		{
+			name: "rules above still decide about the nested repository's directory",
+			files: map[string]string{
+				".gitignore":      "sub/\n/other\n**/deep/\n",
+				"sub/.git/HEAD":   "",
+				"other/.git/HEAD": "",
+				"d/deep/.git":     "gitdir: ../../.git/modules/deep\n",
+				"d/kept/.git":     "gitdir: ../../.git/modules/kept\n",
+			},
+			checks: []check{
+				{"sub", true, true},
+				{"other", true, true},
+				{"d/deep", true, true},
+				{"d/kept", true, false},
+				{"sub/sub", true, false},
+				{"sub/other", true, false},
+				{"sub/x", false, false},
+				{"other/x", false, false},
+				{"d/deep/deep", true, false},
+			},
+		},
+		{
+			name: "the nested repository's exclude file applies relative to it",
+			files: map[string]string{
+				"sub/.git/info/exclude": "/top\nd/x\n*.log\n",
+			},
+			checks: []check{
+				{"top", false, false},
+				{"d/x", false, false},
+				{"x.log", false, false},
+				{"other/x.log", false, false},
+				{"sub/top", false, true},
+				{"sub/d/top", false, false},
+				{"sub/d/x", false, true},
+				{"sub/e/d/x", false, false},
+				{"sub/x.log", false, true},
+				{"sub/d/x.log", false, true},
+			},
+		},
+		{
+			name: "the nested repository's rule files take precedence over its exclude file",
+			files: map[string]string{
+				".gitignore":            "!x.log\n!foo\n",
+				"sub/.git/info/exclude": "*.log\nfoo\n",
+				"sub/.gitignore":        "!keep.log\n",
+				"sub/d/.gitignore":      "!foo\n/bar\n",
+			},
+			checks: []check{
+				{"sub/x.log", false, true},
+				{"sub/d/x.log", false, true},
+				{"sub/keep.log", false, false},
+				{"sub/d/keep.log", false, false},
+				{"sub/foo", false, true},
+				{"sub/d/foo", false, false},
+				{"sub/d/bar", false, true},
+				{"sub/bar", false, false},
+			},
+		},
+		{
+			name: "a Git file pointing into the root repository's Git directory",
+			files: map[string]string{
+				".gitignore":                    "*.log\n",
+				".git/info/exclude":             "*.tmp\n",
+				".git/modules/sub/info/exclude": "*.bak\n",
+				"sub/.git":                      "gitdir: ../.git/modules/sub\n",
+			},
+			checks: []check{
+				{"x.log", false, true},
+				{"x.tmp", false, true},
+				{"x.bak", false, false},
+				{"sub/x.log", false, false},
+				{"sub/x.tmp", false, false},
+				{"sub/x.bak", false, true},
+				{"sub/d/x.bak", false, true},
+			},
+		},
+		{
+			name: "a Git file pointing to a Git directory with a common directory",
+			files: map[string]string{
+				"wt/.git":                             "gitdir: ../repo/.git/worktrees/wt\n",
+				"repo/.git/worktrees/wt/commondir":    "../..\n",
+				"repo/.git/worktrees/wt/info/exclude": "worktree\n",
+				"repo/.git/info/exclude":              "common\n",
+			},
+			checks: []check{
+				{"common", false, false},
+				{"wt/common", false, true},
+				{"wt/worktree", false, false},
+				{"repo/common", false, true},
+				{"repo/worktree", false, false},
+			},
+		},
+		{
+			name: "Git entries that Git wouldn't accept",
+			files: map[string]string{
+				".gitignore":    "*.log\n",
+				"invalid/.git":  "nonsense\n",
+				"empty/.git":    "",
+				"dangling/.git": "gitdir: ../nowhere\n",
+				"modules/.git":  "gitdir: ../.git/modules/missing\n",
+			},
+			directories: []string{"directory/.git"},
+			checks: []check{
+				{"invalid/x.log", false, false},
+				{"empty/x.log", false, false},
+				{"dangling/x.log", false, false},
+				{"modules/x.log", false, false},
+				{"directory/x.log", false, false},
+				{"x.log", false, true},
+			},
+		},
+		{
+			name: "nested repositories within nested repositories",
+			files: map[string]string{
+				".gitignore":                  "*.a\n",
+				".git/info/exclude":           "*.e\n",
+				"sub/.git/info/exclude":       "*.b\n",
+				"sub/.gitignore":              "*.c\ninner2/\n",
+				"sub/inner/.git/info/exclude": "*.d\n",
+				"sub/inner2/.git/HEAD":        "",
+			},
+			checks: []check{
+				{"x.a", false, true},
+				{"x.b", false, false},
+				{"x.c", false, false},
+				{"x.e", false, true},
+				{"sub/x.a", false, false},
+				{"sub/x.b", false, true},
+				{"sub/x.c", false, true},
+				{"sub/x.d", false, false},
+				{"sub/x.e", false, false},
+				{"sub/inner", true, false},
+				{"sub/inner2", true, true},
+				{"sub/inner/x.a", false, false},
+				{"sub/inner/x.b", false, false},
+				{"sub/inner/x.c", false, false},
+				{"sub/inner/x.d", false, true},
+				{"sub/inner/x.e", false, false},
+				{"sub/inner/deep/x.c", false, false},
+				{"sub/inner/deep/x.d", false, true},
+				{"sub/plain/x.c", false, true},
+				{"sub/plain/x.d", false, false},
+			},
+		},
+		{
+			name: "directories without a Git entry inherit",
+			files: map[string]string{
+				".gitignore":          "*.log\n",
+				"a/.gitignore":        "*.tmp\n",
+				"a/b/x":               "",
+				"a/.gitx/HEAD":        "",
+				"a/git/HEAD":          "",
+				"a/x.git/HEAD":        "",
+				"a/.gitignore2/.gitx": "",
+			},
+			checks: []check{
+				{"a/x.log", false, true},
+				{"a/b/x.log", false, true},
+				{"a/b/x.tmp", false, true},
+				{"a/.gitx/x.log", false, true},
+				{"a/git/x.log", false, true},
+				{"a/x.git/x.log", false, true},
+				{"a/.gitignore2/x.tmp", false, true},
+				{"x.tmp", false, false},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Create the tree.
+			root := t.TempDir()
+			writeTree(t, root, test.files)
+			for _, directory := range test.directories {
+				if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(directory)), 0o755); err != nil {
+					t.Fatal("unable to create directory:", err)
+				}
+			}
+
+			// Evaluate the paths in order and in reverse order, so that the
+			// result doesn't depend on which directories are loaded first.
+			ignorer := NewIgnorer(root, nil)
+			for _, c := range test.checks {
+				expectIgnored(t, ignorer, c.path, c.directory, c.ignored)
+			}
+			ignorer = NewIgnorer(root, nil)
+			for index := len(test.checks) - 1; index >= 0; index-- {
+				c := test.checks[index]
+				expectIgnored(t, ignorer, c.path, c.directory, c.ignored)
+			}
+
+			// There are no failures to read rules.
+			for _, c := range test.checks {
+				directory := c.path
+				if !c.directory {
+					directory = directory[:max(strings.LastIndexByte(directory, '/'), 0)]
+				}
+				if err := NewIgnorer(root, nil).EnsureDirectory(directory); err != nil {
+					t.Errorf("unable to load rules for %q: %v", directory, err)
+				}
+			}
+		})
+	}
+}
+
+// TestNestedRepositoryExclusion tests that rules above a nested repository
+// exclude its contents by excluding its directory.
+func TestNestedRepositoryExclusion(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		".gitignore":              "sub/\n",
+		"sub/.git/HEAD":           "",
+		"other/.git/info/exclude": "*.log\n",
+	})
+	for path, expected := range map[string]string{
+		"sub":             "sub",
+		"sub/x":           "sub",
+		"sub/d/x":         "sub",
+		"other/x":         "",
+		"other/x.log":     "other/x.log",
+		"other/d/x.log":   "other/d/x.log",
+		"other/sub/x.log": "other/sub/x.log",
+		"other/sub/x":     "",
+	} {
+		if excluded, err := ignore.Excluded(NewIgnorer(root, nil), path, path == "sub"); err != nil {
+			t.Errorf("path %q: unable to evaluate: %v", path, err)
+		} else if excluded != expected {
+			t.Errorf("path %q: exclusion did not match expected: %q != %q", path, excluded, expected)
+		}
+	}
+}
+
+// TestNestedRepositorySession tests that the session ignorer takes precedence
+// over the rules of a nested repository, and that Git entries are ignored in
+// nested repositories, as they are everywhere.
+func TestNestedRepositorySession(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		".gitignore":            "*.log\n",
+		"sub/.git/info/exclude": "*.tmp\n",
+		"sub/.gitignore":        "!.git\n",
+		"sub/inner/.git/HEAD":   "",
+	})
+	session := sessionIgnorer(func(path string, _ bool) (ignore.IgnoreStatus, bool) {
+		switch path {
+		case "sub/keep.tmp", "sub/.git", "sub/inner/.git":
+			return ignore.IgnoreStatusUnignored, false
+		case "sub/x.txt", "sub/x.log":
+			return ignore.IgnoreStatusIgnored, false
+		}
+		return ignore.IgnoreStatusNominal, false
+	})
+	ignorer := NewIgnorer(root, session)
+	tests := []struct {
+		path     string
+		expected ignore.IgnoreStatus
+	}{
+		{"sub/keep.tmp", ignore.IgnoreStatusUnignored},
+		{"sub/x.tmp", ignore.IgnoreStatusIgnored},
+		{"sub/x.txt", ignore.IgnoreStatusIgnored},
+		{"sub/x.log", ignore.IgnoreStatusIgnored},
+		{"sub/y.log", ignore.IgnoreStatusNominal},
+		{"sub/.git", ignore.IgnoreStatusIgnored},
+		{"sub/inner/.git", ignore.IgnoreStatusIgnored},
+		{"sub/inner/x.tmp", ignore.IgnoreStatusNominal},
+	}
+	for _, test := range tests {
+		for _, directory := range []bool{false, true} {
+			if status, _ := ignorer.Ignore(test.path, directory); status != test.expected {
+				t.Errorf("path %q (directory: %v): status did not match expected: %d != %d", test.path, directory, status, test.expected)
+			}
+		}
+	}
+}
+
+// TestNestedRepositoryReadFailures tests that a failure to read rules above a
+// nested repository applies beneath it too, and that a failure to read the
+// rules of a nested repository applies to its subtree, but not beyond it.
+func TestNestedRepositoryReadFailures(t *testing.T) {
+	tests := []struct {
+		// file is the file that's made too large to be read.
+		file string
+		// git is the contents of the nested repository's Git file, if it has
+		// one rather than a Git directory.
+		git string
+		// blocked are the directories whose rules can't be loaded.
+		blocked []string
+		// unaffected are the directories whose rules can still be loaded.
+		unaffected []string
+	}{
+		{".gitignore", "", []string{"", "a", "a/sub", "a/sub/d"}, nil},
+		{".git/info/exclude", "", []string{"", "a", "a/sub", "a/sub/d"}, nil},
+		{"a/.gitignore", "", []string{"a", "a/sub", "a/sub/d"}, []string{"", "b"}},
+		{"a/sub/.gitignore", "", []string{"a/sub", "a/sub/d"}, []string{"", "a", "a/other", "b"}},
+		{"a/sub/.git/info/exclude", "", []string{"a/sub", "a/sub/d"}, []string{"", "a", "a/other", "b"}},
+		{"a/sub/.git", "gitdir: ../../modules/sub\n", []string{"a/sub", "a/sub/d"}, []string{"", "a", "a/other", "b"}},
+		{"modules/sub/info/exclude", "gitdir: ../../modules/sub\n", []string{"a/sub", "a/sub/d"}, []string{"", "a", "a/other", "modules"}},
+		{"modules/sub/commondir", "gitdir: ../../modules/sub\n", []string{"a/sub", "a/sub/d"}, []string{"", "a", "a/other", "modules"}},
+	}
+	for _, test := range tests {
+		t.Run(test.file, func(t *testing.T) {
+			// Create the tree, with a nested repository whose rules are fine
+			// unless they're the ones that can't be read.
+			root := t.TempDir()
+			files := map[string]string{
+				"a/sub/d/x": "",
+				"a/other/x": "",
+				"b/x":       "",
+			}
+			if test.git == "" {
+				files["a/sub/.git/info/exclude"] = "*.tmp\n"
+			} else {
+				files["a/sub/.git"] = test.git
+				files["modules/sub/info/exclude"] = "*.tmp\n"
+			}
+			files[test.file] = "secret\n"
+			writeTree(t, root, files)
+			limit := int64(maximumRuleFileSize)
+			if path.Base(test.file) == ".git" || path.Base(test.file) == "commondir" {
+				limit = maximumPointerFileSize
+			}
+			if err := os.Truncate(filepath.Join(root, filepath.FromSlash(test.file)), limit+1); err != nil {
+				t.Fatal(err)
+			}
+
+			// Check which directories are affected, with an ignorer for each
+			// directory, so that each loads its chain from scratch.
+			for _, directory := range test.blocked {
+				if err := NewIgnorer(root, nil).EnsureDirectory(directory); err == nil {
+					t.Errorf("rules for %q loaded despite read failure", directory)
+				}
+			}
+			for _, directory := range test.unaffected {
+				if err := NewIgnorer(root, nil).EnsureDirectory(directory); err != nil {
+					t.Errorf("rules for %q affected by read failure: %v", directory, err)
+				}
+			}
+		})
+	}
+}
+
+// TestNestedRepositoryUnreadableExclude tests that a nested repository's
+// exclude file that can't be read blocks the repository's subtree.
+func TestNestedRepositoryUnreadableExclude(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file permissions can't make files unreadable on Windows")
+	}
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{"sub/.git/info/exclude": "*\n", "sub/d/x": ""})
+	exclude := filepath.Join(root, "sub", ".git", "info", "exclude")
+	if err := os.Chmod(exclude, 0); err != nil {
+		t.Fatal("unable to change permissions:", err)
+	} else if file, err := os.Open(exclude); err == nil {
+		file.Close()
+		t.Skip("unable to make exclude file unreadable")
+	}
+	ignorer := NewIgnorer(root, nil)
+	if err := ignorer.EnsureDirectory(""); err != nil {
+		t.Error("unreadable nested exclude file blocked the root:", err)
+	}
+	for _, directory := range []string{"sub", "sub/d"} {
+		if err := ignorer.EnsureDirectory(directory); err == nil {
+			t.Errorf("unreadable nested exclude file did not block %q", directory)
+		}
+	}
+}
+
+// TestNestedRepositorySymbolicLinks tests that a symbolic link named ".git"
+// doesn't make its directory the top level of a nested repository, and that a
+// symbolic link to a nested repository's directory doesn't either, since rule
+// files are never read through symbolic links.
+func TestNestedRepositorySymbolicLinks(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		".gitignore":             "*.log\n",
+		"store/gd/HEAD":          "",
+		"store/gd/info/exclude":  "*.tmp\n",
+		"link/x":                 "",
+		"real/.git/info/exclude": "*.tmp\n",
+	})
+	if err := os.Symlink(filepath.Join("..", "store", "gd"), filepath.Join(root, "link", ".git")); err != nil {
+		t.Skip("unable to create symbolic link:", err)
+	} else if err := os.Symlink("real", filepath.Join(root, "alias")); err != nil {
+		t.Fatal("unable to create symbolic link:", err)
+	}
+	ignorer := NewIgnorer(root, nil)
+	expectIgnored(t, ignorer, "link/.git", false, true)
+	expectIgnored(t, ignorer, "link/x.log", false, true)
+	expectIgnored(t, ignorer, "link/x.tmp", false, false)
+	expectIgnored(t, ignorer, "link/d/x.log", false, true)
+	expectIgnored(t, ignorer, "real/x.log", false, false)
+	expectIgnored(t, ignorer, "real/x.tmp", false, true)
+	expectIgnored(t, ignorer, "alias/x.log", false, true)
+	expectIgnored(t, ignorer, "alias/x.tmp", false, false)
+	for _, directory := range []string{"link", "link/d", "real", "alias", "alias/d"} {
+		if err := ignorer.EnsureDirectory(directory); err != nil {
+			t.Errorf("unable to load rules for %q: %v", directory, err)
+		}
+	}
+}
+
+// TestNestedRepositoryGitEntryCase tests that a Git entry whose name differs
+// from ".git" in case identifies a nested repository if and only if the
+// filesystem finds it by that name, as Git would.
+func TestNestedRepositoryGitEntryCase(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{".gitignore": "*.log\n", "sub/.GIT/info/exclude": "*.tmp\n"})
+	_, err := os.Lstat(filepath.Join(root, "sub", ".git"))
+	caseInsensitive := err == nil
+	ignorer := NewIgnorer(root, nil)
+	expectIgnored(t, ignorer, "sub/.GIT", true, true)
+	expectIgnored(t, ignorer, "sub/x.log", false, !caseInsensitive)
+	expectIgnored(t, ignorer, "sub/x.tmp", false, caseInsensitive)
+}
+
+// TestNestedRepositoryMemoization tests that a nested repository's rules are
+// read lazily and only once.
+func TestNestedRepositoryMemoization(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{"sub/.git/info/exclude": "a\n", "other/x": ""})
+	ignorer := NewIgnorer(root, nil)
+	expectIgnored(t, ignorer, "sub/a", false, true)
+	expectIgnored(t, ignorer, "other/a", false, false)
+
+	// Rewrite the exclude file, and turn another directory into a nested
+	// repository. Neither change has an effect on the existing ignorer.
+	writeTree(t, root, map[string]string{"sub/.git/info/exclude": "b\n", "other/.git/info/exclude": "a\n"})
+	expectIgnored(t, ignorer, "sub/a", false, true)
+	expectIgnored(t, ignorer, "sub/b", false, false)
+	expectIgnored(t, ignorer, "other/a", false, false)
+
+	// A new ignorer sees the changes.
+	ignorer = NewIgnorer(root, nil)
+	expectIgnored(t, ignorer, "sub/a", false, false)
+	expectIgnored(t, ignorer, "sub/b", false, true)
+	expectIgnored(t, ignorer, "other/a", false, true)
 }
 
 // TestIgnoreSessionTraversalEndToEnd tests that traversal directives from the
