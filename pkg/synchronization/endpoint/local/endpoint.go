@@ -1055,16 +1055,34 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 	}
 
 	// Perform a full (warm) scan, watching for errors.
-	snapshot, newCache, newIgnoreCache, err := core.Scan(
-		ctx,
-		e.root,
-		baseline, recheckPaths,
-		e.hasher, e.cache,
-		ignorer, ignoreCache,
-		e.probeMode,
-		e.symbolicLinkMode,
-		e.permissionsMode,
-	)
+	var snapshot *core.Snapshot
+	var newCache *core.Cache
+	var newIgnoreCache ignore.IgnoreCache
+	var err error
+	if e.gitMode {
+		snapshot, newCache, newIgnoreCache, err = core.ScanGitMode(
+			ctx,
+			e.root,
+			baseline, recheckPaths,
+			e.hasher, e.cache,
+			ignorer, ignoreCache,
+			e.probeMode,
+			e.symbolicLinkMode,
+			e.permissionsMode,
+			e.gitProvider,
+		)
+	} else {
+		snapshot, newCache, newIgnoreCache, err = core.Scan(
+			ctx,
+			e.root,
+			baseline, recheckPaths,
+			e.hasher, e.cache,
+			ignorer, ignoreCache,
+			e.probeMode,
+			e.symbolicLinkMode,
+			e.permissionsMode,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -1409,6 +1427,22 @@ func (e *endpoint) Supply(paths []string, signatures []*rsync.Signature, receive
 // In Git mode, the transitions must be limited to what the endpoint may write
 // (see applyTransitions). It doesn't require the scan lock (see Transition).
 func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool) {
+	if e.gitMode {
+		return core.TransitionGitMode(
+			ctx,
+			e.root,
+			transitions,
+			e.lastReturnedScanCache,
+			e.transitionHasher,
+			e.symbolicLinkMode,
+			e.defaultFileMode,
+			e.defaultDirectoryMode,
+			e.defaultOwnership,
+			e.lastReturnedScanSnapshotDecomposesUnicode,
+			e.stager,
+			e.gitProvider,
+		)
+	}
 	return core.Transition(
 		ctx,
 		e.root,

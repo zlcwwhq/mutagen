@@ -74,9 +74,9 @@ func (e *gitStallError) Error() string {
 	return e.message
 }
 
-// gitProvider operates on the repositories of submodules by running Git. It's
-// safe for concurrent usage. Stalls and failures are tracked here rather than
-// in the core package because they have to outlive individual calls to
+// gitProvider implements core.GitProvider by running Git. It's safe for
+// concurrent usage. Stalls and failures are tracked here rather than in the
+// core package because they have to outlive individual calls to
 // core.Transition, and so does the fetching of commits in the background.
 type gitProvider struct {
 	// stallTimeout is the amount of time that a command that uses the network
@@ -293,6 +293,61 @@ func (g *gitProvider) fetchMissing(ctx context.Context, directory, url, commit s
 	return errors.New(strings.Join(failures, "; "))
 }
 
+// Probe implements core.GitProvider.Probe.
+func (g *gitProvider) Probe(ctx context.Context, directory, _ string) (*core.Entry, error) {
+	// Examine the repository.
+	repository, err := git.Probe(ctx, directory)
+	if err != nil {
+		return nil, err
+	} else if repository == nil {
+		return nil, nil
+	}
+
+	// Success.
+	return &core.Entry{
+		Kind:     core.EntryKind_GitLink,
+		Digest:   repository.Commit,
+		Url:      repository.URL,
+		AutoCRLF: repository.AutoCRLF,
+		Eol:      repository.EOL,
+	}, nil
+}
+
+// errGitUnsupported is the error of the operations that populate submodules,
+// attach repositories to them, and move their HEAD, which the provider doesn't
+// support yet.
+var errGitUnsupported = errors.New("submodules aren't supported by this endpoint yet")
+
+// Clone implements core.GitProvider.Clone.
+func (g *gitProvider) Clone(context.Context, string, *core.Entry) (*core.Entry, []string, error) {
+	return nil, nil, errGitUnsupported
+}
+
+// ScanClone implements core.GitProvider.ScanClone.
+func (g *gitProvider) ScanClone(context.Context, string, string) (*core.Entry, error) {
+	return nil, errGitUnsupported
+}
+
+// RecordSeed implements core.GitProvider.RecordSeed.
+func (g *gitProvider) RecordSeed(context.Context, string, *core.Entry) error {
+	return errGitUnsupported
+}
+
+// PrepareAttach implements core.GitProvider.PrepareAttach.
+func (g *gitProvider) PrepareAttach(context.Context, string, *core.Entry) (*core.Entry, []string, error) {
+	return nil, nil, errGitUnsupported
+}
+
+// Refresh implements core.GitProvider.Refresh.
+func (g *gitProvider) Refresh(context.Context, string) error {
+	return errGitUnsupported
+}
+
+// Follow implements core.GitProvider.Follow.
+func (g *gitProvider) Follow(context.Context, string, *core.Entry, *core.Entry) error {
+	return errGitUnsupported
+}
+
 // containsGitRulePath determines whether or not any of the specified re-check
 // paths identifies a file whose contents affect ignore evaluation in Git mode.
 // This includes the exclude files of the root repository and of nested
@@ -321,9 +376,14 @@ func containsGitRulePath(recheckPaths map[string]bool) bool {
 // contents change constantly, even as a result of commands that fail or don't
 // change anything. If those changes were to wake the session, then anything
 // that the session itself runs (or that runs in response to its activity) in
-// the repository could keep it awake indefinitely. Thus, only events for an
-// entry that changes ignore rules (a repository's info/exclude file) are
-// relevant.
+// the repository could keep it awake indefinitely. Thus, only events for
+// entries that indicate a change of the current commit (a repository's HEAD,
+// its references, and its packed references), of ignore rules (its
+// info/exclude file), or of what makes a nested repository a submodule (its
+// config file, which holds its origin and line ending settings) are relevant.
+// Nothing that the session runs in a repository writes its config file. The Git directories of submodules are nested
+// within that of the enclosing repository (e.g. .git/modules/x/y/HEAD), or are
+// found at the submodule's path, and the same applies to them.
 func gitModeEventRelevant(path string) bool {
 	// Split the path into components and reject any with a temporary name.
 	components := strings.Split(path, "/")
@@ -342,11 +402,49 @@ func gitModeEventRelevant(path string) bool {
 	}
 	components = components[gitDirectory+1:]
 
-	// Otherwise, only the exclude file is relevant. We don't have to worry about
-	// the lock file that's used to update it, because that has a different name,
-	// and the update is reported for the file when the lock file is renamed.
+	// The Git directory itself isn't relevant. Events are reported for it when
+	// entries are created or removed within it, which happens continuously due
+	// to lock files.
+	if len(components) == 0 {
+		return false
+	}
+
+	// Look for the components that identify references and reference logs.
+	// These have to be distinguished because reference logs mirror the
+	// locations of what they record (e.g. logs/HEAD and logs/refs/heads/main),
+	// and they are also updated in response to the same changes as what they
+	// record, so we don't lose anything by excluding them. Whichever occurs
+	// first determines the classification (e.g. a branch can be named
+	// logs/refs). The component following one named modules is (at least the
+	// first part of) the name of a submodule, which can be anything, including
+	// refs or logs.
+	for c := 0; c < len(components); c++ {
+		switch components[c] {
+		case "modules":
+			c++
+		case "logs":
+			return false
+		case "refs":
+			// Git refuses reference names that end in .lock, so such a file can
+			// only be the lock file for a reference, which says nothing by
+			// itself: Git takes the one for refs/remotes/<remote>/HEAD in every
+			// fetch of a remote, even if nothing changes. An update is reported
+			// for the reference itself when the lock file is renamed.
+			return !strings.HasSuffix(components[len(components)-1], ".lock")
+		}
+	}
+
+	// Otherwise, only a few specific files are relevant. Their lock files have
+	// different names, and an update is reported for the file itself when its
+	// lock file is renamed.
 	last := len(components) - 1
-	return last > 0 && components[last] == "exclude" && components[last-1] == "info"
+	switch components[last] {
+	case "HEAD", "packed-refs", "config":
+		return true
+	case "exclude":
+		return last > 0 && components[last-1] == "info"
+	}
+	return false
 }
 
 // gitWarnings computes warnings about the content of a snapshot in Git mode,
@@ -362,27 +460,50 @@ func (e *endpoint) gitWarnings(ctx context.Context, snapshot *core.Snapshot) []*
 }
 
 // trackedIgnoredWarnings computes warnings about files that are tracked by the
-// repository at the root (if any), but matched by ignore rules, and which thus
-// aren't synchronized, even though they're probably assumed to be. There's one
-// warning for each such file in the snapshot or, if a file is in an ignored
-// directory, for the directory, up to a maximum, with any remainder being
-// covered by a single summary warning.
+// repository at the root (if any) or by a submodule, but matched by ignore
+// rules, and which thus aren't synchronized, even though they're probably
+// assumed to be. There's one warning for each such file in the snapshot or, if
+// a file is in an ignored directory, for the directory, up to a maximum, with
+// any remainder being covered by a single summary warning.
 func (e *endpoint) trackedIgnoredWarnings(ctx context.Context, snapshot *core.Snapshot) []*core.Problem {
-	// This check only applies to repositories at the root. We don't need to
-	// involve Git to determine that a root doesn't have a repository, which is
-	// the common case for an endpoint that only receives content. Note that Git
-	// won't discover a repository above the root (see git.Command).
+	// Identify the repositories to check: the one at the root, if there is
+	// one, and those of submodules, whose rules are their own (see
+	// gitignore.NewIgnorer). We don't need to involve Git to determine that a
+	// root doesn't have a repository, which is the common case for an endpoint
+	// that only receives content. Note that Git won't discover a repository
+	// above the root (see git.Command).
 	if snapshot.Content == nil || snapshot.Content.Kind != core.EntryKind_Directory {
 		return nil
-	} else if _, err := os.Lstat(filepath.Join(e.root, ".git")); err != nil {
+	}
+	var repositories []string
+	if _, err := os.Lstat(filepath.Join(e.root, ".git")); err == nil {
+		repositories = append(repositories, "")
+	}
+	for path := range snapshot.Content.Submodules() {
+		repositories = append(repositories, path)
+	}
+	if len(repositories) == 0 {
 		return nil
 	}
 
-	// List the tracked files that match ignore rules.
-	paths, err := e.listTrackedIgnored(ctx)
-	if err != nil {
-		e.logger.Debug("Unable to list files tracked by Git but matching ignore rules:", err)
-		return nil
+	// Bound the duration of the commands, for all repositories together.
+	ctx, cancel := context.WithTimeout(ctx, gitWarningTimeout)
+	defer cancel()
+
+	// List the tracked files that match ignore rules, as root-relative paths.
+	var paths []string
+	for _, repository := range repositories {
+		repositoryPaths, err := e.listTrackedIgnored(ctx, repository)
+		if err != nil {
+			e.logger.Debug("Unable to list files tracked by Git but matching ignore rules:", err)
+			continue
+		}
+		for _, path := range repositoryPaths {
+			if repository != "" {
+				path = repository + "/" + path
+			}
+			paths = append(paths, path)
+		}
 	}
 
 	// Identify the shallowest untracked entry for each file, if there is one.
@@ -444,28 +565,27 @@ func (e *endpoint) trackedIgnoredWarnings(ctx context.Context, snapshot *core.Sn
 	return warnings
 }
 
-// listTrackedIgnored lists the root-relative paths of the files that are
-// tracked by the repository at the root but that match its .gitignore files or
-// its exclude file. Like the ignorer used for scanning, it doesn't consider
-// global configuration.
-func (e *endpoint) listTrackedIgnored(ctx context.Context) ([]string, error) {
-	// Bound the duration of the commands.
-	ctx, cancel := context.WithTimeout(ctx, gitWarningTimeout)
-	defer cancel()
+// listTrackedIgnored lists the files that are tracked by the repository at the
+// specified root-relative path (the root or a submodule) but that match its
+// .gitignore files or its exclude file, relative to the repository. Like the
+// ignorer used for scanning, it doesn't consider global configuration.
+func (e *endpoint) listTrackedIgnored(ctx context.Context, repository string) ([]string, error) {
+	// Compute the repository's directory.
+	directory := filepath.Join(e.root, filepath.FromSlash(repository))
 
 	// Locate the exclude file, which isn't necessarily in the root (e.g. if the
 	// root is a linked worktree). Git treats the file as relative to the
 	// working directory, and it refuses to list files if the file doesn't
 	// exist.
 	arguments := []string{"ls-files", "-z", "-c", "-i", "--exclude-per-directory=.gitignore"}
-	output, err := git.Command(ctx, e.root, "rev-parse", "--git-path", "info/exclude").Output()
+	output, err := git.Command(ctx, directory, "rev-parse", "--git-path", "info/exclude").Output()
 	if err != nil {
 		return nil, fmt.Errorf("unable to locate exclude file: %w", err)
 	}
 	excludePath := strings.TrimRight(string(output), "\r\n")
 	excludeFile := excludePath
 	if !filepath.IsAbs(excludeFile) {
-		excludeFile = filepath.Join(e.root, excludeFile)
+		excludeFile = filepath.Join(directory, excludeFile)
 	}
 	if _, err := os.Stat(excludeFile); err == nil {
 		arguments = append(arguments, "--exclude-from="+excludePath)
@@ -473,7 +593,7 @@ func (e *endpoint) listTrackedIgnored(ctx context.Context) ([]string, error) {
 
 	// List and split paths. Paths aren't quoted because we've requested
 	// null-terminated output.
-	output, err = git.Command(ctx, e.root, arguments...).Output()
+	output, err = git.Command(ctx, directory, arguments...).Output()
 	if err != nil {
 		return nil, fmt.Errorf("unable to list files: %w", err)
 	}

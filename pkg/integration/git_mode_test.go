@@ -790,8 +790,15 @@ func TestGitModeSessionIgnoresOverride(t *testing.T) {
 // TestGitModeGitEntriesNotSynchronized tests that entries named .git, whether
 // they're directories (as in repositories) or files (as in submodules and
 // linked worktrees), are never synchronized, even if the session tries to allow
-// it, and that endpoints' own entries don't interfere with each other.
+// it, and that endpoints' own entries don't interfere with each other. A
+// directory below the root whose .git entry isn't a valid repository isn't
+// synchronized at all, which is reported on the endpoint that has it, while a
+// nested repository without an origin is an ordinary directory. A Git entry
+// whose name only matches .git if case is ignored isn't one that Git uses on a
+// case-sensitive filesystem, so its directory is an ordinary directory there.
 func TestGitModeGitEntriesNotSynchronized(t *testing.T) {
+	isolateGitMode(t)
+	caseSensitive := false
 	session := newGitModeSession(t, gitModeOptions{
 		ignores: []string{"!.git"},
 		alpha: map[string]string{
@@ -800,35 +807,80 @@ func TestGitModeGitEntriesNotSynchronized(t *testing.T) {
 			"sub/file":           "file",
 			"directory/.GIT/any": "alpha upper",
 			"directory/file":     "file",
+			"plain/file":         "file",
+			"local/file":         "file",
 		},
 		beta: map[string]string{
 			".git/config":        "beta config",
 			"other/.git/objects": "beta objects",
 			"other/file":         "file",
 		},
+		prepare: func(session *gitModeSession) {
+			gitModeRun(t, filepath.Join(session.alpha, "local"), "init", "--quiet")
+			_, err := os.Lstat(filepath.Join(session.alpha, "directory", ".git"))
+			caseSensitive = os.IsNotExist(err)
+		},
 	})
 	session.flush()
+
+	// The root's Git entries stay where they are, and so do those of the
+	// nested repository without an origin, whose directory is synchronized
+	// otherwise.
 	session.expect(session.beta, map[string]string{
-		"sub/file":           "file",
-		"directory/file":     "file",
 		".git/config":        "beta config",
 		"other/.git/objects": "beta objects",
-	})
-	session.expectMissing(session.beta, "sub/.git", "directory/.GIT")
-	session.expect(session.alpha, map[string]string{
 		"other/file":         "file",
+		"plain/file":         "file",
+		"local/file":         "file",
+	})
+	session.expectMissing(session.beta, "local/.git")
+	session.expect(session.alpha, map[string]string{
 		".git/config":        "alpha config",
 		"sub/.git":           "gitdir: ../.git/modules/sub\n",
+		"sub/file":           "file",
 		"directory/.GIT/any": "alpha upper",
+		"directory/file":     "file",
 	})
-	session.expectMissing(session.alpha, "other/.git")
+	if _, err := os.Lstat(filepath.Join(session.alpha, "local", ".git", "HEAD")); err != nil {
+		t.Error("nested repository affected:", err)
+	}
+
+	// The directories whose Git entries aren't valid repositories aren't
+	// synchronized, and they're reported where they are.
+	session.expectMissing(session.beta, "sub")
+	session.expectMissing(session.alpha, "other")
+	state := session.state()
+	alphaErrors, betaErrors := problemErrors(state.AlphaState.ScanProblems), problemErrors(state.BetaState.ScanProblems)
+	if !strings.Contains(alphaErrors["sub"], "isn't a valid repository") {
+		t.Errorf("incorrect alpha problem for dangling .git file: %q", alphaErrors["sub"])
+	}
+	if len(betaErrors) != 1 || !strings.Contains(betaErrors["other"], "isn't a valid repository") {
+		t.Errorf("incorrect beta problems: %v", betaErrors)
+	}
+
+	// On a case-sensitive filesystem, a .GIT entry isn't a Git entry for Git,
+	// so its directory is an ordinary directory, but the entry itself still
+	// isn't synchronized. Elsewhere, it's the directory's Git entry, which
+	// isn't a valid repository.
+	if caseSensitive {
+		if len(alphaErrors) != 1 {
+			t.Errorf("incorrect alpha problems: %v", alphaErrors)
+		}
+		session.expect(session.beta, map[string]string{"directory/file": "file"})
+		session.expectMissing(session.beta, "directory/.GIT")
+	} else {
+		if len(alphaErrors) != 2 || !strings.Contains(alphaErrors["directory"], "isn't a valid repository") {
+			t.Errorf("incorrect alpha problems: %v", alphaErrors)
+		}
+		session.expectMissing(session.beta, "directory")
+	}
 
 	// Changes to them don't result in any changes on the opposite endpoint.
 	session.write(session.alpha, map[string]string{".git/config": "changed", "sub/.git": "changed"})
 	session.remove(session.alpha, "directory/.GIT/any")
 	session.flush()
 	session.expect(session.beta, map[string]string{".git/config": "beta config"})
-	session.expectMissing(session.beta, "sub/.git")
+	session.expectMissing(session.beta, "sub", "directory/.GIT")
 }
 
 // TestGitModeNestedRepositoryWithoutOrigin tests that nested repositories that

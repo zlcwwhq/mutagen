@@ -108,25 +108,60 @@ func TestGitModeEventRelevant(t *testing.T) {
 		{"a/b/.mutagen-temporary-x/c/d", false},
 		{"not.mutagen-temporary-x/file", true},
 
-		// The exclude files of each kind of repository are.
+		// The current commit and references of each kind of repository are.
+		{".git/HEAD", true},
+		{"sub/.git/HEAD", true},
+		{"a/b/.git/HEAD", true},
+		{".git/modules/x/HEAD", true},
+		{".git/modules/x/y/HEAD", true},
+		{".git/modules/x/modules/y/HEAD", true},
+		{".git/worktrees/w/HEAD", true},
+		{".git/packed-refs", true},
+		{"sub/.git/packed-refs", true},
+		{".git/modules/x/y/packed-refs", true},
+		{".git/refs", true},
+		{".git/refs/heads", true},
+		{".git/refs/heads/main", true},
+		{".git/refs/heads/feature/main", true},
+		{".git/refs/remotes/origin/main", true},
+		{".git/refs/tags/v1", true},
+		{"sub/.git/refs/heads/main", true},
+		{".git/modules/x/refs/heads/main", true},
+		{".git/modules/x/y/refs/heads/main", true},
+		{".GIT/HEAD", true},
+		{".Git/refs/heads/main", true},
+
+		// A branch can have a name that resembles anything.
+		{".git/refs/heads/logs/main", true},
+		{".git/refs/heads/index", true},
+		{".git/refs/heads/modules/x", true},
+
+		// So can a submodule.
+		{".git/modules/logs/HEAD", true},
+		{".git/modules/logs/refs/heads/main", true},
+		{".git/modules/refs/HEAD", true},
+		{".git/modules/refs/index", false},
+		{".git/modules/logs/logs/HEAD", false},
+		{".git/modules/modules/HEAD", true},
+		{".git/modules/modules/index", false},
+
+		// So do the configuration files of each kind of repository, which
+		// determine whether a nested repository is a submodule.
+		{".git/config", true},
+		{"sub/.git/config", true},
+		{".git/modules/x/config", true},
+		{".git/modules/x/y/config", true},
+
+		// So do the exclude files of each kind of repository.
 		{".git/info/exclude", true},
 		{"sub/.git/info/exclude", true},
 		{".git/modules/x/info/exclude", true},
 		{".git/modules/x/y/info/exclude", true},
-		{".GIT/info/exclude", true},
 
 		// Everything else in a Git directory isn't relevant.
 		{".git", false},
 		{"sub/.git", false},
 		{".GIT", false},
-		{".git/HEAD", false},
-		{"sub/.git/HEAD", false},
-		{".git/modules/x/HEAD", false},
-		{".git/packed-refs", false},
-		{".git/refs", false},
-		{".git/refs/heads/main", false},
-		{".git/refs/remotes/origin/main", false},
-		{".git/refs/remotes/origin/HEAD.lock", false},
 		{".git/index", false},
 		{"sub/.git/index", false},
 		{".git/modules/x/index", false},
@@ -134,12 +169,19 @@ func TestGitModeEventRelevant(t *testing.T) {
 		{".git/index.lock", false},
 		{".git/HEAD.lock", false},
 		{".git/packed-refs.lock", false},
+		{".git/refs/heads/main.lock", false},
+		{".git/refs/remotes/origin/HEAD.lock", false},
+		{"sub/.git/refs/remotes/origin/HEAD.lock", false},
+		{".git/modules/x/refs/remotes/origin/HEAD.lock", false},
+		{".git/refs/heads/mainlock", true},
+		{".git/refs/heads/lock", true},
 		{".git/FETCH_HEAD", false},
 		{"sub/.git/FETCH_HEAD", false},
 		{".git/modules/x/FETCH_HEAD", false},
 		{".git/ORIG_HEAD", false},
 		{".git/MERGE_HEAD", false},
-		{".git/config", false},
+		{".git/config.lock", false},
+		{".git/config.worktree", false},
 		{".git/description", false},
 		{".git/shallow", false},
 		{".git/objects", false},
@@ -154,7 +196,7 @@ func TestGitModeEventRelevant(t *testing.T) {
 		{".git/modules", false},
 		{".git/modules/x", false},
 
-		// That includes reference logs.
+		// That includes reference logs, despite their resembling references.
 		{".git/logs", false},
 		{".git/logs/HEAD", false},
 		{"sub/.git/logs/HEAD", false},
@@ -762,4 +804,19 @@ func newGitRoot(t *testing.T, files map[string]string) string {
 	}
 	writeTree(t, root, files)
 	return root
+}
+
+// newGitWithOrigin creates a repository in a new directory within a root that
+// has a single commit and, if the URL isn't empty, an origin.
+func newGitWithOrigin(t *testing.T, root, name, url string) string {
+	t.Helper()
+	directory := filepath.Join(root, name)
+	initializeRepository(t, directory)
+	writeTree(t, directory, map[string]string{"file": "first"})
+	mustGit(t, directory, "add", "--", "file")
+	mustGit(t, directory, "commit", "--quiet", "--no-gpg-sign", "-m", "first")
+	if url != "" {
+		mustGit(t, directory, "config", "remote.origin.url", url)
+	}
+	return directory
 }

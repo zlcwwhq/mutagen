@@ -1161,6 +1161,41 @@ func TestPruneGitTransitionsSubmoduleMessages(t *testing.T) {
 	}
 }
 
+// TestEndpointGitModeSubmoduleRemovalRefused tests that a submodule isn't
+// removed, whether the change removes its directory or its Git entry, and that
+// the refusal says so.
+func TestEndpointGitModeSubmoduleRemovalRefused(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	root := newGitRoot(t, map[string]string{"other": "other"})
+	directory := filepath.Join(root, "sub")
+	mustGit(t, root, "clone", "--quiet", "--", upstream.url, directory)
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	snapshot := scanEndpoint(t, e, true)
+	for _, change := range []*core.Change{
+		{Path: "sub", Old: entryAt(snapshot, "sub")},
+		{Path: "sub/.git", Old: entryAt(snapshot, "sub/.git")},
+		{Path: "sub", Old: entryAt(snapshot, "sub"), New: entryAt(snapshot, "other")},
+	} {
+		scanEndpoint(t, e, true)
+		results, problems, _, err := e.Transition(context.Background(), []*core.Change{change, {Path: "other", Old: entryAt(snapshot, "other")}})
+		if err != nil {
+			t.Fatal("transition failed:", err)
+		}
+		if !results[0].Equal(change.Old, true) {
+			t.Errorf("removal of %s not refused: %v", change.Path, results[0])
+		} else if results[1] != nil {
+			t.Error("unrelated removal not performed:", results[1])
+		}
+		verifySingleProblem(t, problems, "sub/.git", "submodule isn't removed automatically", "remove it manually")
+		if head := mustGit(t, directory, "rev-parse", "HEAD"); head != upstream.head {
+			t.Error("incorrect commit:", head)
+		} else if status := mustGit(t, directory, "status", "--porcelain"); status != "" {
+			t.Errorf("submodule modified: %q", status)
+		}
+		writeTree(t, root, map[string]string{"other": "other"})
+	}
+}
+
 // TestEndpointGitModeRemovalsFromGitEntries tests that crafted changes don't
 // remove anything from Git entries on disk, including the empty directories and
 // symbolic links that removals don't need any cached information about, and that
