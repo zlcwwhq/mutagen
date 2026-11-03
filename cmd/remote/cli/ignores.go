@@ -144,7 +144,7 @@ func printIgnores(router *router, paths []string, output io.Writer) (int, error)
 		// describe where they come from rather than listing them.
 		if ignores.Git {
 			fmt.Fprintln(output, "  Git rules: .gitignore files at every level and .git/info/exclude, case-sensitively; the patterns above take precedence, so they can also unignore")
-			fmt.Fprintln(output, "  .git files and directories, which are never synchronized")
+			fmt.Fprintln(output, "  .git files and directories, which are never synchronized (a submodule follows the commit checked out on the other endpoint instead)")
 		}
 		fmt.Fprintf(output, "Ignored paths aren't synchronized; %[1]s --ignores <path> checks a path, and %[1]s --pull <path> copies ignored paths from the opposite endpoint.\n", router.followUp())
 		return 0, nil

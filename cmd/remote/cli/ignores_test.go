@@ -119,7 +119,7 @@ func TestPrintIgnoresGitMode(t *testing.T) {
 		"  /secret\n" +
 		"  VCS directories (.git, .svn, .hg, .bzr, and _darcs)\n" +
 		"  Git rules: .gitignore files at every level and .git/info/exclude, case-sensitively; the patterns above take precedence, so they can also unignore\n" +
-		"  .git files and directories, which are never synchronized\n" +
+		"  .git files and directories, which are never synchronized (a submodule follows the commit checked out on the other endpoint instead)\n" +
 		"Ignored paths aren't synchronized; remote --ignores <path> checks a path, and remote --pull <path> copies ignored paths from the opposite endpoint.\n"
 	if output.String() != expected {
 		t.Fatalf("incorrect listing:\n%s", output.String())

@@ -60,6 +60,17 @@ follow the code and update this file.
   endpoints. `pkg/synchronization/core` contains the core scan,
   reconcile, stage, and transition logic, while `rsync`,
   `compression`, and `hashing` provide transfer primitives.
+  `pkg/synchronization/core/ignore/gitignore` implements gitignore
+  rules for Git mode (`git: enabled`, see `GitModeEnabled`) and is
+  the only place that evaluates them. `pkg/remote/ignores.go` uses it
+  so that `remote` sees the same ignores as scans, reading the rules
+  from its own system's copy of the tree. In Git mode, submodules are
+  synchronized file by file, with their `.git` represented by a
+  GitLink leaf that identifies the commit:
+  `pkg/synchronization/core/gitlink.go` defines what scans and
+  transitions need from Git, and
+  `pkg/synchronization/endpoint/local/git.go` provides it with the
+  hardened Git commands in `pkg/git`.
 - `pkg/forwarding` contains the forwarding engine and its endpoints.
 - `pkg/forwarding/protocols` and `pkg/synchronization/protocols`
   register transport-specific endpoint handlers.
@@ -170,7 +181,8 @@ compliance before committing:
 - Fanotify support is Linux-only, SSPL-only, and currently
   sidecar-specific.
 - When changing `remote` behavior (options, exit statuses, working
-  directory mapping, synchronization, prologues, or conflicts), update
+  directory mapping, synchronization, ignores, Git mode, prologues, or
+  conflicts), update
   its help text in `cmd/remote/cli/cli.go` and
   `cmd/remote/cli/help.go`, `README.md`, and the skill together.
   Commit skill changes in the skill repository, following its

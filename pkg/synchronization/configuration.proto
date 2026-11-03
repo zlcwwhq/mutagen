@@ -107,9 +107,10 @@ message Configuration {
     ignore.IgnoreVCSMode ignoreVCSMode = 33;
 
     // GitMode specifies whether or not synchronization honors the conventions
-    // of Git working trees: .gitignore files are applied and .git entries are
-    // never synchronized. Enabling it implies VCS ignoring. It can't be combined
-    // with an explicit VCS ignore mode of "propagate".
+    // of Git working trees: .gitignore files are applied, .git entries are
+    // never synchronized, and submodules follow the commits that the other
+    // endpoint checks out. Enabling it implies VCS ignoring. It can't be
+    // combined with an explicit VCS ignore mode of "propagate".
     GitMode gitMode = 35;
 
     // Fields 36-60 are reserved for future ignore configuration parameters.

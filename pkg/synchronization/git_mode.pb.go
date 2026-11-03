@@ -34,7 +34,8 @@ const (
 	// any other directories, with no special handling.
 	GitMode_GitModeDisabled GitMode = 1
 	// GitMode_GitModeEnabled specifies that synchronization honors .gitignore
-	// files and never synchronizes .git entries.
+	// files and never synchronizes .git entries, and that submodules follow the
+	// commits that the other endpoint checks out.
 	GitMode_GitModeEnabled GitMode = 2
 )
 

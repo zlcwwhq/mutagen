@@ -75,9 +75,10 @@ type Configuration struct {
 	// synchronization.
 	IgnoreVCSMode ignore.IgnoreVCSMode `protobuf:"varint,33,opt,name=ignoreVCSMode,proto3,enum=ignore.IgnoreVCSMode" json:"ignoreVCSMode,omitempty"`
 	// GitMode specifies whether or not synchronization honors the conventions
-	// of Git working trees: .gitignore files are applied and .git entries are
-	// never synchronized. Enabling it implies VCS ignoring. It can't be combined
-	// with an explicit VCS ignore mode of "propagate".
+	// of Git working trees: .gitignore files are applied, .git entries are
+	// never synchronized, and submodules follow the commits that the other
+	// endpoint checks out. Enabling it implies VCS ignoring. It can't be
+	// combined with an explicit VCS ignore mode of "propagate".
 	GitMode GitMode `protobuf:"varint,35,opt,name=gitMode,proto3,enum=synchronization.GitMode" json:"gitMode,omitempty"`
 	// PermissionsMode species the manner in which permissions should be
 	// propagated between endpoints.

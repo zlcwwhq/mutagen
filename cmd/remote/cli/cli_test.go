@@ -136,7 +136,7 @@ func TestHelp(t *testing.T) {
 	// Every listed topic has its own help.
 	expectations := map[string][]string{
 		"nodes":       {"--nodes", "--node"},
-		"sync":        {fmt.Sprintf("take over %d seconds", ProgressDelay/time.Second), "--progress=false", fmt.Sprintf("every %d seconds", progressLineInterval/time.Second), "staging on alpha"},
+		"sync":        {fmt.Sprintf("take over %d seconds", ProgressDelay/time.Second), "--progress=false", fmt.Sprintf("every %d seconds", progressLineInterval/time.Second), "staging on alpha", "In Git mode (git: enabled)", ".git/info/exclude"},
 		"termination": {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second)},
 		"jobs":        {fmt.Sprintf("SIGKILL %d seconds later", remote.TerminationGracePeriod/time.Second), "--log FILE", "[--follow]", "--follow prints the log", "status 124"},
 		"scripts":     {fmt.Sprintf("limited to %d KiB", remote.MaximumScriptSize/1024), "or with " + remote.DefaultScriptInterpreter + " if it has none"},

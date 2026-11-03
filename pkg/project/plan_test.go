@@ -214,6 +214,9 @@ sync:
 		"alpha":         func(s *synchronization.Session) { s.Alpha.Path += "-changed" },
 		"beta":          func(s *synchronization.Session) { s.Beta.Path += "-changed" },
 		"configuration": func(s *synchronization.Session) { s.Configuration.MaximumEntryCount = 100 },
+		"git mode": func(s *synchronization.Session) {
+			s.Configuration.GitMode = synchronization.GitMode_GitModeEnabled
+		},
 		"remote commands": func(s *synchronization.Session) {
 			s.Configuration.RemoteCommandMode = synchronization.RemoteCommandMode_RemoteCommandModeBoth
 		},

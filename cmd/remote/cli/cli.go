@@ -149,10 +149,13 @@ type options struct {
 	// arguments (or of conflicting files) should be compared.
 	diff bool
 	// ignores indicates that the session's ignores, or whether the paths
-	// specified by arguments are ignored, should be shown.
+	// specified by arguments are ignored, should be shown. In Git mode, paths
+	// can also be ignored by Git rules, which are read from this system's copy
+	// of the synchronization root.
 	ignores bool
 	// pull indicates that the ignored paths specified by arguments should be
-	// copied from the opposite endpoint.
+	// copied from the opposite endpoint. In Git mode, that includes content
+	// that .gitignore rules ignore.
 	pull bool
 	// help indicates that usage information was requested, for the topic
 	// specified as an argument, if any.

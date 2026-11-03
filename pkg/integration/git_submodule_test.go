@@ -1,7 +1,9 @@
 package integration
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -12,6 +14,10 @@ import (
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/filesystem/watching"
+	"github.com/mutagen-io/mutagen/pkg/integration/protocols/netpipe"
+	"github.com/mutagen-io/mutagen/pkg/logging"
+	"github.com/mutagen-io/mutagen/pkg/project"
+	"github.com/mutagen-io/mutagen/pkg/selection"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 )
@@ -1407,4 +1413,234 @@ func TestGitModeSubmoduleNoHotLoop(t *testing.T) {
 	skipInSlimEndToEnd(t)
 	isolateGitMode(t)
 	runGitSubmoduleNoHotLoop(t, gitSubmoduleTransport{})
+}
+
+// gitSubmoduleStarOptions describes how a star reaches its nodes.
+type gitSubmoduleStarOptions struct {
+	// manager is the session manager.
+	manager *synchronization.Manager
+	// base is a directory for the star's center, which is a project directory.
+	base string
+	// endpoints are the URLs of the server and gpu nodes.
+	endpoints map[string]string
+	// roots are the roots of the server and gpu nodes on this system.
+	roots map[string]string
+	// adjust adjusts session specifications before sessions are created.
+	adjust func(*project.SessionSpecifications)
+}
+
+// testGitSubmoduleStar tests submodules in a star with its nodes around a local
+// center that has the submodule: each node has its own clone, with the center's
+// changes, and each edge follows commits on its own, with the center passing on
+// commits from the nodes.
+func testGitSubmoduleStar(t *testing.T, options gitSubmoduleStarOptions) {
+	upstream := newGitModeUpstream(t, gitSubmoduleFiles)
+	center := filepath.Join(options.base, "center")
+	if err := os.Mkdir(center, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range options.roots {
+		if err := os.Mkdir(root, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(center, "top"), []byte("top"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitModeRun(t, center, "init", "--quiet", "--initial-branch=main")
+	gitModeRun(t, center, "submodule", "add", "--quiet", upstream.url, "sub")
+	gitModeRun(t, center, "commit", "--quiet", "--no-gpg-sign", "-m", "add submodule")
+	if err := os.WriteFile(filepath.Join(center, "sub", "file"), []byte("modified"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Expand and create the star.
+	path := filepath.Join(options.base, "mutagen.yml")
+	config := fmt.Sprintf(`star:
+  remote: true
+  sync:
+    git: enabled
+    watch: {mode: no-watch}
+  center: local
+  nodes:
+    local: {endpoint: ./center}
+    server: {endpoint: %q}
+    gpu: {endpoint: %q, mode: one-way-safe}
+`, options.endpoints["server"], options.endpoints["gpu"])
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(options.base)
+	configuration, err := project.LoadConfiguration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specifications, err := project.NewSessionSpecifications(configuration, nil, "star-git", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.adjust != nil {
+		options.adjust(specifications)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	var identifiers []string
+	for _, s := range specifications.Synchronization {
+		id, err := options.manager.Create(ctx, s.Alpha, s.Beta, s.Configuration, s.ConfigurationAlpha, s.ConfigurationBeta, s.Name, s.Labels, s.Star, false, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		identifiers = append(identifiers, id)
+		logSessionOnFailure(t, id)
+	}
+	all := &selection.Selection{Specifications: identifiers}
+	t.Cleanup(func() { options.manager.Terminate(context.Background(), all, "") })
+
+	// flush flushes the star's sessions, returning their states.
+	flush := func() []*synchronization.State {
+		t.Helper()
+		if err := options.manager.Flush(ctx, all, "", false); err != nil {
+			t.Fatal("unable to flush star:", err)
+		}
+		_, states, err := options.manager.List(ctx, all, 0)
+		if err != nil {
+			t.Fatal("unable to list star's sessions:", err)
+		}
+		return states
+	}
+
+	// flushUntilHeads flushes the star's sessions until all of its copies of
+	// the submodule have a commit checked out, which takes several flushes if
+	// commits have to be fetched, or to go through the center to reach another
+	// node.
+	flushUntilHeads := func(commit string) {
+		t.Helper()
+		deadline := time.Now().Add(45 * time.Second)
+		for {
+			flush()
+			followed := gitModeHeadIs(filepath.Join(center, "sub"), commit)
+			for _, root := range options.roots {
+				followed = followed && gitModeHeadIs(filepath.Join(root, "sub"), commit)
+			}
+			if followed {
+				return
+			} else if time.Now().After(deadline) {
+				t.Fatalf("not all copies of the submodule have commit %s", commit)
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+
+	// Wait for the synchronization loops to start, since a session only accepts
+	// flush requests once it has.
+	for {
+		_, states, err := options.manager.List(ctx, all, 0)
+		if err != nil {
+			t.Fatal("unable to list star's sessions:", err)
+		}
+		ready := len(states) == 2
+		for _, state := range states {
+			ready = ready && state.Status >= synchronization.Status_Watching
+		}
+		if ready {
+			break
+		} else if ctx.Err() != nil {
+			t.Fatal("timed out waiting for star:", states)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// A flush provides each node with its own clone, with the center's
+	// changes.
+	for _, state := range flush() {
+		verifyNoProblems(t, state)
+	}
+	for name, root := range options.roots {
+		for file, expected := range map[string]string{"top": "top", "sub/file": "modified", "sub/other": "other"} {
+			if contents, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(file))); err != nil || string(contents) != expected {
+				t.Errorf("incorrect content for %s on %s: %q, %v", file, name, contents, err)
+			}
+		}
+		if _, err := os.Lstat(filepath.Join(root, ".git")); !os.IsNotExist(err) {
+			t.Errorf("superproject's repository reached %s: %v", name, err)
+		}
+		if info, err := os.Lstat(filepath.Join(root, "sub", ".git")); err != nil || !info.IsDir() {
+			t.Errorf("no clone on %s: %v, %v", name, info, err)
+		} else if !gitModeHeadIs(filepath.Join(root, "sub"), upstream.first) {
+			t.Errorf("incorrect commit on %s", name)
+		}
+	}
+
+	// Pushed commits go from the center to the nodes.
+	second := gitModeCommit(t, filepath.Join(center, "sub"), "second", "second")
+	gitModePush(t, filepath.Join(center, "sub"), "main")
+	flushUntilHeads(second)
+
+	// They also go from a node to the center, and from there to the other node.
+	third := gitModeCommit(t, filepath.Join(options.roots["server"], "sub"), "third", "third")
+	gitModePush(t, filepath.Join(options.roots["server"], "sub"), "main")
+	flushUntilHeads(third)
+	if contents, err := os.ReadFile(filepath.Join(options.roots["gpu"], "sub", "third")); err != nil || string(contents) != "third" {
+		t.Errorf("commit's file didn't reach gpu: %q, %v", contents, err)
+	}
+
+	// A commit that's not available is reported on each edge, but it doesn't
+	// stop commands from running on nodes, including in the submodule's
+	// directory.
+	unpushed := gitModeCommit(t, filepath.Join(center, "sub"), "fourth", "fourth")
+	for _, state := range flush() {
+		gitSubmoduleProblem(t, state.BetaState.TransitionProblems, "sub", unpushed[:12])
+	}
+	code, output, diagnostics := runRemote(t, filepath.Join(center, "sub"), "--timeout", "30s", "--node", "server", "cat", "fourth")
+	if code != 0 || output != "fourth" || !strings.Contains(diagnostics, unpushed[:12]) {
+		t.Errorf("command on node failed: %d: %q: %s", code, output, diagnostics)
+	}
+
+	// Once it's pushed, it's followed by each node.
+	gitModePush(t, filepath.Join(center, "sub"), "main")
+	flushUntilHeads(unpushed)
+	for _, state := range flush() {
+		verifyNoProblems(t, state)
+	}
+}
+
+// TestGitModeSubmoduleStar tests submodules in a star whose nodes are reached
+// through the remote endpoint implementation.
+func TestGitModeSubmoduleStar(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("commands require a POSIX shell")
+	}
+	isolateGitMode(t)
+
+	// Use a short directory for the data directory, which keeps the registries'
+	// socket paths within Unix limits (see newFakeSSHSystem).
+	base, err := os.MkdirTemp("/tmp", "mgs-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	if base, err = filepath.EvalSymlinks(base); err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(base, "data")
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
+	manager, err := synchronization.NewManager(logging.NewLogger(logging.LevelDebug, &synchronizationLog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(manager.Shutdown)
+	server, gpu := filepath.Join(base, "server"), filepath.Join(base, "gpu")
+	testGitSubmoduleStar(t, gitSubmoduleStarOptions{
+		manager:   manager,
+		base:      base,
+		endpoints: map[string]string{"server": "./server", "gpu": "./gpu"},
+		roots:     map[string]string{"server": server, "gpu": gpu},
+		adjust: func(specifications *project.SessionSpecifications) {
+			for _, s := range specifications.Synchronization {
+				if s.Beta.Path == server || s.Beta.Path == gpu {
+					s.Beta.Protocol = netpipe.Protocol_Netpipe
+				}
+			}
+		},
+	})
 }

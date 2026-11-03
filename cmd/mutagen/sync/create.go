@@ -305,6 +305,18 @@ func createMain(_ *cobra.Command, arguments []string) error {
 		ignoreVCSMode = ignore.IgnoreVCSMode_IgnoreVCSModePropagate
 	}
 
+	// Validate and convert the Git mode specification. Git mode never
+	// synchronizes VCS directories, so it contradicts an explicit request to
+	// propagate them. A propagate mode that comes from configuration files is
+	// instead rejected when the daemon creates the session's ignorer.
+	var gitMode synchronization.GitMode
+	if createConfiguration.git {
+		if createConfiguration.noIgnoreVCS {
+			return errors.New("Git mode never synchronizes VCS directories and can't be combined with --no-ignore-vcs")
+		}
+		gitMode = synchronization.GitMode_GitModeEnabled
+	}
+
 	// Validate and convert the permissions mode specification.
 	var permissionsMode core.PermissionsMode
 	if createConfiguration.permissionsMode != "" {
@@ -462,6 +474,7 @@ func createMain(_ *cobra.Command, arguments []string) error {
 		IgnoreSyntax:           ignoreSyntax,
 		Ignores:                createConfiguration.ignores,
 		IgnoreVCSMode:          ignoreVCSMode,
+		GitMode:                gitMode,
 		PermissionsMode:        permissionsMode,
 		DefaultFileMode:        uint32(defaultFileMode),
 		DefaultDirectoryMode:   uint32(defaultDirectoryMode),
@@ -618,6 +631,10 @@ var createConfiguration struct {
 	// noIgnoreVCS specifies whether or not to disable VCS ignores for the
 	// session.
 	noIgnoreVCS bool
+	// git specifies whether or not to enable Git mode for the session, which
+	// honors .gitignore files, never synchronizes .git entries, and has
+	// submodules follow the commits that the other endpoint checks out.
+	git bool
 	// permissionsMode specifies the permissions mode to use for the session.
 	permissionsMode string
 	// defaultFileMode specifies the default permission mode to use for new
@@ -751,6 +768,7 @@ func init() {
 	flags.StringSliceVarP(&createConfiguration.ignores, "ignore", "i", nil, "Specify ignore paths")
 	flags.BoolVar(&createConfiguration.ignoreVCS, "ignore-vcs", false, "Ignore VCS directories")
 	flags.BoolVar(&createConfiguration.noIgnoreVCS, "no-ignore-vcs", false, "Propagate VCS directories")
+	flags.BoolVar(&createConfiguration.git, "git", false, "Honor .gitignore files, never synchronize .git, and have submodules follow each other's commits")
 
 	// Wire up permission flags.
 	flags.StringVar(&createConfiguration.permissionsMode, "permissions-mode", "", "Specify permissions mode (portable|manual)")
