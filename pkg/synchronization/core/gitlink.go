@@ -8,7 +8,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/fastpath"
 )
 
-// GitProvider defines the interface that scanning uses to
+// GitProvider defines the interface that scanning and transitioning use to
 // operate on the repositories of submodules, which keeps this package free of
 // any knowledge of how Git is executed. A submodule is a directory (other than
 // the synchronization root) whose Git entry (its content named .git) belongs to
@@ -18,7 +18,9 @@ import (
 // entry, which identifies the commit, and whose own contents are never
 // synchronized. All directories are absolute paths on the filesystem of the
 // synchronization root, and all paths are root-relative and slash-separated.
-// Implementations must return promptly when their context is cancelled.
+// Implementations must return promptly when their context is cancelled, and
+// they must be safe for concurrent use, because a background scan can overlap
+// with a transition.
 type GitProvider interface {
 	// Probe examines the repository in a directory that has a Git entry, at the
 	// specified path. If the directory is a submodule, then it returns the
@@ -29,6 +31,24 @@ type GitProvider interface {
 	// returns an error whose message tells the user what to do about it,
 	// because the directory's content can't be classified.
 	Probe(ctx context.Context, directory, path string) (*Entry, error)
+	// Clone populates an empty directory with a clone of the repository that a
+	// GitLink entry identifies, with the entry's commit (or, if that isn't
+	// available, the commit of the origin's default branch) checked out on a
+	// detached HEAD, without populating nested submodules. It returns the
+	// GitLink entry for the result, without a seed, along with warnings about
+	// how the result differs from what was requested. If it fails, then the
+	// directory may contain partial content, which the caller must remove.
+	Clone(ctx context.Context, directory string, target *Entry) (*Entry, []string, error)
+	// ScanClone scans a clone made by Clone as if it were at the specified path
+	// within the synchronization root, with the endpoint's settings and ignore
+	// rules. The result doesn't represent the clone's Git entry.
+	ScanClone(ctx context.Context, directory, path string) (*Entry, error)
+	// RecordSeed records, in the Git directory of a clone made by Clone, that
+	// the endpoint populated a submodule with it, along with the content that
+	// the population yielded (whose GitLink entry carries the seed). The record
+	// is what Probe reports a seed for, and what the endpoint reports in its
+	// snapshots until the session has absorbed it.
+	RecordSeed(ctx context.Context, directory string, content *Entry) error
 }
 
 // gitLink returns the GitLink entry of a directory, if it has one.

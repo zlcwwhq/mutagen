@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mutagen-io/mutagen/pkg/filesystem/behavior"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/fastpath"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 )
@@ -74,7 +75,9 @@ type testingGitCall struct {
 
 // testingGitProvider is a fake implementation of GitProvider for tests. Each
 // method records its call, then invokes the hook configured for it (if any),
-// and then fails with the error configured for it (if any).
+// and then fails with the error configured for it (if any). Clone creates a
+// Git directory, which is all that a repository amounts to here, while the
+// other methods operate only on the provider's own fields.
 type testingGitProvider struct {
 	// lock serializes access to the provider's fields, since scans and
 	// transitions may run concurrently with tests that inspect them.
@@ -85,6 +88,17 @@ type testingGitProvider struct {
 	// probeErrors maps root-relative paths to the errors that Probe returns
 	// for them, in addition to any error configured for all of its calls.
 	probeErrors map[string]error
+	// cloneFiles maps slash-separated paths within a clone to the contents of
+	// the files that Clone writes, in addition to a Git directory.
+	cloneFiles map[string]string
+	// cloneWarnings are the warnings that Clone returns.
+	cloneWarnings []string
+	// scanned is the entry that ScanClone returns, if non-nil. Otherwise,
+	// ScanClone scans the clone with ignored as the ignorer.
+	scanned *Entry
+	// ignored are the paths within a clone that ScanClone ignores when it
+	// scans the clone.
+	ignored map[string]bool
 	// errors maps method names to the errors that they return.
 	errors map[string]error
 	// hooks maps method names to callbacks that they invoke with their
@@ -92,6 +106,8 @@ type testingGitProvider struct {
 	hooks map[string]func(directory string)
 	// calls are the calls that have been made, in order.
 	calls []testingGitCall
+	// recorded is the content passed to the most recent call to RecordSeed.
+	recorded *Entry
 }
 
 // begin records a call and returns the hook and the error configured for its
@@ -126,6 +142,25 @@ func (p *testingGitProvider) callsTo(method string) []testingGitCall {
 	return result
 }
 
+// methods returns the names of the methods that have been called, in order.
+func (p *testingGitProvider) methods() []string {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	var result []string
+	for _, call := range p.calls {
+		result = append(result, call.method)
+	}
+	return result
+}
+
+// testingCreateGitDirectory creates a minimal Git directory in a directory.
+func testingCreateGitDirectory(directory string) error {
+	if err := os.Mkdir(filepath.Join(directory, GitLinkName), 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(directory, GitLinkName, "HEAD"), []byte("ref: refs/heads/main\n"), 0600)
+}
+
 // Probe implements GitProvider.Probe.
 func (p *testingGitProvider) Probe(_ context.Context, directory, path string) (*Entry, error) {
 	if err := p.run("Probe", directory, path); err != nil {
@@ -137,6 +172,71 @@ func (p *testingGitProvider) Probe(_ context.Context, directory, path string) (*
 		return nil, err
 	}
 	return p.links[path], nil
+}
+
+// Clone implements GitProvider.Clone. If it fails, then it leaves partial
+// content behind, as a real clone can.
+func (p *testingGitProvider) Clone(_ context.Context, directory string, target *Entry) (*Entry, []string, error) {
+	if err := p.run("Clone", directory, ""); err != nil {
+		os.WriteFile(filepath.Join(directory, "partial"), []byte("partial"), 0600)
+		return nil, nil, err
+	}
+	if err := testingCreateGitDirectory(directory); err != nil {
+		return nil, nil, err
+	}
+	p.lock.Lock()
+	files, warnings := p.cloneFiles, p.cloneWarnings
+	p.lock.Unlock()
+	for path, content := range files {
+		path = filepath.Join(directory, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return nil, nil, err
+		} else if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			return nil, nil, err
+		}
+	}
+	link := target.Copy(EntryCopyBehaviorSlim)
+	link.Seed = ""
+	return link, warnings, nil
+}
+
+// ScanClone implements GitProvider.ScanClone.
+func (p *testingGitProvider) ScanClone(ctx context.Context, directory, path string) (*Entry, error) {
+	if err := p.run("ScanClone", directory, path); err != nil {
+		return nil, err
+	}
+	p.lock.Lock()
+	scanned, ignored := p.scanned, p.ignored
+	p.lock.Unlock()
+	if scanned != nil {
+		return scanned, nil
+	}
+	snapshot, _, _, err := ScanGitMode(
+		ctx,
+		directory,
+		nil, nil,
+		newTestingHasher(), nil,
+		&testingGitIgnorer{ignored: ignored}, nil,
+		behavior.ProbeMode_ProbeModeProbe,
+		SymbolicLinkMode_SymbolicLinkModePortable,
+		PermissionsMode_PermissionsModePortable,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Content, nil
+}
+
+// RecordSeed implements GitProvider.RecordSeed.
+func (p *testingGitProvider) RecordSeed(_ context.Context, directory string, content *Entry) error {
+	if err := p.run("RecordSeed", directory, ""); err != nil {
+		return err
+	}
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.recorded = content
+	return nil
 }
 
 // testingWriteContent creates files and directories within a directory. The
@@ -164,4 +264,24 @@ func testingWriteContent(t *testing.T, directory string, content map[string]stri
 			t.Fatal("unable to backdate file:", err)
 		}
 	}
+}
+
+// testingTemporaryClones returns the root-relative paths of the temporary
+// directories for submodules within a directory.
+func testingTemporaryClones(t *testing.T, root string) []string {
+	t.Helper()
+	var result []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		} else if strings.HasPrefix(entry.Name(), gitLinkTemporaryNamePrefix) {
+			relative, _ := filepath.Rel(root, path)
+			result = append(result, filepath.ToSlash(relative))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal("unable to look for temporary directories:", err)
+	}
+	return result
 }

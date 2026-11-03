@@ -55,3 +55,85 @@ func TestTransitionDependencies(t *testing.T) {
 		}
 	}
 }
+
+// TestTransitionDependenciesSubmodules tests that TransitionDependencies doesn't
+// request the contents of submodules that transitions populate, since they come
+// from clones, while it still requests the files that transitions write within
+// existing submodules.
+func TestTransitionDependenciesSubmodules(t *testing.T) {
+	// Define test cases.
+	submodule := testingSubmodule(tGL0, map[string]*Entry{"file": tF1, "directory": tD2})
+	tests := []struct {
+		// description is a human readable description of the test case.
+		description string
+		// transition is the transition.
+		transition *Change
+		// expectedPaths are the expected paths, in the order that they're
+		// expected.
+		expectedPaths []string
+		// expectedDigests are the expected digests.
+		expectedDigests [][]byte
+	}{
+		{
+			description: "creation of submodule",
+			transition:  &Change{Path: "sub", New: submodule},
+		},
+		{
+			description: "population of empty directory",
+			transition:  &Change{Path: "sub", Old: tD0, New: submodule},
+		},
+		{
+			description: "replacement of file with submodule",
+			transition:  &Change{Path: "sub", Old: tF2, New: submodule},
+		},
+		{
+			description:     "creation of directory containing submodule",
+			transition:      &Change{Path: "parent", New: &Entry{Contents: map[string]*Entry{"sub": submodule, "other": tF3}}},
+			expectedPaths:   []string{"parent/other"},
+			expectedDigests: [][]byte{tF3.Digest},
+		},
+		{
+			description: "creation of root containing nested submodule",
+			transition: &Change{New: &Entry{Contents: map[string]*Entry{
+				"parent": nested("sub", submodule),
+			}}},
+		},
+		{
+			description:     "file within existing submodule",
+			transition:      &Change{Path: "sub/file", Old: tF1, New: tF2},
+			expectedPaths:   []string{"sub/file"},
+			expectedDigests: [][]byte{tF2.Digest},
+		},
+		{
+			description:     "directory within existing submodule",
+			transition:      &Change{Path: "sub/directory", New: tD2},
+			expectedPaths:   []string{"sub/directory/file"},
+			expectedDigests: [][]byte{tF2.Digest},
+		},
+		{
+			description: "commit of existing submodule",
+			transition:  &Change{Path: "sub/.git", Old: tGL0, New: tGL1},
+		},
+		{
+			description: "attachment of Git entry",
+			transition:  &Change{Path: "sub/.git", New: tGL0},
+		},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		paths, digests := TransitionDependencies([]*Change{test.transition})
+		if !comparison.StringSlicesEqual(paths, test.expectedPaths) {
+			t.Errorf("%s: incorrect paths: %v != %v", test.description, paths, test.expectedPaths)
+		}
+		if len(digests) != len(test.expectedDigests) {
+			t.Errorf("%s: incorrect number of digests: %d != %d", test.description, len(digests), len(test.expectedDigests))
+		} else {
+			for d, digest := range digests {
+				if !bytes.Equal(digest, test.expectedDigests[d]) {
+					t.Errorf("%s: incorrect digest at index %d", test.description, d)
+				}
+			}
+		}
+	}
+}
