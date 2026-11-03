@@ -2,10 +2,13 @@ package gitignore
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 )
@@ -18,8 +21,8 @@ const (
 	// file for the root repository.
 	excludeFilePath = ".git/info/exclude"
 	// maximumRuleFileSize is the maximum size of a rule file that will be read.
-	// A larger file is treated as though it were empty. This is simply a
-	// safeguard against unreasonable memory consumption.
+	// Larger files cause an error, preventing synchronization without their
+	// rules while bounding memory consumption.
 	maximumRuleFileSize = 100 * 1024 * 1024
 	// maximumPointerFileSize is the maximum size of the files that point to the
 	// location of a Git directory (a ".git" file or a "commondir" file) that
@@ -42,6 +45,9 @@ func IsRulePath(path string) bool {
 // apply to the tree beyond it. A rule set is a link in a chain that ends at
 // the lowest-precedence rules.
 type ruleSet struct {
+	// err is the failure to read the rules of this set or of a parent set, in
+	// which case there are no rules to evaluate.
+	err error
 	// rules are the rules, in the order they appeared in their file.
 	rules []rule
 	// prefixLength is the length of the root-relative path of the directory
@@ -76,6 +82,9 @@ type ignorer struct {
 	excludeLoaded bool
 	// exclude is the rule set for the root repository's exclude file.
 	exclude *ruleSet
+	// untraversable records the root-relative paths that a scan wouldn't reach
+	// as directories. See traversable.
+	untraversable map[string]bool
 	// matcher is used to match rules.
 	matcher matcher
 }
@@ -86,13 +95,26 @@ type ignorer struct {
 // observe changes to those files. The session ignorer, which may be nil,
 // provides ignore rules that take precedence over the rule files and that
 // directly control traversal. The returned ignorer is not safe for concurrent
-// use by multiple Goroutines.
-func NewIgnorer(root string, session ignore.Ignorer) ignore.Ignorer {
+// use by multiple Goroutines. Callers have to use EnsureDirectory before
+// processing a directory's contents, since Ignore can't report that the rules
+// for them couldn't be read. Rule files are only read from directories that a
+// scan would traverse, so a path beneath anything else, including a symbolic
+// link, is only subject to the rules of its parents.
+func NewIgnorer(root string, session ignore.Ignorer) ignore.DirectoryIgnorer {
 	return &ignorer{
-		root:        root,
-		session:     session,
-		directories: make(map[string]*ruleSet),
+		root:          root,
+		session:       session,
+		directories:   make(map[string]*ruleSet),
+		untraversable: make(map[string]bool),
 	}
+}
+
+// EnsureDirectory implements ignore.DirectoryIgnorer.EnsureDirectory.
+func (i *ignorer) EnsureDirectory(path string) error {
+	if rules := i.rulesFor(path); rules != nil {
+		return rules.err
+	}
+	return nil
 }
 
 // Ignore implements ignore.Ignorer.Ignore.
@@ -170,11 +192,11 @@ func (i *ignorer) load(directory string) *ruleSet {
 	// The rules of the parent directory also apply (with lower precedence), and
 	// the root's parent is the root repository's exclude file.
 	var parent *ruleSet
+	var parentDirectory string
 	var prefixLength int
 	if directory == "" {
 		parent = i.excludeRules()
 	} else {
-		parentDirectory := ""
 		if slash := strings.LastIndexByte(directory, '/'); slash >= 0 {
 			parentDirectory = directory[:slash]
 		}
@@ -182,12 +204,25 @@ func (i *ignorer) load(directory string) *ruleSet {
 		prefixLength = len(directory) + 1
 	}
 
-	// Read the directory's own rules. If it doesn't have any, then the chain is
-	// simply the parent's.
+	// A failure to read a parent's rules applies to the whole subtree, whatever
+	// this directory's own rules say.
+	if parent != nil && parent.err != nil {
+		i.directories[directory] = parent
+		return parent
+	}
+
+	// Read the directory's own rules, if it's one that can have any. If it
+	// doesn't have any, then the chain is simply the parent's.
 	rules := parent
-	path := filepath.Join(i.root, filepath.FromSlash(directory), ruleFileName)
-	if parsed := parseRules(readRegularFile(path, maximumRuleFileSize)); len(parsed) > 0 {
-		rules = &ruleSet{rules: parsed, prefixLength: prefixLength, parent: parent}
+	if traversable, err := i.traversable(directory, parentDirectory); err != nil {
+		rules = &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
+	} else if traversable {
+		path := filepath.Join(i.root, filepath.FromSlash(directory), ruleFileName)
+		if contents, err := readRegularFile(path, maximumRuleFileSize); err != nil {
+			rules = &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
+		} else if parsed := parseRules(contents); len(parsed) > 0 {
+			rules = &ruleSet{rules: parsed, prefixLength: prefixLength, parent: parent}
+		}
 	}
 
 	// Remember the result.
@@ -195,13 +230,41 @@ func (i *ignorer) load(directory string) *ruleSet {
 	return rules
 }
 
+// traversable determines whether or not a scan would reach a path as a
+// directory, given the path of its parent, which must have been checked before
+// it. A scan doesn't follow symbolic links, so what's at a link's target, which
+// can be anything, including a cycle or another directory's rules, has nothing
+// to do with the paths beneath the link, and rule files mustn't be read through
+// it. The root itself is always traversed, since a symbolic link there is how
+// the user has chosen to specify it.
+func (i *ignorer) traversable(directory, parent string) (bool, error) {
+	if directory == "" {
+		return true, nil
+	} else if i.untraversable[parent] {
+		i.untraversable[directory] = true
+		return false, nil
+	}
+	info, err := os.Lstat(filepath.Join(i.root, filepath.FromSlash(directory)))
+	if err == nil && info.IsDir() {
+		return true, nil
+	} else if err == nil || os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		i.untraversable[directory] = true
+		return false, nil
+	}
+	return false, err
+}
+
 // excludeRules returns the rule set for the root repository's exclude file, or
 // nil if there is no such file or it contains no rules.
 func (i *ignorer) excludeRules() *ruleSet {
 	if !i.excludeLoaded {
 		i.excludeLoaded = true
-		if path := excludeFileLocation(i.root); path != "" {
-			if rules := parseRules(readRegularFile(path, maximumRuleFileSize)); len(rules) > 0 {
+		if path, err := excludeFileLocation(i.root); err != nil {
+			i.exclude = &ruleSet{err: fmt.Errorf("unable to locate ignore rules: %w", err)}
+		} else if path != "" {
+			if contents, err := readRegularFile(path, maximumRuleFileSize); err != nil {
+				i.exclude = &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
+			} else if rules := parseRules(contents); len(rules) > 0 {
 				i.exclude = &ruleSet{rules: rules}
 			}
 		}
@@ -211,25 +274,37 @@ func (i *ignorer) excludeRules() *ruleSet {
 
 // readRegularFile reads a file if (and only if) it is a regular file (i.e. not
 // a symbolic link or anything else) that is no larger than the specified size.
-// Otherwise it returns nil.
-func readRegularFile(path string, limit int64) []byte {
+// If there's no such file (including because a parent isn't a directory) or
+// it's something other than a regular file, then it returns nil. If it can't be
+// read or it's too large, then it returns an error, because treating that like
+// an empty file would synchronize what its rules ignore.
+func readRegularFile(path string, limit int64) ([]byte, error) {
 	// Check the type and size of the file.
-	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() || info.Size() > limit {
-		return nil
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	} else if !info.Mode().IsRegular() {
+		return nil, nil
+	} else if info.Size() > limit {
+		return nil, fmt.Errorf("%s exceeds the rule file size limit", path)
 	}
 
 	// Open the file and read it, taking care not to read more than expected if
 	// the file grows.
 	file, err := os.Open(path)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer file.Close()
 	contents, err := io.ReadAll(io.LimitReader(file, limit+1))
-	if err != nil || int64(len(contents)) > limit {
-		return nil
+	if err != nil {
+		return nil, err
+	} else if int64(len(contents)) > limit {
+		return nil, fmt.Errorf("%s exceeds the rule file size limit", path)
 	}
-	return contents
+	return contents, nil
 }
 
 // excludeFileLocation determines the location of the exclude file for the
@@ -240,38 +315,44 @@ func readRegularFile(path string, limit int64) []byte {
 // linked worktrees). If the Git directory in turn points to a common directory
 // (as is the case for linked worktrees), then that is where the exclude file
 // is found.
-func excludeFileLocation(root string) string {
+func excludeFileLocation(root string) (string, error) {
 	// Check the type of the root's ".git" entry. We deliberately don't follow
 	// symbolic links.
 	dotGit := filepath.Join(root, ".git")
 	info, err := os.Lstat(dotGit)
-	if err != nil {
-		return ""
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		return "", nil
+	} else if err != nil {
+		return "", err
 	}
 	if info.IsDir() {
-		return filepath.Join(dotGit, "info", "exclude")
+		return filepath.Join(dotGit, "info", "exclude"), nil
 	} else if !info.Mode().IsRegular() {
-		return ""
+		return "", nil
 	}
 
 	// Read the location of the Git directory from the file.
-	contents := readRegularFile(dotGit, maximumPointerFileSize)
-	if contents == nil {
-		return ""
+	contents, err := readRegularFile(dotGit, maximumPointerFileSize)
+	if err != nil {
+		return "", err
+	} else if contents == nil {
+		return "", nil
 	}
 	pointer, ok := parsePointer(contents, "gitdir:")
 	if !ok {
-		return ""
+		return "", nil
 	}
 	gitDirectory := resolvePath(root, pointer)
 
 	// Check whether or not the Git directory points to a common directory.
-	if contents := readRegularFile(filepath.Join(gitDirectory, "commondir"), maximumPointerFileSize); contents != nil {
+	if contents, err := readRegularFile(filepath.Join(gitDirectory, "commondir"), maximumPointerFileSize); err != nil {
+		return "", err
+	} else if contents != nil {
 		if pointer, ok := parsePointer(contents, ""); ok {
-			return filepath.Join(resolvePath(gitDirectory, pointer), "info", "exclude")
+			return filepath.Join(resolvePath(gitDirectory, pointer), "info", "exclude"), nil
 		}
 	}
-	return filepath.Join(gitDirectory, "info", "exclude")
+	return filepath.Join(gitDirectory, "info", "exclude"), nil
 }
 
 // parsePointer extracts a path from the first line of a file that points to
