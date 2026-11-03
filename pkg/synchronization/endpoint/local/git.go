@@ -3,22 +3,44 @@ package local
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/text/unicode/norm"
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/git"
+	"github.com/mutagen-io/mutagen/pkg/logging"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/gitignore"
 )
 
 const (
+	// gitDefaultStallTimeout is the amount of time that a command that uses the
+	// network can run without producing any output before it's considered to
+	// have stalled. There's no limit on the overall duration of such a command,
+	// because a clone of a large repository can legitimately take a long time,
+	// but it reports progress all the while.
+	gitDefaultStallTimeout = 60 * time.Second
+
+	// gitDefaultStallBackoff is the amount of time for which a URL won't be
+	// contacted after a command that used it has stalled. A transition holds up
+	// its session's synchronization cycle, and thus flushes, so without this,
+	// each flush on a system that can't reach the repository would take at
+	// least as long as the stall timeout.
+	gitDefaultStallBackoff = 5 * time.Minute
+
+	// gitShortCommitLength is the length of the abbreviated commit identifiers
+	// that are used in messages.
+	gitShortCommitLength = 12
+
 	// gitWarningTimeout is the maximum amount of time that the Git commands of
 	// each warning check can take. Warnings are only informational, so they
 	// mustn't be able to hold up a synchronization cycle indefinitely (e.g. on
@@ -32,6 +54,244 @@ const (
 	// display.
 	maximumTrackedIgnoredWarnings = 20
 )
+
+// gitShortCommit returns the abbreviated form of a commit's hexadecimal
+// identifier for use in messages.
+func gitShortCommit(commit string) string {
+	return commit[:min(len(commit), gitShortCommitLength)]
+}
+
+// gitStallError indicates that a command was stopped because it stalled, or
+// that it wasn't started because of a recent stall. In either case, there's no
+// point in trying anything else that uses the same URL.
+type gitStallError struct {
+	// message is the error message.
+	message string
+}
+
+// Error implements error.Error.
+func (e *gitStallError) Error() string {
+	return e.message
+}
+
+// gitProvider operates on the repositories of submodules by running Git. It's
+// safe for concurrent usage. Stalls and failures are tracked here rather than
+// in the core package because they have to outlive individual calls to
+// core.Transition, and so does the fetching of commits in the background.
+type gitProvider struct {
+	// stallTimeout is the amount of time that a command that uses the network
+	// can run without producing any output.
+	stallTimeout time.Duration
+	// stallBackoff is the amount of time for which a URL won't be contacted
+	// after a command that used it has stalled.
+	stallBackoff time.Duration
+	// logger is the underlying logger.
+	logger *logging.Logger
+	// backoffsLock serializes access to backoffs.
+	backoffsLock sync.Mutex
+	// backoffs maps URLs that have stalled to the time until which they won't
+	// be contacted.
+	backoffs map[string]time.Time
+	// fetcher fetches commits in the background.
+	fetcher *gitFetcher
+}
+
+// newGitProvider creates a new provider. Its fetcher has to be started by the
+// caller (see gitFetcher.run).
+func newGitProvider(logger *logging.Logger, signal func()) *gitProvider {
+	provider := &gitProvider{
+		stallTimeout: gitDefaultStallTimeout,
+		stallBackoff: gitDefaultStallBackoff,
+		logger:       logger,
+		backoffs:     make(map[string]time.Time),
+	}
+	provider.fetcher = newGitFetcher(provider, signal)
+	return provider
+}
+
+// backoffRemaining returns the amount of time until a URL can be contacted
+// again, which is zero or less if it can be contacted now.
+func (g *gitProvider) backoffRemaining(url string) time.Duration {
+	g.backoffsLock.Lock()
+	defer g.backoffsLock.Unlock()
+	until, ok := g.backoffs[url]
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(until)
+	if remaining <= 0 {
+		delete(g.backoffs, url)
+	}
+	return remaining
+}
+
+// runNetwork runs a Git command that may contact the specified URL, stopping it
+// if it stalls, which is the only failure that results in the URL not being
+// contacted for a while. Other failures, such as a missing commit or a failure
+// to authenticate, are worth retrying right away, because they don't cost much
+// time and because the commit may be pushed or the credentials fixed at any
+// moment. The command must be one that reports its progress.
+func (g *gitProvider) runNetwork(ctx context.Context, directory, url string, args ...string) error {
+	// If this URL has stalled recently, then don't contact it.
+	if remaining := g.backoffRemaining(url); remaining > 0 {
+		return &gitStallError{fmt.Sprintf(
+			"not contacting %s, because it showed no progress recently; it will be tried again in %s",
+			url, remaining.Round(time.Second),
+		)}
+	}
+
+	// Start the command in a context that we can cancel if it stalls.
+	commandCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	command := git.Command(commandCtx, directory, args...)
+	output := git.NewOutputRecorder()
+	command.Stdout, command.Stderr = output, output
+	if err := command.Start(); err != nil {
+		return &git.CommandError{Err: err}
+	}
+
+	// Watch for the command to stop producing output. We wait for this
+	// Goroutine to exit before we look at its result.
+	stalled := make(chan bool, 1)
+	done := make(chan struct{})
+	go func() {
+		timer := time.NewTimer(g.stallTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-done:
+				stalled <- false
+				return
+			case <-timer.C:
+				idle := output.Idle()
+				if idle >= g.stallTimeout {
+					stalled <- true
+					cancel()
+					return
+				}
+				timer.Reset(g.stallTimeout - idle)
+			}
+		}
+	}()
+
+	// Wait for the command, then for the Goroutine.
+	err := command.Wait()
+	close(done)
+	didStall := <-stalled
+
+	// If the command succeeded, then it doesn't matter what else happened. This
+	// includes helper processes outliving the command and keeping its output
+	// open.
+	if err == nil || errors.Is(err, exec.ErrWaitDelay) {
+		return nil
+	}
+
+	// If the command stalled, then avoid this URL for a while.
+	if didStall {
+		g.backoffsLock.Lock()
+		g.backoffs[url] = time.Now().Add(g.stallBackoff)
+		g.backoffsLock.Unlock()
+		g.logger.Debugf("Git command for %s stalled, avoiding it for %s", url, g.stallBackoff)
+		return &gitStallError{fmt.Sprintf(
+			"stopped because %s showed no progress for %s; it won't be tried again for %s",
+			url, g.stallTimeout, g.stallBackoff,
+		)}
+	}
+
+	// Otherwise, it's a normal failure.
+	return &git.CommandError{Err: err, Output: output.Message()}
+}
+
+// hasCommit determines whether or not the repository in a directory has a
+// commit, specified by its hexadecimal identifier.
+func (g *gitProvider) hasCommit(ctx context.Context, directory, commit string) bool {
+	_, err := git.Run(ctx, directory, "cat-file", "-e", commit+"^{commit}")
+	return err == nil
+}
+
+// fetchCommit fetches a commit, specified by its hexadecimal identifier, into
+// the repository in a directory. The remote is what Git is told to fetch from,
+// which is either the name of a remote or a URL, and the URL is what it refers
+// to, which must not have credentials. Nothing but objects is added to the
+// repository: no references change, and FETCH_HEAD isn't written.
+func (g *gitProvider) fetchCommit(ctx context.Context, directory, remote, url, commit string) error {
+	// Try to fetch only the commit that we need.
+	err := g.runNetwork(ctx, directory, url, "fetch", "--no-write-fetch-head", "--progress", "--", remote, commit)
+	if err == nil {
+		return nil
+	}
+
+	// Stalls and cancellation aren't going to be any different the second time.
+	var stall *gitStallError
+	if errors.As(err, &stall) {
+		return err
+	} else if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// Not all servers allow commits to be requested by their identifiers, in
+	// which case the commit might still be reachable from what they do provide,
+	// so see if we can get it that way. If we're fetching from a URL rather
+	// than a remote, then there's no configuration to indicate what to fetch,
+	// and Git will only fetch the repository's default branch.
+	err = g.runNetwork(ctx, directory, url, "fetch", "--no-write-fetch-head", "--progress", "--", remote)
+	if errors.As(err, &stall) {
+		return err
+	} else if ctx.Err() != nil {
+		return ctx.Err()
+	} else if err != nil {
+		return fmt.Errorf("unable to fetch commit %s from %s: %w", gitShortCommit(commit), url, err)
+	}
+
+	// The fetch has succeeded, so we can tell if the commit is available.
+	if !g.hasCommit(ctx, directory, commit) {
+		return fmt.Errorf("commit %s isn't available from %s; if it hasn't been pushed, push it, and the next synchronization will fetch it", gitShortCommit(commit), url)
+	}
+	return nil
+}
+
+// fetchMissing fetches a commit, specified by its hexadecimal identifier, into
+// the repository in a directory, from its own origin and then from a URL, which
+// is the one that the other endpoint has for the repository, since they may
+// reach it in different ways. If both attempts are unsuccessful, then the error
+// describes both.
+func (g *gitProvider) fetchMissing(ctx context.Context, directory, url, commit string) error {
+	var failures []string
+
+	// Try the repository's own origin. It's okay if there's no longer an
+	// origin, because we have another URL to try. We refer to the origin by its
+	// name, which allows Git to use whatever credentials are in its URL, but we
+	// only refer to it without them, and backoffs for it are shared with all of
+	// its other uses.
+	var originURL string
+	if origin, err := git.Run(ctx, directory, "config", "--get", "remote.origin.url"); err == nil && origin != "" {
+		originURL = git.StripCredentials(origin)
+		err := g.fetchCommit(ctx, directory, "origin", originURL, commit)
+		if err == nil {
+			return nil
+		} else if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		failures = append(failures, err.Error())
+	}
+
+	// Try the other endpoint's URL, unless it's the same one that just failed.
+	usable, err := git.UsableURL(url)
+	if err != nil {
+		failures = append(failures, fmt.Sprintf("unable to use the other endpoint's URL: %v", err))
+	} else if usable != originURL {
+		err := g.fetchCommit(ctx, directory, usable, usable, commit)
+		if err == nil {
+			return nil
+		} else if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		failures = append(failures, err.Error())
+	}
+
+	// Report the failures.
+	return errors.New(strings.Join(failures, "; "))
+}
 
 // containsGitRulePath determines whether or not any of the specified re-check
 // paths identifies a file whose contents affect ignore evaluation in Git mode.
