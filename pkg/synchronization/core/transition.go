@@ -65,6 +65,11 @@ const (
 var (
 	// errTransitionCancelled indicates that the transition was cancelled.
 	errTransitionCancelled = errors.New("transition cancelled")
+	// errGitLinkRemovalRefused indicates that the removal of a submodule's Git
+	// entry was refused. A submodule's repository can hold work that exists
+	// nowhere else, such as unpushed commits and stashes, and it isn't
+	// synchronized, so its removal is never performed automatically.
+	errGitLinkRemovalRefused = errors.New("submodule isn't removed automatically; remove it manually")
 )
 
 // Provider defines the interface that higher-level logic can use to provide
@@ -528,6 +533,13 @@ ContentLoop:
 				t.recordProblem(contentPath, fmt.Errorf("unable to remove symbolic link: %w", err))
 				continue
 			}
+		} else if entry.Kind == EntryKind_GitLink {
+			// This can't happen, because remove refuses to remove directories
+			// containing submodules, but if it did, then the submodule would be
+			// kept in the reduced entry, along with this directory.
+			contentRemovalFailed = true
+			t.recordProblem(contentPath, errGitLinkRemovalRefused)
+			continue
 		} else {
 			contentRemovalFailed = true
 			t.recordProblem(contentPath, errors.New("unknown entry type found in removal target"))
@@ -592,6 +604,28 @@ func (t *transitioner) remove(path string, entry *Entry) *Entry {
 	// If the entry is nil, we're done.
 	if entry == nil {
 		return nil
+	}
+
+	// Refuse to remove a submodule, leaving its entry in place. We check this
+	// before accessing the filesystem so that the refusal is unconditional.
+	if entry.Kind == EntryKind_GitLink {
+		t.recordProblem(path, errGitLinkRemovalRefused)
+		return entry
+	}
+
+	// Likewise, refuse to remove a directory that contains a submodule, as a
+	// whole. Removing the rest of its content would remove the submodule's
+	// working tree, uncommitted changes included, while leaving its Git entry,
+	// which isn't anything that either endpoint has, and which would make the
+	// endpoints disagree about the submodule's files in ways that they can only
+	// resolve by deleting it.
+	if entry.Kind == EntryKind_Directory {
+		if links := entry.GitLinkPaths(); len(links) > 0 {
+			for _, link := range links {
+				t.recordProblem(fastpath.Joinable(path)+link, errGitLinkRemovalRefused)
+			}
+			return entry
+		}
 	}
 
 	// Walk down to the parent of the target and compute the target's leaf name.
@@ -1096,7 +1130,9 @@ func (t *transitioner) populateIn(parent *filesystem.Directory, name, path strin
 
 	// Remove the old content, which verifies that it hasn't been modified. If
 	// only a portion of it can be removed, then the submodule can't go in its
-	// place. The removal has already recorded the relevant problems.
+	// place. In particular, it can be a directory containing submodules, whose
+	// Git entries are never removed. The removal has already recorded the
+	// relevant problems.
 	if reduced := t.remove(path, old); reduced != nil {
 		t.removeTemporaryClone(path, temporary)
 		return reduced

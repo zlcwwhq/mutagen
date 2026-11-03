@@ -440,6 +440,17 @@ func TestTransitionPopulateFailures(t *testing.T) {
 				testingVerifyFile(t, root, "sub", "modified")
 			},
 		},
+		{
+			description:      "old content containing a submodule",
+			content:          map[string]string{"sub/.git/HEAD": "head"},
+			old:              testingSubmodule(tGL1, nil),
+			expectedResult:   testingSubmodule(tGL1, nil),
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: errGitLinkRemovalRefused.Error()}},
+			expectedCalls:    []string{"Clone", "ScanClone", "RecordSeed"},
+			verify: func(t *testing.T, root string) {
+				testingVerifyFile(t, root, "sub/.git/HEAD", "head")
+			},
+		},
 	}
 
 	// Process test cases.
@@ -636,4 +647,88 @@ func TestTransitionCreateDirectoryWithSubmodule(t *testing.T) {
 	testingVerifyProblems(t, problems, []*Problem{{Path: "directory/sub", Error: "clone failed"}})
 	testingVerifyMissing(t, root, "directory/sub")
 	testingVerifyFile(t, root, "directory/plain/file", tF1Content)
+}
+
+// TestTransitionSubmoduleRemoval tests that a submodule's Git entry is never
+// removed, whether by itself or as part of a directory, and that the provider
+// isn't involved in that. The removal of a directory containing a submodule is
+// refused as a whole, so that the submodule's working tree stays intact.
+func TestTransitionSubmoduleRemoval(t *testing.T) {
+	// Define the content on disk.
+	content := map[string]string{
+		"sub/.git/HEAD":              "head",
+		"sub/a":                      tF1Content,
+		"directory/nested/.git/HEAD": "head",
+		"directory/nested/a":         tF1Content,
+	}
+	refused := errGitLinkRemovalRefused.Error()
+
+	// Define test cases.
+	tests := []struct {
+		// description is a human readable description of the test case.
+		description string
+		// transition is the transition.
+		transition *Change
+		// expectedResult is the expected result.
+		expectedResult *Entry
+		// expectedProblems are the expected problems.
+		expectedProblems []*Problem
+	}{
+		{
+			description:      "removal of Git entry",
+			transition:       &Change{Path: "sub/.git", Old: tGL0},
+			expectedResult:   tGL0,
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: refused}},
+		},
+		{
+			description:      "replacement of Git entry",
+			transition:       &Change{Path: "sub/.git", Old: tGL0, New: tD0},
+			expectedResult:   tGL0,
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: refused}},
+		},
+		{
+			description:      "removal of submodule",
+			transition:       &Change{Path: "sub", Old: testingSubmodule(tGL0, map[string]*Entry{"a": tF1})},
+			expectedResult:   testingSubmodule(tGL0, map[string]*Entry{"a": tF1}),
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: refused}},
+		},
+		{
+			description:      "replacement of submodule",
+			transition:       &Change{Path: "sub", Old: testingSubmodule(tGL0, map[string]*Entry{"a": tF1}), New: tF1},
+			expectedResult:   testingSubmodule(tGL0, map[string]*Entry{"a": tF1}),
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: refused}},
+		},
+		{
+			description: "removal of directory containing submodule",
+			transition: &Change{Path: "directory", Old: nested("nested", testingSubmodule(tGL0, map[string]*Entry{
+				"a": tF1,
+			}))},
+			expectedResult: nested("nested", testingSubmodule(tGL0, map[string]*Entry{
+				"a": tF1,
+			})),
+			expectedProblems: []*Problem{{Path: "directory/nested/.git", Error: refused}},
+		},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			root, cache := testingGitTransitionRoot(t, content)
+			provider := &testingGitProvider{}
+			results, problems := testingTransitionGitMode(t, context.Background(), root, cache, provider, nil,
+				test.transition,
+			)
+			if !results[0].Equal(test.expectedResult, true) {
+				t.Errorf("incorrect result: %v != %v", results[0], test.expectedResult)
+			}
+			testingVerifyProblems(t, problems, test.expectedProblems)
+			if methods := provider.methods(); len(methods) != 0 {
+				t.Errorf("provider called: %v", methods)
+			}
+			testingVerifyFile(t, root, "sub/.git/HEAD", "head")
+			testingVerifyFile(t, root, "sub/a", tF1Content)
+			testingVerifyFile(t, root, "directory/nested/.git/HEAD", "head")
+			testingVerifyFile(t, root, "directory/nested/a", tF1Content)
+		})
+	}
 }
