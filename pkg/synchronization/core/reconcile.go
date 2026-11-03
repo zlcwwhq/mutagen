@@ -96,6 +96,14 @@ func (r *reconciler) reconcile(path string, ancestor, alpha, beta *Entry) {
 		}
 	}
 
+	// In Git mode, a few situations involving submodules can't be reconciled
+	// like other content, and they have to be handled before the comparison
+	// below, because a submodule is a directory, and the comparison would
+	// otherwise send them into the usual recursion.
+	if r.gitMode && r.reconcileSubmodule(path, ancestor, alpha, beta) {
+		return
+	}
+
 	// Check if alpha and beta agree on the contents of this path. If so, then
 	// we can simply recurse, because there's no disagreement at this level.
 	if alpha.Equal(beta, false) {
@@ -196,6 +204,94 @@ func (r *reconciler) reconcile(path string, ancestor, alpha, beta *Entry) {
 	default:
 		panic("invalid synchronization mode")
 	}
+}
+
+// reconcileSubmodule handles the situations involving submodules that can't be
+// reconciled like other content, returning true if it has handled the path. A
+// submodule is a directory whose Git entry is a GitLink entry, which identifies
+// the commit that the submodule has checked out, and whose other contents are
+// reconciled like those of any other directory. The invariants established by
+// reconcile up to this point hold: neither side is problematic or untracked.
+func (r *reconciler) reconcileSubmodule(path string, ancestor, alpha, beta *Entry) bool {
+	// Determine whether or not changes can propagate from beta to alpha.
+	bidirectional := r.mode == SynchronizationMode_SynchronizationModeTwoWaySafe ||
+		r.mode == SynchronizationMode_SynchronizationModeTwoWayResolved
+
+	// An empty directory opposite a submodule isn't a deletion of the
+	// submodule's content, because cloning a repository without
+	// --recurse-submodules leaves an empty directory at each submodule's path,
+	// and running git submodule deinit leaves one too. Instead, the empty side
+	// receives the submodule, whatever the ancestor contains, which means that
+	// git submodule deinit on one side gets undone. The empty side has nothing
+	// to lose, and the submodule is populated by cloning its repository, with
+	// the result as the ancestor's content, so that the other side's
+	// uncommitted changes propagate in the next cycle without conflicts. In
+	// one-way modes, content never propagates from beta to alpha, so an empty
+	// directory on alpha and a submodule on beta are left alone, without a
+	// change or a conflict, rather than having the mode's mirroring delete the
+	// submodule's content on beta or report a conflict about it.
+	alphaIsEmptyDirectory := alpha != nil && alpha.Kind == EntryKind_Directory && len(alpha.Contents) == 0
+	betaIsEmptyDirectory := beta != nil && beta.Kind == EntryKind_Directory && len(beta.Contents) == 0
+	if betaIsEmptyDirectory && alpha.IsSubmodule() {
+		r.betaChanges = append(r.betaChanges, &Change{Path: path, Old: beta, New: alpha.synchronizable()})
+		return true
+	} else if alphaIsEmptyDirectory && beta.IsSubmodule() {
+		if bidirectional {
+			r.alphaChanges = append(r.alphaChanges, &Change{Path: path, Old: alpha, New: beta.synchronizable()})
+		}
+		return true
+	}
+
+	// If both sides have a submodule here, and both have moved it to different
+	// commits since the ancestor (or there's no ancestor commit), then the
+	// working trees are those of two different commits, and reconciling them
+	// path by path would mix the files of both, with the result matching
+	// neither commit. In the two-way-safe mode, that's a conflict for the whole
+	// submodule, which lists only the Git entries as changes, and which goes
+	// away once the commits agree (or one of them is the ancestor's again). The
+	// two-way-resolved mode resolves it in alpha's favor path by path, as it
+	// does for other content, and the one-way modes always do, so they don't
+	// need this.
+	if r.mode == SynchronizationMode_SynchronizationModeTwoWaySafe {
+		alphaLink, betaLink := alpha.gitLink(), beta.gitLink()
+		if alphaLink != nil && betaLink != nil && !alphaLink.Equal(betaLink, false) {
+			ancestorLink := ancestor.gitLink()
+			if !ancestorLink.Equal(alphaLink, false) && !ancestorLink.Equal(betaLink, false) {
+				linkPath := fastpath.Joinable(path) + GitLinkName
+				r.conflicts = append(r.conflicts, &Conflict{
+					Root:         path,
+					AlphaChanges: []*Change{{Path: linkPath, Old: ancestorLink, New: alphaLink}},
+					BetaChanges:  []*Change{{Path: linkPath, Old: ancestorLink, New: betaLink}},
+				})
+				return true
+			}
+		}
+	}
+
+	// If only one side has a submodule's Git entry, then the other side has a
+	// directory with the same contents (or not, which is reconciled path by
+	// path) but without a repository. That's never a deletion of the
+	// repository, which isn't something that can be propagated, but rather the
+	// side without it lacks it, so it receives the other side's commit, in the
+	// form of a repository attached to its existing working tree. In one-way
+	// modes, beta never gives alpha anything, so a Git entry on beta alone is
+	// left alone, rather than being deleted by the mode's mirroring.
+	if _, ok := gitLinkDirectory(path); ok {
+		alphaIsLink := alpha != nil && alpha.Kind == EntryKind_GitLink
+		betaIsLink := beta != nil && beta.Kind == EntryKind_GitLink
+		if alphaIsLink && beta == nil {
+			r.betaChanges = append(r.betaChanges, &Change{Path: path, New: alpha})
+			return true
+		} else if betaIsLink && alpha == nil {
+			if bidirectional {
+				r.alphaChanges = append(r.alphaChanges, &Change{Path: path, New: beta})
+			}
+			return true
+		}
+	}
+
+	// Otherwise, the path is reconciled as usual.
+	return false
 }
 
 // handleDisagreementBidirectional handles content disagreements between alpha
