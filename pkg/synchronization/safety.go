@@ -2,6 +2,8 @@ package synchronization
 
 import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/fastpath"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/gitignore"
 )
 
 // oneEndpointEmptiedRoot determines whether or not one endpoint (but not both)
@@ -60,6 +62,113 @@ func rootEmptied(ancestor, root *core.Entry, gitMode bool) bool {
 		}
 	}
 	return true
+}
+
+// isIgnoreRuleChange determines whether or not a change affects a file that
+// provides ignore rules in Git mode, either by leaving a regular file at the
+// change's path or by removing one from it. Removals count because they change
+// what the next scan synchronizes just as additions do. Only regular files
+// count, because rule files that are symbolic links aren't read.
+func isIgnoreRuleChange(change *core.Change) bool {
+	if !gitignore.IsRulePath(change.Path) {
+		return false
+	} else if change.New != nil {
+		return change.New.Kind == core.EntryKind_File
+	}
+	return change.Old != nil && change.Old.Kind == core.EntryKind_File
+}
+
+// pruneToIgnoreRules creates a copy of a directory entry containing only the
+// files beneath it that provide ignore rules in Git mode and the directories
+// leading to them, or returns nil if there aren't any such files. The path is
+// the directory's path relative to the synchronization root. Entries are
+// immutable, so directories are newly created and files can be shared.
+func pruneToIgnoreRules(path string, directory *core.Entry) *core.Entry {
+	// Compute the prefix to add to content names to compute their paths.
+	contentPathPrefix := fastpath.Joinable(path)
+
+	// Determine which contents to retain.
+	var contents map[string]*core.Entry
+	for name, entry := range directory.Contents {
+		contentPath := contentPathPrefix + name
+		var retained *core.Entry
+		if entry.Kind == core.EntryKind_File && gitignore.IsRulePath(contentPath) {
+			retained = entry
+		} else if entry.Kind == core.EntryKind_Directory {
+			retained = pruneToIgnoreRules(contentPath, entry)
+		}
+		if retained != nil {
+			if contents == nil {
+				contents = make(map[string]*core.Entry)
+			}
+			contents[name] = retained
+		}
+	}
+
+	// A directory that doesn't lead to any rule files isn't retained.
+	if contents == nil {
+		return nil
+	}
+
+	// Create the pruned copy.
+	pruned := directory.Copy(core.EntryCopyBehaviorSlim)
+	pruned.Contents = contents
+	return pruned
+}
+
+// ignoreRuleDeliveries computes the changes that deliver ignore rules to an
+// endpoint in Git mode, given the transitions computed for that endpoint. There
+// are two types of delivery:
+//
+// A change satisfying isIgnoreRuleChange is included as is.
+//
+// A change that creates a directory (including the root) containing rule files
+// is included with a pruned copy of the directory (see pruneToIgnoreRules). The
+// remainder of the directory is then reconciled by the next synchronization
+// cycle, in which the ancestor and the endpoint have the partial directory and
+// the opposite endpoint has all of it, and which also takes the delivered rules
+// into account.
+//
+// Anything else isn't a delivery, including a directory deletion or a type
+// change that happens to involve rule files. The former removes the rules along
+// with the content that they apply to, and the latter is left to the next cycle
+// because it has to replace what's there with all of the new content.
+func ignoreRuleDeliveries(changes []*core.Change) []*core.Change {
+	var deliveries []*core.Change
+	for _, change := range changes {
+		if isIgnoreRuleChange(change) {
+			deliveries = append(deliveries, change)
+		} else if change.Old == nil && change.New != nil && change.New.Kind == core.EntryKind_Directory {
+			if pruned := pruneToIgnoreRules(change.Path, change.New); pruned != nil {
+				deliveries = append(deliveries, &core.Change{Path: change.Path, New: pruned})
+			}
+		}
+	}
+	return deliveries
+}
+
+// ruleOnlyTransitions takes the transitions computed for each endpoint and
+// returns those to perform in this synchronization cycle, for sessions in Git
+// mode, along with whether or not they're limited to ignore rule deliveries.
+//
+// Each endpoint evaluates ignore rules using only the rule files that it has on
+// disk, so transitions computed before an endpoint has its rules may be for
+// exactly what those rules would have ignored. Transferring a large data
+// directory from a server to its opposite endpoint would be wasteful, but
+// deleting it, because it's absent from an endpoint that ignores it, would lose
+// data. Thus, if either endpoint has rules to receive, then the cycle only
+// delivers rules, on both endpoints, and every other transition is dropped.
+// Dropped transitions need no record, since the next cycle's reconciliation
+// recomputes them from scans that reflect the new rules, and ancestor changes
+// don't depend on them, since a transition's path is disjoint from those of all
+// other changes.
+func ruleOnlyTransitions(αTransitions, βTransitions []*core.Change) ([]*core.Change, []*core.Change, bool) {
+	αDeliveries := ignoreRuleDeliveries(αTransitions)
+	βDeliveries := ignoreRuleDeliveries(βTransitions)
+	if len(αDeliveries) == 0 && len(βDeliveries) == 0 {
+		return αTransitions, βTransitions, false
+	}
+	return αDeliveries, βDeliveries, true
 }
 
 // containsRootDeletion determines whether or not any of the specified changes
