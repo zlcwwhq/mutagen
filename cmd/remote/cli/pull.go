@@ -15,6 +15,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 	"github.com/mutagen-io/mutagen/pkg/platform/terminal"
 	"github.com/mutagen-io/mutagen/pkg/remote"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/gitignore"
 )
 
 // pull copies paths that the session ignores from the opposite endpoint,
@@ -84,6 +85,8 @@ func pullPath(router *router, target *remote.Target, locator *locator, argument 
 		return nil, err
 	} else if relative == "" {
 		return nil, errors.New("the session's root can't be pulled")
+	} else if gitEntry := gitignore.ShallowestGitEntry(relative); gitEntry != "" && gitEntry != relative {
+		return nil, fmt.Errorf("it's inside %s, which holds a repository's metadata, so remote doesn't write it; use Git to change the repository", locator.display(gitEntry))
 	}
 
 	// Check that the session ignores the path as some kind of entry before
@@ -321,7 +324,10 @@ func prepareParents(ctx context.Context, target *remote.Target, locator *locator
 // merge moves a staged entry to a destination, replacing files and symbolic
 // links that differ, merging directories, and recording entries that can't be
 // merged, such as directories whose destinations aren't directories, without
-// deleting local content.
+// deleting local content. A Git entry (a .git directory or file) is only added
+// where none exists locally, since a repository's metadata can't be merged
+// file by file: replacing files in it would mix two repositories, such as the
+// copies of a submodule that each endpoint has.
 func (s *pullSummary) merge(source, destination, display string) {
 	problem := func(format string, arguments ...any) {
 		s.problems = append(s.problems, display+" "+fmt.Sprintf(format, arguments...))
@@ -341,6 +347,9 @@ func (s *pullSummary) merge(source, destination, display string) {
 		return
 	} else if err != nil {
 		problem("couldn't be accessed: %v", err)
+		return
+	} else if gitignore.IsGitEntry(filepath.Base(destination)) {
+		problem("exists locally and holds a repository's metadata, which remote doesn't merge into; use Git to change the repository")
 		return
 	}
 	if sourceInfo.IsDir() {

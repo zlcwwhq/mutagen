@@ -885,3 +885,38 @@ func TestAutomaticCheckoutChecksTake(t *testing.T) {
 		}
 	}
 }
+
+func TestSubmoduleConflictListing(t *testing.T) {
+	// A conflict between the commits that both sides checked out in a
+	// submodule is described by its commits, with what resolves it, both in
+	// the listing and when it's checked out, which remote refuses.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	root := t.TempDir()
+	target := &remote.Target{SourceSession: "session", SourceAlpha: true, Session: "session", Alpha: true, Root: root, Contained: true}
+	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{{
+		Path:         "sub",
+		Submodule:    true,
+		AlphaChanges: []remote.Change{{Path: "sub/.git", Old: "submodule commit 010000000000", New: "submodule commit 020000000000"}},
+		BetaChanges:  []remote.Change{{Path: "sub/.git", Old: "submodule commit 010000000000", New: "submodule commit 030000000000"}},
+	}}}
+	var output, errorOutput strings.Builder
+	if err := renderConflicts(ctx, root, &options{}, &output, &errorOutput, listing, target); err != nil {
+		t.Fatal("unable to list conflicts:", err)
+	}
+	for _, expected := range []string{
+		"sub: changed submodule commit 010000000000 to submodule commit 020000000000",
+		"check out the same commit",
+	} {
+		if !strings.Contains(output.String(), expected) {
+			t.Errorf("listing doesn't contain %q: %q", expected, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "involves a directory") {
+		t.Errorf("submodule conflict described as a directory conflict: %q", output.String())
+	}
+	if _, err := checkout(ctx, root, &options{}, listing, target, filepath.Join(root, "sub")); err == nil ||
+		!strings.Contains(err.Error(), "check out the same commit") {
+		t.Fatal("submodule conflict checkout not refused with an explanation:", err)
+	}
+}

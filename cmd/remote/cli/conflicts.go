@@ -897,6 +897,10 @@ type listedConflict struct {
 	ExcludedChanges uint64 `json:",omitempty"`
 	// Resolvable indicates whether remote can resolve the conflict.
 	Resolvable bool
+	// Submodule indicates that the conflict is between the commits that both
+	// copies of a submodule have checked out (see
+	// remote.ConflictRoot.Submodule).
+	Submodule bool `json:",omitempty"`
 	// Files indicates whether both copies are files, which can be merged.
 	Files bool `json:",omitempty"`
 	// Take lists the copies that can be taken.
@@ -1054,7 +1058,7 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 		}
 		listed := listedConflict{
 			Path: l.local(conflict.Path), Resolvable: conflict.Resolvable(), Files: conflict.Files,
-			Take: localSides(conflict, target), CheckedOut: checkedOut(conflict.Path),
+			Submodule: conflict.Submodule, Take: localSides(conflict, target), CheckedOut: checkedOut(conflict.Path),
 			LocalChanges: localize(localChanges), RemoteChanges: localize(remoteChanges),
 			ExcludedChanges: conflict.ExcludedChanges,
 		}
@@ -1134,7 +1138,9 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 	}
 	for c, conflict := range conflicts {
 		line := reports.describeConflict(limitChanges(listing.Conflicts[c].Changes(), listedChanges))
-		if !conflict.Resolvable {
+		if conflict.Submodule {
+			line += " (the submodule's checked-out commits differ, which remote can't resolve: check out the same commit on both sides with Git, or delete the submodule on the side whose commit and changes should be discarded, which then gets a clone of the other side's commit; see remote --help sync)"
+		} else if !conflict.Resolvable {
 			line += " (remote can't resolve it, since it involves a directory, the synchronization root, or content that can't be synchronized or read)"
 		} else if !conflict.Files {
 			line += fmt.Sprintf(" (not two files, so it can only be resolved with --take %s)", strings.Join(conflict.Take, " or --take "))
@@ -1275,6 +1281,8 @@ func checkoutLocked(ctx context.Context, directory string, o *options, listing *
 		return nil, 0, err
 	} else if conflict == nil {
 		return nil, 0, fmt.Errorf("isn't a conflict root (see %s --conflicts)", followUpCommand(o.node))
+	} else if conflict.Submodule {
+		return nil, 0, errors.New("is a conflict between the commits that both sides checked out in a submodule, which remote can't resolve: check out the same commit on both sides with Git (see remote --help sync)")
 	} else if !conflict.Resolvable() {
 		return nil, 0, fmt.Errorf("isn't a conflict that remote can resolve (see %s --conflicts)", followUpCommand(o.node))
 	} else if o.base != "" && !conflict.Files {

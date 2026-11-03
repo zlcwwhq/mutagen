@@ -491,3 +491,74 @@ func TestCommandRelayStopUnblocksLocalSubmission(t *testing.T) {
 		t.Fatal("stopping the relay didn't end the blocked route")
 	}
 }
+
+// TestRemoteSubmoduleConflicts tests that a conflict between the commits that
+// both endpoints have checked out in a submodule is identified as such, that it
+// isn't resolvable, and that its changes describe the commits.
+func TestRemoteSubmoduleConflicts(t *testing.T) {
+	file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+	link := func(commit byte) *core.Entry {
+		return &core.Entry{
+			Kind:   core.EntryKind_GitLink,
+			Digest: []byte{commit, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, commit},
+			Url:    "https://example.com/sub.git",
+		}
+	}
+	submodule := func(commit byte) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{
+			core.GitLinkName: link(commit),
+			"file":           file,
+		}}
+	}
+	wrap := func(entry *core.Entry) *core.Entry {
+		return &core.Entry{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"sub": entry}}
+	}
+	_, _, _, conflicts := core.ReconcileGitMode(
+		wrap(submodule(1)), wrap(submodule(2)), wrap(submodule(3)),
+		core.SynchronizationMode_SynchronizationModeTwoWaySafe,
+	)
+	if len(conflicts) != 1 {
+		t.Fatalf("unexpected conflicts: %+v", conflicts)
+	}
+	root := resolution(conflicts[0], "sha1")
+	if root.Path != "sub" || !root.Submodule || root.Resolvable() {
+		t.Fatalf("submodule conflict misreported: %+v", root)
+	}
+	expected := []remote.Change{{
+		Path: "sub/.git",
+		Old:  "submodule commit 010000000000",
+		New:  "submodule commit 020000000000",
+	}}
+	if !reflect.DeepEqual(root.AlphaChanges, expected) {
+		t.Errorf("unexpected alpha changes: %+v", root.AlphaChanges)
+	}
+
+	// In the one-way-safe mode, a commit that beta has checked out is kept,
+	// and the conflict is rooted at the Git entry, which remote can't take
+	// either.
+	_, _, _, conflicts = core.ReconcileGitMode(
+		wrap(submodule(1)), wrap(submodule(1)), wrap(submodule(3)),
+		core.SynchronizationMode_SynchronizationModeOneWaySafe,
+	)
+	if len(conflicts) != 1 {
+		t.Fatalf("unexpected one-way-safe conflicts: %+v", conflicts)
+	} else if root := resolution(conflicts[0], "sha1"); root.Path != "sub/.git" || !root.Submodule || root.Resolvable() {
+		t.Fatalf("one-way-safe submodule conflict misreported: %+v", root)
+	}
+
+	// A conflict between files within a submodule isn't a submodule conflict.
+	changed := func(digest byte) *core.Entry {
+		result := submodule(1)
+		result.Contents["file"] = &core.Entry{Kind: core.EntryKind_File, Digest: []byte{digest}}
+		return result
+	}
+	_, _, _, conflicts = core.ReconcileGitMode(
+		wrap(submodule(1)), wrap(changed(2)), wrap(changed(3)),
+		core.SynchronizationMode_SynchronizationModeTwoWaySafe,
+	)
+	if len(conflicts) != 1 {
+		t.Fatalf("unexpected conflicts: %+v", conflicts)
+	} else if root := resolution(conflicts[0], "sha1"); root.Path != "sub/file" || root.Submodule || !root.Files {
+		t.Fatalf("file conflict within submodule misreported: %+v", root)
+	}
+}

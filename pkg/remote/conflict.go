@@ -40,6 +40,16 @@ type ConflictRoot struct {
 	// the other endpoint.
 	AlphaTakable bool `json:",omitempty"`
 	BetaTakable  bool `json:",omitempty"`
+	// Submodule indicates that, in Git mode, the endpoints have checked out
+	// different commits in a submodule. In the two-way-safe mode, the conflict
+	// root is the submodule's directory, and the conflict holds back the
+	// synchronization of the whole submodule until they have the same commit
+	// checked out again (or one of them has the commit that they last agreed
+	// on), or until one of them no longer has the submodule. In the
+	// one-way-safe mode, the conflict root is the submodule's Git entry, and
+	// only the commit is held back. Its changes are those of the submodule's
+	// Git entry, and remote can't resolve it.
+	Submodule bool `json:",omitempty"`
 	// AlphaDigest and BetaDigest are the hexadecimal digests of alpha's and
 	// beta's files, for conflicts between two files, as the synchronization
 	// cycle that listed the conflict saw them. Copies downloaded afterward are

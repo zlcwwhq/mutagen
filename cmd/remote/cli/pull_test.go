@@ -102,6 +102,19 @@ func TestPullMerge(t *testing.T) {
 		t.Errorf("incorrect problems: %q", summary.problems)
 	}
 
+	// A Git entry is added where none exists, but never merged into, since
+	// that would mix two repositories.
+	gitStaged, gitDestination := t.TempDir(), t.TempDir()
+	writeFiles(t, gitStaged, map[string]string{"new/.git/HEAD": "remote\n", "existing/.git/HEAD": "remote\n", "existing/file": "remote\n"})
+	writeFiles(t, gitDestination, map[string]string{"existing/.git/HEAD": "local\n"})
+	gitSummary := &pullSummary{}
+	gitSummary.merge(gitStaged, gitDestination, "results")
+	if tree := readTree(t, gitDestination); tree["new/.git/HEAD"] != "remote\n" || tree["existing/.git/HEAD"] != "local\n" || tree["existing/file"] != "remote\n" {
+		t.Errorf("incorrect merge of Git entries: %v", tree)
+	} else if len(gitSummary.problems) != 1 || !strings.Contains(gitSummary.problems[0], "results/existing/.git exists locally and holds a repository's metadata") {
+		t.Errorf("incorrect problems for Git entries: %q", gitSummary.problems)
+	}
+
 	// Executability differences replace files.
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(filepath.Join(staged, "same"), 0700); err != nil {
@@ -454,6 +467,17 @@ func TestPullGitMode(t *testing.T) {
 	// synchronizes.
 	if output, err := pullPaths("sub/src/main.c"); err == nil || !strings.Contains(output, "sub/src/main.c: the session synchronizes it, so remote doesn't write it") {
 		t.Errorf("content of a nested repository pulled: %q, %v", output, err)
+	}
+
+	// A repository's metadata isn't merged into, since that would mix two
+	// repositories, and nothing is written inside it.
+	if output, err := pullPaths("sub/.git"); err == nil || !strings.Contains(output, "sub/.git exists locally and holds a repository's metadata") {
+		t.Errorf("repository metadata merged into: %q, %v", output, err)
+	} else if data, err := os.ReadFile(filepath.Join(alpha, "sub", ".git")); err != nil || string(data) != local["sub/.git"] {
+		t.Errorf("repository metadata changed: %q, %v", data, err)
+	}
+	if output, err := pullPaths("sub/.git/HEAD"); err == nil || !strings.Contains(output, "it's inside sub/.git, which holds a repository's metadata") {
+		t.Errorf("content inside repository metadata pulled: %q, %v", output, err)
 	}
 
 	// A parent that doesn't exist locally is left to synchronization, since the
