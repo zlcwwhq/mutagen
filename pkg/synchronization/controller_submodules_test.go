@@ -35,6 +35,203 @@ func testingSubmodule(link *core.Entry, contents map[string]*core.Entry) *core.E
 	return result
 }
 
+// TestPopulatesSubmodules tests populatesSubmodules.
+func TestPopulatesSubmodules(t *testing.T) {
+	// Define entries.
+	seeded := func(seed string) *core.Entry {
+		return testingSubmodule(testingSeededLink(seed), map[string]*core.Entry{"file": testingFile})
+	}
+	ancestor := testingDirectory()
+	ancestor.Contents["absorbed"] = seeded("absorbed")
+	ancestor.Contents["unseeded"] = testingSubmodule(testingLink, nil)
+
+	// Define test cases.
+	tests := []struct {
+		// description is a human readable description of the test case.
+		description string
+		// ancestor is the ancestor.
+		ancestor *core.Entry
+		// results are the transition results for each endpoint.
+		results [][]*core.Entry
+		// expected is the expected result.
+		expected bool
+	}{
+		{"no results", ancestor, nil, false},
+		{"empty results", ancestor, [][]*core.Entry{nil, {}}, false},
+		{"results without seeds", ancestor, [][]*core.Entry{{testingFile, nil, testingSubmodule(testingLink, nil), testingLink}}, false},
+		{"absorbed seed", ancestor, [][]*core.Entry{{seeded("absorbed")}}, false},
+		{"absorbed seed at another path", ancestor, [][]*core.Entry{{nil}, {testingDirectory(), seeded("absorbed")}}, false},
+		{"new seed", ancestor, [][]*core.Entry{{seeded("new")}}, true},
+		{"new seed on beta", ancestor, [][]*core.Entry{{testingFile}, {nil, seeded("new")}}, true},
+		{"new seed with absorbed seed", ancestor, [][]*core.Entry{{seeded("absorbed"), seeded("new")}}, true},
+		{
+			"nested new seed",
+			ancestor,
+			[][]*core.Entry{{{Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{
+				"directory": {Kind: core.EntryKind_Directory, Contents: map[string]*core.Entry{"sub": seeded("new")}},
+			}}}},
+			true,
+		},
+		{"new seed on GitLink entry", ancestor, [][]*core.Entry{{testingSeededLink("new")}}, true},
+		{"new seed without ancestor", nil, [][]*core.Entry{{seeded("new")}}, true},
+		{"no seeds without ancestor", nil, [][]*core.Entry{{testingFile}}, false},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		if result := populatesSubmodules(test.ancestor, test.results...); result != test.expected {
+			t.Errorf("%s: incorrect result: %t != %t", test.description, result, test.expected)
+		}
+	}
+}
+
+// TestSynchronizeFlushHeldForPopulations tests that a flush isn't answered by a
+// synchronization cycle that populated submodules, which only provides their
+// clones, but rather by the first cycle that doesn't, by which point the
+// content that the other endpoint has in them, and submodules nested in them,
+// have followed. It also tests that populated submodules' contents aren't
+// staged, and that the scans receive the seeds that the ancestor carries.
+func TestSynchronizeFlushHeldForPopulations(t *testing.T) {
+	// Start with nothing to synchronize, but with clones for beta to populate
+	// submodules with, which differ from alpha's content.
+	alpha, beta := newTestingEndpoint(nil), newTestingEndpoint(nil)
+	beta.populations = map[string]*core.Entry{
+		"sub": testingSubmodule(testingSeededLink("first"), map[string]*core.Entry{
+			"x":      testingClonedFile,
+			"nested": testingDirectory(),
+		}),
+		"sub/nested": testingSubmodule(testingSeededLink("second"), map[string]*core.Entry{
+			"y": testingClonedFile,
+		}),
+	}
+	loop := startTestingLoop(t, testingGitMode, alpha, beta)
+	loop.waitForPolling()
+	loop.verify(1, nil, nil)
+
+	// Create a submodule on alpha, with a nested submodule, and uncommitted
+	// changes in both, and flush.
+	alpha.update(func() {
+		alpha.contents["sub"] = testingSubmodule(testingLink, map[string]*core.Entry{
+			"x":      testingFile,
+			"nested": testingSubmodule(testingLink, map[string]*core.Entry{"y": testingFile}),
+		})
+	})
+	loop.flush()
+
+	// The flush must have waited for three cycles: one that populated the
+	// submodule, one that populated the nested submodule and transferred the
+	// submodule's changes, and one that transferred the nested submodule's
+	// changes. Only the changes are staged.
+	loop.verifyCycles(4)
+	loop.verifyOperations("alpha", alpha, nil, nil)
+	loop.verifyOperations("beta", beta,
+		[][]string{{"sub/x"}, {"sub/nested/y"}},
+		[][]string{{"sub"}, {"sub/nested", "sub/x"}, {"sub/nested/y"}},
+	)
+	beta.update(func() {
+		sub := beta.contents["sub"]
+		if !sub.Contents["x"].Equal(testingFile, true) || !sub.Contents["nested"].Contents["y"].Equal(testingFile, true) {
+			t.Errorf("changes not synchronized: %v", sub)
+		}
+	})
+	loop.controller.stateLock.Lock()
+	conflicts := loop.controller.state.Conflicts
+	loop.controller.stateLock.UnlockWithoutNotify()
+	if len(conflicts) != 0 {
+		t.Errorf("unexpected conflicts: %v", conflicts)
+	}
+
+	// Every cycle of the flush must have forced full scans, which received the
+	// seeds as the ancestor absorbed them, as must the ancestor itself.
+	for name, endpoint := range map[string]*testingEndpoint{"alpha": alpha, "beta": beta} {
+		_, fullScans, _, _ := endpoint.status()
+		if fullScans != 3 {
+			t.Errorf("incorrect %s full scan count: %d", name, fullScans)
+		}
+		endpoint.update(func() {
+			expected := [][]string{{}, {}, {"first"}, {"first", "second"}}
+			if !slices.EqualFunc(endpoint.scanSeeds, expected, slices.Equal[[]string]) {
+				t.Errorf("incorrect seeds received by %s: %v != %v", name, endpoint.scanSeeds, expected)
+			}
+		})
+	}
+	seeds := loop.ancestor().GitLinkSeeds()
+	slices.Sort(seeds)
+	if !slices.Equal(seeds, []string{"first", "second"}) {
+		t.Errorf("incorrect seeds in ancestor: %v", seeds)
+	}
+
+	// No more cycles occur on their own.
+	loop.waitForPolling()
+	loop.verifyCycles(4)
+}
+
+// TestSynchronizeFlushHeldForRulesAfterPopulation tests that a flush is held
+// for a cycle that only delivers rules after a cycle that populated
+// submodules, even if an earlier cycle of the same flush only delivered rules
+// too. The population makes progress, so it's a new opportunity to deliver
+// rules, which the submodule's uncommitted rule files require, and without
+// which the rest of the submodule's content wouldn't follow before the flush
+// is answered.
+func TestSynchronizeFlushHeldForRulesAfterPopulation(t *testing.T) {
+	// Start with nothing to synchronize, but with a clone for beta to populate
+	// a submodule with, which lacks the submodule's rule file.
+	alpha, beta := newTestingEndpoint(nil), newTestingEndpoint(nil)
+	beta.populations = map[string]*core.Entry{
+		"sub": testingSubmodule(testingSeededLink("seed"), map[string]*core.Entry{"x": testingClonedFile}),
+	}
+	loop := startTestingLoop(t, testingGitMode, alpha, beta)
+	loop.waitForPolling()
+	loop.verify(1, nil, nil)
+
+	// Create a rule file on alpha, along with a submodule that has an
+	// uncommitted rule file and an uncommitted change, and flush.
+	alpha.update(func() {
+		alpha.contents[testingFileRules] = testingFile
+		alpha.contents["sub"] = testingSubmodule(testingLink, map[string]*core.Entry{
+			testingFileRules: testingFile,
+			"x":              testingFile,
+		})
+	})
+	loop.flush()
+
+	// The flush must have waited for the rule file to be delivered, for the
+	// submodule to be populated, for the submodule's rule file to be
+	// delivered, and only then for the submodule's change. A cycle that only
+	// delivers rules forces another cycle even without a flush, so the cycles
+	// that the flush held are identified by their full scans, once the loop
+	// has settled.
+	loop.waitForPolling()
+	loop.verifyCycles(5)
+	loop.verifyOperations("beta", beta,
+		[][]string{{testingFileRules}, {"sub/" + testingFileRules}, {"sub/x"}},
+		[][]string{{testingFileRules}, {"sub"}, {"sub/" + testingFileRules}, {"sub/x"}},
+	)
+	for name, endpoint := range map[string]*testingEndpoint{"alpha": alpha, "beta": beta} {
+		if _, fullScans, _, _ := endpoint.status(); fullScans != 4 {
+			t.Errorf("incorrect %s full scan count: %d", name, fullScans)
+		}
+	}
+}
+
+// TestSynchronizeFlushNotHeldForFailedPopulation tests that a population that
+// fails doesn't hold a flush, which is then answered with the failure, and
+// doesn't cause any further cycles.
+func TestSynchronizeFlushNotHeldForFailedPopulation(t *testing.T) {
+	alpha, beta := newTestingEndpoint(nil), newTestingEndpoint(nil)
+	beta.populations = map[string]*core.Entry{"sub": nil}
+	loop := startTestingLoop(t, testingGitMode, alpha, beta)
+	loop.waitForPolling()
+	alpha.update(func() {
+		alpha.contents["sub"] = testingSubmodule(testingLink, map[string]*core.Entry{"x": testingFile})
+	})
+	loop.flush()
+	loop.verifyCycles(2)
+	loop.verifyOperations("beta", beta, nil, [][]string{{"sub"}})
+	loop.waitForPolling()
+	loop.verifyCycles(2)
+}
+
 // TestSynchronizeAbsorbsReportedPopulation tests that a population that an
 // endpoint reports in its snapshot, because the session stopped before saving
 // the ancestor that the population yielded, is used as the ancestor's content

@@ -1464,6 +1464,14 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.state.BetaState.TransitionProblems = βProblems
 		c.stateLock.Unlock()
 
+		// Determine whether or not this cycle populated any submodules, which is
+		// the case if a transition result carries a seed that the ancestor
+		// doesn't. A population only yields the content of the clone, so the
+		// content that the other endpoint has in the submodule (such as
+		// uncommitted changes) follows in the next cycle, and so do any
+		// submodules nested within it, so another cycle is necessary.
+		populatedSubmodules := gitMode && populatesSubmodules(ancestor, αResults, βResults)
+
 		// Fold applied changes into the ancestor's change list and update the
 		// ancestor if any changes are present. Any changes that absorb
 		// populations come first, since the other changes were computed against
@@ -1540,6 +1548,19 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			skippingPollingDueToRuleOnlyCycle = false
 		}
 
+		// If this cycle populated submodules, then skip polling and run another
+		// synchronization cycle immediately, because the content that the
+		// other endpoint has in them, and any submodules nested in them, only
+		// follow in the next cycle, and nothing else may come along to trigger
+		// it. Unlike a cycle that only delivers rules, this can't continue
+		// indefinitely: each such cycle populates submodules that the previous
+		// one didn't, and a failed population doesn't count, so the number of
+		// such cycles in a row is limited by how deeply submodules are nested.
+		if populatedSubmodules {
+			c.logger.Debug("Populated submodules, skipping polling")
+			skipPolling = true
+		}
+
 		// Increment the synchronization cycle count.
 		c.stateLock.Lock()
 		c.state.SuccessfulCycles++
@@ -1556,8 +1577,25 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		// and because polling would overwrite the request with any new one that
 		// it receives. Holding the request also keeps the next cycle's scan a
 		// full one.
+		//
+		// Likewise, a cycle that populated submodules only provided their clones,
+		// so we hold the request until a cycle that doesn't, which has
+		// synchronized the content that the other endpoint has in them and
+		// populated any nested submodules. As above, this can't continue
+		// indefinitely, so there's no limit. A population is progress, after
+		// which the next cycle may only deliver rules (such as uncommitted rule
+		// files in the submodules), so it resets the limit on holding the
+		// request for such cycles, which only applies to consecutive ones.
+		// Otherwise, a cycle that only delivered rules earlier in the same
+		// flush would make that cycle answer the request, before the rest of
+		// the submodules' content had followed. The number of such cycles is
+		// still limited by how deeply submodules are nested.
 		if flushRequest != nil {
-			if ruleOnlyCycle && !flushHeldDueToRuleOnlyCycle {
+			if populatedSubmodules {
+				c.logger.Debug("Populated submodules, holding flush request for another cycle")
+				flushHeldDueToRuleOnlyCycle = false
+				skipPolling = true
+			} else if ruleOnlyCycle && !flushHeldDueToRuleOnlyCycle {
 				c.logger.Debug("Only delivered ignore rules, holding flush request for another cycle")
 				flushHeldDueToRuleOnlyCycle = true
 				skipPolling = true
@@ -1568,4 +1606,27 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			}
 		}
 	}
+}
+
+// populatesSubmodules determines whether or not transition results include the
+// population of a submodule, which is the case if they carry a seed that the
+// ancestor (as it was before the transitions) doesn't.
+func populatesSubmodules(ancestor *core.Entry, results ...[]*core.Entry) bool {
+	var absorbed map[string]bool
+	for _, endpointResults := range results {
+		for _, result := range endpointResults {
+			for _, seed := range result.GitLinkSeeds() {
+				if absorbed == nil {
+					absorbed = make(map[string]bool)
+					for _, existing := range ancestor.GitLinkSeeds() {
+						absorbed[existing] = true
+					}
+				}
+				if !absorbed[seed] {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

@@ -66,6 +66,11 @@ type testingEndpoint struct {
 	// synchronization cycle performs at most one such operation on an endpoint,
 	// and only if it has transitions.
 	transitioned [][]string
+	// populations maps paths to the results of the transitions that populate
+	// submodules at them, which are what clones contain, rather than what was
+	// requested. A nil result is a failed population, which yields the old
+	// content. Transitions for other paths yield what was requested.
+	populations map[string]*core.Entry
 	// seeds are the populations that the endpoint reports in its snapshots
 	// (see core.Snapshot.Seeds). Like an endpoint's records of populations,
 	// each is discarded by the first scan that receives its seed.
@@ -161,11 +166,17 @@ func (e *testingEndpoint) Transition(_ context.Context, transitions []*core.Chan
 			continue
 		}
 		results[t] = transition.New
+		if population, ok := e.populations[transition.Path]; ok && transition.New.IsSubmodule() {
+			results[t] = population
+			if population == nil {
+				results[t] = transition.Old
+			}
+		}
 		var root *core.Entry
 		if !e.rootMissing {
 			root = &core.Entry{Kind: core.EntryKind_Directory, Contents: e.contents}
 		}
-		root, err := core.Apply(root, []*core.Change{{Path: transition.Path, New: transition.New}})
+		root, err := core.Apply(root, []*core.Change{{Path: transition.Path, New: results[t]}})
 		if err != nil {
 			return nil, nil, false, err
 		}
