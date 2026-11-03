@@ -232,11 +232,13 @@ func (i *ignorer) load(directory string) *ruleSet {
 
 // traversable determines whether or not a scan would reach a path as a
 // directory, given the path of its parent, which must have been checked before
-// it. A scan doesn't follow symbolic links, so what's at a link's target, which
-// can be anything, including a cycle or another directory's rules, has nothing
-// to do with the paths beneath the link, and rule files mustn't be read through
-// it. The root itself is always traversed, since a symbolic link there is how
-// the user has chosen to specify it.
+// it. Paths are also evaluated when something else is in the way of a directory
+// that's yet to be created, such as a symbolic link that's about to be replaced
+// by one. A scan doesn't follow symbolic links, so what's at a link's target,
+// which can be anything, including a cycle or another directory's rules, has
+// nothing to do with the paths beneath the link, and rule files mustn't be read
+// through it. The root itself is always traversed, since a symbolic link there
+// is how the user has chosen to specify it.
 func (i *ignorer) traversable(directory, parent string) (bool, error) {
 	if directory == "" {
 		return true, nil

@@ -587,6 +587,23 @@ func isolateGit(t *testing.T) {
 	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.org")
 }
 
+// verifySingleProblem verifies that a list of problems consists of one problem,
+// for the specified path, whose message contains the specified strings.
+func verifySingleProblem(t *testing.T, problems []*core.Problem, path string, contents ...string) {
+	t.Helper()
+	if len(problems) != 1 {
+		t.Fatalf("incorrect number of problems: %v", problems)
+	}
+	if problems[0].Path != path {
+		t.Errorf("incorrect problem path: %q != %q", problems[0].Path, path)
+	}
+	for _, content := range contents {
+		if !strings.Contains(problems[0].Error, content) {
+			t.Errorf("problem doesn't contain %q: %s", content, problems[0].Error)
+		}
+	}
+}
+
 // newGitRoot creates a root for an endpoint with the specified files.
 func newGitRoot(t *testing.T, files map[string]string) string {
 	t.Helper()

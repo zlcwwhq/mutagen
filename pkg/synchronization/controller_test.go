@@ -648,8 +648,8 @@ func TestSynchronizeFlushNotHeldWithoutDeliveries(t *testing.T) {
 
 // TestSynchronizeWarnings tests that snapshot warnings are reported as scan
 // problems, along with the problems in the snapshot's content, that they're
-// sorted and truncated as such, that they remain identifiable as warnings, and
-// that they don't outlive the snapshot.
+// sorted after those problems and truncated like them, that they remain
+// identifiable as warnings, and that they don't outlive the snapshot.
 func TestSynchronizeWarnings(t *testing.T) {
 	alpha := newTestingEndpoint(map[string]*core.Entry{"problematic": {Kind: core.EntryKind_Problematic, Problem: "unreadable"}})
 	alpha.warnings = []*core.Problem{{Path: "warned", Error: "warning", Warning: true}, {Path: "a", Error: "another warning", Warning: true}}
@@ -665,7 +665,7 @@ func TestSynchronizeWarnings(t *testing.T) {
 	loop.controller.stateLock.UnlockWithoutNotify()
 	core.SortProblems(alphaProblems)
 	if len(alphaProblems) != 3 ||
-		alphaProblems[0].Path != "a" || alphaProblems[1].Path != "problematic" || alphaProblems[2].Path != "warned" {
+		alphaProblems[0].Path != "problematic" || alphaProblems[1].Path != "a" || alphaProblems[2].Path != "warned" {
 		t.Errorf("incorrect alpha scan problems: %v", alphaProblems)
 	}
 	if len(betaProblems) != 1 || betaProblems[0].Error != "beta warning" {
@@ -681,10 +681,10 @@ func TestSynchronizeWarnings(t *testing.T) {
 		paths = append(paths, problem.Path)
 		warnings = append(warnings, problem.Warning)
 	}
-	if !slices.Equal(paths, []string{"a", "problematic", "warned", "file"}) {
+	if !slices.Equal(paths, []string{"problematic", "a", "warned", "file"}) {
 		t.Errorf("incorrect report paths: %v", paths)
 	}
-	if !slices.Equal(warnings, []bool{true, false, true, true}) {
+	if !slices.Equal(warnings, []bool{false, true, true, true}) {
 		t.Errorf("incorrect report warning indications: %v", warnings)
 	}
 	if alpha.warnings[0].Path != "warned" {

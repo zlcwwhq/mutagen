@@ -45,4 +45,19 @@ func TestCopyProblemsPreservesWarnings(t *testing.T) {
 
 // TODO: Implement TestCopyProblems.
 
-// TODO: Implement TestSortProblems.
+// TestSortProblems tests that SortProblems sorts problems by path, with warnings
+// following all other problems.
+func TestSortProblems(t *testing.T) {
+	problems := []*Problem{
+		{Path: "a", Error: "warning", Warning: true},
+		{Path: "c", Error: "error"},
+		{Path: "d", Error: "warning", Warning: true},
+		{Path: "b", Error: "error"},
+	}
+	SortProblems(problems)
+	for p, expected := range []string{"b", "c", "a", "d"} {
+		if problems[p].Path != expected {
+			t.Errorf("incorrect problem at index %d: %q != %q", p, problems[p].Path, expected)
+		}
+	}
+}

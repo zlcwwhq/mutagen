@@ -1280,6 +1280,24 @@ func (e *endpoint) Stage(paths []string, digests [][]byte) ([]string, []*rsync.S
 	// Release the scan lock.
 	e.unlockScanLock()
 
+	// In Git mode, don't transfer files that this endpoint won't write, either
+	// because its own rules exclude them or because they can't be evaluated,
+	// including those for paths that don't exist yet. Transition reports these
+	// paths, one by one, and this mustn't fail for them, because that would end
+	// the synchronization cycle for every other path.
+	if e.gitMode {
+		ignorer := gitignore.NewIgnorer(e.root, e.ignorer)
+		var receivablePaths []string
+		var receivableDigests [][]byte
+		for p, path := range paths {
+			if gitReceivableFile(ignorer, path) {
+				receivablePaths = append(receivablePaths, path)
+				receivableDigests = append(receivableDigests, digests[p])
+			}
+		}
+		paths, digests = receivablePaths, receivableDigests
+	}
+
 	// Inform the stager that we're about to begin staging and transition
 	// operations.
 	if err := e.stager.Initialize(); err != nil {
@@ -1364,10 +1382,27 @@ func (e *endpoint) Supply(paths []string, signatures []*rsync.Signature, receive
 // endpoint's transition parameters. It returns the results of core.Transition.
 // It doesn't require the scan lock (see Transition).
 func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool) {
-	return core.Transition(
+	// In Git mode, limit the changes to what this endpoint may write according
+	// to its rules as they are now, before anything on disk changes, so that a
+	// refused change's old content stays in place.
+	applicable := transitions
+	var pruned []*core.Change
+	var problems []*core.Problem
+	if e.gitMode {
+		pruned, problems = pruneGitTransitions(gitignore.NewIgnorer(e.root, e.ignorer), transitions)
+		applicable = make([]*core.Change, 0, len(pruned))
+		for _, change := range pruned {
+			if change != nil {
+				applicable = append(applicable, change)
+			}
+		}
+	}
+
+	// Apply the changes.
+	applied, transitionProblems, missing := core.Transition(
 		ctx,
 		e.root,
-		transitions,
+		applicable,
 		e.lastReturnedScanCache,
 		e.transitionHasher,
 		e.symbolicLinkMode,
@@ -1377,6 +1412,21 @@ func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) (
 		e.lastReturnedScanSnapshotDecomposesUnicode,
 		e.stager,
 	)
+	if !e.gitMode {
+		return applied, transitionProblems, missing
+	}
+
+	// There has to be a result for each of the original transitions, and applied
+	// has one for each applicable change, in the same order.
+	results := make([]*core.Entry, len(transitions))
+	for t, change := range pruned {
+		if change == nil {
+			results[t] = transitions[t].Old
+		} else {
+			results[t], applied = applied[0], applied[1:]
+		}
+	}
+	return results, append(problems, transitionProblems...), missing
 }
 
 // transitionWithinMaximumEntryCount performs transitions on the

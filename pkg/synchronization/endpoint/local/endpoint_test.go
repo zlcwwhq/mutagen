@@ -172,18 +172,18 @@ func verifyTargetStagingEmpty(t *testing.T) {
 	}
 }
 
-// propagate propagates the content of the source endpoint's root to the target
-// endpoint in the same sequence as the controller: it scans both endpoints,
-// stages on the target, supplies from the source, and transitions the target.
-// Changes are computed for the top-level names whose content differs, which
-// stands in for reconciliation with the (flat) hierarchies used in tests. If
-// beforeTransition is non-nil, it's invoked immediately before the target's
-// transition, which allows tests to simulate concurrent modifications. It
-// verifies that the transition's results correspond to the changes in order,
-// and it returns any problems reported by the transition, or the error returned
-// by the target's staging, in which case no transition is performed (as in the
-// controller). Any other failure is fatal to the test.
-func propagate(t *testing.T, source, target synchronization.Endpoint, beforeTransition func()) ([]*core.Problem, error) {
+// propagateChanges propagates the content of the source endpoint's root to the
+// target endpoint in the same sequence as the controller: it scans both
+// endpoints, stages on the target, supplies from the source, and transitions
+// the target. Changes are computed for the top-level names whose content
+// differs, which stands in for reconciliation with the (flat) hierarchies used
+// in tests. If beforeTransition is non-nil, it's invoked immediately before the
+// target's transition, which allows tests to simulate concurrent modifications.
+// It returns the changes, the transition's results, and any problems reported
+// by the transition, or the error returned by the target's staging, in which
+// case no transition is performed (as in the controller). Any other failure is
+// fatal to the test.
+func propagateChanges(t *testing.T, source, target synchronization.Endpoint, beforeTransition func()) ([]*core.Change, []*core.Entry, []*core.Problem, error) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -219,7 +219,7 @@ func propagate(t *testing.T, source, target synchronization.Endpoint, beforeTran
 	if paths, digests := core.TransitionDependencies(changes); len(paths) > 0 {
 		filteredPaths, signatures, receiver, err := target.Stage(paths, digests)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		if len(filteredPaths) > 0 {
 			if err := source.Supply(filteredPaths, signatures, receiver); err != nil {
@@ -239,6 +239,18 @@ func propagate(t *testing.T, source, target synchronization.Endpoint, beforeTran
 		t.Fatal("staged files missing during transition")
 	} else if len(results) != len(changes) {
 		t.Fatalf("transition result count (%d) doesn't match change count (%d)", len(results), len(changes))
+	}
+	return changes, results, problems, nil
+}
+
+// propagate performs propagateChanges, verifies that the transition's results
+// correspond to the changes in order, and returns any problems reported by the
+// transition, or the error returned by the target's staging.
+func propagate(t *testing.T, source, target synchronization.Endpoint, beforeTransition func()) ([]*core.Problem, error) {
+	t.Helper()
+	changes, results, problems, err := propagateChanges(t, source, target, beforeTransition)
+	if err != nil {
+		return nil, err
 	}
 
 	// Verify that the results line up with the changes, i.e. that each result
