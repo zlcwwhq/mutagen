@@ -1067,17 +1067,18 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.state.Status = Status_Scanning
 		c.stateLock.Unlock()
 		forceFullScan := flushRequest != nil
+		seeds := ancestor.GitLinkSeeds()
 		var αSnapshot, βSnapshot *core.Snapshot
 		var αScanErr, βScanErr error
 		var αTryAgain, βTryAgain bool
 		scanDone := &sync.WaitGroup{}
 		scanDone.Add(2)
 		go func() {
-			αSnapshot, αScanErr, αTryAgain = alpha.Scan(ctx, ancestor, forceFullScan)
+			αSnapshot, αScanErr, αTryAgain = alpha.Scan(ctx, ancestor, seeds, forceFullScan)
 			scanDone.Done()
 		}()
 		go func() {
-			βSnapshot, βScanErr, βTryAgain = beta.Scan(ctx, ancestor, forceFullScan)
+			βSnapshot, βScanErr, βTryAgain = beta.Scan(ctx, ancestor, seeds, forceFullScan)
 			scanDone.Done()
 		}()
 		scanDone.Wait()
@@ -1224,6 +1225,28 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			c.state.Status = Status_HaltedOnRootEmptied
 			c.stateLock.Unlock()
 			return errHaltedForSafety
+		}
+
+		// In Git mode, an endpoint may report that it populated submodules with
+		// clones whose content the ancestor hasn't absorbed, which happens if the
+		// session stopped between a transition that populated a submodule and
+		// the saving of the ancestor that it yielded. That content is the merge
+		// base for the submodule, without which the other endpoint's changes to
+		// it (such as uncommitted edits and deletions) would conflict with the
+		// clone or be undone by it, so we put it in the ancestor before
+		// reconciling. The changes are also recorded as ancestor changes, so
+		// that the ancestor is saved at the end of this cycle, because the
+		// endpoint discards its record once a scan sees the ancestor carry it.
+		var seedChanges []*core.Change
+		if gitMode {
+			if seedChanges = core.SeedChanges(ancestor, αSnapshot.Seeds, βSnapshot.Seeds); len(seedChanges) > 0 {
+				c.logger.Debugf("Absorbing %d change(s) from unabsorbed submodule populations", len(seedChanges))
+				if seeded, err := core.Apply(ancestor, seedChanges); err != nil {
+					return fmt.Errorf("unable to absorb submodule populations: %w", err)
+				} else {
+					ancestor = seeded
+				}
+			}
 		}
 
 		// Perform reconciliation.
@@ -1442,7 +1465,10 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.stateLock.Unlock()
 
 		// Fold applied changes into the ancestor's change list and update the
-		// ancestor if any changes are present.
+		// ancestor if any changes are present. Any changes that absorb
+		// populations come first, since the other changes were computed against
+		// an ancestor that included them.
+		ancestorChanges = append(seedChanges, ancestorChanges...)
 		ancestorChanges = append(ancestorChanges, αChanges...)
 		ancestorChanges = append(ancestorChanges, βChanges...)
 		if len(ancestorChanges) > 0 {

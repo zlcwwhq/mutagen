@@ -1067,7 +1067,7 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 }
 
 // Scan implements the Scan method for local endpoints.
-func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, full bool) (*core.Snapshot, error, bool) {
+func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, seeds []string, full bool) (*core.Snapshot, error, bool) {
 	// Compute the snapshot.
 	snapshot, err, tryAgain := e.lockAndScan(ctx, full)
 	if err != nil {

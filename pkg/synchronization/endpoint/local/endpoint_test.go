@@ -188,11 +188,11 @@ func propagateChanges(t *testing.T, source, target synchronization.Endpoint, bef
 	ctx := context.Background()
 
 	// Scan both endpoints.
-	sourceSnapshot, err, _ := source.Scan(ctx, nil, true)
+	sourceSnapshot, err, _ := source.Scan(ctx, nil, nil, true)
 	if err != nil {
 		t.Fatal("unable to scan source:", err)
 	}
-	targetSnapshot, err, _ := target.Scan(ctx, nil, true)
+	targetSnapshot, err, _ := target.Scan(ctx, nil, nil, true)
 	if err != nil {
 		t.Fatal("unable to scan target:", err)
 	}
@@ -414,7 +414,7 @@ func TestEndpointMaximumEntryCount(t *testing.T) {
 
 			// Verify that the target scans successfully with the expected entry
 			// count (the root and its files).
-			snapshot, err, _ := target.Scan(context.Background(), nil, true)
+			snapshot, err, _ := target.Scan(context.Background(), nil, nil, true)
 			if err != nil {
 				t.Fatal("unable to rescan target:", err)
 			} else if count, expected := snapshot.Content.Count(), uint64(1+len(testCase.expected)); count != expected {
@@ -574,7 +574,7 @@ func verifyKinds(t *testing.T, snapshot *core.Snapshot, expected map[string]core
 // scanEndpoint performs a scan that must succeed.
 func scanEndpoint(t *testing.T, e *endpoint, full bool) *core.Snapshot {
 	t.Helper()
-	snapshot, err, _ := e.Scan(context.Background(), nil, full)
+	snapshot, err, _ := e.Scan(context.Background(), nil, nil, full)
 	if err != nil {
 		t.Fatal("scan failed:", err)
 	}

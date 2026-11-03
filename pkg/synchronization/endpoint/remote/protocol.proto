@@ -54,6 +54,9 @@ message ScanRequest {
     // Full indicates whether or not to force a full (warm) scan, temporarily
     // avoiding any acceleration that might be available on the endpoint.
     bool full = 2;
+    // Seeds are the seeds that the ancestor's GitLink entries carry. See the
+    // seeds parameter of synchronization.Endpoint.Scan.
+    repeated string seeds = 3;
 }
 
 // ScanCompletionRequest is paired with a ScanRequest and indicates a request

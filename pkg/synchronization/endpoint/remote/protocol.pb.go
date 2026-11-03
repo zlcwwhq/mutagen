@@ -283,7 +283,10 @@ type ScanRequest struct {
 	BaselineSnapshotSignature *rsync.Signature `protobuf:"bytes,1,opt,name=baselineSnapshotSignature,proto3" json:"baselineSnapshotSignature,omitempty"`
 	// Full indicates whether or not to force a full (warm) scan, temporarily
 	// avoiding any acceleration that might be available on the endpoint.
-	Full          bool `protobuf:"varint,2,opt,name=full,proto3" json:"full,omitempty"`
+	Full bool `protobuf:"varint,2,opt,name=full,proto3" json:"full,omitempty"`
+	// Seeds are the seeds that the ancestor's GitLink entries carry. See the
+	// seeds parameter of synchronization.Endpoint.Scan.
+	Seeds         []string `protobuf:"bytes,3,rep,name=seeds,proto3" json:"seeds,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -330,6 +333,13 @@ func (x *ScanRequest) GetFull() bool {
 		return x.Full
 	}
 	return false
+}
+
+func (x *ScanRequest) GetSeeds() []string {
+	if x != nil {
+		return x.Seeds
+	}
+	return nil
 }
 
 // ScanCompletionRequest is paired with a ScanRequest and indicates a request
@@ -883,10 +893,11 @@ const file_synchronization_endpoint_remote_protocol_proto_rawDesc = "" +
 	"\vPollRequest\"\x17\n" +
 	"\x15PollCompletionRequest\"$\n" +
 	"\fPollResponse\x12\x14\n" +
-	"\x05error\x18\x01 \x01(\tR\x05error\"q\n" +
+	"\x05error\x18\x01 \x01(\tR\x05error\"\x87\x01\n" +
 	"\vScanRequest\x12N\n" +
 	"\x19baselineSnapshotSignature\x18\x01 \x01(\v2\x10.rsync.SignatureR\x19baselineSnapshotSignature\x12\x12\n" +
-	"\x04full\x18\x02 \x01(\bR\x04full\"\x17\n" +
+	"\x04full\x18\x02 \x01(\bR\x04full\x12\x14\n" +
+	"\x05seeds\x18\x03 \x03(\tR\x05seeds\"\x17\n" +
 	"\x15ScanCompletionRequest\"x\n" +
 	"\fScanResponse\x126\n" +
 	"\rsnapshotDelta\x18\x01 \x03(\v2\x10.rsync.OperationR\rsnapshotDelta\x12\x14\n" +
