@@ -21,6 +21,10 @@ type reconciler struct {
 	// mode is the synchronization mode to use when determining directionality
 	// and conflict resolution behavior.
 	mode SynchronizationMode
+	// gitMode indicates that content can be untracked because of ignore rules
+	// that are read separately on each endpoint, and that may thus temporarily
+	// disagree between them.
+	gitMode bool
 	// ancestorChanges are the changes to be applied to the ancestor.
 	ancestorChanges []*Change
 	// alphaChanges are the changes to be applied to alpha.
@@ -65,6 +69,31 @@ func (r *reconciler) reconcile(path string, ancestor, alpha, beta *Entry) {
 			r.ancestorChanges = append(r.ancestorChanges, &Change{Path: path})
 		}
 		return
+	}
+
+	// In Git mode, whether or not content is untracked depends on ignore rules
+	// that each endpoint reads for itself from its own filesystem, so the
+	// endpoints routinely disagree about it: one endpoint receives a new rule
+	// before the other, and an exclude file exists on one endpoint only.
+	// Without intervention, content that's tracked in the ancestor, untracked
+	// on one side, and unchanged on the other would look like a deletion and be
+	// propagated, deleting the other side's files just because a rule reached
+	// this side first. Thus, if either side is untracked at this path, then we
+	// don't propagate anything to or from that side, and we also don't report a
+	// conflict, since there's nothing to resolve. We clear the ancestor,
+	// because the path is no longer being tracked, and this also means that if
+	// the rule goes away, the content on both sides will be reconciled as if
+	// the session had just been created, which can't propagate a deletion
+	// either.
+	if r.gitMode {
+		alphaUntracked := alpha != nil && alpha.Kind == EntryKind_Untracked
+		betaUntracked := beta != nil && beta.Kind == EntryKind_Untracked
+		if alphaUntracked || betaUntracked {
+			if ancestor != nil {
+				r.ancestorChanges = append(r.ancestorChanges, &Change{Path: path})
+			}
+			return
+		}
 	}
 
 	// Check if alpha and beta agree on the contents of this path. If so, then
@@ -521,9 +550,19 @@ func (r *reconciler) handleDisagreementOneWayReplica(path string, ancestor, alph
 // changes for the ancestor, alpha, and beta, as well as a list of conflicts.
 // All of these lists are returned in depth-first but non-deterministic order.
 func Reconcile(ancestor, alpha, beta *Entry, mode SynchronizationMode) ([]*Change, []*Change, []*Change, []*Conflict) {
-	// Create the reconciler.
-	r := &reconciler{mode: mode}
+	return (&reconciler{mode: mode}).run(ancestor, alpha, beta)
+}
 
+// ReconcileGitMode is a variant of Reconcile for sessions in Git mode, whose
+// ignore rules are read separately on each endpoint. It never propagates
+// anything to or from a side on which a path is untracked, so a rule that has
+// only reached one endpoint can't cause content to be deleted on the other.
+func ReconcileGitMode(ancestor, alpha, beta *Entry, mode SynchronizationMode) ([]*Change, []*Change, []*Change, []*Conflict) {
+	return (&reconciler{mode: mode, gitMode: true}).run(ancestor, alpha, beta)
+}
+
+// run performs reconciliation on the root and returns the resulting lists.
+func (r *reconciler) run(ancestor, alpha, beta *Entry) ([]*Change, []*Change, []*Change, []*Conflict) {
 	// Perform reconciliation.
 	r.reconcile("", ancestor, alpha, beta)
 

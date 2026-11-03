@@ -6,8 +6,10 @@ import (
 
 // oneEndpointEmptiedRoot determines whether or not one endpoint (but not both)
 // transitioned from a directory root with a non-trivial amount of content to a
-// directory root without any content.
-func oneEndpointEmptiedRoot(ancestor, alpha, beta *core.Entry) bool {
+// directory root without any content. If gitMode is true, then a root can also
+// count as being without content if all that remains in it is untracked (see
+// rootEmptied).
+func oneEndpointEmptiedRoot(ancestor, alpha, beta *core.Entry, gitMode bool) bool {
 	// Check that all three entries are directories. If not, then this check
 	// doesn't apply.
 	if ancestor == nil || ancestor.Kind != core.EntryKind_Directory {
@@ -27,13 +29,37 @@ func oneEndpointEmptiedRoot(ancestor, alpha, beta *core.Entry) bool {
 	}
 
 	// Check if alpha deleted all content within the root.
-	alphaEmptied := len(alpha.Contents) == 0
+	alphaEmptied := rootEmptied(ancestor, alpha, gitMode)
 
 	// Check if beta deleted all content within the root.
-	betaEmptied := len(beta.Contents) == 0
+	betaEmptied := rootEmptied(ancestor, beta, gitMode)
 
 	// Determine whether one (and only one) endpoint emptied root content.
 	return (alphaEmptied || betaEmptied) && !(alphaEmptied && betaEmptied)
+}
+
+// rootEmptied determines whether or not an endpoint's directory root has been
+// emptied relative to the ancestor's directory root. A root that doesn't have
+// any contents has always been emptied. In Git mode, untracked content doesn't
+// prevent this conclusion, because a repository's untracked .git entry survives
+// the deletion of everything else in a root, but only if the untracked content
+// has names that the ancestor doesn't: the ancestor only contains synchronized
+// content, so an untracked entry with a name in the ancestor was hidden by an
+// ignore rule rather than deleted, and it's still there.
+func rootEmptied(ancestor, root *core.Entry, gitMode bool) bool {
+	if len(root.Contents) == 0 {
+		return true
+	} else if !gitMode {
+		return false
+	}
+	for name, entry := range root.Contents {
+		if entry.Kind != core.EntryKind_Untracked {
+			return false
+		} else if _, tracked := ancestor.Contents[name]; tracked {
+			return false
+		}
+	}
+	return true
 }
 
 // containsRootDeletion determines whether or not any of the specified changes
