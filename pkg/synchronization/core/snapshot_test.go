@@ -97,3 +97,98 @@ func TestSnapshotConsistentSerialization(t *testing.T) {
 		t.Error("snapshot marshalling is not consistent")
 	}
 }
+
+// TestSnapshotWarningsEnsureValid tests that Snapshot.EnsureValid validates
+// warnings.
+func TestSnapshotWarningsEnsureValid(t *testing.T) {
+	valid := &Snapshot{Warnings: []*Problem{{Path: "path", Error: "error"}}}
+	if err := valid.EnsureValid(); err != nil {
+		t.Error("snapshot with valid warning classified as invalid:", err)
+	}
+	for _, warnings := range [][]*Problem{{nil}, {{Path: "path"}}} {
+		if (&Snapshot{Warnings: warnings}).EnsureValid() == nil {
+			t.Errorf("snapshot with invalid warnings classified as valid: %v", warnings)
+		}
+	}
+}
+
+// TestSnapshotEqualIgnoresWarnings tests that warnings don't participate in
+// snapshot equality.
+func TestSnapshotEqualIgnoresWarnings(t *testing.T) {
+	without := &Snapshot{Content: tD1, PreservesExecutability: true}
+	with := without.WithWarnings([]*Problem{{Path: "path", Error: "error"}})
+	if !without.Equal(with) || !with.Equal(without) {
+		t.Error("snapshots differing only in warnings not considered equal")
+	}
+}
+
+// TestSnapshotWithWarnings tests that Snapshot.WithWarnings copies every other
+// field of the snapshot, including any that are added in the future, without
+// modifying the original.
+func TestSnapshotWithWarnings(t *testing.T) {
+	// Create a snapshot with every field populated.
+	original := &Snapshot{
+		Content:                tD1,
+		PreservesExecutability: true,
+		DecomposesUnicode:      true,
+		Directories:            1,
+		Files:                  2,
+		SymbolicLinks:          3,
+		TotalFileSize:          4,
+		Warnings:               []*Problem{{Path: "old", Error: "old warning"}},
+	}
+	reflected := original.ProtoReflect()
+	fields := reflected.Descriptor().Fields()
+	warningsField := fields.ByName("warnings")
+	for f := 0; f < fields.Len(); f++ {
+		if !reflected.Has(fields.Get(f)) {
+			t.Fatalf("field %s not populated by test", fields.Get(f).Name())
+		}
+	}
+
+	// Add new warnings and verify the result.
+	warnings := []*Problem{{Path: "new", Error: "new warning"}}
+	result := original.WithWarnings(warnings)
+	if result == original {
+		t.Fatal("snapshot not copied")
+	}
+	reflectedResult := result.ProtoReflect()
+	for f := 0; f < fields.Len(); f++ {
+		field := fields.Get(f)
+		if field == warningsField {
+			continue
+		} else if !reflectedResult.Get(field).Equal(reflected.Get(field)) {
+			t.Errorf("field %s not copied", field.Name())
+		}
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0] != warnings[0] {
+		t.Errorf("incorrect warnings in result: %v", result.Warnings)
+	}
+	if len(original.Warnings) != 1 || original.Warnings[0].Path != "old" {
+		t.Errorf("original warnings modified: %v", original.Warnings)
+	}
+}
+
+// TestSnapshotWarningsSerialization tests that warnings survive the
+// serialization that's used to transmit snapshots from remote endpoints.
+func TestSnapshotWarningsSerialization(t *testing.T) {
+	marshaling := proto.MarshalOptions{Deterministic: true}
+	data, err := marshaling.Marshal(&Snapshot{
+		Content:  tD1,
+		Warnings: []*Problem{{Path: "first", Error: "first warning", Warning: true}, {Path: "second", Error: "second warning"}},
+	})
+	if err != nil {
+		t.Fatal("unable to marshal snapshot:", err)
+	}
+	snapshot := &Snapshot{}
+	if err := proto.Unmarshal(data, snapshot); err != nil {
+		t.Fatal("unable to unmarshal snapshot:", err)
+	} else if err := snapshot.EnsureValid(); err != nil {
+		t.Fatal("unmarshaled snapshot invalid:", err)
+	}
+	if len(snapshot.Warnings) != 2 ||
+		snapshot.Warnings[0].Path != "first" || snapshot.Warnings[0].Error != "first warning" || !snapshot.Warnings[0].Warning ||
+		snapshot.Warnings[1].Path != "second" || snapshot.Warnings[1].Error != "second warning" || snapshot.Warnings[1].Warning {
+		t.Errorf("incorrect warnings after serialization: %v", snapshot.Warnings)
+	}
+}

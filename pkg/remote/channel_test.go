@@ -1025,8 +1025,11 @@ func TestFlush(t *testing.T) {
 			Beta:  []Change{{Path: "out/log", Old: "file", New: "file"}},
 		}},
 		ExcludedConflicts: 2,
-		Problems:          []Problem{{Alpha: true, Path: "secret", Error: "permission denied"}},
-		ExcludedProblems:  1,
+		Problems: []Problem{
+			{Alpha: true, Path: "secret", Error: "permission denied"},
+			{Path: "tracked", Error: "tracked by Git, but ignored", Warning: true},
+		},
+		ExcludedProblems: 1,
 	}
 	if received, err := flush(ctx, outcome{report: report}); err != nil || !reflect.DeepEqual(received, report) {
 		t.Fatalf("report transmitted incorrectly: %+v, %v", received, err)

@@ -504,9 +504,10 @@ func (c *controller) remoteReport() *remote.Report {
 		}
 		for _, problem := range list.problems {
 			report.Problems = append(report.Problems, remote.Problem{
-				Alpha: list.alpha,
-				Path:  problem.Path,
-				Error: problem.Error,
+				Alpha:   list.alpha,
+				Path:    problem.Path,
+				Error:   problem.Error,
+				Warning: problem.Warning,
 			})
 		}
 	}
@@ -540,7 +541,12 @@ func (c *controller) remoteConflicts(algorithm string) (*remote.Listing, error) 
 	}
 	for _, list := range problems {
 		for _, problem := range list.problems {
-			listing.Problems = append(listing.Problems, remote.Problem{Alpha: list.alpha, Path: problem.Path, Error: problem.Error})
+			listing.Problems = append(listing.Problems, remote.Problem{
+				Alpha:   list.alpha,
+				Path:    problem.Path,
+				Error:   problem.Error,
+				Warning: problem.Warning,
+			})
 		}
 	}
 	checkouts, err := c.checkouts()

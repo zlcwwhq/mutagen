@@ -1068,6 +1068,32 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 
 // Scan implements the Scan method for local endpoints.
 func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, full bool) (*core.Snapshot, error, bool) {
+	// Compute the snapshot.
+	snapshot, err, tryAgain := e.lockAndScan(ctx, full)
+	if err != nil {
+		return nil, err, tryAgain
+	}
+
+	// In Git mode, attach warnings about the content of the snapshot. Doing
+	// this here means that it happens once per synchronization cycle and not
+	// for the watching Goroutines' scans. We've released the scan lock by this
+	// point so that running Git doesn't get in the way of the watching
+	// Goroutines. Since the snapshot may be the baseline of the next scan, and
+	// it's compared with previous snapshots by poll-based watching, it stays
+	// free of warnings, and we only return a copy of it that has them.
+	if e.gitMode {
+		if warnings := e.gitWarnings(ctx, snapshot); len(warnings) > 0 {
+			snapshot = snapshot.WithWarnings(warnings)
+		}
+	}
+
+	// Success.
+	return snapshot, nil, false
+}
+
+// lockAndScan performs the scan for Scan, acquiring the scan lock for its
+// duration. It has the same return values as Scan.
+func (e *endpoint) lockAndScan(ctx context.Context, full bool) (*core.Snapshot, error, bool) {
 	// Grab the scan lock and defer its release. If lock acquisition is
 	// preempted, then the controller has cancelled the request.
 	if !e.lockScanLock(ctx) {

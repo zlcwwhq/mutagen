@@ -46,6 +46,8 @@ type testingEndpoint struct {
 	// ruleTargets are the names of entries that are untracked if the root has a
 	// rule file.
 	ruleTargets []string
+	// warnings are the warnings to include in snapshots.
+	warnings []*core.Problem
 	// failing indicates that transitions for rule files in the root should
 	// fail.
 	failing bool
@@ -98,7 +100,7 @@ func (e *testingEndpoint) Scan(_ context.Context, _ *core.Entry, full bool) (*co
 		e.fullScans++
 	}
 	if e.rootMissing {
-		return &core.Snapshot{}, nil, false
+		return &core.Snapshot{Warnings: e.warnings}, nil, false
 	}
 	contents := make(map[string]*core.Entry, len(e.contents))
 	for name, entry := range e.contents {
@@ -108,7 +110,8 @@ func (e *testingEndpoint) Scan(_ context.Context, _ *core.Entry, full bool) (*co
 		}
 	}
 	return &core.Snapshot{
-		Content: &core.Entry{Kind: core.EntryKind_Directory, Contents: contents},
+		Content:  &core.Entry{Kind: core.EntryKind_Directory, Contents: contents},
+		Warnings: e.warnings,
 	}, nil, false
 }
 
@@ -640,5 +643,88 @@ func TestSynchronizeFlushNotHeldWithoutDeliveries(t *testing.T) {
 		beta.update(func() { beta.contents["second"] = testingFile })
 		loop.flush()
 		loop.verify(2, [][]string{{"second"}}, [][]string{{"first"}})
+	}
+}
+
+// TestSynchronizeWarnings tests that snapshot warnings are reported as scan
+// problems, along with the problems in the snapshot's content, that they're
+// sorted and truncated as such, that they remain identifiable as warnings, and
+// that they don't outlive the snapshot.
+func TestSynchronizeWarnings(t *testing.T) {
+	alpha := newTestingEndpoint(map[string]*core.Entry{"problematic": {Kind: core.EntryKind_Problematic, Problem: "unreadable"}})
+	alpha.warnings = []*core.Problem{{Path: "warned", Error: "warning", Warning: true}, {Path: "a", Error: "another warning", Warning: true}}
+	beta := newTestingEndpoint(map[string]*core.Entry{"file": testingFile})
+	beta.warnings = []*core.Problem{{Path: "file", Error: "beta warning", Warning: true}}
+	loop := startTestingLoop(t, testingGitMode, alpha, beta)
+	loop.waitForPolling()
+
+	// Verify the state.
+	loop.controller.stateLock.Lock()
+	alphaProblems := core.CopyProblems(loop.controller.state.AlphaState.ScanProblems)
+	betaProblems := core.CopyProblems(loop.controller.state.BetaState.ScanProblems)
+	loop.controller.stateLock.UnlockWithoutNotify()
+	core.SortProblems(alphaProblems)
+	if len(alphaProblems) != 3 ||
+		alphaProblems[0].Path != "a" || alphaProblems[1].Path != "problematic" || alphaProblems[2].Path != "warned" {
+		t.Errorf("incorrect alpha scan problems: %v", alphaProblems)
+	}
+	if len(betaProblems) != 1 || betaProblems[0].Error != "beta warning" {
+		t.Errorf("incorrect beta scan problems: %v", betaProblems)
+	}
+
+	// Verify that the report sorts them, without affecting the snapshots, and
+	// that it distinguishes them from the problem that isn't a warning.
+	report := loop.controller.remoteReport()
+	var paths []string
+	var warnings []bool
+	for _, problem := range report.Problems {
+		paths = append(paths, problem.Path)
+		warnings = append(warnings, problem.Warning)
+	}
+	if !slices.Equal(paths, []string{"a", "problematic", "warned", "file"}) {
+		t.Errorf("incorrect report paths: %v", paths)
+	}
+	if !slices.Equal(warnings, []bool{true, false, true, true}) {
+		t.Errorf("incorrect report warning indications: %v", warnings)
+	}
+	if alpha.warnings[0].Path != "warned" {
+		t.Error("snapshot warnings modified")
+	}
+
+	// Verify that the conflict listing distinguishes them as well.
+	listing, err := loop.controller.remoteConflicts("sha256")
+	if err != nil {
+		t.Fatal("unable to list conflicts:", err)
+	}
+	listed := make(map[string]bool)
+	for _, problem := range listing.Problems {
+		listed[problem.Path] = problem.Warning
+	}
+	if len(listed) != 4 || !listed["a"] || listed["problematic"] || !listed["warned"] || !listed["file"] {
+		t.Errorf("incorrect listing warning indications: %v", listed)
+	}
+
+	// Verify that warnings are truncated in reports.
+	alpha.update(func() {
+		alpha.warnings = nil
+		for i := 0; i <= maximumListScanProblems; i++ {
+			alpha.warnings = append(alpha.warnings, &core.Problem{Path: "w" + string(rune('a'+i)), Error: "warning", Warning: true})
+		}
+	})
+	loop.flush()
+	report = loop.controller.remoteReport()
+	if report.ExcludedProblems != 2 {
+		t.Errorf("incorrect excluded problem count: %d", report.ExcludedProblems)
+	}
+
+	// Verify that warnings disappear with the next snapshot.
+	alpha.update(func() { alpha.warnings = nil })
+	loop.waitForPolling()
+	loop.flush()
+	loop.controller.stateLock.Lock()
+	alphaProblems = core.CopyProblems(loop.controller.state.AlphaState.ScanProblems)
+	loop.controller.stateLock.UnlockWithoutNotify()
+	if len(alphaProblems) != 1 || alphaProblems[0].Path != "problematic" {
+		t.Errorf("incorrect alpha scan problems after warnings removed: %v", alphaProblems)
 	}
 }

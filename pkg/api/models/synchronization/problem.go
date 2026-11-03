@@ -11,6 +11,9 @@ type Problem struct {
 	Path string `json:"path"`
 	// Error is a human-readable summary of the problem.
 	Error string `json:"error"`
+	// Warning indicates that the problem describes content that isn't
+	// synchronized by design rather than a failure.
+	Warning bool `json:"warning,omitempty"`
 }
 
 // loadFromInternal sets a problem to match an internal Protocol Buffers
@@ -18,6 +21,7 @@ type Problem struct {
 func (p *Problem) loadFromInternal(problem *core.Problem) {
 	p.Path = problem.Path
 	p.Error = problem.Error
+	p.Warning = problem.Warning
 }
 
 // exportProblems is a convenience function that calls Problem.loadFromInternal

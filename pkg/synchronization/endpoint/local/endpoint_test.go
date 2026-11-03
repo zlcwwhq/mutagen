@@ -753,7 +753,7 @@ func TestEndpointNoGitModeRetainsIgnoreCache(t *testing.T) {
 	t.Cleanup(func() { result.Shutdown() })
 	e := result.(*endpoint)
 
-	// Rule files are ordinary content.
+	// Rule files are ordinary content, and nothing is attached to the snapshot.
 	writeTree(t, root, map[string]string{".gitignore": "data/\n"})
 	snapshot := scanEndpoint(t, e, true)
 	verifyKinds(t, snapshot, map[string]core.EntryKind{
@@ -762,5 +762,8 @@ func TestEndpointNoGitModeRetainsIgnoreCache(t *testing.T) {
 	})
 	if e.ignoreCache == nil {
 		t.Error("ignore cache not stored")
+	}
+	if snapshot != e.snapshot {
+		t.Error("snapshot copied without Git mode")
 	}
 }
