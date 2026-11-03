@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package synchronization;
+
+option go_package = "github.com/mutagen-io/mutagen/pkg/synchronization";
+
+// GitMode specifies whether or not synchronization honors the conventions of
+// Git working trees.
+enum GitMode {
+    // GitMode_GitModeDefault represents an unspecified Git mode. It should be
+    // converted to one of the following values based on the desired default
+    // behavior.
+    GitModeDefault = 0;
+    // GitMode_GitModeDisabled specifies that Git working trees are treated like
+    // any other directories, with no special handling.
+    GitModeDisabled = 1;
+    // GitMode_GitModeEnabled specifies that synchronization honors .gitignore
+    // files and never synchronizes .git entries.
+    GitModeEnabled = 2;
+}

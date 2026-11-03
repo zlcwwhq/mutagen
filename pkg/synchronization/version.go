@@ -152,6 +152,16 @@ func (v Version) DefaultIgnoreVCSMode() ignore.IgnoreVCSMode {
 	}
 }
 
+// DefaultGitMode returns the default Git mode for the session version.
+func (v Version) DefaultGitMode() GitMode {
+	switch v {
+	case Version_Version1:
+		return GitMode_GitModeDisabled
+	default:
+		panic("unknown or unsupported session version")
+	}
+}
+
 // DefaultPermissionsMode returns the default permissions mode for the session
 // version.
 func (v Version) DefaultPermissionsMode() core.PermissionsMode {
