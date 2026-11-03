@@ -16,6 +16,8 @@ func (s *Snapshot) EnsureValid() error {
 	// contain unsynchronizable content.
 	if err := s.Content.EnsureValid(false); err != nil {
 		return fmt.Errorf("invalid snapshot content: %w", err)
+	} else if s.Content != nil && s.Content.Kind == EntryKind_GitLink {
+		return errors.New("invalid snapshot content: submodule Git entry at root")
 	}
 
 	// Ensure that warnings are valid.
