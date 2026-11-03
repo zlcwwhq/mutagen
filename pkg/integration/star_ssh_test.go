@@ -49,11 +49,23 @@ esac
 exec cp "$source" "$destination"
 `
 
-// TestStarFakeSSH runs a star end to end over the SSH transport, using fake
-// ssh and scp commands, so that agents are installed on the nodes and the
-// agents' remote executable submits commands, as on remote systems. It
-// requires the agent bundle of a local build (see BUILDING.md).
-func TestStarFakeSSH(t *testing.T) {
+// fakeSSHSystem is a fake remote system, which is this system, reached using
+// fake ssh and scp commands, along with the environment that uses them.
+type fakeSSHSystem struct {
+	// base is a short directory in which to create local content. It's a real
+	// path, with symbolic links evaluated.
+	base string
+	// home is the home directory on the fake remote system.
+	home string
+}
+
+// newFakeSSHSystem sets up a fake remote system for the duration of a test,
+// skipping the test if that's not possible. It requires the agent bundle of a
+// local build (see BUILDING.md). It sets up the test's environment to use the
+// system and a data directory, so a session manager has to be created after
+// this function returns.
+func newFakeSSHSystem(t *testing.T) *fakeSSHSystem {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake SSH commands require a POSIX shell")
 	}
@@ -76,8 +88,8 @@ func TestStarFakeSSH(t *testing.T) {
 		os.Remove(path)
 	}
 
-	// Create the fake remote system and the center's workspace in a short
-	// directory, which keeps the registries' socket paths within Unix limits:
+	// Create the fake remote system and the local content in a short directory,
+	// which keeps the registries' socket paths within Unix limits:
 	// sun_path holds 104 bytes on macOS, including the terminating NUL. The
 	// temporary directory there is long (/var/folders/xx/<28 characters>/T,
 	// which resolves to /private/var/...), so use /tmp, which resolves to
@@ -96,7 +108,7 @@ func TestStarFakeSSH(t *testing.T) {
 	if base, err = filepath.EvalSymlinks(base); err != nil {
 		t.Fatal(err)
 	}
-	tools, home, local, data := filepath.Join(base, "tools"), filepath.Join(base, "home"), filepath.Join(base, "local"), filepath.Join(base, "data")
+	tools, home, data := filepath.Join(base, "tools"), filepath.Join(base, "home"), filepath.Join(base, "data")
 	for _, directory := range []string{filepath.Join(home, filesystem.MutagenDataDirectoryDevelopmentName), data} {
 		for _, registry := range []string{"remote", "remote-scopes"} {
 			if socket := filepath.Join(directory, registry, strings.Repeat("0", 16)+".sock"); len(socket) > 103 {
@@ -104,7 +116,7 @@ func TestStarFakeSSH(t *testing.T) {
 			}
 		}
 	}
-	for _, directory := range []string{tools, home, local} {
+	for _, directory := range []string{tools, home} {
 		if err := os.Mkdir(directory, 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -113,12 +125,27 @@ func TestStarFakeSSH(t *testing.T) {
 		t.Fatal(err)
 	} else if err := os.WriteFile(filepath.Join(tools, "scp"), []byte(fakeSCP), 0700); err != nil {
 		t.Fatal(err)
-	} else if err := os.WriteFile(filepath.Join(local, "input"), []byte("from the center"), 0600); err != nil {
-		t.Fatal(err)
 	}
 	t.Setenv("MUTAGEN_SSH_PATH", tools)
 	t.Setenv("FAKE_REMOTE_HOME", home)
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
+	return &fakeSSHSystem{base: base, home: home}
+}
+
+// TestStarFakeSSH runs a star end to end over the SSH transport, using fake
+// ssh and scp commands, so that agents are installed on the nodes and the
+// agents' remote executable submits commands, as on remote systems. It
+// requires the agent bundle of a local build (see BUILDING.md).
+func TestStarFakeSSH(t *testing.T) {
+	// Create the fake remote system and the center's workspace.
+	system := newFakeSSHSystem(t)
+	base, home := system.base, system.home
+	local := filepath.Join(base, "local")
+	if err := os.Mkdir(local, 0700); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(filepath.Join(local, "input"), []byte("from the center"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	t.Chdir(base)
 
 	// Expand and create the star.
