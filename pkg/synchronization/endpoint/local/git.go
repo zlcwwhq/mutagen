@@ -6,20 +6,26 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/text/unicode/norm"
 
+	"github.com/mutagen-io/mutagen/pkg/encoding"
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
+	"github.com/mutagen-io/mutagen/pkg/filesystem/behavior"
 	"github.com/mutagen-io/mutagen/pkg/git"
 	"github.com/mutagen-io/mutagen/pkg/logging"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/gitignore"
 )
 
@@ -54,7 +60,28 @@ const (
 	// it's somewhat arbitrary, though it exceeds what session listings will
 	// display.
 	maximumTrackedIgnoredWarnings = 20
+
+	// gitSeedDirectoryName is the name of the directory within a clone's Git
+	// directory that holds the records of the populations that the endpoint
+	// has performed with it (see RecordSeed).
+	gitSeedDirectoryName = "mutagen"
+	// gitSeedFilePrefix is the prefix of the names of those records.
+	gitSeedFilePrefix = "seed-"
 )
+
+// gitCheckoutOptions are the options for the checkout that populates a clone.
+// By default, Git overwrites ignored files if the target commit tracks files at
+// their paths, which can't happen in a new clone, but which is disabled anyway.
+// Given the submodule.recurse setting, Git would also populate nested
+// submodules as part of the checkout, which is the session's job, since it
+// does so in the same way as for any other submodule.
+var gitCheckoutOptions = []string{"--detach", "--no-overwrite-ignore", "--no-recurse-submodules"}
+
+// gitFilterOverride is the content of the attributes file that a clone's
+// checkout falls back to (see Clone), which unsets the filter attribute for
+// every path. The attributes in a repository's info/attributes file take
+// precedence over those in its .gitattributes files.
+const gitFilterOverride = "* -filter\n"
 
 // gitShortCommit returns the abbreviated form of a commit's hexadecimal
 // identifier for use in messages.
@@ -88,13 +115,26 @@ type gitProvider struct {
 	stallBackoff time.Duration
 	// logger is the underlying logger.
 	logger *logging.Logger
+	// root is the synchronization root.
+	root string
+	// session is the identifier of the session.
+	session string
+	// sessionIgnorer is the session's ignorer (see endpoint.ignorer).
+	sessionIgnorer ignore.Ignorer
+	// hasherFactory creates hashers for scanning clones.
+	hasherFactory func() hash.Hash
+	// probeMode, symbolicLinkMode, and permissionsMode are the endpoint's
+	// settings for scanning clones.
+	probeMode        behavior.ProbeMode
+	symbolicLinkMode core.SymbolicLinkMode
+	permissionsMode  core.PermissionsMode
 	// backoffsLock serializes access to backoffs.
 	backoffsLock sync.Mutex
 	// backoffs maps URLs that have stalled to the time until which they won't
 	// be contacted.
 	backoffs map[string]time.Time
-	// cloneRetries throttles the clones that prepare repositories for
-	// attachment.
+	// cloneRetries throttles the clones that populate submodules and that
+	// prepare repositories for attachment.
 	cloneRetries *gitRetries
 	// fetcher fetches commits in the background.
 	fetcher *gitFetcher
@@ -102,13 +142,20 @@ type gitProvider struct {
 
 // newGitProvider creates a new provider. Its fetcher has to be started by the
 // caller (see gitFetcher.run).
-func newGitProvider(logger *logging.Logger, signal func()) *gitProvider {
+func newGitProvider(logger *logging.Logger, root, session string, sessionIgnorer ignore.Ignorer, hasherFactory func() hash.Hash, probeMode behavior.ProbeMode, symbolicLinkMode core.SymbolicLinkMode, permissionsMode core.PermissionsMode, signal func()) *gitProvider {
 	provider := &gitProvider{
-		stallTimeout: gitDefaultStallTimeout,
-		stallBackoff: gitDefaultStallBackoff,
-		logger:       logger,
-		backoffs:     make(map[string]time.Time),
-		cloneRetries: newGitRetries(),
+		stallTimeout:     gitDefaultStallTimeout,
+		stallBackoff:     gitDefaultStallBackoff,
+		logger:           logger,
+		root:             root,
+		session:          session,
+		sessionIgnorer:   sessionIgnorer,
+		hasherFactory:    hasherFactory,
+		probeMode:        probeMode,
+		symbolicLinkMode: symbolicLinkMode,
+		permissionsMode:  permissionsMode,
+		backoffs:         make(map[string]time.Time),
+		cloneRetries:     newGitRetries(),
 	}
 	provider.fetcher = newGitFetcher(provider, signal)
 	return provider
@@ -322,11 +369,18 @@ func (g *gitProvider) Probe(ctx context.Context, directory, _ string) (*core.Ent
 		return nil, nil
 	}
 
+	// Look for a record of having populated the submodule.
+	seed, err := g.findSeed(directory)
+	if err != nil {
+		return nil, fmt.Errorf("unable to look for population record: %w", err)
+	}
+
 	// Success.
 	return &core.Entry{
 		Kind:     core.EntryKind_GitLink,
 		Digest:   repository.Commit,
 		Url:      repository.URL,
+		Seed:     seed,
 		AutoCRLF: repository.AutoCRLF,
 		Eol:      repository.EOL,
 	}, nil
@@ -351,10 +405,11 @@ func cloneOptions(target *core.Entry) []string {
 // directory, without checking anything out, determines the commit to use (the
 // entry's commit if it's available, after fetching it if necessary, or
 // otherwise the commit of the origin's default branch), and then calls prepare
-// with that commit to make what the caller needs of the clone. Failures of any
-// of these steps are throttled per URL and commit (see gitRetries), since
-// trying again means cloning again, so that a repository that can't be cloned
-// isn't contacted in every synchronization cycle. It returns the hexadecimal
+// with that commit to make what the caller needs of the clone (such as a
+// checkout). Failures of any of these steps are throttled per URL and commit
+// (see gitRetries), since trying again means cloning again, so that a
+// repository that can't be cloned, or whose commit can't be checked out, isn't
+// contacted in every synchronization cycle. It returns the hexadecimal
 // identifier of the commit and, if it isn't the entry's, a warning that says
 // so.
 func (g *gitProvider) cloneAndResolve(ctx context.Context, directory string, target *core.Entry, prepare func(commit string) error) (string, string, error) {
@@ -447,23 +502,238 @@ func gitLinkFor(target *core.Entry, commit string) (*core.Entry, error) {
 	}, nil
 }
 
-// errGitUnsupported is the error of the operations that populate submodules,
-// which the provider doesn't support yet.
-var errGitUnsupported = errors.New("populating submodules isn't supported by this endpoint yet")
-
 // Clone implements core.GitProvider.Clone.
-func (g *gitProvider) Clone(context.Context, string, *core.Entry) (*core.Entry, []string, error) {
-	return nil, nil, errGitUnsupported
+func (g *gitProvider) Clone(ctx context.Context, directory string, target *core.Entry) (*core.Entry, []string, error) {
+	// Clone the repository, determine the commit, and check it out.
+	var checkoutWarning string
+	commit, warning, err := g.cloneAndResolve(ctx, directory, target, func(commit string) error {
+		var err error
+		checkoutWarning, err = g.checkout(ctx, directory, commit)
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	var warnings []string
+	for _, w := range []string{warning, checkoutWarning} {
+		if w != "" {
+			warnings = append(warnings, w)
+		}
+	}
+
+	// Create the result.
+	link, err := gitLinkFor(target, commit)
+	if err != nil {
+		return nil, nil, err
+	}
+	return link, warnings, nil
+}
+
+// checkout checks out a commit in a clone made without a checkout. If that's
+// only possible without filters, then it returns a warning that says so.
+func (g *gitProvider) checkout(ctx context.Context, directory, commit string) (string, error) {
+	// Check out the commit. Progress has to be requested because the output
+	// isn't a terminal, and checking out a large repository can take a while,
+	// though nothing watches for stalls here.
+	arguments := slices.Concat([]string{"checkout", "--progress"}, gitCheckoutOptions, []string{commit})
+	_, err := git.Run(ctx, directory, arguments...)
+	if err == nil {
+		return "", nil
+	} else if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+
+	// A checkout can fail because a filter that the repository's
+	// attributes ask for, and that this system's configuration marks as
+	// required, fails, as Git LFS does if its server can't be reached. The
+	// clone can't be used without a checkout, so we try again without
+	// filters, which checks out what the repository stores (such as LFS
+	// pointers), after which the other endpoint's content (such as the
+	// files that the pointers stand for) propagates in the next cycle, as
+	// it would if the filter weren't configured here at all. We use the
+	// attributes file that takes precedence over all others, which doesn't
+	// require knowing the names of the filters, and we remove it again
+	// afterwards, so that the repository behaves as configured from then
+	// on. The forced checkout discards whatever the failed one left behind.
+	// If this fails too, then the original failure is the one to report.
+	attributes := filepath.Join(directory, ".git", "info", "attributes")
+	if mkdirErr := os.MkdirAll(filepath.Dir(attributes), 0700); mkdirErr != nil {
+		return "", fmt.Errorf("unable to check out commit %s: %w", gitShortCommit(commit), err)
+	} else if writeErr := os.WriteFile(attributes, []byte(gitFilterOverride), 0600); writeErr != nil {
+		return "", fmt.Errorf("unable to check out commit %s: %w", gitShortCommit(commit), err)
+	}
+	forced := slices.Concat([]string{"checkout", "--progress", "--force"}, gitCheckoutOptions, []string{commit})
+	_, retryErr := git.Run(ctx, directory, forced...)
+	removeErr := os.Remove(attributes)
+	if retryErr != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("unable to check out commit %s: %w", gitShortCommit(commit), err)
+	} else if removeErr != nil {
+		return "", fmt.Errorf("unable to restore attributes after checking out without filters: %w", removeErr)
+	}
+	return fmt.Sprintf(
+		"checked out without filters, since checking out with them failed (%v); files that filters would produce (such as Git LFS files) are synchronized from the other endpoint instead",
+		err,
+	), nil
+}
+
+// gitPrefixedIgnorer is an ignore.Ignorer that evaluates the paths of a tree
+// that's located elsewhere as if they were at a path within the
+// synchronization root, using an ignorer for the synchronization root.
+type gitPrefixedIgnorer struct {
+	// prefix is the root-relative path at which the tree is evaluated.
+	prefix string
+	// ignorer is the ignorer for the synchronization root.
+	ignorer ignore.Ignorer
+}
+
+// Ignore implements ignore.Ignorer.Ignore.
+func (i *gitPrefixedIgnorer) Ignore(path string, directory bool) (ignore.IgnoreStatus, bool) {
+	if path == "" {
+		return i.ignorer.Ignore(i.prefix, directory)
+	}
+	return i.ignorer.Ignore(i.prefix+"/"+path, directory)
 }
 
 // ScanClone implements core.GitProvider.ScanClone.
-func (g *gitProvider) ScanClone(context.Context, string, string) (*core.Entry, error) {
-	return nil, errGitUnsupported
+func (g *gitProvider) ScanClone(ctx context.Context, directory, path string) (*core.Entry, error) {
+	// Create the ignorer. The clone is the root of its own repository, so the
+	// rule files above it don't apply to its contents, just as they don't once
+	// it's in place (see gitignore.NewIgnorer). The session's own ignores
+	// apply to it by its path.
+	ignorer := gitignore.NewIgnorer(directory, &gitPrefixedIgnorer{prefix: path, ignorer: g.sessionIgnorer})
+
+	// Perform the scan, with a hasher of its own, since this is called during a
+	// transition, which doesn't hold the scan lock.
+	snapshot, _, _, err := core.ScanGitMode(
+		ctx,
+		directory,
+		nil, nil,
+		g.hasherFactory(), nil,
+		ignorer, nil,
+		g.probeMode,
+		g.symbolicLinkMode,
+		g.permissionsMode,
+		g,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Content, nil
+}
+
+// seedPrefix returns the prefix of the names of the files that record the
+// populations that the endpoint has performed (see RecordSeed), which include
+// the session's identifier, because sessions can share a directory (e.g. the
+// edges of a star at its center), and each has its own ancestor.
+func (g *gitProvider) seedPrefix() string {
+	return gitSeedFilePrefix + g.session + "-"
+}
+
+// seedPath returns the path of the file that records a population of the
+// submodule in a directory with the specified seed.
+func (g *gitProvider) seedPath(directory, seed string) string {
+	return filepath.Join(directory, core.GitLinkName, gitSeedDirectoryName, g.seedPrefix()+seed)
+}
+
+// findSeed looks for a record of a population of the submodule in a directory,
+// returning its seed, or an empty string if there's none. A record can only be
+// in a Git directory that's the directory's Git entry, since that's what Clone
+// creates.
+func (g *gitProvider) findSeed(directory string) (string, error) {
+	if metadata, err := os.Lstat(filepath.Join(directory, core.GitLinkName)); err != nil || !metadata.IsDir() {
+		return "", nil
+	}
+	// The error is wrapped, which os.IsNotExist doesn't look through. Most
+	// submodules don't have the directory, since only clones that the endpoint
+	// made do.
+	names, err := filesystem.DirectoryContentsByPath(filepath.Join(directory, core.GitLinkName, gitSeedDirectoryName))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return "", nil
+		}
+		return "", err
+	}
+	prefix := g.seedPrefix()
+	for _, name := range names {
+		if seed, ok := strings.CutPrefix(name.Name(), prefix); ok && seed != "" {
+			return seed, nil
+		}
+	}
+	return "", nil
 }
 
 // RecordSeed implements core.GitProvider.RecordSeed.
-func (g *gitProvider) RecordSeed(context.Context, string, *core.Entry) error {
-	return errGitUnsupported
+func (g *gitProvider) RecordSeed(_ context.Context, directory string, content *core.Entry) error {
+	link := content.Contents[core.GitLinkName]
+	if link == nil || link.Seed == "" {
+		return errors.New("content doesn't have a seed")
+	}
+	path := g.seedPath(directory, link.Seed)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	return encoding.MarshalAndSaveProtobuf(path, content)
+}
+
+// populations processes the records of populations that the scan that yielded
+// the specified content found (see Probe). Those that the ancestor has
+// absorbed, which carries the specified seeds, are discarded. The content of
+// the others is returned, keyed by the paths of the submodules, for inclusion
+// in the snapshot (see core.Snapshot.Seeds). A record that can't be used is
+// reported as a warning, since the only consequence is that the submodule's
+// content is reconciled without a merge base, which can result in conflicts.
+// It fails if a record that's been absorbed can't be discarded, since the
+// record would be used again if the ancestor were to lose its seed.
+func (g *gitProvider) populations(content *core.Entry, seeds []string) (map[string]*core.Entry, []*core.Problem, error) {
+	// Find the records, which is usually the end of it.
+	var populations map[string]*core.Entry
+	var warnings []*core.Problem
+	for path, link := range content.Submodules() {
+		if link.Seed == "" {
+			continue
+		}
+		file := g.seedPath(filepath.Join(g.root, filepath.FromSlash(path)), link.Seed)
+
+		// If the ancestor has absorbed the population, then discard its record.
+		// The record may be gone already if the snapshot isn't fresh.
+		if slices.Contains(seeds, link.Seed) {
+			if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+				return nil, nil, fmt.Errorf("unable to remove absorbed population record for %s: %w", path, err)
+			}
+			continue
+		}
+
+		// Otherwise, load the record and verify that it's the content of a
+		// population with the same seed.
+		record := &core.Entry{}
+		if err := encoding.LoadAndUnmarshalProtobuf(file, record); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			warnings = append(warnings, &core.Problem{
+				Path:    path,
+				Error:   fmt.Sprintf("unable to read the record of this submodule's population, so its content is reconciled without one (%v); remove %s once synchronization is complete", err, file),
+				Warning: true,
+			})
+			continue
+		} else if err := record.EnsureValid(true); err != nil || !record.IsSubmodule() ||
+			record.Contents[core.GitLinkName].Seed != link.Seed {
+			warnings = append(warnings, &core.Problem{
+				Path:    path,
+				Error:   fmt.Sprintf("the record of this submodule's population is invalid, so its content is reconciled without one; remove %s once synchronization is complete", file),
+				Warning: true,
+			})
+			continue
+		}
+		if populations == nil {
+			populations = make(map[string]*core.Entry)
+		}
+		populations[path] = record
+	}
+	return populations, warnings, nil
 }
 
 // PrepareAttach implements core.GitProvider.PrepareAttach.
