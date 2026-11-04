@@ -757,6 +757,64 @@ func TestEndpointGitModeAcceleratedRuleChange(t *testing.T) {
 	}
 }
 
+// newLinkedWorktree creates a repository with a single commit in a new
+// directory within a base directory, and a linked worktree of it at the
+// specified path, whose exclude file is thus the repository's.
+func newLinkedWorktree(t *testing.T, base, name, worktree string) string {
+	t.Helper()
+	repository := newGitWithOrigin(t, base, name, "")
+	mustGit(t, repository, "worktree", "add", "--quiet", worktree)
+	return repository
+}
+
+// TestEndpointGitModeAcceleratedOutsideExclude tests that scans accelerated by
+// recursive watching discard the baseline if the exclude file of a repository
+// whose Git directory is outside of the root changes, which the watcher can't
+// report. That's the case for a root that's a linked worktree, and for a nested
+// repository that's a linked worktree, which may only be found by an
+// accelerated scan. Otherwise, a file that the exclude file now excludes would
+// remain in snapshots, and its deletion on the other endpoint would remove it.
+// This test simulates recursive watching, which isn't available on all
+// platforms.
+func TestEndpointGitModeAcceleratedOutsideExclude(t *testing.T) {
+	// Create a root that's a linked worktree of a repository elsewhere.
+	isolateGit(t)
+	base := realTemporaryDirectory(t)
+	root := filepath.Join(base, "root")
+	repository := newLinkedWorktree(t, base, "repository", root)
+	writeTree(t, root, map[string]string{"local": "local", "other/a": "a"})
+
+	// Create an endpoint with a baseline for accelerated scanning.
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	verifyKinds(t, scanEndpoint(t, e, true), map[string]core.EntryKind{"local": core.EntryKind_File})
+	e.watchMode = reifiedWatchModeRecursive
+	e.accelerate = true
+	e.recheckPaths = make(map[string]bool)
+
+	// Verify that an accelerated scan still reuses the baseline if the exclude
+	// file hasn't changed, so a change to rules within the root that isn't
+	// among the re-check paths isn't seen.
+	writeTree(t, root, map[string]string{".gitignore": "a\n"})
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{"other/a": core.EntryKind_File})
+
+	// Verify that a change to the exclude file forces a full scan.
+	writeTree(t, repository, map[string]string{".git/info/exclude": "local\n"})
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		"local":   core.EntryKind_Untracked,
+		"other/a": core.EntryKind_Untracked,
+	})
+
+	// Create a nested repository that's a linked worktree of another
+	// repository, which an accelerated scan finds because of a re-check path.
+	nested := newLinkedWorktree(t, base, "nested", filepath.Join(root, "sub"))
+	e.recheckPaths = map[string]bool{"sub": true}
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{"sub/file": core.EntryKind_File})
+
+	// Verify that a change to its exclude file forces a full scan as well.
+	writeTree(t, nested, map[string]string{".git/info/exclude": "file\n"})
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{"sub/file": core.EntryKind_Untracked})
+}
+
 // TestEndpointNoGitModeRetainsIgnoreCache tests that the ignore cache continues
 // to be used without Git mode, in which rule files aren't read.
 func TestEndpointNoGitModeRetainsIgnoreCache(t *testing.T) {

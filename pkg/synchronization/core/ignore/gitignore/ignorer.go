@@ -227,6 +227,9 @@ type ignorer struct {
 	// untraversable records the root-relative paths that a scan wouldn't reach
 	// as directories. See traversable.
 	untraversable map[string]bool
+	// repositories records what the root and the top levels of nested
+	// repositories' working trees contributed to the rules. See Repositories.
+	repositories map[string]repositoryState
 	// matcher is used to match rules.
 	matcher matcher
 }
@@ -258,6 +261,7 @@ func NewIgnorer(root string, session ignore.Ignorer) ignore.DirectoryIgnorer {
 		session:       session,
 		directories:   make(map[string]*ruleSet),
 		untraversable: make(map[string]bool),
+		repositories:  make(map[string]repositoryState),
 	}
 }
 
@@ -486,23 +490,19 @@ func isEntryName(component string) bool {
 // error, and the directory counts as a repository's top level, so that the
 // error replaces any rules that would otherwise apply beneath it. The caller is
 // responsible for retaining the result, so that the file is only read once.
+// The result is recorded for the root and for the top levels of repositories
+// (see Repositories).
 func (i *ignorer) repositoryRules(directory string) (bool, *ruleSet) {
-	// Locate the exclude file. A nested repository that Git doesn't accept has
-	// no rules of its own, but the root's exclude file is read wherever it can
-	// be located, since the root is the top level of whatever repository it's
-	// in, and its exclude file can only add rules.
-	repository, path, err := excludeFileLocation(filepath.Join(i.root, filepath.FromSlash(directory)))
+	// Read the exclude file and record the result.
+	repository, contents, err := readExcludeFile(i.root, directory)
+	if directory == "" || repository {
+		i.repositories[directory] = newRepositoryState(repository, contents, err)
+	}
 	if err != nil {
-		return true, &ruleSet{err: fmt.Errorf("unable to locate ignore rules: %w", err)}
-	} else if path == "" || (directory != "" && !repository) {
-		return repository, nil
+		return true, &ruleSet{err: err}
 	}
 
-	// Read and parse the exclude file.
-	contents, err := readRegularFile(path, maximumRuleFileSize)
-	if err != nil {
-		return true, &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
-	}
+	// Parse the exclude file.
 	rules := parseRules(contents)
 	if len(rules) == 0 {
 		return repository, nil
@@ -512,6 +512,34 @@ func (i *ignorer) repositoryRules(directory string) (bool, *ruleSet) {
 		prefixLength = len(directory) + 1
 	}
 	return repository, &ruleSet{rules: rules, prefixLength: prefixLength}
+}
+
+// readExcludeFile determines whether or not a directory, specified by its
+// root-relative path (which is empty for the synchronization root), is the top
+// level of a repository's working tree (see excludeFileLocation), and reads the
+// exclude file of its repository, if that file's rules apply beneath it. A
+// nested repository that Git doesn't accept has no rules of its own, but the
+// root's exclude file is read wherever it can be located, since the root is the
+// top level of whatever repository it's in, and its exclude file can only add
+// rules. The contents are nil if there's no exclude file to read. If the
+// exclude file can't be located or read, including because the directory's
+// ".git" entry can't be examined, then the directory counts as a repository's
+// top level, and the error is returned.
+func readExcludeFile(root, directory string) (bool, []byte, error) {
+	// Locate the exclude file.
+	repository, path, err := excludeFileLocation(filepath.Join(root, filepath.FromSlash(directory)))
+	if err != nil {
+		return true, nil, fmt.Errorf("unable to locate ignore rules: %w", err)
+	} else if path == "" || (directory != "" && !repository) {
+		return repository, nil, nil
+	}
+
+	// Read the exclude file.
+	contents, err := readRegularFile(path, maximumRuleFileSize)
+	if err != nil {
+		return true, nil, fmt.Errorf("unable to read ignore rules: %w", err)
+	}
+	return repository, contents, nil
 }
 
 // readRegularFile reads a file if (and only if) it is a regular file (i.e. not

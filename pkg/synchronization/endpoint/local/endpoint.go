@@ -182,6 +182,10 @@ type endpoint struct {
 	// ignoreCache is the ignore cache from the last successful scan on the
 	// endpoint. It remains nil in Git mode (see scan).
 	ignoreCache ignore.IgnoreCache
+	// gitRepositories records what repositories contributed to the rules that
+	// produced the decisions in snapshot, in Git mode (see scan). It's nil
+	// until a scan succeeds, and it's always nil outside of Git mode.
+	gitRepositories *gitignore.Repositories
 	// cacheWriteError is the last error encountered when trying to write the
 	// cache to disk, if any.
 	cacheWriteError error
@@ -1057,8 +1061,10 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 	// this reason, we also don't retain the ignore cache that the scan
 	// generates.
 	ignorer, ignoreCache := e.ignorer, e.ignoreCache
+	var gitIgnorer ignore.DirectoryIgnorer
 	if e.gitMode {
-		ignorer, ignoreCache = gitignore.NewIgnorer(e.root, e.ignorer), nil
+		gitIgnorer = gitignore.NewIgnorer(e.root, e.ignorer)
+		ignorer, ignoreCache = gitIgnorer, nil
 	}
 
 	// Perform a full (warm) scan, watching for errors.
@@ -1101,6 +1107,19 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 	e.cache = newCache
 	if !e.gitMode {
 		e.ignoreCache = newIgnoreCache
+	}
+
+	// In Git mode, record what repositories contributed to the rules. A scan
+	// with a baseline only reads the rules for the paths that it re-checks,
+	// and it reuses the decisions of the scans before it for everything else,
+	// so what it records only extends what they recorded (which remains nil if
+	// they didn't succeed).
+	if e.gitMode {
+		if repositories := gitignore.RecordedRepositories(gitIgnorer); baseline == nil {
+			e.gitRepositories = repositories
+		} else {
+			e.gitRepositories.Include(repositories)
+		}
 	}
 
 	// Update the last scan entry count.
@@ -1193,12 +1212,16 @@ func (e *endpoint) lockAndScan(ctx context.Context, full bool) (*core.Snapshot, 
 	// thus the decisions) of other directories from the baseline. In that case,
 	// we perform a full scan instead, using the same error handling. Since the
 	// resulting snapshot accounts for the re-check paths, they're reset as
-	// usual.
+	// usual. The same applies to a change to the exclude file of a repository
+	// whose Git directory is outside of the root (such as when the root is a
+	// linked worktree), or to whether or not a directory is the top level of a
+	// repository, which the watcher can't report, so we check what the
+	// repositories found by earlier scans contribute directly.
 	if e.accelerate && !full {
 		if e.watchMode == reifiedWatchModeRecursive {
 			e.logger.Debug("Performing accelerated scan with", len(e.recheckPaths), "recheck paths")
 			baseline, recheckPaths := e.snapshot, e.recheckPaths
-			if e.gitMode && containsGitRulePath(recheckPaths) {
+			if e.gitMode && (containsGitRulePath(recheckPaths) || e.gitRepositories.Changed()) {
 				e.logger.Debug("Ignore rules changed, performing full scan")
 				baseline, recheckPaths = nil, nil
 			}
