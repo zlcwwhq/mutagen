@@ -256,6 +256,59 @@ func TestGitExcludeSymbolicLinkRoot(t *testing.T) {
 	}
 }
 
+// TestGitExcludeGitSymbolicLink tests exclude files in repositories whose
+// working tree is the root, and whose ".git" entry is a symbolic link, either
+// to a Git directory elsewhere or to a ".git" file elsewhere, whose relative
+// location Git resolves against the directory that contains the link. Git
+// follows the link, and so must the ignorer at the root, which is exempt from
+// the rule that rule files aren't read through symbolic links.
+func TestGitExcludeGitSymbolicLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links may require privileges")
+	}
+	h := newGitHarness(t)
+	for _, file := range []bool{false, true} {
+		for _, c := range excludeCases {
+			name := c.name + " to directory"
+			if file {
+				name = c.name + " to file"
+			}
+			t.Run(name, func(t *testing.T) {
+				// Create a repository with a separate Git directory, and move
+				// its ".git" file away if requested.
+				base := t.TempDir()
+				root := filepath.Join(base, "work")
+				gitDirectory := filepath.Join(base, "separate", "git")
+				if err := os.MkdirAll(root, 0o755); err != nil {
+					t.Fatal("unable to create working tree:", err)
+				} else if err = os.MkdirAll(filepath.Dir(gitDirectory), 0o755); err != nil {
+					t.Fatal("unable to create Git directory parent:", err)
+				}
+				h.run(root, nil, "init", "--quiet", "--separate-git-dir", gitDirectory)
+				target := gitDirectory
+				if file {
+					target = filepath.Join(base, "pointers", "deep", "gitfile")
+					if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+						t.Fatal("unable to create pointer directory:", err)
+					} else if err := os.WriteFile(target, []byte("gitdir: ../separate/git\n"), 0o644); err != nil {
+						t.Fatal("unable to write Git file:", err)
+					}
+				}
+
+				// Replace the ".git" file with a symbolic link.
+				if err := os.Remove(filepath.Join(root, ".git")); err != nil {
+					t.Fatal("unable to remove Git file:", err)
+				} else if err := os.Symlink(target, filepath.Join(root, ".git")); err != nil {
+					t.Skip("unable to create symbolic link:", err)
+				}
+
+				// Run the test.
+				runExcludeCase(t, h, root, filepath.Join(gitDirectory, "info", "exclude"), c)
+			})
+		}
+	}
+}
+
 // TestGitSymbolicLinkRuleFile tests that rule files that are symbolic links
 // are ignored, which is not something that we can rely on git to do on every
 // version, so it's also checked explicitly.

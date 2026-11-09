@@ -805,7 +805,7 @@ func TestExcludeFileLocation(t *testing.T) {
 			// processing, so they're cleaned for the comparison, which is
 			// equivalent here, since the test doesn't involve symbolic links.
 			expected := test.setup(t, root)
-			location, err := excludeFileLocation(root)
+			location, err := excludeFileLocation(root, false)
 			if err != nil {
 				t.Fatal("unable to locate exclude file:", err)
 			} else if actual := location.exclude; actual != expected && filepath.Clean(actual) != expected {
@@ -820,6 +820,67 @@ func TestExcludeFileLocation(t *testing.T) {
 			_, err = os.Lstat(filepath.Join(root, ".git"))
 			if present := err == nil; location.present != present {
 				t.Errorf("presence did not match expected: %v != %v", location.present, present)
+			}
+		})
+	}
+}
+
+// TestExcludeFileLocationFollowsLink tests that a symbolic link named ".git"
+// is followed if requested, as it is for the synchronization root, whether it
+// leads to a Git directory or to a ".git" file, whose relative location is
+// resolved against the directory that contains the link, as Git resolves it,
+// and that a link that doesn't lead anywhere counts as a ".git" file that
+// doesn't point anywhere. Otherwise, a link doesn't count.
+func TestExcludeFileLocationFollowsLink(t *testing.T) {
+	tests := []struct {
+		name       string
+		target     string
+		repository bool
+		setup      func(t *testing.T, root string) string
+	}{
+		{"Git directory", filepath.Join("elsewhere", ".git"), true, func(t *testing.T, root string) string {
+			writeTree(t, root, withGitDirectories(nil, "elsewhere/.git"))
+			return filepath.Join(root, "elsewhere", ".git", "info", "exclude")
+		}},
+		{"Git file", filepath.Join("pointers", "gitfile"), true, func(t *testing.T, root string) string {
+			writeTree(t, root, withGitDirectories(map[string]string{"pointers/gitfile": "gitdir: modules/sub\n"}, "modules/sub"))
+			return filepath.Join(root, "modules", "sub", "info", "exclude")
+		}},
+		{"nothing", "nowhere", false, func(t *testing.T, root string) string {
+			return ""
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Create the root, with its symbolic links resolved, so that the
+			// locations that result from following the link can be compared.
+			root := filepath.Join(physicalPath(t.TempDir()), "root")
+			if err := os.Mkdir(root, 0o755); err != nil {
+				t.Fatal("unable to create root:", err)
+			}
+			expected := test.setup(t, root)
+			if err := os.Symlink(test.target, filepath.Join(root, ".git")); err != nil {
+				t.Skip("unable to create symbolic link:", err)
+			}
+
+			// Follow the link.
+			location, err := excludeFileLocation(root, true)
+			if err != nil {
+				t.Fatal("unable to locate exclude file:", err)
+			} else if actual := location.exclude; actual != expected && filepath.Clean(actual) != expected {
+				t.Errorf("location did not match expected: %q != %q", actual, expected)
+			} else if location.repository != test.repository {
+				t.Errorf("repository status did not match expected: %v != %v", location.repository, test.repository)
+			} else if !location.present {
+				t.Error("link not reported as present")
+			}
+
+			// Don't follow the link.
+			location, err = excludeFileLocation(root, false)
+			if err != nil {
+				t.Fatal("unable to locate exclude file:", err)
+			} else if location.exclude != "" || location.repository || !location.present {
+				t.Errorf("link that isn't followed counts: %+v", location)
 			}
 		})
 	}

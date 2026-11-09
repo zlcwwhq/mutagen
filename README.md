@@ -253,9 +253,9 @@ where the directory has no `.git` treats it as an ordinary directory, to which
 the rules above it apply, and doesn't write what they exclude (see above). Only
 a `.git` entry that Git accepts gives a directory rules of its own. A directory
 whose `.git` entry Git can't use (such as an empty, damaged, or dangling one),
-whose `.git` is a symbolic link (which Git mode doesn't follow), or whose
-`origin` URL the other endpoint couldn't use, isn't synchronized until that's
-fixed, which is reported as a problem.
+whose `.git` is a symbolic link (which Git mode follows only for the root), or
+whose `origin` URL the other endpoint couldn't use, isn't synchronized until
+that's fixed, which is reported as a problem.
 
 **Warnings.** What Git mode doesn't synchronize is reported by
 `mutagen sync list`, and `remote` prints it after each flush without preventing

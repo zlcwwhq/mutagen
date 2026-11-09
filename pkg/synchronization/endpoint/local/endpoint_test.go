@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 )
 
 // TODO: Implement tests for the remaining endpoint behavior.
@@ -922,6 +924,73 @@ func TestEndpointGitModeAcceleratedRepositoryAppears(t *testing.T) {
 	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
 		"reported/data/f":     core.EntryKind_File,
 		"reported/deep/x.log": core.EntryKind_File,
+	})
+}
+
+// TestEndpointGitModeRootGitSymbolicLink tests a root whose Git entry is a
+// symbolic link to a Git directory elsewhere. Git follows it, and applies that
+// repository's exclude file in the root, and so do scans, rather than
+// synchronizing what it excludes without reporting anything. Scans
+// accelerated by recursive watching notice when the link is pointed to another
+// repository, which the watcher reports as nothing but a change to the root's
+// Git entry. This test simulates recursive watching, which isn't available on
+// all platforms.
+func TestEndpointGitModeRootGitSymbolicLink(t *testing.T) {
+	// Symbolic links may require privileges on Windows.
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links may require privileges")
+	}
+
+	// Create a root whose Git entry is a symbolic link to a repository whose
+	// exclude file excludes a file, and another repository whose exclude file
+	// excludes another.
+	isolateGit(t)
+	base := realTemporaryDirectory(t)
+	for name, exclude := range map[string]string{"first": "secret\n", "second": "other\n"} {
+		initializeRepository(t, filepath.Join(base, name))
+		writeTree(t, filepath.Join(base, name), map[string]string{".git/info/exclude": exclude})
+	}
+	root := filepath.Join(base, "root")
+	writeTree(t, root, map[string]string{"secret": "s", "other": "o", "kept": "k"})
+	if err := os.Symlink(filepath.Join(base, "first", ".git"), filepath.Join(root, ".git")); err != nil {
+		t.Skip("unable to create symbolic link:", err)
+	}
+
+	// Verify that Git ignores the file.
+	if output, err := runGit(root, "check-ignore", "--", "secret"); err != nil || output != "secret" {
+		t.Fatalf("Git doesn't ignore secret: %q, %v", output, err)
+	}
+
+	// Verify that a scan excludes it too, and that remote agrees.
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	verifyKinds(t, scanEndpoint(t, e, true), map[string]core.EntryKind{
+		".git":   core.EntryKind_Untracked,
+		"secret": core.EntryKind_Untracked,
+		"other":  core.EntryKind_File,
+		"kept":   core.EntryKind_File,
+	})
+	ignores := &remote.Ignores{Syntax: ignore.Syntax_SyntaxMutagen, VCS: true, Git: true}
+	if excluded := ignores.WithRoot(root).ExcludedInAnyForm("secret", false); excluded != "secret" {
+		t.Errorf("remote doesn't exclude secret: %q", excluded)
+	}
+
+	// Point the link to the other repository. The event for the root's Git
+	// entry is relevant, and an accelerated scan applies the other exclude
+	// file.
+	e.watchMode = reifiedWatchModeRecursive
+	e.accelerate = true
+	if err := os.Remove(filepath.Join(root, ".git")); err != nil {
+		t.Fatal("unable to remove symbolic link:", err)
+	} else if err := os.Symlink(filepath.Join(base, "second", ".git"), filepath.Join(root, ".git")); err != nil {
+		t.Fatal("unable to create symbolic link:", err)
+	}
+	if !e.gitEntryChanged("") {
+		t.Error("event for the root's changed Git entry isn't relevant")
+	}
+	e.recheckPaths = map[string]bool{".git": true}
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		"secret": core.EntryKind_File,
+		"other":  core.EntryKind_Untracked,
 	})
 }
 

@@ -544,10 +544,10 @@ func (i *ignorer) repositoryRules(directory string) (bool, *ruleSet) {
 // ".git" file refers to its Git directory by a relative location that leads
 // out of its working tree (such as "../.git/modules/<name>"), and so can a
 // linked worktree's. Directories beneath the root that a scan reaches aren't
-// symbolic links.
+// symbolic links. The root's ".git" entry may be one, which is followed.
 func readExcludeFile(root, directory string) (repositoryLocation, []byte, error) {
 	// Locate the exclude file.
-	location, err := excludeFileLocation(filepath.Join(root, filepath.FromSlash(directory)))
+	location, err := excludeFileLocation(filepath.Join(root, filepath.FromSlash(directory)), directory == "")
 	if err != nil {
 		return location, nil, fmt.Errorf("unable to locate ignore rules: %w", err)
 	} else if location.exclude == "" || (directory != "" && !location.repository) {
@@ -644,18 +644,35 @@ type repositoryLocation struct {
 //
 // A symbolic link named ".git" doesn't count, even though Git follows it,
 // since rule files are never read through symbolic links, and the directory
-// is then treated as an ordinary one. The entry is looked up by name, so
-// whether ".GIT" counts depends on whether the filesystem distinguishes case,
-// as it does for Git.
-func excludeFileLocation(directory string) (repositoryLocation, error) {
+// is then treated as an ordinary one, unless follow is true, which is the case
+// for the synchronization root. The root is exempt from that rule, as it is
+// when it's specified by a symbolic link itself (see traversable), and there's
+// nothing above it whose rules a link could replace, so its ".git" entry is
+// followed, as Git follows it, and a relative location in a ".git" file that
+// it leads to is resolved against the directory, as Git resolves it. A link
+// that doesn't lead anywhere counts as a ".git" file that doesn't point
+// anywhere. The entry is looked up by name, so whether ".GIT" counts depends
+// on whether the filesystem distinguishes case, as it does for Git.
+func excludeFileLocation(directory string, follow bool) (repositoryLocation, error) {
 	// Check the type of the directory's ".git" entry. We deliberately don't
-	// follow symbolic links.
+	// follow symbolic links, unless requested.
 	dotGit := filepath.Join(directory, gitEntryName)
 	info, err := os.Lstat(dotGit)
 	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
 		return repositoryLocation{}, nil
 	} else if err != nil {
 		return repositoryLocation{present: true, repository: true}, err
+	} else if follow && info.Mode()&os.ModeSymlink != 0 {
+		target, err := filepath.EvalSymlinks(dotGit)
+		if err == nil {
+			info, err = os.Lstat(target)
+		}
+		if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+			return repositoryLocation{present: true}, nil
+		} else if err != nil {
+			return repositoryLocation{present: true, repository: true}, err
+		}
+		dotGit = target
 	}
 
 	// Determine the location of the Git directory. If a ".git" file has been
