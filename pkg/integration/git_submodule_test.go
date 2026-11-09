@@ -450,7 +450,12 @@ var gitSubmoduleScenarios = []struct {
 	{"deletion resolves diverged commits", func(t *testing.T, transport gitSubmoduleTransport) {
 		testGitSubmoduleDeletionResolves(t, transport, true)
 	}},
-	{"one way/submodule only on beta", testGitSubmoduleOnlyOnBeta},
+	{"one way/submodule only on beta", func(t *testing.T, transport gitSubmoduleTransport) {
+		testGitSubmoduleOnlyOnBeta(t, transport, false)
+	}},
+	{"one way/empty directory on alpha", func(t *testing.T, transport gitSubmoduleTransport) {
+		testGitSubmoduleOnlyOnBeta(t, transport, true)
+	}},
 	{"one way/Git entry only on beta", testGitSubmoduleGitEntryOnlyOnBeta},
 	{"one way/changes on beta", testGitSubmoduleOneWayChangesOnBeta},
 	{"dangling .git file", testGitSubmoduleDanglingGitfile},
@@ -1002,8 +1007,11 @@ var gitModeOneWayModes = []core.SynchronizationMode{
 }
 
 // testGitSubmoduleOnlyOnBeta tests that a submodule that only beta has is left
-// alone in one-way modes, with its uncommitted changes.
-func testGitSubmoduleOnlyOnBeta(t *testing.T, transport gitSubmoduleTransport) {
+// alone in one-way modes, with its uncommitted changes, including when alpha
+// has an empty directory in its place, which is how Git leaves a submodule that
+// isn't initialized. The one-way-replica mode would remove it, which beta
+// refuses, so beta reports a problem there, rather than diverging silently.
+func testGitSubmoduleOnlyOnBeta(t *testing.T, transport gitSubmoduleTransport, emptyOnAlpha bool) {
 	for _, mode := range gitModeOneWayModes {
 		t.Run(mode.Description(), func(t *testing.T) {
 			upstream := newGitModeUpstream(t, gitSubmoduleFiles)
@@ -1011,6 +1019,11 @@ func testGitSubmoduleOnlyOnBeta(t *testing.T, transport gitSubmoduleTransport) {
 				mode:  mode,
 				alpha: map[string]string{"top": "top"},
 				prepare: func(s *gitModeSession) {
+					if emptyOnAlpha {
+						if err := os.Mkdir(filepath.Join(s.alpha, "sub"), 0700); err != nil {
+							t.Fatal(err)
+						}
+					}
 					gitModeRun(t, s.beta, "clone", "--quiet", upstream.url, "sub")
 					s.write(filepath.Join(s.beta, "sub"), map[string]string{"other": "changed on beta", "untracked": "untracked"})
 				},
@@ -1021,20 +1034,22 @@ func testGitSubmoduleOnlyOnBeta(t *testing.T, transport gitSubmoduleTransport) {
 				if head := gitModeHead(t, filepath.Join(session.beta, "sub")); head != upstream.first {
 					t.Errorf("incorrect commit on beta: %s", head)
 				}
-				session.expectMissing(session.alpha, "sub")
-				if len(state.Conflicts) != 0 {
-					t.Errorf("unexpected conflicts: %v", state.Conflicts)
+				if !emptyOnAlpha {
+					session.expectMissing(session.alpha, "sub")
+				} else if names, err := os.ReadDir(filepath.Join(session.alpha, "sub")); err != nil || len(names) != 0 {
+					t.Errorf("empty directory on alpha changed: %v, %v", names, err)
 				}
 
-				// The one-way-replica mode would delete beta's content, which
-				// is refused for a submodule. Report what it does, which isn't
-				// prescribed.
-				problems := state.BetaState.TransitionProblems
-				if mode == core.SynchronizationMode_SynchronizationModeOneWaySafe {
-					verifyNoProblems(t, state)
-				} else if len(problems) > 0 {
-					t.Logf("beta's problems in the one-way-replica mode: %v", problems)
+				// The one-way-replica mode would remove beta's submodule, which
+				// beta refuses and reports.
+				if mode == core.SynchronizationMode_SynchronizationModeOneWayReplica {
+					problem := gitSubmoduleProblem(t, state.BetaState.TransitionProblems, "sub", "isn't removed automatically")
+					if problem.Warning {
+						t.Error("refused removal reported as a warning:", problem)
+					}
+					state.BetaState.TransitionProblems = nil
 				}
+				verifyNoProblems(t, state)
 			}
 		})
 	}
@@ -1042,7 +1057,8 @@ func testGitSubmoduleOnlyOnBeta(t *testing.T, transport gitSubmoduleTransport) {
 
 // testGitSubmoduleGitEntryOnlyOnBeta tests that a repository on beta, in a
 // directory that alpha has without one, is left alone in one-way modes, while
-// the directory's files are synchronized like any others.
+// the directory's files are synchronized like any others. The one-way-replica
+// mode would remove its Git entry, which beta refuses and reports.
 func testGitSubmoduleGitEntryOnlyOnBeta(t *testing.T, transport gitSubmoduleTransport) {
 	for _, mode := range gitModeOneWayModes {
 		t.Run(mode.Description(), func(t *testing.T) {
@@ -1059,13 +1075,22 @@ func testGitSubmoduleGitEntryOnlyOnBeta(t *testing.T, transport gitSubmoduleTran
 					gitModeRun(t, s.beta, "clone", "--quiet", upstream.url, "sub")
 				},
 			}))
-			session.flush()
-			session.expect(session.beta, map[string]string{"sub/added": "added"})
-			if head := gitModeHead(t, filepath.Join(session.beta, "sub")); head != upstream.first {
-				t.Errorf("incorrect commit on beta: %s", head)
+			for i := 0; i < 2; i++ {
+				state := session.flushAllowingProblems()
+				session.expect(session.beta, map[string]string{"sub/added": "added"})
+				if head := gitModeHead(t, filepath.Join(session.beta, "sub")); head != upstream.first {
+					t.Errorf("incorrect commit on beta: %s", head)
+				}
+				session.expectMissing(session.alpha, "sub/.git")
+				if mode == core.SynchronizationMode_SynchronizationModeOneWayReplica {
+					problem := gitSubmoduleProblem(t, state.BetaState.TransitionProblems, "sub/.git", "isn't removed automatically")
+					if problem.Warning {
+						t.Error("refused removal reported as a warning:", problem)
+					}
+					state.BetaState.TransitionProblems = nil
+				}
+				verifyNoProblems(t, state)
 			}
-			session.expectMissing(session.alpha, "sub/.git")
-			verifyNoProblems(t, session.state())
 		})
 	}
 }

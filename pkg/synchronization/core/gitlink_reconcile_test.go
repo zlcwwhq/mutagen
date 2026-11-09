@@ -372,10 +372,26 @@ func TestReconcileGitModeSubmodules(t *testing.T) {
 		},
 		{
 			description: "Git entry missing on alpha",
-			modes:       oneWayModes,
+			modes:       oneWaySafeMode,
 			ancestor:    submodule(tGL0, base),
 			alpha:       plain(base),
 			beta:        submodule(tGL0, base),
+		},
+		{
+			description:         "Git entry missing on alpha",
+			modes:               oneWayReplicaMode,
+			ancestor:            submodule(tGL0, base),
+			alpha:               plain(base),
+			beta:                submodule(tGL0, base),
+			expectedBetaChanges: []*Change{{Path: "sub/.git", Old: tGL0}},
+		},
+		{
+			description:         "Git entry missing on alpha without one in the ancestor",
+			modes:               oneWayReplicaMode,
+			ancestor:            plain(base),
+			alpha:               plain(base),
+			beta:                submodule(tGL0, base),
+			expectedBetaChanges: []*Change{{Path: "sub/.git", Old: tGL0}},
 		},
 		{
 			description:          "Git entry missing on alpha with file modified on alpha",
@@ -388,11 +404,22 @@ func TestReconcileGitModeSubmodules(t *testing.T) {
 		},
 		{
 			description:         "Git entry missing on alpha with file modified on alpha",
-			modes:               oneWayModes,
+			modes:               oneWaySafeMode,
 			ancestor:            submodule(tGL0, base),
 			alpha:               plain(contents{"a": tF2, "b": tF1}),
 			beta:                submodule(tGL0, base),
 			expectedBetaChanges: []*Change{{Path: "sub/a", Old: tF1, New: tF2}},
+		},
+		{
+			description: "Git entry missing on alpha with file modified on alpha",
+			modes:       oneWayReplicaMode,
+			ancestor:    submodule(tGL0, base),
+			alpha:       plain(contents{"a": tF2, "b": tF1}),
+			beta:        submodule(tGL0, base),
+			expectedBetaChanges: []*Change{
+				{Path: "sub/.git", Old: tGL0},
+				{Path: "sub/a", Old: tF1, New: tF2},
+			},
 		},
 
 		// A Git entry that's untracked on one side (a repository without
@@ -431,7 +458,11 @@ func TestReconcileGitModeSubmodules(t *testing.T) {
 
 		// An empty directory opposite a submodule is populated, whatever the
 		// ancestor contains, except that one-way modes never give alpha
-		// anything, nor do they delete anything from beta in that case.
+		// anything, nor do they delete beta's content path by path in that
+		// case. The one-way-replica mode replaces beta's submodule as a whole,
+		// as it would remove a submodule that alpha doesn't have, which beta
+		// refuses with a problem, unless beta's submodule has content that
+		// can't be removed, which is a conflict.
 		{
 			description:         "empty directory on beta without an ancestor",
 			modes:               allModes,
@@ -466,10 +497,30 @@ func TestReconcileGitModeSubmodules(t *testing.T) {
 		},
 		{
 			description: "empty directory on alpha without an ancestor",
-			modes:       oneWayModes,
+			modes:       oneWaySafeMode,
 			ancestor:    tD0,
 			alpha:       root(tD0),
 			beta:        submodule(tGL0, base),
+		},
+		{
+			description:         "empty directory on alpha without an ancestor",
+			modes:               oneWayReplicaMode,
+			ancestor:            tD0,
+			alpha:               root(tD0),
+			beta:                submodule(tGL0, base),
+			expectedBetaChanges: []*Change{{Path: "sub", Old: testingSubmodule(tGL0, base), New: tD0}},
+		},
+		{
+			description: "empty directory on alpha with untracked content on beta",
+			modes:       oneWayReplicaMode,
+			ancestor:    tD0,
+			alpha:       root(tD0),
+			beta:        submodule(tGL0, contents{"a": tF1, "untracked": tU}),
+			expectedConflicts: []*Conflict{{
+				Root:         "sub",
+				AlphaChanges: []*Change{{Path: "sub", New: tD0}},
+				BetaChanges:  []*Change{{Path: "sub/untracked", New: tU}},
+			}},
 		},
 		{
 			description:          "empty directory on alpha with the submodule in the ancestor",
@@ -481,10 +532,18 @@ func TestReconcileGitModeSubmodules(t *testing.T) {
 		},
 		{
 			description: "empty directory on alpha with the submodule in the ancestor",
-			modes:       oneWayModes,
+			modes:       oneWaySafeMode,
 			ancestor:    submodule(tGL0, base),
 			alpha:       root(tD0),
 			beta:        submodule(tGL0, base),
+		},
+		{
+			description:         "empty directory on alpha with the submodule in the ancestor",
+			modes:               oneWayReplicaMode,
+			ancestor:            submodule(tGL0, base),
+			alpha:               root(tD0),
+			beta:                submodule(tGL0, base),
+			expectedBetaChanges: []*Change{{Path: "sub", Old: testingSubmodule(tGL0, base), New: tD0}},
 		},
 		{
 			description:             "empty directories on both sides",

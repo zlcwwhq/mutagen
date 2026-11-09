@@ -230,10 +230,12 @@ it has checked out is synchronized:
   `two-way-resolved` sessions follow alpha's commit and resolve files as usual.
 - Deleting a submodule isn't synchronized: the endpoint that still has it
   reports a problem, and you delete it there too.
-- In one-way modes, a submodule that only beta has stays there (with a problem
-  in `one-way-replica`, which would otherwise delete it), and `one-way-replica`
-  overwrites uncommitted changes in beta's submodules like any other content of
-  beta's.
+- In one-way modes, a submodule that only beta has stays there, including one
+  opposite an empty directory on alpha, and so does a `.git` that beta has in a
+  directory that alpha has without one. `one-way-replica`, which would otherwise
+  delete them, reports a problem on beta until you delete them there or alpha
+  gets them too. `one-way-replica` overwrites uncommitted changes in beta's
+  submodules like any other content of beta's.
 
 Clones that Mutagen makes use the other endpoint's `core.autocrlf` and
 `core.eol` settings, so that their files have the same bytes. Existing

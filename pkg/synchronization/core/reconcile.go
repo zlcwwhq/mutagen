@@ -227,9 +227,14 @@ func (r *reconciler) reconcileSubmodule(path string, ancestor, alpha, beta *Entr
 	// the result as the ancestor's content, so that the other side's
 	// uncommitted changes propagate in the next cycle without conflicts. In
 	// one-way modes, content never propagates from beta to alpha, so an empty
-	// directory on alpha and a submodule on beta are left alone, without a
-	// change or a conflict, rather than having the mode's mirroring delete the
-	// submodule's content on beta or report a conflict about it.
+	// directory on alpha and a submodule on beta are left alone, rather than
+	// having the mode's mirroring delete the submodule's content on beta path
+	// by path. In the one-way-safe mode, that's without a change or a
+	// conflict, as for other content that only beta has. The one-way-replica
+	// mode replaces the submodule as a whole with alpha's empty directory, as
+	// it would remove a submodule that alpha doesn't have at all, which beta
+	// refuses with a problem, since a submodule is never removed (see
+	// handleDisagreementOneWayReplica), so that the divergence isn't silent.
 	alphaIsEmptyDirectory := alpha != nil && alpha.Kind == EntryKind_Directory && len(alpha.Contents) == 0
 	betaIsEmptyDirectory := beta != nil && beta.Kind == EntryKind_Directory && len(beta.Contents) == 0
 	if betaIsEmptyDirectory && alpha.IsSubmodule() {
@@ -238,6 +243,8 @@ func (r *reconciler) reconcileSubmodule(path string, ancestor, alpha, beta *Entr
 	} else if alphaIsEmptyDirectory && beta.IsSubmodule() {
 		if bidirectional {
 			r.alphaChanges = append(r.alphaChanges, &Change{Path: path, Old: alpha, New: beta.synchronizable()})
+		} else if r.mode == SynchronizationMode_SynchronizationModeOneWayReplica {
+			r.handleDisagreementOneWayReplica(path, ancestor, alpha, beta)
 		}
 		return true
 	}
@@ -275,7 +282,10 @@ func (r *reconciler) reconcileSubmodule(path string, ancestor, alpha, beta *Entr
 	// side without it lacks it, so it receives the other side's commit, in the
 	// form of a repository attached to its existing working tree. In one-way
 	// modes, beta never gives alpha anything, so a Git entry on beta alone is
-	// left alone, rather than being deleted by the mode's mirroring.
+	// left alone. In the one-way-safe mode, that's without a change, while the
+	// one-way-replica mode removes it, as it removes whatever alpha doesn't
+	// have, which beta refuses with a problem, since a submodule's Git entry is
+	// never removed, so that the divergence isn't silent.
 	if _, ok := gitLinkDirectory(path); ok {
 		alphaIsLink := alpha != nil && alpha.Kind == EntryKind_GitLink
 		betaIsLink := beta != nil && beta.Kind == EntryKind_GitLink
@@ -285,6 +295,8 @@ func (r *reconciler) reconcileSubmodule(path string, ancestor, alpha, beta *Entr
 		} else if betaIsLink && alpha == nil {
 			if bidirectional {
 				r.alphaChanges = append(r.alphaChanges, &Change{Path: path, New: beta})
+			} else if r.mode == SynchronizationMode_SynchronizationModeOneWayReplica {
+				r.handleDisagreementOneWayReplica(path, ancestor, alpha, beta)
 			}
 			return true
 		}

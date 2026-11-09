@@ -1107,6 +1107,7 @@ func TestPruneGitTransitionsOldContent(t *testing.T) {
 		{"submodule in deletion", &core.Change{Path: "sub", Old: submodule}, true, []string{"sub/.git"}},
 		{"submodule deep in deletion", &core.Change{Path: "a", Old: directory(map[string]*core.Entry{"b": submodule})}, true, []string{"a/b/.git"}},
 		{"submodule in type change", &core.Change{Path: "sub", Old: submodule, New: file}, true, []string{"sub/.git"}},
+		{"submodule replaced by empty directory", &core.Change{Path: "sub", Old: submodule, New: directory(nil)}, true, []string{"sub/.git"}},
 		{"submodule replaced by submodule", &core.Change{Path: "sub", Old: submodule, New: directory(map[string]*core.Entry{".git": moved})}, true, []string{"sub/.git"}},
 		{"Git entry replaced by submodule Git entry", &core.Change{Path: "sub/.git", Old: directory(nil), New: gitLink}, true, []string{"sub/.git"}},
 		{"untracked Git entry replaced by submodule Git entry", &core.Change{Path: "sub/.git", Old: untracked, New: gitLink}, true, []string{"sub/.git"}},
@@ -1176,8 +1177,10 @@ func TestPruneGitTransitionsSubmoduleMessages(t *testing.T) {
 }
 
 // TestEndpointGitModeSubmoduleRemovalRefused tests that a submodule isn't
-// removed, whether the change removes its directory or its Git entry, and that
-// the refusal says so.
+// removed, whether the change removes its directory or its Git entry, or
+// replaces it with something else, such as the empty directory that a
+// one-way-replica session gives beta for an uninitialized submodule on alpha,
+// and that the refusal says so.
 func TestEndpointGitModeSubmoduleRemovalRefused(t *testing.T) {
 	upstream := newGitUpstream(t, "upstream")
 	root := newGitRoot(t, map[string]string{"other": "other"})
@@ -1189,6 +1192,7 @@ func TestEndpointGitModeSubmoduleRemovalRefused(t *testing.T) {
 		{Path: "sub", Old: entryAt(snapshot, "sub")},
 		{Path: "sub/.git", Old: entryAt(snapshot, "sub/.git")},
 		{Path: "sub", Old: entryAt(snapshot, "sub"), New: entryAt(snapshot, "other")},
+		{Path: "sub", Old: entryAt(snapshot, "sub"), New: &core.Entry{Kind: core.EntryKind_Directory}},
 	} {
 		scanEndpoint(t, e, true)
 		results, problems, _, err := e.Transition(context.Background(), []*core.Change{change, {Path: "other", Old: entryAt(snapshot, "other")}})
