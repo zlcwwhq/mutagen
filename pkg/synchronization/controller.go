@@ -937,11 +937,15 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 
 	// Determine whether or not the session is in Git mode and select the
 	// corresponding reconciliation behavior. In Git mode, ignore rules are read
-	// separately on each endpoint, which reconciliation has to account for.
+	// separately on each endpoint, which reconciliation has to account for,
+	// and the endpoints describe the working trees of submodules that have
+	// moved to another commit, which reconciliation uses.
 	gitMode := GitModeEnabled(c.session.Configuration, c.session.Version)
-	reconcile := core.Reconcile
+	reconcile := func(ancestor, alpha, beta *core.Entry, _, _ map[string]*core.SubmoduleStatus, mode core.SynchronizationMode) ([]*core.Change, []*core.Change, []*core.Change, []*core.Conflict) {
+		return core.Reconcile(ancestor, alpha, beta, mode)
+	}
 	if gitMode {
-		reconcile = core.ReconcileGitMode
+		reconcile = core.ReconcileGitModeWithStatuses
 	}
 
 	// In the one-way-replica mode with Git mode enabled, load the record of
@@ -1103,11 +1107,11 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		c.state.Status = Status_Scanning
 		c.stateLock.Unlock()
 		forceFullScan := flushRequest != nil
-		// Only sessions in Git mode can have submodules, and thus seeds, and
-		// collecting them walks the whole ancestor.
-		var seeds []string
+		// Only sessions in Git mode can have submodules, and collecting them
+		// walks the whole ancestor.
+		var submodules map[string]*core.Entry
 		if gitMode {
-			seeds = ancestor.GitLinkSeeds()
+			submodules = ancestor.Submodules()
 		}
 		var αSnapshot, βSnapshot *core.Snapshot
 		var αScanErr, βScanErr error
@@ -1115,11 +1119,11 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		scanDone := &sync.WaitGroup{}
 		scanDone.Add(2)
 		go func() {
-			αSnapshot, αScanErr, αTryAgain = alpha.Scan(ctx, ancestor, seeds, forceFullScan)
+			αSnapshot, αScanErr, αTryAgain = alpha.Scan(ctx, ancestor, submodules, forceFullScan)
 			scanDone.Done()
 		}()
 		go func() {
-			βSnapshot, βScanErr, βTryAgain = beta.Scan(ctx, ancestor, seeds, forceFullScan)
+			βSnapshot, βScanErr, βTryAgain = beta.Scan(ctx, ancestor, submodules, forceFullScan)
 			scanDone.Done()
 		}()
 		scanDone.Wait()
@@ -1357,6 +1361,8 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			ancestor,
 			αContent,
 			βContent,
+			αSnapshot.SubmoduleStatuses,
+			βSnapshot.SubmoduleStatuses,
 			synchronizationMode,
 		)
 		if c.logger.Level() >= logging.LevelTrace {

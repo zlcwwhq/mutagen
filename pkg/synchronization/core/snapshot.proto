@@ -48,4 +48,30 @@ message Snapshot {
     // The session uses it in place of the ancestor at those paths. Like
     // warnings, seeds aren't part of the snapshot's identity.
     map<string, Entry> seeds = 9;
+    // SubmoduleStatuses maps the paths of submodules that have a commit
+    // checked out other than the one that the ancestor has for them (or for
+    // which the ancestor doesn't have one) to how their working trees differ
+    // from that commit, as far as Git could tell. Reconciliation uses them
+    // when both endpoints have the same commit checked out, to identify the
+    // content that one endpoint has changed and the other hasn't. Like
+    // warnings, they aren't part of the snapshot's identity.
+    map<string, SubmoduleStatus> submoduleStatuses = 10;
+}
+
+// SubmoduleStatus describes how the working tree of a submodule differs from
+// the commit that it has checked out, according to Git (after its filters and
+// line ending conversions).
+message SubmoduleStatus {
+    // Commit is the commit that the submodule had checked out, which is the
+    // digest of its GitLink entry in the snapshot.
+    bytes commit = 1;
+    // Changed are the paths, relative to the submodule, of the files and
+    // symbolic links in the snapshot's content for the submodule (excluding
+    // the content of submodules nested in it) whose content Git doesn't
+    // consider to be the commit's: those that are modified, staged, or not
+    // tracked, along with those for which Git doesn't compare the content
+    // (because they're marked as assumed to be unchanged or as outside of a
+    // sparse checkout). Every other file and symbolic link in the snapshot's
+    // content for the submodule is the commit's.
+    repeated string changed = 2;
 }

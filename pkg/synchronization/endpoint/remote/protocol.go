@@ -3,6 +3,8 @@ package remote
 import (
 	"errors"
 	"fmt"
+
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 )
 
 const (
@@ -109,6 +111,18 @@ func (r *ScanRequest) ensureValid() error {
 	}
 
 	// Full is correct regardless of value, so no validation is required.
+
+	// Ensure that the submodules are GitLink entries at paths other than the
+	// root.
+	for path, link := range r.Submodules {
+		if path == "" {
+			return errors.New("submodule at root")
+		} else if link == nil || link.Kind != core.EntryKind_GitLink {
+			return errors.New("submodule entry isn't a Git entry")
+		} else if err := link.EnsureValid(true); err != nil {
+			return fmt.Errorf("invalid submodule entry: %w", err)
+		}
+	}
 
 	// Success.
 	return nil

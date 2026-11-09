@@ -284,9 +284,10 @@ type ScanRequest struct {
 	// Full indicates whether or not to force a full (warm) scan, temporarily
 	// avoiding any acceleration that might be available on the endpoint.
 	Full bool `protobuf:"varint,2,opt,name=full,proto3" json:"full,omitempty"`
-	// Seeds are the seeds that the ancestor's GitLink entries carry. See the
-	// seeds parameter of synchronization.Endpoint.Scan.
-	Seeds         []string `protobuf:"bytes,3,rep,name=seeds,proto3" json:"seeds,omitempty"`
+	// Submodules are the ancestor's GitLink entries, keyed by the paths of the
+	// submodules that contain them. See the submodules parameter of
+	// synchronization.Endpoint.Scan.
+	Submodules    map[string]*core.Entry `protobuf:"bytes,4,rep,name=submodules,proto3" json:"submodules,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -335,9 +336,9 @@ func (x *ScanRequest) GetFull() bool {
 	return false
 }
 
-func (x *ScanRequest) GetSeeds() []string {
+func (x *ScanRequest) GetSubmodules() map[string]*core.Entry {
 	if x != nil {
-		return x.Seeds
+		return x.Submodules
 	}
 	return nil
 }
@@ -881,7 +882,7 @@ var File_synchronization_endpoint_remote_protocol_proto protoreflect.FileDescrip
 
 const file_synchronization_endpoint_remote_protocol_proto_rawDesc = "" +
 	"\n" +
-	".synchronization/endpoint/remote/protocol.proto\x12\x06remote\x1a\"synchronization/rsync/engine.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/version.proto\x1a\"synchronization/core/archive.proto\x1a!synchronization/core/change.proto\x1a\"synchronization/core/problem.proto\"\xe0\x01\n" +
+	".synchronization/endpoint/remote/protocol.proto\x12\x06remote\x1a\"synchronization/rsync/engine.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/version.proto\x1a\"synchronization/core/archive.proto\x1a!synchronization/core/change.proto\x1a synchronization/core/entry.proto\x1a\"synchronization/core/problem.proto\"\xe0\x01\n" +
 	" InitializeSynchronizationRequest\x12\x18\n" +
 	"\asession\x18\x01 \x01(\tR\asession\x122\n" +
 	"\aversion\x18\x02 \x01(\x0e2\x18.synchronization.VersionR\aversion\x12D\n" +
@@ -893,11 +894,16 @@ const file_synchronization_endpoint_remote_protocol_proto_rawDesc = "" +
 	"\vPollRequest\"\x17\n" +
 	"\x15PollCompletionRequest\"$\n" +
 	"\fPollResponse\x12\x14\n" +
-	"\x05error\x18\x01 \x01(\tR\x05error\"\x87\x01\n" +
+	"\x05error\x18\x01 \x01(\tR\x05error\"\x88\x02\n" +
 	"\vScanRequest\x12N\n" +
 	"\x19baselineSnapshotSignature\x18\x01 \x01(\v2\x10.rsync.SignatureR\x19baselineSnapshotSignature\x12\x12\n" +
-	"\x04full\x18\x02 \x01(\bR\x04full\x12\x14\n" +
-	"\x05seeds\x18\x03 \x03(\tR\x05seeds\"\x17\n" +
+	"\x04full\x18\x02 \x01(\bR\x04full\x12C\n" +
+	"\n" +
+	"submodules\x18\x04 \x03(\v2#.remote.ScanRequest.SubmodulesEntryR\n" +
+	"submodules\x1aJ\n" +
+	"\x0fSubmodulesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12!\n" +
+	"\x05value\x18\x02 \x01(\v2\v.core.EntryR\x05value:\x028\x01J\x04\b\x03\x10\x04\"\x17\n" +
 	"\x15ScanCompletionRequest\"x\n" +
 	"\fScanResponse\x126\n" +
 	"\rsnapshotDelta\x18\x01 \x03(\v2\x10.rsync.OperationR\rsnapshotDelta\x12\x14\n" +
@@ -946,7 +952,7 @@ func file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP() []byte {
 	return file_synchronization_endpoint_remote_protocol_proto_rawDescData
 }
 
-var file_synchronization_endpoint_remote_protocol_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_synchronization_endpoint_remote_protocol_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_synchronization_endpoint_remote_protocol_proto_goTypes = []any{
 	(*InitializeSynchronizationRequest)(nil),  // 0: remote.InitializeSynchronizationRequest
 	(*InitializeSynchronizationResponse)(nil), // 1: remote.InitializeSynchronizationResponse
@@ -963,34 +969,38 @@ var file_synchronization_endpoint_remote_protocol_proto_goTypes = []any{
 	(*TransitionCompletionRequest)(nil),       // 12: remote.TransitionCompletionRequest
 	(*TransitionResponse)(nil),                // 13: remote.TransitionResponse
 	(*EndpointRequest)(nil),                   // 14: remote.EndpointRequest
-	(synchronization.Version)(0),              // 15: synchronization.Version
-	(*synchronization.Configuration)(nil),     // 16: synchronization.Configuration
-	(*rsync.Signature)(nil),                   // 17: rsync.Signature
-	(*rsync.Operation)(nil),                   // 18: rsync.Operation
-	(*core.Change)(nil),                       // 19: core.Change
-	(*core.Archive)(nil),                      // 20: core.Archive
-	(*core.Problem)(nil),                      // 21: core.Problem
+	nil,                                       // 15: remote.ScanRequest.SubmodulesEntry
+	(synchronization.Version)(0),              // 16: synchronization.Version
+	(*synchronization.Configuration)(nil),     // 17: synchronization.Configuration
+	(*rsync.Signature)(nil),                   // 18: rsync.Signature
+	(*rsync.Operation)(nil),                   // 19: rsync.Operation
+	(*core.Change)(nil),                       // 20: core.Change
+	(*core.Archive)(nil),                      // 21: core.Archive
+	(*core.Problem)(nil),                      // 22: core.Problem
+	(*core.Entry)(nil),                        // 23: core.Entry
 }
 var file_synchronization_endpoint_remote_protocol_proto_depIdxs = []int32{
-	15, // 0: remote.InitializeSynchronizationRequest.version:type_name -> synchronization.Version
-	16, // 1: remote.InitializeSynchronizationRequest.configuration:type_name -> synchronization.Configuration
-	17, // 2: remote.ScanRequest.baselineSnapshotSignature:type_name -> rsync.Signature
-	18, // 3: remote.ScanResponse.snapshotDelta:type_name -> rsync.Operation
-	17, // 4: remote.StageResponse.signatures:type_name -> rsync.Signature
-	17, // 5: remote.SupplyRequest.signatures:type_name -> rsync.Signature
-	19, // 6: remote.TransitionRequest.transitions:type_name -> core.Change
-	20, // 7: remote.TransitionResponse.results:type_name -> core.Archive
-	21, // 8: remote.TransitionResponse.problems:type_name -> core.Problem
-	2,  // 9: remote.EndpointRequest.poll:type_name -> remote.PollRequest
-	5,  // 10: remote.EndpointRequest.scan:type_name -> remote.ScanRequest
-	8,  // 11: remote.EndpointRequest.stage:type_name -> remote.StageRequest
-	10, // 12: remote.EndpointRequest.supply:type_name -> remote.SupplyRequest
-	11, // 13: remote.EndpointRequest.transition:type_name -> remote.TransitionRequest
-	14, // [14:14] is the sub-list for method output_type
-	14, // [14:14] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	16, // 0: remote.InitializeSynchronizationRequest.version:type_name -> synchronization.Version
+	17, // 1: remote.InitializeSynchronizationRequest.configuration:type_name -> synchronization.Configuration
+	18, // 2: remote.ScanRequest.baselineSnapshotSignature:type_name -> rsync.Signature
+	15, // 3: remote.ScanRequest.submodules:type_name -> remote.ScanRequest.SubmodulesEntry
+	19, // 4: remote.ScanResponse.snapshotDelta:type_name -> rsync.Operation
+	18, // 5: remote.StageResponse.signatures:type_name -> rsync.Signature
+	18, // 6: remote.SupplyRequest.signatures:type_name -> rsync.Signature
+	20, // 7: remote.TransitionRequest.transitions:type_name -> core.Change
+	21, // 8: remote.TransitionResponse.results:type_name -> core.Archive
+	22, // 9: remote.TransitionResponse.problems:type_name -> core.Problem
+	2,  // 10: remote.EndpointRequest.poll:type_name -> remote.PollRequest
+	5,  // 11: remote.EndpointRequest.scan:type_name -> remote.ScanRequest
+	8,  // 12: remote.EndpointRequest.stage:type_name -> remote.StageRequest
+	10, // 13: remote.EndpointRequest.supply:type_name -> remote.SupplyRequest
+	11, // 14: remote.EndpointRequest.transition:type_name -> remote.TransitionRequest
+	23, // 15: remote.ScanRequest.SubmodulesEntry.value:type_name -> core.Entry
+	16, // [16:16] is the sub-list for method output_type
+	16, // [16:16] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_endpoint_remote_protocol_proto_init() }
@@ -1004,7 +1014,7 @@ func file_synchronization_endpoint_remote_protocol_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_synchronization_endpoint_remote_protocol_proto_rawDesc), len(file_synchronization_endpoint_remote_protocol_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   15,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -108,12 +108,18 @@ func (e *testingEndpoint) Poll(ctx context.Context) error {
 }
 
 // Scan implements Endpoint.Scan.
-func (e *testingEndpoint) Scan(_ context.Context, _ *core.Entry, seeds []string, full bool) (*core.Snapshot, error, bool) {
+func (e *testingEndpoint) Scan(_ context.Context, _ *core.Entry, submodules map[string]*core.Entry, full bool) (*core.Snapshot, error, bool) {
 	e.lock.Lock()
 	defer e.lock.Unlock()
 	e.scans++
 	if full {
 		e.fullScans++
+	}
+	var seeds []string
+	for _, link := range submodules {
+		if link.Seed != "" {
+			seeds = append(seeds, link.Seed)
+		}
 	}
 	e.scanSeeds = append(e.scanSeeds, slices.Sorted(slices.Values(seeds)))
 	for path, population := range e.seeds {

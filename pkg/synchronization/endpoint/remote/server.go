@@ -303,7 +303,7 @@ func (s *endpointServer) serveScan(request *ScanRequest) error {
 
 		// Perform a scan and set up the response.
 		var response *ScanResponse
-		snapshot, err, tryAgain := s.endpoint.Scan(ctx, nil, request.Seeds, request.Full)
+		snapshot, err, tryAgain := s.endpoint.Scan(ctx, nil, request.Submodules, request.Full)
 		if err != nil {
 			response = &ScanResponse{
 				Error:    err.Error(),

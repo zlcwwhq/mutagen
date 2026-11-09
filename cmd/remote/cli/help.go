@@ -207,8 +207,10 @@ between a star's center and one of its nodes:
     synchronize nothing in it and list a conflict until they agree,
     one-way-safe sessions synchronize its files but list a conflict for its
     commit, and two-way-resolved sessions follow alpha's commit and resolve
-    files as usual. Deleting it isn't synchronized: delete it on each
-    endpoint. Other nested repositories are synchronized as
+    files as usual. Once both have the same commit, a file that Git
+    considers changed on only one endpoint propagates from it, and only a
+    file changed on both is a conflict. Deleting it isn't synchronized:
+    delete it on each endpoint. Other nested repositories are synchronized as
     directories without their .git. Inside a nested repository, as for Git
     run in it, only its own .gitignore files and exclude file apply; the
     rules above it only decide whether its directory is ignored. An endpoint

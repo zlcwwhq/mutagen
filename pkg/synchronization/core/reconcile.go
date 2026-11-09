@@ -25,6 +25,10 @@ type reconciler struct {
 	// that are read separately on each endpoint, and that may thus temporarily
 	// disagree between them.
 	gitMode bool
+	// alphaStatuses and betaStatuses are the endpoints' submodule statuses
+	// (see Snapshot.SubmoduleStatuses), which are only used in Git mode.
+	alphaStatuses map[string]*SubmoduleStatus
+	betaStatuses  map[string]*SubmoduleStatus
 	// ancestorChanges are the changes to be applied to the ancestor.
 	ancestorChanges []*Change
 	// alphaChanges are the changes to be applied to alpha.
@@ -102,6 +106,14 @@ func (r *reconciler) reconcile(path string, ancestor, alpha, beta *Entry) {
 	// otherwise send them into the usual recursion.
 	if r.gitMode && r.reconcileSubmodule(path, ancestor, alpha, beta) {
 		return
+	}
+
+	// In Git mode, if both sides have a submodule here with the same commit
+	// checked out, then the ancestor's content for it may belong to another
+	// commit, in which case it's replaced with a better merge base, if one can
+	// be determined (see rebaseSubmodule).
+	if r.gitMode {
+		ancestor = r.rebaseSubmodule(path, ancestor, alpha, beta)
 	}
 
 	// Check if alpha and beta agree on the contents of this path. If so, then
@@ -666,7 +678,22 @@ func Reconcile(ancestor, alpha, beta *Entry, mode SynchronizationMode) ([]*Chang
 // anything to or from a side on which a path is untracked, so a rule that has
 // only reached one endpoint can't cause content to be deleted on the other.
 func ReconcileGitMode(ancestor, alpha, beta *Entry, mode SynchronizationMode) ([]*Change, []*Change, []*Change, []*Conflict) {
-	return (&reconciler{mode: mode, gitMode: true}).run(ancestor, alpha, beta)
+	return ReconcileGitModeWithStatuses(ancestor, alpha, beta, nil, nil, mode)
+}
+
+// ReconcileGitModeWithStatuses is a variant of ReconcileGitMode that also
+// takes the endpoints' submodule statuses (see Snapshot.SubmoduleStatuses),
+// with which it determines a merge base for each submodule that both endpoints
+// have moved to the same commit since the ancestor (see
+// reconciler.rebaseSubmodule). Without them, the ancestor's content is the
+// merge base for such submodules too.
+func ReconcileGitModeWithStatuses(ancestor, alpha, beta *Entry, alphaStatuses, betaStatuses map[string]*SubmoduleStatus, mode SynchronizationMode) ([]*Change, []*Change, []*Change, []*Conflict) {
+	return (&reconciler{
+		mode:          mode,
+		gitMode:       true,
+		alphaStatuses: alphaStatuses,
+		betaStatuses:  betaStatuses,
+	}).run(ancestor, alpha, beta)
 }
 
 // run performs reconciliation on the root and returns the resulting lists.

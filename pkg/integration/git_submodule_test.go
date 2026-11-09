@@ -435,6 +435,7 @@ var gitSubmoduleScenarios = []struct {
 	{"follow", testGitSubmoduleFollow},
 	{"unpushed commit", testGitSubmoduleUnpushedCommit},
 	{"diverged commits", testGitSubmoduleDiverged},
+	{"diverged commits agreed", testGitSubmoduleDivergedAgreed},
 	{"diverged commits resolved for alpha", testGitSubmoduleDivergedResolved},
 	{"attach", testGitSubmoduleAttach},
 	{"attach with unpushed commit", testGitSubmoduleAttachUnpushed},
@@ -800,6 +801,57 @@ func testGitSubmoduleDiverged(t *testing.T, transport gitSubmoduleTransport) {
 	}
 
 	// The session continues as usual.
+	f.write(f.follower, map[string]string{"file": "changed on beta"})
+	f.flush()
+	f.expect(f.alpha, map[string]string{"sub/file": "changed on beta"})
+}
+
+// testGitSubmoduleDivergedAgreed tests that once both endpoints have the same
+// commit checked out again after different new commits, which were a conflict,
+// uncommitted changes to files that the commit changed propagate from the
+// endpoint that made them, because the other endpoint has the commit's content
+// for them, rather than being conflicts. Before both moved, the ancestor had
+// another commit for the submodule, so it doesn't have the commit's content.
+func testGitSubmoduleDivergedAgreed(t *testing.T, transport gitSubmoduleTransport) {
+	f := newGitSubmoduleFixture(t, transport, gitModeOptions{}, nil)
+	f.flush()
+
+	// Create different commits, which both endpoints could obtain, the one on
+	// alpha changing files, two of which alpha then changes further without
+	// committing that.
+	alphaCommit := gitModeCommitFiles(t, f.leader, map[string]string{
+		"file":    "committed on alpha",
+		"other":   "committed on alpha",
+		"deleted": "committed on alpha",
+	}, "alpha")
+	gitModePush(t, f.leader, "alpha")
+	f.write(f.leader, map[string]string{"file": "changed on alpha"})
+	f.remove(f.leader, "deleted")
+	gitModeCommit(t, f.follower, "beta", "beta")
+	gitModePush(t, f.follower, "beta")
+	if state := f.flushAllowingProblems(); len(state.Conflicts) != 1 || state.Conflicts[0].Root != "sub" {
+		t.Fatalf("incorrect conflicts: %v", state.Conflicts)
+	}
+
+	// Check out alpha's commit on beta, and change one of the files that the
+	// commit changed there, without committing that. Each endpoint's changes
+	// arrive on the other, without any conflicts.
+	gitModeRun(t, f.follower, "fetch", "--quiet", "origin", "alpha")
+	gitModeRun(t, f.follower, "checkout", "--quiet", "--detach", alphaCommit)
+	f.write(f.follower, map[string]string{"other": "changed on beta"})
+	f.flush()
+	f.verifyAlphaAt(alphaCommit)
+	if head := gitModeHead(t, f.follower); head != alphaCommit {
+		t.Errorf("incorrect commit on beta: %s != %s", head, alphaCommit)
+	}
+	f.expect(f.beta, map[string]string{"sub/file": "changed on alpha"})
+	f.expect(f.alpha, map[string]string{"sub/other": "changed on beta"})
+	f.expectMissing(f.beta, "sub/deleted", "sub/beta")
+	f.verifySameStatus("", " D deleted\n M file\n M other")
+	f.verifySettled()
+
+	// The session continues as usual, with the commit's content as the
+	// ancestor's.
 	f.write(f.follower, map[string]string{"file": "changed on beta"})
 	f.flush()
 	f.expect(f.alpha, map[string]string{"sub/file": "changed on beta"})

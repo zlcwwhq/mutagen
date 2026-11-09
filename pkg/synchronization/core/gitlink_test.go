@@ -368,6 +368,7 @@ func TestSnapshotWithSeeds(t *testing.T) {
 		TotalFileSize:          4,
 		Warnings:               []*Problem{{Path: "path", Error: "warning"}},
 		Seeds:                  map[string]*Entry{"old": tD1},
+		SubmoduleStatuses:      map[string]*SubmoduleStatus{"path": {Commit: []byte{1}}},
 	}
 	reflected := original.ProtoReflect()
 	fields := reflected.Descriptor().Fields()

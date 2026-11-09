@@ -9,6 +9,7 @@ import "synchronization/configuration.proto";
 import "synchronization/version.proto";
 import "synchronization/core/archive.proto";
 import "synchronization/core/change.proto";
+import "synchronization/core/entry.proto";
 import "synchronization/core/problem.proto";
 
 // InitializeSynchronizationRequest encodes a request for endpoint
@@ -54,9 +55,13 @@ message ScanRequest {
     // Full indicates whether or not to force a full (warm) scan, temporarily
     // avoiding any acceleration that might be available on the endpoint.
     bool full = 2;
-    // Seeds are the seeds that the ancestor's GitLink entries carry. See the
-    // seeds parameter of synchronization.Endpoint.Scan.
-    repeated string seeds = 3;
+    // Field 3 held the seeds that the ancestor's GitLink entries carry, which
+    // are now part of the entries in submodules.
+    reserved 3;
+    // Submodules are the ancestor's GitLink entries, keyed by the paths of the
+    // submodules that contain them. See the submodules parameter of
+    // synchronization.Endpoint.Scan.
+    map<string, core.Entry> submodules = 4;
 }
 
 // ScanCompletionRequest is paired with a ScanRequest and indicates a request

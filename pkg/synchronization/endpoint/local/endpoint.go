@@ -1168,25 +1168,39 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 }
 
 // Scan implements the Scan method for local endpoints.
-func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, seeds []string, full bool) (*core.Snapshot, error, bool) {
+func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, submodules map[string]*core.Entry, full bool) (*core.Snapshot, error, bool) {
 	// Compute the snapshot.
 	snapshot, err, tryAgain := e.lockAndScan(ctx, full)
 	if err != nil {
 		return nil, err, tryAgain
 	}
 
-	// In Git mode, process the records of submodule populations, and attach
-	// warnings about the content of the snapshot. Doing this here means that
-	// it happens once per synchronization cycle and not for the watching
+	// In Git mode, process the records of submodule populations, describe the
+	// working trees of submodules that have moved to another commit, and
+	// attach warnings about the content of the snapshot. Doing this here means
+	// that it happens once per synchronization cycle and not for the watching
 	// Goroutines' scans. We've released the scan lock by this point so that
 	// running Git doesn't get in the way of the watching Goroutines. Since the
 	// snapshot may be the baseline of the next scan, and it's compared with
-	// previous snapshots by poll-based watching, it stays free of seeds and
-	// warnings, and we only return a copy of it that has them.
+	// previous snapshots by poll-based watching, it stays free of seeds,
+	// statuses, and warnings, and we only return a copy of it that has them.
+	// The statuses have to be determined after the scan, so that a file that
+	// Git says is the commit's either was the commit's when it was scanned or
+	// has changed since, in which case transitions refuse to replace it.
 	if e.gitMode {
+		var seeds []string
+		for _, link := range submodules {
+			if link.GetSeed() != "" {
+				seeds = append(seeds, link.Seed)
+			}
+		}
 		populations, warnings, err := e.gitProvider.populations(snapshot.Content, seeds)
 		if err != nil {
 			return nil, err, true
+		}
+		statuses, err := e.gitProvider.submoduleStatuses(ctx, snapshot.Content, submodules)
+		if err != nil {
+			return nil, err, false
 		}
 		warnings = append(warnings, e.gitWarnings(ctx, snapshot)...)
 		if len(warnings) > 0 {
@@ -1194,6 +1208,9 @@ func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, seeds []string, full
 		}
 		if len(populations) > 0 {
 			snapshot = snapshot.WithSeeds(populations)
+		}
+		if len(statuses) > 0 {
+			snapshot = snapshot.WithSubmoduleStatuses(statuses)
 		}
 	}
 

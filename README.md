@@ -238,7 +238,12 @@ it has checked out is synchronized:
   then merging their files path by path would mix two commits. So, in
   `two-way-safe` sessions, nothing in the submodule is synchronized, and
   `remote --conflicts` lists a conflict, until both have the same commit checked
-  out. Deleting the submodule on one endpoint also resolves it: that endpoint's
+  out. Then a file that Git considers changed from that commit (modified,
+  deleted, or not tracked) on only one endpoint propagates to the other, even if
+  the commit changed it, and only a file that both have changed, or whose bytes
+  differ although Git considers both unchanged, is a conflict. The same holds
+  for a session that starts with both at the same commit. Deleting the
+  submodule on one endpoint also resolves the conflict: that endpoint's
   commit and changes are discarded, and it gets a clone of the other's commit.
   `two-way-resolved` sessions follow alpha's commit and resolve files as usual.
 - Deleting a submodule isn't synchronized: the endpoint that still has it

@@ -111,10 +111,23 @@ func verifyDetachedAt(t *testing.T, directory, commit string) {
 
 // scanWithSeeds performs a full scan that must succeed, with the specified
 // seeds as those that the session's ancestor carries, and verifies that the
-// resulting snapshot is valid.
+// resulting snapshot is valid. The seeds are carried by GitLink entries at
+// paths that the endpoint doesn't have.
 func scanWithSeeds(t *testing.T, e *endpoint, seeds []string) *core.Snapshot {
 	t.Helper()
-	snapshot, err, _ := e.Scan(context.Background(), nil, seeds, true)
+	var submodules map[string]*core.Entry
+	for s, seed := range seeds {
+		if submodules == nil {
+			submodules = make(map[string]*core.Entry)
+		}
+		submodules[fmt.Sprintf("ancestor/%d", s)] = &core.Entry{
+			Kind:   core.EntryKind_GitLink,
+			Digest: []byte{1},
+			Url:    "https://example.com/submodule.git",
+			Seed:   seed,
+		}
+	}
+	snapshot, err, _ := e.Scan(context.Background(), nil, submodules, true)
 	if err != nil {
 		t.Fatal("scan failed:", err)
 	} else if err := snapshot.EnsureValid(); err != nil {

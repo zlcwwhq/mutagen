@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
@@ -34,7 +35,7 @@ func (s *Snapshot) EnsureValid() error {
 	// otherwise needn't match, since the endpoint's content may have changed
 	// since the population.
 	for path, seed := range s.Seeds {
-		if path == "" || strings.HasPrefix(path, "/") || strings.HasSuffix(path, "/") || strings.Contains(path, "//") {
+		if !validRelativePath(path) {
 			return errors.New("invalid seed path")
 		} else if err := seed.EnsureValid(true); err != nil {
 			return fmt.Errorf("invalid seed: %w", err)
@@ -42,6 +43,25 @@ func (s *Snapshot) EnsureValid() error {
 			return errors.New("seed isn't a populated submodule")
 		} else if current := lookup(s.Content, path).gitLink(); current == nil || current.Seed != link.Seed {
 			return errors.New("seed doesn't match snapshot content")
+		}
+	}
+
+	// Ensure that submodule statuses are valid. Each must be for a submodule
+	// at a path other than the root that has the status's commit checked out
+	// in the snapshot, and its changed paths must be relative paths. They
+	// needn't identify content, since paths that don't aren't used.
+	for path, status := range s.SubmoduleStatuses {
+		if !validRelativePath(path) {
+			return errors.New("invalid submodule status path")
+		} else if status == nil {
+			return errors.New("nil submodule status")
+		} else if link := lookup(s.Content, path).gitLink(); link == nil || !bytes.Equal(link.Digest, status.Commit) {
+			return errors.New("submodule status doesn't match snapshot content")
+		}
+		for _, changed := range status.Changed {
+			if !validRelativePath(changed) {
+				return errors.New("invalid changed path in submodule status")
+			}
 		}
 	}
 
@@ -59,11 +79,17 @@ func (s *Snapshot) EnsureValid() error {
 	return nil
 }
 
+// validRelativePath determines whether or not a path is a non-empty relative
+// path in the form that content paths take.
+func validRelativePath(path string) bool {
+	return path != "" && !strings.HasPrefix(path, "/") && !strings.HasSuffix(path, "/") && !strings.Contains(path, "//")
+}
+
 // Equal performs an equivalence comparison between this snapshot and another.
-// It doesn't compare warnings or seeds, which don't describe the snapshot's
-// content and which aren't necessarily computed for every snapshot. In
-// particular, a change in either doesn't constitute a modification to be
-// synchronized.
+// It doesn't compare warnings, seeds, or submodule statuses, which don't
+// describe the snapshot's content and which aren't necessarily computed for
+// every snapshot. In particular, a change in any of them doesn't constitute a
+// modification to be synchronized.
 func (s *Snapshot) Equal(other *Snapshot) bool {
 	return s.Content.Equal(other.Content, true) &&
 		s.PreservesExecutability == other.PreservesExecutability &&
@@ -73,7 +99,7 @@ func (s *Snapshot) Equal(other *Snapshot) bool {
 // WithWarnings returns a shallow copy of the snapshot with the specified
 // warnings in place of any that it has. Snapshots are immutable and may be
 // shared (e.g. as the baseline for a subsequent scan), so this is the way to
-// attach warnings to one. Seeds are retained.
+// attach warnings to one. Seeds and submodule statuses are retained.
 func (s *Snapshot) WithWarnings(warnings []*Problem) *Snapshot {
 	return &Snapshot{
 		Content:                s.Content,
@@ -85,14 +111,24 @@ func (s *Snapshot) WithWarnings(warnings []*Problem) *Snapshot {
 		TotalFileSize:          s.TotalFileSize,
 		Warnings:               warnings,
 		Seeds:                  s.Seeds,
+		SubmoduleStatuses:      s.SubmoduleStatuses,
 	}
 }
 
 // WithSeeds returns a shallow copy of the snapshot with the specified seeds in
-// place of any that it has, for the same reason as WithWarnings. Warnings are
-// retained.
+// place of any that it has, for the same reason as WithWarnings. Warnings and
+// submodule statuses are retained.
 func (s *Snapshot) WithSeeds(seeds map[string]*Entry) *Snapshot {
 	result := s.WithWarnings(s.Warnings)
 	result.Seeds = seeds
+	return result
+}
+
+// WithSubmoduleStatuses returns a shallow copy of the snapshot with the
+// specified submodule statuses in place of any that it has, for the same
+// reason as WithWarnings. Warnings and seeds are retained.
+func (s *Snapshot) WithSubmoduleStatuses(statuses map[string]*SubmoduleStatus) *Snapshot {
+	result := s.WithWarnings(s.Warnings)
+	result.SubmoduleStatuses = statuses
 	return result
 }

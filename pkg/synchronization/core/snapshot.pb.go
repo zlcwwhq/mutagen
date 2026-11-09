@@ -62,9 +62,17 @@ type Snapshot struct {
 	// content came from a clone rather than from changes on this endpoint.
 	// The session uses it in place of the ancestor at those paths. Like
 	// warnings, seeds aren't part of the snapshot's identity.
-	Seeds         map[string]*Entry `protobuf:"bytes,9,rep,name=seeds,proto3" json:"seeds,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Seeds map[string]*Entry `protobuf:"bytes,9,rep,name=seeds,proto3" json:"seeds,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// SubmoduleStatuses maps the paths of submodules that have a commit
+	// checked out other than the one that the ancestor has for them (or for
+	// which the ancestor doesn't have one) to how their working trees differ
+	// from that commit, as far as Git could tell. Reconciliation uses them
+	// when both endpoints have the same commit checked out, to identify the
+	// content that one endpoint has changed and the other hasn't. Like
+	// warnings, they aren't part of the snapshot's identity.
+	SubmoduleStatuses map[string]*SubmoduleStatus `protobuf:"bytes,10,rep,name=submoduleStatuses,proto3" json:"submoduleStatuses,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Snapshot) Reset() {
@@ -160,11 +168,83 @@ func (x *Snapshot) GetSeeds() map[string]*Entry {
 	return nil
 }
 
+func (x *Snapshot) GetSubmoduleStatuses() map[string]*SubmoduleStatus {
+	if x != nil {
+		return x.SubmoduleStatuses
+	}
+	return nil
+}
+
+// SubmoduleStatus describes how the working tree of a submodule differs from
+// the commit that it has checked out, according to Git (after its filters and
+// line ending conversions).
+type SubmoduleStatus struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Commit is the commit that the submodule had checked out, which is the
+	// digest of its GitLink entry in the snapshot.
+	Commit []byte `protobuf:"bytes,1,opt,name=commit,proto3" json:"commit,omitempty"`
+	// Changed are the paths, relative to the submodule, of the files and
+	// symbolic links in the snapshot's content for the submodule (excluding
+	// the content of submodules nested in it) whose content Git doesn't
+	// consider to be the commit's: those that are modified, staged, or not
+	// tracked, along with those for which Git doesn't compare the content
+	// (because they're marked as assumed to be unchanged or as outside of a
+	// sparse checkout). Every other file and symbolic link in the snapshot's
+	// content for the submodule is the commit's.
+	Changed       []string `protobuf:"bytes,2,rep,name=changed,proto3" json:"changed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SubmoduleStatus) Reset() {
+	*x = SubmoduleStatus{}
+	mi := &file_synchronization_core_snapshot_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubmoduleStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubmoduleStatus) ProtoMessage() {}
+
+func (x *SubmoduleStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_synchronization_core_snapshot_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubmoduleStatus.ProtoReflect.Descriptor instead.
+func (*SubmoduleStatus) Descriptor() ([]byte, []int) {
+	return file_synchronization_core_snapshot_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *SubmoduleStatus) GetCommit() []byte {
+	if x != nil {
+		return x.Commit
+	}
+	return nil
+}
+
+func (x *SubmoduleStatus) GetChanged() []string {
+	if x != nil {
+		return x.Changed
+	}
+	return nil
+}
+
 var File_synchronization_core_snapshot_proto protoreflect.FileDescriptor
 
 const file_synchronization_core_snapshot_proto_rawDesc = "" +
 	"\n" +
-	"#synchronization/core/snapshot.proto\x12\x04core\x1a synchronization/core/entry.proto\x1a\"synchronization/core/problem.proto\"\xbe\x03\n" +
+	"#synchronization/core/snapshot.proto\x12\x04core\x1a synchronization/core/entry.proto\x1a\"synchronization/core/problem.proto\"\xf0\x04\n" +
 	"\bSnapshot\x12%\n" +
 	"\acontent\x18\x01 \x01(\v2\v.core.EntryR\acontent\x126\n" +
 	"\x16preservesExecutability\x18\x02 \x01(\bR\x16preservesExecutability\x12,\n" +
@@ -174,11 +254,19 @@ const file_synchronization_core_snapshot_proto_rawDesc = "" +
 	"\rsymbolicLinks\x18\x06 \x01(\x04R\rsymbolicLinks\x12$\n" +
 	"\rtotalFileSize\x18\a \x01(\x04R\rtotalFileSize\x12)\n" +
 	"\bwarnings\x18\b \x03(\v2\r.core.ProblemR\bwarnings\x12/\n" +
-	"\x05seeds\x18\t \x03(\v2\x19.core.Snapshot.SeedsEntryR\x05seeds\x1aE\n" +
+	"\x05seeds\x18\t \x03(\v2\x19.core.Snapshot.SeedsEntryR\x05seeds\x12S\n" +
+	"\x11submoduleStatuses\x18\n" +
+	" \x03(\v2%.core.Snapshot.SubmoduleStatusesEntryR\x11submoduleStatuses\x1aE\n" +
 	"\n" +
 	"SeedsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12!\n" +
-	"\x05value\x18\x02 \x01(\v2\v.core.EntryR\x05value:\x028\x01B8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"
+	"\x05value\x18\x02 \x01(\v2\v.core.EntryR\x05value:\x028\x01\x1a[\n" +
+	"\x16SubmoduleStatusesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12+\n" +
+	"\x05value\x18\x02 \x01(\v2\x15.core.SubmoduleStatusR\x05value:\x028\x01\"C\n" +
+	"\x0fSubmoduleStatus\x12\x16\n" +
+	"\x06commit\x18\x01 \x01(\fR\x06commit\x12\x18\n" +
+	"\achanged\x18\x02 \x03(\tR\achangedB8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"
 
 var (
 	file_synchronization_core_snapshot_proto_rawDescOnce sync.Once
@@ -192,23 +280,27 @@ func file_synchronization_core_snapshot_proto_rawDescGZIP() []byte {
 	return file_synchronization_core_snapshot_proto_rawDescData
 }
 
-var file_synchronization_core_snapshot_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_synchronization_core_snapshot_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_synchronization_core_snapshot_proto_goTypes = []any{
-	(*Snapshot)(nil), // 0: core.Snapshot
-	nil,              // 1: core.Snapshot.SeedsEntry
-	(*Entry)(nil),    // 2: core.Entry
-	(*Problem)(nil),  // 3: core.Problem
+	(*Snapshot)(nil),        // 0: core.Snapshot
+	(*SubmoduleStatus)(nil), // 1: core.SubmoduleStatus
+	nil,                     // 2: core.Snapshot.SeedsEntry
+	nil,                     // 3: core.Snapshot.SubmoduleStatusesEntry
+	(*Entry)(nil),           // 4: core.Entry
+	(*Problem)(nil),         // 5: core.Problem
 }
 var file_synchronization_core_snapshot_proto_depIdxs = []int32{
-	2, // 0: core.Snapshot.content:type_name -> core.Entry
-	3, // 1: core.Snapshot.warnings:type_name -> core.Problem
-	1, // 2: core.Snapshot.seeds:type_name -> core.Snapshot.SeedsEntry
-	2, // 3: core.Snapshot.SeedsEntry.value:type_name -> core.Entry
-	4, // [4:4] is the sub-list for method output_type
-	4, // [4:4] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	4, // 0: core.Snapshot.content:type_name -> core.Entry
+	5, // 1: core.Snapshot.warnings:type_name -> core.Problem
+	2, // 2: core.Snapshot.seeds:type_name -> core.Snapshot.SeedsEntry
+	3, // 3: core.Snapshot.submoduleStatuses:type_name -> core.Snapshot.SubmoduleStatusesEntry
+	4, // 4: core.Snapshot.SeedsEntry.value:type_name -> core.Entry
+	1, // 5: core.Snapshot.SubmoduleStatusesEntry.value:type_name -> core.SubmoduleStatus
+	6, // [6:6] is the sub-list for method output_type
+	6, // [6:6] is the sub-list for method input_type
+	6, // [6:6] is the sub-list for extension type_name
+	6, // [6:6] is the sub-list for extension extendee
+	0, // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_core_snapshot_proto_init() }
@@ -224,7 +316,7 @@ func file_synchronization_core_snapshot_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_synchronization_core_snapshot_proto_rawDesc), len(file_synchronization_core_snapshot_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
