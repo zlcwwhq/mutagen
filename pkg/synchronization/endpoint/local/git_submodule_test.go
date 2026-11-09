@@ -1283,9 +1283,9 @@ func TestEndpointGitModeFollow(t *testing.T) {
 		verifyDetachedAt(t, clone.directory, second)
 	})
 
-	// A lock on the index stops the index and HEAD from moving, but HEAD is
-	// detached at the commit where it was, which is consistent with the index.
-	// The next attempt succeeds once the lock is gone.
+	// A lock on the index, which another Git command holds while it writes
+	// the index, stops HEAD from following, and leaves HEAD and the branch
+	// that it refers to alone. The next attempt succeeds once the lock is gone.
 	t.Run("locked index", func(t *testing.T) {
 		upstream := newGitUpstream(t, "upstream")
 		clone := newSubmoduleClone(t, upstream)
@@ -1300,7 +1300,11 @@ func TestEndpointGitModeFollow(t *testing.T) {
 			t.Error("incorrect result:", result)
 		}
 		verifySingleWarning(t, problems, "sub/.git", gitShortCommit(second), "index.lock")
-		verifyDetachedAt(t, clone.directory, clone.first)
+		if branch := mustGit(t, clone.directory, "symbolic-ref", "HEAD"); branch != "refs/heads/main" {
+			t.Errorf("HEAD doesn't refer to the branch: %s", branch)
+		} else if head := mustGit(t, clone.directory, "rev-parse", "HEAD"); head != clone.first {
+			t.Errorf("HEAD moved: %s", head)
+		}
 		if err := os.Remove(lock); err != nil {
 			t.Fatal(err)
 		}

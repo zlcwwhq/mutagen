@@ -208,7 +208,9 @@ it has checked out is synchronized:
   endpoint can follow them. Until it has the commit, its `HEAD` stays behind,
   which is reported as a warning. Once it has the commit, a session that
   watches for changes follows right away, and one that doesn't at its next
-  flush.
+  flush. `HEAD` also stays behind, with a warning, while a Git operation is in
+  progress there, such as a merge, a rebase, or a commit whose message is
+  being edited, and follows once it's finished or aborted.
 - An endpoint that doesn't have the submodule, or has an empty directory in its
   place (as `git clone` without `--recurse-submodules` and `git submodule
   deinit` leave), gets a clone from the `origin` URL of the other endpoint's

@@ -792,7 +792,10 @@ func (g *gitProvider) Refresh(ctx context.Context, directory string) error {
 }
 
 // gitOperations maps the entries of a Git directory that record an operation
-// in progress to descriptions of the operation for use in messages.
+// in progress to descriptions of the operation for use in messages. The index's
+// lock file records that a Git command is writing the index, which a commit
+// does for as long as its message is being edited, and when it's done, it
+// moves whatever HEAD refers to at that point.
 var gitOperations = []struct {
 	// path is the entry's path within the Git directory.
 	path string
@@ -804,12 +807,19 @@ var gitOperations = []struct {
 	{"REVERT_HEAD", "a revert is in progress"},
 	{"rebase-merge", "a rebase is in progress"},
 	{"rebase-apply", "a rebase is in progress"},
+	{"index.lock", "another Git command is using the index (index.lock exists), such as a commit whose message is being edited"},
 }
+
+// gitRestoreTimeout is the maximum amount of time that the Git commands that
+// reattach HEAD to its branch after a failed follow can take (see Follow).
+// They run even if the follow was cancelled, since they undo what the follow
+// did, and they only read and write a few small files.
+const gitRestoreTimeout = 10 * time.Second
 
 // gitOperationInProgress determines whether or not an operation whose state
 // isn't just HEAD and the index is in progress in the repository in a directory,
-// such as a merge or a rebase that has stopped, or whether the index has
-// conflicts, and if so, it returns a description for use in messages.
+// such as a merge or a rebase that has stopped, or a commit, or whether the
+// index has conflicts, and if so, it returns a description for use in messages.
 func gitOperationInProgress(ctx context.Context, directory string) (string, error) {
 	// Locate the entries that record operations. Git reports paths relative to
 	// the directory unless they're elsewhere.
@@ -876,11 +886,23 @@ func (g *gitProvider) Follow(ctx context.Context, directory string, old, target 
 
 	// Don't follow while an operation is in progress whose state is in the
 	// index and the Git directory, such as a merge with conflicts, since
-	// moving HEAD and resetting the index would discard it.
+	// moving HEAD and resetting the index would discard it, or while another
+	// command is using the index, which would make moving the index fail, and
+	// which may be a commit that would then move HEAD.
 	if operation, err := gitOperationInProgress(ctx, directory); err != nil {
 		return fmt.Errorf("HEAD didn't follow commit %s: %w", gitShortCommit(targetCommit), err)
 	} else if operation != "" {
-		return fmt.Errorf("HEAD didn't follow commit %s, because %s, which moving HEAD would discard; finish or abort it, and HEAD will follow", gitShortCommit(targetCommit), operation)
+		return fmt.Errorf("HEAD didn't follow commit %s, because %s, which moving HEAD would disrupt; finish or abort it, and HEAD will follow", gitShortCommit(targetCommit), operation)
+	}
+
+	// Determine the branch that HEAD refers to, if any, so that HEAD can be
+	// reattached to it if moving the index fails. Git answers with an exit
+	// code of one if HEAD is detached.
+	var branch string
+	if output, err := git.Run(ctx, directory, "symbolic-ref", "--quiet", "HEAD"); err == nil && strings.HasPrefix(output, "refs/") {
+		branch = output
+	} else if err != nil && !git.ExitedWith(err, 1) {
+		return fmt.Errorf("HEAD didn't follow commit %s: unable to determine the branch: %w", gitShortCommit(targetCommit), err)
 	}
 
 	// Detach HEAD where it is, which also verifies that it's still the
@@ -893,16 +915,76 @@ func (g *gitProvider) Follow(ctx context.Context, directory string, old, target 
 	// the commits merely lack cached file information. The reset writes the
 	// index before it moves HEAD, so if it's interrupted, then HEAD is detached
 	// at the old commit, which is consistent, and the next cycle tries again.
+	//
+	// If moving the index fails, such as because another command has started
+	// to use the index since we checked, then HEAD is reattached to the branch
+	// that it referred to. Otherwise, a commit that was in progress would be
+	// made on the detached HEAD rather than on the branch, since a commit only
+	// verifies that HEAD is still at the commit where it was. Nothing changes
+	// for the commit if HEAD is reattached before the commit is made, and if
+	// it's made in the mean time, then HEAD is left alone, as it is if anything
+	// else has moved HEAD or the branch.
 	if _, err := git.Run(ctx, directory, "update-ref", "--no-deref", "-m", "mutagen: follow", "HEAD", oldCommit, oldCommit); err != nil {
 		return fmt.Errorf("HEAD didn't follow commit %s: %w", gitShortCommit(targetCommit), err)
 	} else if err := resetWithoutRefresh(ctx, directory, targetCommit); err != nil {
 		if ctx.Err() != nil || !replaceIndex(ctx, directory, oldCommit, targetCommit) {
+			if branch != "" {
+				if reattachErr := reattachHead(ctx, directory, branch, oldCommit); reattachErr != nil {
+					return fmt.Errorf("HEAD didn't follow commit %s: %w; HEAD is left detached at %s, because it couldn't be reattached to %s (%v)",
+						gitShortCommit(targetCommit), err, gitShortCommit(oldCommit), branch, reattachErr,
+					)
+				}
+			}
 			return fmt.Errorf("HEAD didn't follow commit %s: %w", gitShortCommit(targetCommit), err)
 		}
 	}
 
 	// Success.
 	return nil
+}
+
+// reattachHead points HEAD back at a branch after Follow has detached it at
+// the commit that the branch is at, if moving the index has failed. HEAD is
+// only reattached if it's still detached at that commit, since otherwise
+// something else has moved it and the result isn't Follow's to undo, and if the
+// branch is still at that commit, since otherwise reattaching would change
+// what's checked out. The commands run even if the context has been cancelled,
+// because the follow would otherwise leave HEAD detached. There's no way to
+// make the change conditional on HEAD's state with the versions of Git that
+// submodules support, so the state is checked first, which leaves a window of
+// a few milliseconds, as opposed to the indefinite one of leaving HEAD detached.
+func reattachHead(ctx context.Context, directory, branch, commit string) error {
+	// Create a context that isn't cancelled along with the follow.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gitRestoreTimeout)
+	defer cancel()
+
+	// Verify that HEAD is still detached at the commit. If it isn't, then
+	// something else has changed it, and it's left alone.
+	if _, err := git.Run(ctx, directory, "symbolic-ref", "--quiet", "HEAD"); err == nil {
+		return nil
+	} else if !git.ExitedWith(err, 1) {
+		return err
+	}
+	if output, err := git.Run(ctx, directory, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err != nil {
+		return err
+	} else if commitBytes, err := git.CommitFromOutput(output); err != nil {
+		return err
+	} else if hex.EncodeToString(commitBytes) != commit {
+		return nil
+	}
+
+	// Verify that the branch is still at the commit.
+	if output, err := git.Run(ctx, directory, "rev-parse", "--verify", "--quiet", branch+"^{commit}"); err != nil {
+		return fmt.Errorf("unable to determine the commit of the branch: %w", err)
+	} else if commitBytes, err := git.CommitFromOutput(output); err != nil {
+		return err
+	} else if hex.EncodeToString(commitBytes) != commit {
+		return errors.New("the branch has moved")
+	}
+
+	// Reattach HEAD.
+	_, err := git.Run(ctx, directory, "symbolic-ref", "-m", "mutagen: follow failed", "HEAD", branch)
+	return err
 }
 
 // replaceIndex moves HEAD and the index of the repository in a directory from
