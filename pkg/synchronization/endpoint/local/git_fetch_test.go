@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -66,6 +67,47 @@ func TestGitProviderFetchCommitKeepsReferences(t *testing.T) {
 		t.Error("FETCH_HEAD written")
 	} else if !os.IsNotExist(err) {
 		t.Fatal("unable to check for FETCH_HEAD:", err)
+	}
+}
+
+// TestGitProviderFetchMissingLocalOrigin tests that fetching a commit from
+// origins that are a local path and a file URL, which Git mode doesn't fetch
+// from by default, fails with an error that says which origins it fetches
+// from, once, although both attempts fail for that reason.
+func TestGitProviderFetchMissingLocalOrigin(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	directory := filepath.Join(realTemporaryDirectory(t), "clone")
+	mustGit(t, filepath.Dir(directory), "clone", "--quiet", upstream.url, directory)
+	mustGit(t, directory, "remote", "set-url", "origin", upstream.bare)
+	commit := upstream.commit("second", "second")
+	upstream.push()
+
+	// Restore the default list of transports, which the upstream needed to
+	// be set up.
+	t.Setenv("GIT_ALLOW_PROTOCOL", "")
+	if err := os.Unsetenv("GIT_ALLOW_PROTOCOL"); err != nil {
+		t.Fatal("unable to unset GIT_ALLOW_PROTOCOL:", err)
+	}
+
+	// Fetch the commit from the clone's origin and the file URL.
+	provider := &gitProvider{
+		stallTimeout: time.Minute,
+		stallBackoff: time.Minute,
+		backoffs:     make(map[string]time.Time),
+	}
+	err := provider.fetchMissing(context.Background(), directory, upstream.url, commit)
+	if err == nil {
+		t.Fatal("commit fetched")
+	}
+	message := err.Error()
+	if count := strings.Count(message, "transport 'file' not allowed"); count != 2 {
+		t.Errorf("both refusals not reported: %s", message)
+	}
+	if count := strings.Count(message, "only clones and fetches submodules from https, http, ssh, and git URLs"); count != 1 {
+		t.Errorf("refusals not explained once: %s", message)
+	}
+	if provider.hasCommit(context.Background(), directory, commit) {
+		t.Error("commit fetched")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -513,6 +514,40 @@ func TestCommandNoLazyFetch(t *testing.T) {
 	}
 }
 
+// TestExplainRefusedTransport tests the explanation of Git's refusal to use a
+// transport, which names the transports that Git mode uses by default, or the
+// ones that the environment allows instead.
+func TestExplainRefusedTransport(t *testing.T) {
+	refusal := "unable to clone /srv/repository.git: fatal: transport 'file' not allowed"
+
+	// Messages without a refusal aren't explained.
+	unsetEnvironmentVariable(t, "GIT_ALLOW_PROTOCOL")
+	for _, message := range []string{"", "fatal: repository not found", "transport 'file' allowed"} {
+		if explanation := ExplainRefusedTransport(message); explanation != "" {
+			t.Errorf("message %q explained: %s", message, explanation)
+		}
+	}
+
+	// The default explanation names every transport in the default list.
+	explanation := ExplainRefusedTransport(refusal)
+	for _, protocol := range strings.Split(defaultAllowedProtocols, ":") {
+		if !strings.Contains(explanation, protocol) {
+			t.Errorf("default explanation doesn't name %s: %s", protocol, explanation)
+		}
+	}
+	if !strings.Contains(explanation, "local paths") {
+		t.Error("default explanation doesn't mention local paths:", explanation)
+	}
+
+	// A list in the environment is named instead, even an empty one.
+	for _, value := range []string{"https", ""} {
+		t.Setenv("GIT_ALLOW_PROTOCOL", value)
+		if explanation := ExplainRefusedTransport(refusal); !strings.Contains(explanation, fmt.Sprintf("GIT_ALLOW_PROTOCOL lists (%q)", value)) {
+			t.Errorf("explanation doesn't name %q: %s", value, explanation)
+		}
+	}
+}
+
 // TestCommandFileProtocol verifies, with Git itself, that the file protocol
 // is disallowed by default for commands that use the network and can be
 // enabled by the environment, while commands that don't use the network can't
@@ -530,14 +565,19 @@ func TestCommandFileProtocol(t *testing.T) {
 	}
 	remoteURL := "file://" + remotePath
 
-	// Verify that the file protocol is disallowed by default. That the failure
-	// is due to the protocol rather than the repository is established by the
-	// same command succeeding when the environment enables the protocol.
+	// Verify that the file protocol is disallowed by default, for file URLs
+	// and local paths alike, and that the failure is explained. That the
+	// failure is due to the protocol rather than the repository is established
+	// by the same command succeeding when the environment enables the protocol.
 	unsetEnvironmentVariable(t, "GIT_ALLOW_PROTOCOL")
-	if _, err := runNetworkCommand(root, "ls-remote", "--", remoteURL); err == nil {
-		t.Error("file protocol allowed by default")
-	} else {
-		t.Log("default protocols reject the file protocol:", err)
+	for _, location := range []string{remoteURL, remote} {
+		if _, err := runNetworkCommand(root, "ls-remote", "--", location); err == nil {
+			t.Errorf("file protocol allowed by default for %s", location)
+		} else if explanation := ExplainRefusedTransport(err.Error()); explanation == "" {
+			t.Errorf("refusal of %s not explained: %v", location, err)
+		} else {
+			t.Logf("default protocols reject %s: %v; %s", location, err, explanation)
+		}
 	}
 
 	// Verify that the environment can enable it, but only for commands that

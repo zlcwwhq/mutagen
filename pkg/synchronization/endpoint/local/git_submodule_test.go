@@ -753,6 +753,44 @@ func TestEndpointGitModeDefaultRemoteName(t *testing.T) {
 	}
 }
 
+// TestEndpointGitModeLocalOrigin tests that a submodule whose origin is a local
+// path or a file URL, which Git mode doesn't clone from by default, can't be
+// populated or attached, and that the problem says which origins can be.
+func TestEndpointGitModeLocalOrigin(t *testing.T) {
+	upstream := newGitUpstream(t, "upstream")
+	root := newGitRoot(t, map[string]string{"attached/file": "first"})
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+
+	// Restore the default list of transports, which the upstream needed to
+	// be set up.
+	t.Setenv("GIT_ALLOW_PROTOCOL", "")
+	if err := os.Unsetenv("GIT_ALLOW_PROTOCOL"); err != nil {
+		t.Fatal("unable to unset GIT_ALLOW_PROTOCOL:", err)
+	}
+
+	// Try to populate submodules from both kinds of origin, and to attach one.
+	fileURL := upstream.entry(upstream.head)
+	localPath := upstream.entry(upstream.head)
+	localPath.Url = upstream.bare
+	for _, change := range []*core.Change{
+		{Path: "url", New: submodule(fileURL, nil)},
+		{Path: "path", New: submodule(localPath, nil)},
+		{Path: "attached/.git", New: localPath},
+	} {
+		results, problems := transitionEndpoint(t, context.Background(), e, change)
+		if results[0] != nil {
+			t.Errorf("%s: change applied: %v", change.Path, results[0])
+		}
+		verifySingleFailure(t, problems, change.Path,
+			"transport 'file' not allowed",
+			"only clones and fetches submodules from https, http, ssh, and git URLs",
+		)
+	}
+	verifyAbsent(t, root, "url")
+	verifyAbsent(t, root, "path")
+	verifyAbsent(t, root, "attached/.git")
+}
+
 // TestEndpointGitModePopulateWithoutFilters tests that a checkout that fails
 // because of a required filter is performed again without filters, with a
 // warning, and that the attributes that disable them don't stay behind.

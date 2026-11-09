@@ -368,8 +368,13 @@ func (g *gitProvider) fetchMissing(ctx context.Context, directory, url, commit s
 		failures = append(failures, err.Error())
 	}
 
-	// Report the failures.
-	return errors.New(strings.Join(failures, "; "))
+	// Report the failures, explaining a refused transport only once, even if
+	// both attempts were refused.
+	message := strings.Join(failures, "; ")
+	if explanation := git.ExplainRefusedTransport(message); explanation != "" {
+		message += "; " + explanation
+	}
+	return errors.New(message)
 }
 
 // head returns the hexadecimal identifier of the commit that the repository in
@@ -483,7 +488,11 @@ func (g *gitProvider) cloneAndResolveOnce(ctx context.Context, directory, url, c
 		if errors.As(err, &stall) || ctx.Err() != nil {
 			return "", "", err
 		}
-		return "", "", fmt.Errorf("unable to clone %s: %w", url, err)
+		err = fmt.Errorf("unable to clone %s: %w", url, err)
+		if explanation := git.ExplainRefusedTransport(err.Error()); explanation != "" {
+			err = fmt.Errorf("%w; %s", err, explanation)
+		}
+		return "", "", err
 	}
 
 	// The commit might not be reachable from any branch, in which case it may

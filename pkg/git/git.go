@@ -323,6 +323,25 @@ func ExitedWith(err error, code int) bool {
 	return errors.As(err, &exitError) && exitError.ExitCode() == code
 }
 
+// refusedTransport matches the message with which Git refuses to use a
+// transport that GIT_ALLOW_PROTOCOL doesn't list.
+var refusedTransport = regexp.MustCompile(`transport '[^']*' not allowed`)
+
+// ExplainRefusedTransport returns an explanation for a message that includes
+// Git's refusal to use a transport that GIT_ALLOW_PROTOCOL doesn't list, or an
+// empty string if the message doesn't include one. Git's message only names
+// the transport that it refused, such as "file" for a local path or a file URL,
+// which the default list doesn't include (see Command), so it doesn't say what
+// Git mode can clone and fetch from.
+func ExplainRefusedTransport(message string) string {
+	if !refusedTransport.MatchString(message) {
+		return ""
+	} else if allowed, ok := os.LookupEnv("GIT_ALLOW_PROTOCOL"); ok {
+		return fmt.Sprintf("Git mode only clones and fetches submodules over the transports that GIT_ALLOW_PROTOCOL lists (%q)", allowed)
+	}
+	return "Git mode only clones and fetches submodules from https, http, ssh, and git URLs, not from local paths or file URLs"
+}
+
 // OutputRecorder is an io.Writer that retains the tail of a command's output
 // for error messages and records when output last arrived, which is how stalled
 // commands are detected. The same recorder can be used as both the standard

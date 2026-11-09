@@ -218,7 +218,12 @@ it has checked out is synchronized:
   available there, the clone checks out the default branch, with a warning. The
   other endpoint's uncommitted changes and nested submodules arrive in the
   following cycles, which a flush waits for. Credentials aren't copied: the
-  endpoint clones with its own.
+  endpoint clones with its own. Clones and fetches only use `https`, `http`,
+  `ssh` (including `host:path`), and `git` URLs, so a submodule whose `origin`
+  is a local path or a `file://` URL can't be cloned or fetched from, and the
+  problem or warning says so (`transport 'file' not allowed`). If
+  `GIT_ALLOW_PROTOCOL` is set in the environment of the daemon or agent, then
+  its list applies instead.
 - An endpoint that has the directory but no `.git` gets one attached, with the
   other endpoint's commit, and its files are left as they are.
 - If both endpoints have checked out different commits since they last agreed,

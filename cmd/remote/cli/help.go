@@ -197,8 +197,10 @@ between a star's center and one of its nodes:
     the background, and until it's pushed, HEAD stays behind with a warning.
     An endpoint without the repository gets a clone from origin (filled in
     with the other endpoint's changes and nested submodules by the following
-    cycles, which flushes wait for), or a .git attached to its directory. If
-    both endpoints check out different commits, then two-way-safe sessions
+    cycles, which flushes wait for), or a .git attached to its directory.
+    Clones and fetches only use https, http, ssh, and git URLs, so a local
+    path or file:// origin fails (transport 'file' not allowed). If both
+    endpoints check out different commits, then two-way-safe sessions
     synchronize nothing in it and list a conflict until they agree,
     one-way-safe sessions synchronize its files but list a conflict for its
     commit, and two-way-resolved sessions follow alpha's commit and resolve
