@@ -67,21 +67,26 @@ func RecordedRepositories(i ignore.DirectoryIgnorer) *Repositories {
 	return &Repositories{root: recording.root, states: states}
 }
 
-// Include adds what another record has for directories that this one doesn't
-// have. What this record has for a directory is retained even if the other
-// record differs, so that Changed still compares the directory with what this
-// record's ignorer found. This extends the record of a scan with directories
-// that a later scan found, when the later scan reused decisions from the earlier
-// one. A nil record (of either kind) leaves the receiver as it is.
-func (r *Repositories) Include(other *Repositories) {
+// Contains determines whether or not a record has the same as another record
+// for every directory in the other record. A scan that reuses decisions from
+// earlier scans evaluates the directories along its re-check paths again, and
+// if it finds something other than what the earlier scans recorded for one of
+// them, then the decisions that it reused beneath that directory were made
+// with other rules. That includes a directory that the earlier scans didn't
+// record, such as an existing directory that has since become the top level
+// of a repository's working tree, but also a new one, for which nothing was
+// reused. A nil record (of either kind) doesn't count as containing anything,
+// since nothing is known about the rules.
+func (r *Repositories) Contains(other *Repositories) bool {
 	if r == nil || other == nil {
-		return
+		return false
 	}
 	for directory, state := range other.states {
-		if _, ok := r.states[directory]; !ok {
-			r.states[directory] = state
+		if recorded, ok := r.states[directory]; !ok || recorded != state {
+			return false
 		}
 	}
+	return true
 }
 
 // Changed determines whether or not a new ignorer would find something

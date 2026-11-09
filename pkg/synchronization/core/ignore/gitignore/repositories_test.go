@@ -146,32 +146,34 @@ func TestRepositoriesRecordedDirectories(t *testing.T) {
 	}
 }
 
-// TestRepositoriesInclude tests that including another record only adds the
-// directories that a record doesn't have.
-func TestRepositoriesInclude(t *testing.T) {
-	// Create a record of the root alone, then change the root's exclude file
-	// and record a nested repository along with it.
+// TestRepositoriesContains tests that a record only contains another if it
+// has the same for every directory in the other.
+func TestRepositoriesContains(t *testing.T) {
+	// A record contains itself and records of fewer directories.
 	root := t.TempDir()
 	writeTree(t, root, withGitDirectories(map[string]string{".git/info/exclude": "x\n"}, ".git", "sub/.git"))
-	repositories := record(t, root, "")
-	writeTree(t, root, map[string]string{".git/info/exclude": "y\n"})
-	other := record(t, root, "", "sub")
-
-	// The root still compares with the original record, while the nested
-	// repository is checked too.
-	repositories.Include(other)
-	if len(repositories.states) != 2 {
-		t.Fatal("nested repository not included")
+	repositories := record(t, root, "", "sub")
+	partial := record(t, root, "")
+	if !repositories.Contains(repositories) || !repositories.Contains(partial) {
+		t.Error("record doesn't contain what it has")
 	}
-	expectChanged(t, repositories, true)
-	writeTree(t, root, map[string]string{".git/info/exclude": "x\n"})
-	expectChanged(t, repositories, false)
-	writeTree(t, root, map[string]string{"sub/.git/info/exclude": "x\n"})
-	expectChanged(t, repositories, true)
 
-	// Nil records are tolerated, and a nil record always counts as changed.
-	repositories.Include(nil)
+	// It doesn't contain a record of a directory that it doesn't have.
+	if partial.Contains(repositories) {
+		t.Error("record contains directory that it doesn't have")
+	}
+
+	// It doesn't contain a record of a directory that differs.
+	writeTree(t, root, map[string]string{".git/info/exclude": "y\n"})
+	if repositories.Contains(record(t, root, "")) {
+		t.Error("record contains directory that differs")
+	}
+
+	// A nil record neither contains anything nor is contained, and it always
+	// counts as changed.
 	var missing *Repositories
-	missing.Include(other)
+	if missing.Contains(partial) || repositories.Contains(missing) {
+		t.Error("nil record treated as known")
+	}
 	expectChanged(t, missing, true)
 }
