@@ -140,14 +140,38 @@ func TestGitModeEventRelevant(t *testing.T) {
 		{".git/refs/heads/index", true},
 		{".git/refs/heads/modules/x", true},
 
-		// So can a submodule.
+		// So can a submodule, and its name can have several components, so
+		// what's relevant in any submodule that a path may belong to is.
 		{".git/modules/logs/HEAD", true},
 		{".git/modules/logs/refs/heads/main", true},
 		{".git/modules/refs/HEAD", true},
 		{".git/modules/refs/index", false},
-		{".git/modules/logs/logs/HEAD", false},
+		{".git/modules/logs/logs/HEAD", true},
 		{".git/modules/modules/HEAD", true},
 		{".git/modules/modules/index", false},
+		{".git/modules/vendor/logs/HEAD", true},
+		{".git/modules/vendor/logs/refs/heads/main", true},
+		{".git/modules/vendor/logs/info/exclude", true},
+		{".git/modules/vendor/logs/config", true},
+		{".git/modules/a/b/logs/HEAD", true},
+		{".git/modules/a/refs/HEAD", true},
+		{".git/modules/a/refs/index", true},
+		{".git/modules/a/modules/b/HEAD", true},
+		{".git/modules/a/b/c/index", false},
+		{".git/modules/a/logs/index", false},
+		{".git/modules/a/objects/ab/cdef", false},
+
+		// So can a linked worktree's directory, whose name is a single
+		// component.
+		{".git/worktrees/logs/HEAD", true},
+		{".git/worktrees/logs/refs/bisect/bad", true},
+		{".git/worktrees/refs/HEAD", true},
+		{".git/worktrees/refs/index", false},
+		{".git/worktrees/refs/logs/HEAD", false},
+		{".git/worktrees/modules/HEAD", true},
+		{".git/worktrees/modules/index", false},
+		{".git/modules/x/worktrees/logs/HEAD", true},
+		{"sub/.git/worktrees/logs/HEAD", true},
 
 		// So do the configuration files of each kind of repository, which
 		// determine whether a nested repository is a submodule.
@@ -203,15 +227,36 @@ func TestGitModeEventRelevant(t *testing.T) {
 		{".git/modules", false},
 		{".git/modules/x", false},
 
-		// That includes reference logs, despite their resembling references.
+		// That includes reference logs, despite their resembling references,
+		// unless they may be something else in the Git directory of a
+		// submodule whose name has several components.
 		{".git/logs", false},
 		{".git/logs/HEAD", false},
 		{"sub/.git/logs/HEAD", false},
 		{".git/logs/refs/heads/main", false},
 		{"sub/.git/logs/refs/heads/main", false},
-		{".git/modules/x/logs/HEAD", false},
-		{".git/modules/x/y/logs/HEAD", false},
-		{".git/modules/x/logs/refs/heads/main", false},
+		{".git/worktrees/w/logs/HEAD", false},
+		{".git/modules/x/worktrees/w/logs/refs/bisect/bad", true},
+		{".git/modules/x/logs/HEAD", true},
+		{".git/modules/x/y/logs/HEAD", true},
+		{".git/modules/x/logs/refs/heads/main", true},
+
+		// Lock files never are, whatever the path, so that a fetch doesn't
+		// wake the session.
+		{".git/modules/a/b/refs/remotes/origin/HEAD.lock", false},
+		{".git/modules/logs/refs/remotes/origin/HEAD.lock", false},
+		{".git/modules/a/logs/HEAD.lock", false},
+		{".git/modules/a/refs/heads/main.lock", false},
+		{".git/modules/a/b/config.lock", false},
+		{".git/modules/a/info/exclude.lock", false},
+		{".git/worktrees/refs/HEAD.lock", false},
+		{".git/worktrees/w/refs/bisect/bad.lock", false},
+
+		// Neither are the directories of worktrees themselves.
+		{".git/worktrees", false},
+		{".git/worktrees/w", false},
+		{".git/worktrees/HEAD", false},
+		{".git/worktrees/w/index", false},
 	}
 	for _, test := range tests {
 		if result := gitModeEventRelevant(test.path); result != test.expected {

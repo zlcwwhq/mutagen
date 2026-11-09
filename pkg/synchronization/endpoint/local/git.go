@@ -1069,8 +1069,11 @@ func isDirectoryInSnapshot(content *core.Entry, path string) bool {
 // its origin and line ending settings) are relevant. Nothing that the session
 // runs in a repository writes its config file. The Git directories of
 // submodules are nested within that of the enclosing repository (e.g.
-// .git/modules/x/y/HEAD), or are found at the submodule's path, and the same
-// applies to them.
+// .git/modules/x/y/HEAD), or are found at the submodule's path, and those of
+// linked worktrees within that of their repository (e.g. .git/worktrees/w/HEAD),
+// and the same applies to them. Where the path can't be attributed to a single
+// Git directory with certainty, it's relevant if it might be relevant (see
+// gitDirectoryEventRelevant), since a missed event is worse than a spurious one.
 func gitModeEventRelevant(path string) bool {
 	// Split the path into components and reject any with a temporary name.
 	components := strings.Split(path, "/")
@@ -1097,44 +1100,72 @@ func gitModeEventRelevant(path string) bool {
 		return false
 	}
 
-	// Look for the components that identify references and reference logs.
-	// These have to be distinguished because reference logs mirror the
-	// locations of what they record (e.g. logs/HEAD and logs/refs/heads/main),
-	// and they are also updated in response to the same changes as what they
-	// record, so we don't lose anything by excluding them. Whichever occurs
-	// first determines the classification (e.g. a branch can be named
-	// logs/refs). The component following one named modules is (at least the
-	// first part of) the name of a submodule, which can be anything, including
-	// refs or logs.
-	for c := 0; c < len(components); c++ {
-		switch components[c] {
-		case "modules":
-			c++
-		case "logs":
-			return false
-		case "refs":
-			// Git refuses reference names that end in .lock, so such a file can
-			// only be the lock file for a reference, which says nothing by
-			// itself: Git takes the one for refs/remotes/<remote>/HEAD in every
-			// fetch of a remote, even if nothing changes. An update is reported
-			// for the reference itself when the lock file is renamed.
-			return !strings.HasSuffix(components[len(components)-1], ".lock")
-		}
-	}
+	// Classify the path within the Git directory.
+	return gitDirectoryEventRelevant(components)
+}
 
-	// Otherwise, only a few specific files are relevant. Their lock files have
-	// different names, and an update is reported for the file itself when its
-	// lock file is renamed.
-	last := len(components) - 1
-	switch components[last] {
-	case "HEAD", "packed-refs", "config":
-		return true
-	case "exclude":
-		return last > 0 && components[last-1] == "info"
-	case "tables.list":
-		return last > 0 && components[last-1] == "reftable"
+// gitDirectoryEventRelevant determines whether or not an event for a path in a
+// Git directory, specified by its components relative to the Git directory,
+// might be relevant (see gitModeEventRelevant).
+//
+// A Git directory has a few fixed entries, and those of its HEAD, references,
+// and reference logs, and the Git directories of submodules can be nested
+// within it, at modules/<name>, as can the administrative directories of
+// linked worktrees, at worktrees/<name>, each of which has its own HEAD,
+// references, and reference logs. Reference logs mirror the locations of what
+// they record (e.g. logs/HEAD and logs/refs/heads/main), and they're updated
+// along with what they record, so we don't lose anything by excluding them.
+// The name of a worktree's directory is a single component, but that of a
+// submodule can have several, each of which can be anything, including logs,
+// refs, modules, or HEAD. So without examining the filesystem, a path within
+// modules can't always be attributed to a single Git directory: for example,
+// modules/a/logs/HEAD is the reference log of the HEAD of a submodule named a,
+// which isn't relevant, or the HEAD of a submodule named a/logs, which is. Such
+// a path is relevant if it's relevant for any of the submodule names that it
+// may contain. That makes some reference logs and a few other entries of the
+// Git directories of submodules with such names relevant, but they're usually
+// written along with an entry that's relevant anyway.
+//
+// A path whose final component ends in .lock is never relevant, however it's
+// attributed, since none of the relevant entries can have such a name: Git
+// refuses reference names that end in .lock, so within refs, such a file can
+// only be the lock file for a reference, which says nothing by itself. Git
+// takes the one for refs/remotes/<remote>/HEAD in every fetch of a remote, even
+// if nothing changes, so this keeps fetches from waking the session. When a
+// lock file is renamed into place, an event is reported for the entry itself.
+func gitDirectoryEventRelevant(components []string) bool {
+	// Determine whether or not each suffix of the components is relevant as a
+	// path within a Git directory, from the shortest to the longest, since a
+	// path within modules continues with a path within the Git directory of a
+	// submodule. relevant[c] is set for components[c:], and anyRelevant[c]
+	// records whether or not that or any shorter suffix is relevant. The empty
+	// suffix is a Git directory itself, which isn't relevant.
+	count := len(components)
+	relevant := make([]bool, count+1)
+	anyRelevant := make([]bool, count+1)
+	for c := count - 1; c >= 0; c-- {
+		switch remaining := components[c:]; {
+		case remaining[0] == "modules":
+			// The name of a submodule follows, with at least one component,
+			// followed by a path within its Git directory.
+			relevant[c] = c+2 <= count && anyRelevant[c+2]
+		case remaining[0] == "worktrees":
+			// The single-component name of a linked worktree's directory
+			// follows, followed by a path within that directory.
+			relevant[c] = c+2 <= count && relevant[c+2]
+		case remaining[0] == "logs":
+			relevant[c] = false
+		case remaining[0] == "refs":
+			relevant[c] = !strings.HasSuffix(components[count-1], ".lock")
+		case len(remaining) == 1:
+			relevant[c] = remaining[0] == "HEAD" || remaining[0] == "packed-refs" || remaining[0] == "config"
+		case len(remaining) == 2:
+			relevant[c] = (remaining[0] == "info" && remaining[1] == "exclude") ||
+				(remaining[0] == "reftable" && remaining[1] == "tables.list")
+		}
+		anyRelevant[c] = relevant[c] || anyRelevant[c+1]
 	}
-	return false
+	return relevant[0]
 }
 
 // gitWarnings computes warnings about the content of a snapshot in Git mode,
