@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package synchronization;
+
+option go_package = "github.com/mutagen-io/mutagen/pkg/synchronization";
+
+// ReplicaRecord is what a session in the one-way-replica mode with Git mode
+// enabled records about beta's content between synchronization cycles, so that
+// content that beta's ignore rules kept out of synchronization isn't removed or
+// overwritten once a change of rules exposes it (see updateReplicaRecord). It's
+// saved next to the session's archive.
+message ReplicaRecord {
+    // Untracked are the paths of the untracked entries in beta's last snapshot,
+    // other than Git entries, in sorted order.
+    repeated string untracked = 1;
+    // Exposed are the paths of content on beta that was untracked and that has
+    // since become synchronizable without becoming identical to alpha's, which
+    // the session doesn't remove or overwrite, in sorted order.
+    repeated string exposed = 2;
+}

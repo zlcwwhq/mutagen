@@ -14,6 +14,7 @@ import (
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem/watching"
 	"github.com/mutagen-io/mutagen/pkg/integration/protocols/netpipe"
+	"github.com/mutagen-io/mutagen/pkg/logging"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/selection"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
@@ -559,6 +560,134 @@ func TestGitModePreexistingContentNotMirrored(t *testing.T) {
 			session.expect(session.beta, test.surviving)
 		})
 	}
+}
+
+// verifyExposedContentProblem verifies that a session's only problem is beta's
+// report of the content at a path that it keeps, since a change of rules
+// exposed it.
+func verifyExposedContentProblem(t *testing.T, state *synchronization.State, path string) {
+	t.Helper()
+	if len(state.Conflicts) != 0 {
+		t.Errorf("unexpected conflicts: %v", state.Conflicts)
+	}
+	if len(state.AlphaState.TransitionProblems) != 0 {
+		t.Errorf("unexpected alpha transition problems: %v", state.AlphaState.TransitionProblems)
+	}
+	if len(state.AlphaState.ScanProblems) != 0 || len(state.BetaState.ScanProblems) != 0 {
+		t.Errorf("unexpected scan problems: %v, %v", state.AlphaState.ScanProblems, state.BetaState.ScanProblems)
+	}
+	if len(state.BetaState.TransitionProblems) != 1 {
+		t.Fatalf("incorrect beta transition problems: %v", state.BetaState.TransitionProblems)
+	}
+	problem := gitModeProblem(t, state.BetaState.TransitionProblems, path, "isn't removed or overwritten automatically", "ignore it again")
+	if problem.Warning {
+		t.Error("exposed content reported as a warning:", problem)
+	}
+}
+
+// TestGitModeReplicaKeepsExposedContent tests that, in the one-way-replica mode,
+// content that a rule file that only beta has ignored isn't removed once the
+// session removes the rule file, in a cycle that only delivers that, while
+// beta's other content is still removed. Beta reports what it keeps, until the
+// content is ignored again.
+func TestGitModeReplicaKeepsExposedContent(t *testing.T) {
+	isolateGitMode(t)
+	for _, remoteBeta := range []bool{false, true} {
+		name := "local"
+		if remoteBeta {
+			name = "remote endpoint"
+		}
+		t.Run(name, func(t *testing.T) {
+			session := newGitModeSession(t, gitModeOptions{
+				mode:       core.SynchronizationMode_SynchronizationModeOneWayReplica,
+				remoteBeta: remoteBeta,
+				alpha:      map[string]string{"keep": "keep"},
+				beta: map[string]string{
+					".gitignore": "data/\n",
+					"data/file":  "beta data",
+					"keep":       "keep",
+					"other":      "other",
+				},
+				prepare: excludeOnBeta(""),
+			})
+
+			// The rule file and the other content are removed from beta, but
+			// what the rule file ignored stays there, in further cycles too.
+			for i := 0; i < 2; i++ {
+				state := session.flushAllowingProblems()
+				session.expect(session.beta, map[string]string{"data/file": "beta data", "keep": "keep"})
+				session.expectMissing(session.beta, ".gitignore", "other")
+				session.expectMissing(session.alpha, "data")
+				verifyExposedContentProblem(t, state, "data")
+			}
+
+			// Ignoring the content again on beta ends the problem, and the
+			// content stays where it is.
+			session.write(session.beta, map[string]string{".git/info/exclude": "data/\n"})
+			session.flush()
+			session.expect(session.beta, map[string]string{"data/file": "beta data"})
+			session.expectMissing(session.alpha, "data")
+		})
+	}
+}
+
+// TestGitModeReplicaExposedContentAfterRestart tests that, in the
+// one-way-replica mode, content that beta's exclude file ignored isn't removed
+// if the exclude file changes while the daemon isn't running, which the
+// session only notices once it's been restarted, while what beta creates
+// meanwhile is still removed. Deleting the content on beta ends the problem.
+func TestGitModeReplicaExposedContentAfterRestart(t *testing.T) {
+	isolateGitMode(t)
+
+	// Create a session with a manager of its own, which is replaced below as a
+	// daemon restart would replace it.
+	newManager := func() *synchronization.Manager {
+		manager, err := synchronization.NewManager(logging.NewLogger(logging.LevelDebug, &synchronizationLog))
+		if err != nil {
+			t.Fatal("unable to create session manager:", err)
+		}
+		return manager
+	}
+	manager := newManager()
+	t.Cleanup(func() { manager.Shutdown() })
+	session := newGitModeSession(t, gitModeOptions{
+		mode:    core.SynchronizationMode_SynchronizationModeOneWayReplica,
+		manager: manager,
+		alpha:   map[string]string{"keep": "keep"},
+		beta:    map[string]string{"keep": "keep", "data/file": "beta data", "other": "other"},
+		prepare: excludeOnBeta("data/\n"),
+	})
+	session.flush()
+	session.expect(session.beta, map[string]string{"data/file": "beta data"})
+	session.expectMissing(session.beta, "other")
+
+	// Stop the daemon, stop ignoring the content on beta and create something
+	// else there, and start the daemon again.
+	manager.Shutdown()
+	session.write(session.beta, map[string]string{".git/info/exclude": "", "new": "new"})
+	manager = newManager()
+	session.manager = manager
+	session.waitForState(func(state *synchronization.State) bool {
+		return state.Status >= synchronization.Status_Watching
+	})
+
+	// The content stays on beta, while what beta created is removed.
+	for i := 0; i < 2; i++ {
+		state := session.flushAllowingProblems()
+		session.expect(session.beta, map[string]string{"data/file": "beta data", "keep": "keep"})
+		session.expectMissing(session.beta, "new")
+		session.expectMissing(session.alpha, "data")
+		verifyExposedContentProblem(t, state, "data")
+	}
+
+	// Deleting the content on beta ends the problem, and content that beta
+	// creates there from then on is removed.
+	session.remove(session.beta, "data/file")
+	session.remove(session.beta, "data")
+	session.flush()
+	session.write(session.beta, map[string]string{"data/file": "new beta data"})
+	session.flush()
+	session.expectMissing(session.beta, "data")
 }
 
 // TestGitModeRuleAddedWithDeletion tests that adding a rule to an endpoint

@@ -181,7 +181,10 @@ between a star's center and one of its nodes:
     which Git refuses to track. remote
     --ignores lists these sources and says which one ignores a path, and
     --pull copies what they ignore. A rule added later doesn't delete files
-    that were synchronized. If a rule file can't be read, then its directory
+    that were synchronized. One-way-replica sessions keep what beta's rules
+    ignored once a change of rules exposes it, and report a problem until
+    it's deleted, identical to alpha's, or ignored again (such as in beta's
+    .git/info/exclude). If a rule file can't be read, then its directory
     isn't synchronized until that's fixed, and --pull refuses to write there.
     An endpoint doesn't write a path that its own rules ignore, even if it
     doesn't have that path yet: remote warns, and the rest of the directory,

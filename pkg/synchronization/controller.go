@@ -42,6 +42,10 @@ type controller struct {
 	sessionPath string
 	// archivePath is the path to the serialized archive.
 	archivePath string
+	// replicaRecordPath is the path to the serialized replica record, which
+	// only sessions in the one-way-replica mode with Git mode enabled use (see
+	// ReplicaRecord).
+	replicaRecordPath string
 	// stateLock guards and tracks changes to session's Paused field, state, and
 	// synchronizing. Previous holders may continue to poll on synchronizing if
 	// they store it in a separate variable before releasing the lock.
@@ -214,6 +218,10 @@ func newSession(
 	if err != nil {
 		return nil, fmt.Errorf("unable to compute archive path: %w", err)
 	}
+	replicaRecordPath, err := pathForReplicaRecord(session.Identifier)
+	if err != nil {
+		return nil, fmt.Errorf("unable to compute replica record path: %w", err)
+	}
 
 	// Save components to disk.
 	if err := encoding.MarshalAndSaveProtobuf(sessionPath, session); err != nil {
@@ -230,6 +238,7 @@ func newSession(
 		logger:                   logger,
 		sessionPath:              sessionPath,
 		archivePath:              archivePath,
+		replicaRecordPath:        replicaRecordPath,
 		stateLock:                state.NewTrackingLock(tracker),
 		session:                  session,
 		mergedAlphaConfiguration: mergedAlphaConfiguration,
@@ -272,6 +281,10 @@ func loadSession(logger *logging.Logger, tracker *state.Tracker, stars *commandS
 	if err != nil {
 		return nil, fmt.Errorf("unable to compute archive path: %w", err)
 	}
+	replicaRecordPath, err := pathForReplicaRecord(identifier)
+	if err != nil {
+		return nil, fmt.Errorf("unable to compute replica record path: %w", err)
+	}
 
 	// Load and validate the session. We have to populate a few optional fields
 	// before validation if they're not set. We can't do this in the Session
@@ -293,12 +306,13 @@ func loadSession(logger *logging.Logger, tracker *state.Tracker, stars *commandS
 
 	// Create the controller.
 	controller := &controller{
-		stars:       stars,
-		logger:      logger,
-		sessionPath: sessionPath,
-		archivePath: archivePath,
-		stateLock:   state.NewTrackingLock(tracker),
-		session:     session,
+		stars:             stars,
+		logger:            logger,
+		sessionPath:       sessionPath,
+		archivePath:       archivePath,
+		replicaRecordPath: replicaRecordPath,
+		stateLock:         state.NewTrackingLock(tracker),
+		session:           session,
 		mergedAlphaConfiguration: MergeConfigurations(
 			session.Configuration,
 			session.ConfigurationAlpha,
@@ -636,14 +650,21 @@ func (c *controller) halt(_ context.Context, mode controllerHaltMode, prompter s
 		// Disable the controller.
 		c.disabled = true
 
-		// Wipe the session information from disk.
+		// Wipe the session information from disk. Only some sessions have a
+		// replica record.
 		sessionRemoveErr := os.Remove(c.sessionPath)
 		archiveRemoveErr := os.Remove(c.archivePath)
+		replicaRecordRemoveErr := os.Remove(c.replicaRecordPath)
+		if os.IsNotExist(replicaRecordRemoveErr) {
+			replicaRecordRemoveErr = nil
+		}
 		checkoutsRemoveErr := c.removeCheckouts()
 		if sessionRemoveErr != nil {
 			return fmt.Errorf("unable to remove session from disk: %w", sessionRemoveErr)
 		} else if archiveRemoveErr != nil {
 			return fmt.Errorf("unable to remove archive from disk: %w", archiveRemoveErr)
+		} else if replicaRecordRemoveErr != nil {
+			return fmt.Errorf("unable to remove replica record from disk: %w", replicaRecordRemoveErr)
 		} else if checkoutsRemoveErr != nil {
 			return fmt.Errorf("unable to remove conflict checkouts from disk: %w", checkoutsRemoveErr)
 		}
@@ -673,7 +694,9 @@ func (c *controller) reset(ctx context.Context, prompter string) error {
 		}
 	}
 
-	// Reset the session archive on disk.
+	// Reset the session archive on disk. The replica record (if any) is kept,
+	// since what beta's rules have kept out of synchronization doesn't change
+	// when its history is forgotten.
 	c.logger.Infof("Resetting ancestor")
 	archive := &core.Archive{}
 	if err := encoding.MarshalAndSaveProtobuf(c.archivePath, archive); err != nil {
@@ -919,6 +942,19 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 	reconcile := core.Reconcile
 	if gitMode {
 		reconcile = core.ReconcileGitMode
+	}
+
+	// In the one-way-replica mode with Git mode enabled, load the record of
+	// beta's untracked and exposed content, without which content that a
+	// change of rules exposes would be removed or overwritten (see
+	// ReplicaRecord). A record that can't be loaded stops synchronization.
+	var replicaRecord *ReplicaRecord
+	if gitMode && synchronizationMode == core.SynchronizationMode_SynchronizationModeOneWayReplica {
+		if record, err := loadReplicaRecord(c.replicaRecordPath); err != nil {
+			return fmt.Errorf("unable to load replica record: %w", err)
+		} else {
+			replicaRecord = record
+		}
 	}
 
 	// Compute the effective permissions mode.
@@ -1232,6 +1268,24 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			return errHaltedForSafety
 		}
 
+		// If we're keeping a replica record, then update it with what beta's
+		// snapshot has untracked and what a change of rules has exposed, and
+		// save it before anything is transitioned, since the rule files that a
+		// transition delivers are one of the things that expose content. This
+		// also happens before populations are absorbed, since that takes a
+		// cycle of its own, whose scans would otherwise go unrecorded.
+		if replicaRecord != nil {
+			if record, changed := updateReplicaRecord(replicaRecord, αContent, βContent); changed {
+				c.logger.Debugf("Saving replica record with %d untracked and %d exposed path(s)",
+					len(record.Untracked), len(record.Exposed),
+				)
+				if err := encoding.MarshalAndSaveProtobuf(c.replicaRecordPath, record); err != nil {
+					return fmt.Errorf("unable to save replica record: %w", err)
+				}
+				replicaRecord = record
+			}
+		}
+
 		// In Git mode, an endpoint may report that it populated submodules with
 		// clones whose content the ancestor hasn't absorbed, which happens if the
 		// session stopped between a transition that populated a submodule and
@@ -1376,6 +1430,20 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		// proceeding without the rules is what deletes data. The failure stays
 		// visible as a transition problem, and flush requests are still
 		// answered (see below).
+		//
+		// Before that, in the one-way-replica mode, we withhold the
+		// transitions that would remove or replace content on beta that a
+		// change of rules has exposed, which beta keeps (see ReplicaRecord).
+		// This happens first so that a withheld transition can't make this
+		// cycle one that only delivers rules, which it would then do again in
+		// every cycle.
+		var exposedProblems []*core.Problem
+		if replicaRecord != nil {
+			βTransitions, exposedProblems = withholdExposedChanges(replicaRecord.Exposed, βTransitions)
+			if len(exposedProblems) > 0 {
+				c.logger.Debugf("Keeping %d path(s) of exposed content on beta", len(exposedProblems))
+			}
+		}
 		var ruleOnlyCycle bool
 		if gitMode {
 			αTransitions, βTransitions, ruleOnlyCycle = ruleOnlyTransitions(αTransitions, βTransitions)
@@ -1505,7 +1573,9 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		}
 		transitionDone.Wait()
 
-		// Record transition problems.
+		// Record transition problems, including those for exposed content
+		// that beta keeps.
+		βProblems = append(βProblems, exposedProblems...)
 		c.stateLock.Lock()
 		c.state.Status = Status_Saving
 		c.state.AlphaState.TransitionProblems = αProblems

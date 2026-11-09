@@ -176,10 +176,18 @@ own copy of the rule files, endpoints can briefly disagree about them. So a
 cycle that has rule files to deliver or remove does only that, on both
 endpoints, and every other change waits for the next cycle. Content that the new
 rules ignore, such as a `data/` directory that you prepared on a server, is thus
-neither copied back nor deleted before the rules arrive. If a rule file can't be
-written, the session reports the problem, and nothing else synchronizes until
-it's fixed. If a rule file can't be read, then the session reports the problem
-and doesn't synchronize its directory until it's fixed.
+neither copied back nor deleted before the rules arrive. A `one-way-replica`
+session would remove or overwrite whatever beta has that differs from alpha's,
+so it keeps content on beta that beta's rules ignored until a change of rules
+exposed it: the session removing a `.gitignore` that only beta has, or
+replacing beta's copy with alpha's, alpha removing a rule, or an edit of beta's
+`.git/info/exclude`. Beta reports a problem for that content, also after a
+restart, until it's gone, identical to alpha's, or ignored again (such as in
+beta's `.git/info/exclude`, or with `ignore.paths`), while content that beta
+creates elsewhere is still removed. If a rule file can't be written, the
+session reports the problem, and nothing else synchronizes until it's fixed. If
+a rule file can't be read, then the session reports the problem and doesn't
+synchronize its directory until it's fixed.
 
 An endpoint also applies its own rules to what it receives, including paths
 that it doesn't have yet, so a `.git/info/exclude` on one endpoint keeps the
@@ -239,7 +247,8 @@ it has checked out is synchronized:
   opposite an empty directory on alpha, and so does a `.git` that beta has in a
   directory that alpha has without one. `one-way-replica`, which would otherwise
   delete them, reports a problem on beta until you delete them there or alpha
-  gets them too. `one-way-replica` overwrites uncommitted changes in beta's
+  gets them too, as it does for content that a change of rules exposes on beta
+  (see above). `one-way-replica` overwrites uncommitted changes in beta's
   submodules like any other content of beta's.
 
 Clones that Mutagen makes use the other endpoint's `core.autocrlf` and

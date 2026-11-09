@@ -3,6 +3,7 @@ package synchronization
 import (
 	"context"
 	"maps"
+	"os"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -47,6 +48,9 @@ type testingEndpoint struct {
 	// ruleTargets are the names of entries that are untracked if the root has a
 	// rule file.
 	ruleTargets []string
+	// excluded are the names of entries that are untracked regardless, as if
+	// the endpoint's own exclude file, which isn't synchronized, ignored them.
+	excluded []string
 	// warnings are the warnings to include in snapshots.
 	warnings []*core.Problem
 	// failing indicates that transitions for rule files in the root should
@@ -124,6 +128,8 @@ func (e *testingEndpoint) Scan(_ context.Context, _ *core.Entry, seeds []string,
 	for name, entry := range e.contents {
 		contents[name] = entry
 		if e.contents[testingFileRules] != nil && slices.Contains(e.ruleTargets, name) {
+			contents[name] = &core.Entry{Kind: core.EntryKind_Untracked}
+		} else if slices.Contains(e.excluded, name) {
 			contents[name] = &core.Entry{Kind: core.EntryKind_Untracked}
 		}
 	}
@@ -232,17 +238,32 @@ func startTestingLoop(t *testing.T, configuration *Configuration, alpha, beta *t
 // whose archive already has an ancestor.
 func startTestingLoopWithAncestor(t *testing.T, configuration *Configuration, ancestor *core.Entry, alpha, beta *testingEndpoint) *testingLoop {
 	t.Helper()
+	return startTestingLoopWithRecord(t, configuration, ancestor, nil, alpha, beta)
+}
 
-	// Create the archive.
-	archivePath := filepath.Join(t.TempDir(), "archive")
+// startTestingLoopWithRecord is a variant of startTestingLoopWithAncestor for a
+// session that has already saved a replica record, unless it's nil.
+func startTestingLoopWithRecord(t *testing.T, configuration *Configuration, ancestor *core.Entry, record *ReplicaRecord, alpha, beta *testingEndpoint) *testingLoop {
+	t.Helper()
+
+	// Create the archive and the replica record.
+	directory := t.TempDir()
+	archivePath := filepath.Join(directory, "archive")
 	if err := encoding.MarshalAndSaveProtobuf(archivePath, &core.Archive{Content: ancestor}); err != nil {
 		t.Fatal("unable to create archive:", err)
+	}
+	replicaRecordPath := filepath.Join(directory, "replica")
+	if record != nil {
+		if err := encoding.MarshalAndSaveProtobuf(replicaRecordPath, record); err != nil {
+			t.Fatal("unable to create replica record:", err)
+		}
 	}
 
 	// Create the controller.
 	session := &Session{Identifier: "testing", Version: Version_Version1, Configuration: configuration}
 	c := &controller{
 		archivePath:              archivePath,
+		replicaRecordPath:        replicaRecordPath,
 		stateLock:                state.NewTrackingLock(state.NewTracker()),
 		session:                  session,
 		mergedAlphaConfiguration: configuration,
@@ -321,6 +342,25 @@ func (l *testingLoop) ancestor() *core.Entry {
 		l.t.Fatal("unable to load archive:", err)
 	}
 	return archive.Content
+}
+
+// replicaRecord loads the replica record that the loop has saved, which is
+// empty if it hasn't saved one.
+func (l *testingLoop) replicaRecord() *ReplicaRecord {
+	l.t.Helper()
+	record, err := loadReplicaRecord(l.controller.replicaRecordPath)
+	if err != nil {
+		l.t.Fatal("unable to load replica record:", err)
+	}
+	return record
+}
+
+// betaTransitionProblems returns beta's transition problems from the loop's
+// last synchronization cycle.
+func (l *testingLoop) betaTransitionProblems() []*core.Problem {
+	l.controller.stateLock.Lock()
+	defer l.controller.stateLock.UnlockWithoutNotify()
+	return slices.Clone(l.controller.state.BetaState.TransitionProblems)
 }
 
 // verifyCycles verifies the synchronization cycle count.
@@ -444,6 +484,229 @@ func TestSynchronizeRuleOnlyCycleForRemoval(t *testing.T) {
 	loop.verifyCycles(3)
 	loop.verifyOperations("alpha", alpha, nil, nil)
 	loop.verifyOperations("beta", beta, [][]string{{"data"}}, [][]string{{testingFileRules}, {"data"}})
+}
+
+// testingReplica is a configuration with Git mode enabled in the
+// one-way-replica mode.
+var testingReplica = &Configuration{
+	GitMode:             GitMode_GitModeEnabled,
+	SynchronizationMode: core.SynchronizationMode_SynchronizationModeOneWayReplica,
+}
+
+// testingOtherFile is a file entry with content other than testingFile's.
+var testingOtherFile = &core.Entry{Kind: core.EntryKind_File, Digest: []byte{2}}
+
+// verifyExposedContentKept verifies that beta has the specified content at a
+// path that a change of rules has exposed, that the replica record says so, and
+// that beta reports it as a problem.
+func (l *testingLoop) verifyExposedContentKept(path string, content *core.Entry) {
+	l.t.Helper()
+	l.beta.update(func() {
+		if !l.beta.contents[path].Equal(content, true) {
+			l.t.Errorf("exposed content at %s not kept: %v", path, l.beta.contents[path])
+		}
+	})
+	if record := l.replicaRecord(); !slices.Equal(record.Exposed, []string{path}) {
+		l.t.Errorf("incorrect exposed paths: %v", record.Exposed)
+	}
+	problems := l.betaTransitionProblems()
+	if len(problems) != 1 || problems[0].Path != path || problems[0].Warning || problems[0].Error != exposedContentProblem {
+		l.t.Errorf("incorrect problems for exposed content: %v", problems)
+	}
+}
+
+// TestSynchronizeReplicaKeepsExposedContent tests that, in the one-way-replica
+// mode, content that beta's rules ignored isn't removed or overwritten once a
+// change of rules exposes it, whether the session itself removes the rules from
+// beta or delivers their removal from alpha, and that beta reports it.
+func TestSynchronizeReplicaKeepsExposedContent(t *testing.T) {
+	t.Run("rules only on beta", func(t *testing.T) {
+		// The rule file only exists on beta, so the session removes it in a
+		// cycle that only does that, after which the content that it ignored is
+		// tracked, but missing from alpha.
+		alpha := newTestingEndpoint(map[string]*core.Entry{"src": testingFile})
+		beta := newTestingEndpoint(map[string]*core.Entry{
+			"src":            testingFile,
+			testingFileRules: testingFile,
+			"data":           testingDirectory("big"),
+		}, "data")
+		loop := startTestingLoopWithAncestor(t, testingReplica, testingDirectory("src"), alpha, beta)
+		loop.waitForPolling()
+		loop.verifyCycles(2)
+		loop.verifyOperations("beta", beta, nil, [][]string{{testingFileRules}})
+		loop.verifyExposedContentKept("data", testingDirectory("big"))
+
+		// Nothing changes in further cycles, and the ancestor doesn't record
+		// the content.
+		loop.flush()
+		loop.verifyOperations("beta", beta, nil, [][]string{{testingFileRules}})
+		loop.verifyExposedContentKept("data", testingDirectory("big"))
+		if loop.ancestor().Contents["data"] != nil {
+			t.Error("ancestor records exposed content")
+		}
+	})
+
+	t.Run("rule removed on alpha", func(t *testing.T) {
+		// Both endpoints ignore beta's content, until alpha's rule is removed,
+		// which the session delivers to beta.
+		alpha := newTestingEndpoint(map[string]*core.Entry{"src": testingFile, testingFileRules: testingFile})
+		beta := newTestingEndpoint(map[string]*core.Entry{
+			"src":            testingFile,
+			testingFileRules: testingFile,
+			"data":           testingDirectory("big"),
+		}, "data")
+		loop := startTestingLoopWithAncestor(t, testingReplica, testingDirectory("src", testingFileRules), alpha, beta)
+		loop.waitForPolling()
+		if record := loop.replicaRecord(); !slices.Equal(record.Untracked, []string{"data"}) || len(record.Exposed) != 0 {
+			t.Errorf("incorrect replica record: %v", record)
+		}
+		alpha.update(func() { delete(alpha.contents, testingFileRules) })
+		loop.flush()
+		loop.verifyOperations("beta", beta, nil, [][]string{{testingFileRules}})
+		loop.verifyExposedContentKept("data", testingDirectory("big"))
+	})
+
+	t.Run("different content on alpha", func(t *testing.T) {
+		// Both endpoints ignore their own content at the same path, until
+		// alpha's rule is removed, which would overwrite beta's.
+		alpha := newTestingEndpoint(map[string]*core.Entry{testingFileRules: testingFile, "data": testingOtherFile}, "data")
+		beta := newTestingEndpoint(map[string]*core.Entry{testingFileRules: testingFile, "data": testingFile}, "data")
+		loop := startTestingLoopWithAncestor(t, testingReplica, testingDirectory(testingFileRules), alpha, beta)
+		loop.waitForPolling()
+		alpha.update(func() { delete(alpha.contents, testingFileRules) })
+		loop.flush()
+		loop.verifyOperations("beta", beta, nil, [][]string{{testingFileRules}})
+		loop.verifyExposedContentKept("data", testingFile)
+	})
+
+	t.Run("identical content on alpha", func(t *testing.T) {
+		// Content that's identical to alpha's isn't exposed, but synchronized.
+		alpha := newTestingEndpoint(map[string]*core.Entry{testingFileRules: testingFile, "data": testingFile}, "data")
+		beta := newTestingEndpoint(map[string]*core.Entry{testingFileRules: testingFile, "data": testingFile}, "data")
+		loop := startTestingLoopWithAncestor(t, testingReplica, testingDirectory(testingFileRules), alpha, beta)
+		loop.waitForPolling()
+		alpha.update(func() { delete(alpha.contents, testingFileRules) })
+		loop.flush()
+		if record := loop.replicaRecord(); len(record.Untracked) != 0 || len(record.Exposed) != 0 {
+			t.Errorf("incorrect replica record: %v", record)
+		}
+		if problems := loop.betaTransitionProblems(); len(problems) != 0 {
+			t.Error("unexpected problems:", problems)
+		}
+		if !loop.ancestor().Contents["data"].Equal(testingFile, true) {
+			t.Error("ancestor doesn't record synchronized content")
+		}
+	})
+}
+
+// TestSynchronizeReplicaExposedContentAfterRestart tests that the protection of
+// exposed content survives a restart of the synchronization loop, both between
+// the cycle in which the content was untracked and the one in which it's
+// exposed, and after it's been exposed, while content that beta has created at
+// other paths is still removed.
+func TestSynchronizeReplicaExposedContentAfterRestart(t *testing.T) {
+	records := map[string]*ReplicaRecord{
+		"untracked": {Untracked: []string{"data"}},
+		"exposed":   {Exposed: []string{"data"}},
+	}
+	for name, record := range records {
+		t.Run(name, func(t *testing.T) {
+			alpha := newTestingEndpoint(map[string]*core.Entry{"src": testingFile})
+			beta := newTestingEndpoint(map[string]*core.Entry{
+				"src":   testingFile,
+				"data":  testingDirectory("big"),
+				"other": testingFile,
+			})
+			loop := startTestingLoopWithRecord(t, testingReplica, testingDirectory("src"), record, alpha, beta)
+			loop.waitForPolling()
+			loop.verifyOperations("beta", beta, nil, [][]string{{"other"}})
+			loop.verifyExposedContentKept("data", testingDirectory("big"))
+			beta.update(func() {
+				if beta.contents["other"] != nil {
+					t.Error("content created on beta not removed")
+				}
+			})
+		})
+	}
+}
+
+// TestSynchronizeReplicaExposedContentReleased tests that exposed content is no
+// longer protected once it's gone from beta, identical to alpha's, or ignored
+// again, and that beta stops reporting it.
+func TestSynchronizeReplicaExposedContentReleased(t *testing.T) {
+	tests := []struct {
+		// name is the name of the test.
+		name string
+		// release releases the exposed content.
+		release func(alpha, beta *testingEndpoint)
+		// untracked are the expected untracked paths in the record.
+		untracked []string
+		// data is the expected content at the exposed path on beta afterward.
+		data *core.Entry
+	}{
+		{"deleted", func(_, beta *testingEndpoint) { delete(beta.contents, "data") }, nil, nil},
+		{"identical", func(alpha, _ *testingEndpoint) { alpha.contents["data"] = testingDirectory("big") }, nil, testingDirectory("big")},
+		{"ignored again", func(_, beta *testingEndpoint) { beta.excluded = []string{"data"} }, []string{"data"}, testingDirectory("big")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			alpha := newTestingEndpoint(map[string]*core.Entry{"src": testingFile})
+			beta := newTestingEndpoint(map[string]*core.Entry{"src": testingFile, "data": testingDirectory("big")})
+			record := &ReplicaRecord{Exposed: []string{"data"}}
+			loop := startTestingLoopWithRecord(t, testingReplica, testingDirectory("src"), record, alpha, beta)
+			loop.waitForPolling()
+			loop.verifyExposedContentKept("data", testingDirectory("big"))
+
+			// Release the content.
+			alpha.update(func() {
+				beta.update(func() { test.release(alpha, beta) })
+			})
+			loop.flush()
+			if record := loop.replicaRecord(); !slices.Equal(record.Untracked, test.untracked) || len(record.Exposed) != 0 {
+				t.Errorf("incorrect replica record: %v", record)
+			}
+			if problems := loop.betaTransitionProblems(); len(problems) != 0 {
+				t.Error("unexpected problems:", problems)
+			}
+			beta.update(func() {
+				if !beta.contents["data"].Equal(test.data, true) {
+					t.Error("incorrect content on beta:", beta.contents["data"])
+				}
+			})
+
+			// Content that beta creates there from now on is removed, unless
+			// it's ignored.
+			if test.untracked == nil {
+				beta.update(func() { beta.contents["data"] = testingDirectory("new") })
+				loop.flush()
+				beta.update(func() {
+					if !beta.contents["data"].Equal(test.data, true) {
+						t.Error("content created on beta not replaced:", beta.contents["data"])
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestSynchronizeNoReplicaRecordInOtherModes tests that sessions in other modes
+// don't keep a replica record, and that exposed content is synchronized as
+// before.
+func TestSynchronizeNoReplicaRecordInOtherModes(t *testing.T) {
+	alpha := newTestingEndpoint(map[string]*core.Entry{testingFileRules: testingFile})
+	beta := newTestingEndpoint(map[string]*core.Entry{testingFileRules: testingFile, "data": testingFile}, "data")
+	loop := startTestingLoopWithAncestor(t, testingGitMode, testingDirectory(testingFileRules), alpha, beta)
+	loop.waitForPolling()
+	alpha.update(func() { delete(alpha.contents, testingFileRules) })
+	loop.flush()
+	alpha.update(func() {
+		if !alpha.contents["data"].Equal(testingFile, true) {
+			t.Error("exposed content not synchronized:", alpha.contents["data"])
+		}
+	})
+	if _, err := os.Lstat(loop.controller.replicaRecordPath); !os.IsNotExist(err) {
+		t.Error("replica record saved:", err)
+	}
 }
 
 // TestSynchronizeNoRuleOnlyCycleWithoutGitMode tests that behavior is unchanged
