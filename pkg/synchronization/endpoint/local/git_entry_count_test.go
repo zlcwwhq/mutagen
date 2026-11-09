@@ -2,7 +2,9 @@ package local
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -565,4 +567,88 @@ func TestEndpointGitModeRemovalValidation(t *testing.T) {
 	}
 	verifyContents(t, root, "public", "public")
 	verifyAbsent(t, root, "outputs")
+}
+
+// TestEndpointGitModePopulationMaximumEntryCount tests that a population, which
+// yields what its clone contains rather than what it requests, is refused if
+// the clone has more entries than the endpoint can accommodate, whether or not
+// the maximum entry count restricts the transitions, since every scan would
+// fail afterwards. The populations request a submodule with a single file,
+// such as the other endpoint might have with a sparse checkout, while the
+// commit has many.
+func TestEndpointGitModePopulationMaximumEntryCount(t *testing.T) {
+	// The root's directory and file are two entries, and a clone of the commit
+	// is 23 (its directory, its Git entry, and 21 files). The population at sub
+	// requests three entries. In some cases, a population at other requests 32
+	// entries, which is too many in all, so that transitions are restricted,
+	// and which is always refused.
+	tests := []struct {
+		// name is the name of the test.
+		name string
+		// maximum is the maximum entry count.
+		maximum uint64
+		// other indicates that the second population is requested too.
+		other bool
+		// populated indicates that the population at sub is expected to be
+		// performed.
+		populated bool
+	}{
+		{name: "clone far beyond the maximum", maximum: 8},
+		{name: "clone just beyond the maximum", maximum: 24},
+		{name: "clone at the maximum", maximum: 25, populated: true},
+		{name: "restricted, clone beyond the maximum", maximum: 24, other: true},
+		{name: "restricted, clone within the maximum", maximum: 26, other: true, populated: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Create an upstream whose commit tracks many files.
+			upstream := newGitUpstream(t, "upstream")
+			files := make(map[string]string)
+			for i := 0; i < 20; i++ {
+				files[fmt.Sprintf("file%02d", i)] = "content"
+			}
+			head := upstream.commitFiles("many files", files)
+			upstream.push()
+
+			// Create the endpoint and request the populations.
+			root := newGitRoot(t, map[string]string{"kept": "kept"})
+			e := newLimitedGitModeEndpoint(t, root, test.maximum)
+			file := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{1}}
+			changes := []*core.Change{{Path: "sub", New: submodule(upstream.entry(head), map[string]*core.Entry{"file00": file})}}
+			if test.other {
+				requested := make(map[string]*core.Entry)
+				for i := 0; i < 30; i++ {
+					requested[fmt.Sprintf("file%02d", i)] = file
+				}
+				changes = append(changes, &core.Change{Path: "other", New: submodule(upstream.entry(head), requested)})
+			}
+			results, problems := transitionEndpoint(t, context.Background(), e, changes...)
+
+			// Verify the outcome.
+			var refusals []string
+			if test.populated {
+				if count := results[0].Count(); count != 23 {
+					t.Errorf("incorrect number of entries in population: %d", count)
+				}
+				verifyCheckout(t, filepath.Join(root, "sub"), head)
+			} else {
+				refusals = append(refusals, "sub")
+				if results[0] != nil {
+					t.Error("incorrect result for refused population:", results[0])
+				}
+				verifyAbsent(t, root, "sub")
+			}
+			if test.other {
+				refusals = append(refusals, "other")
+				verifyAbsent(t, root, "other")
+			}
+			slices.Sort(refusals)
+			verifyEntryCountProblems(t, problems, nil, refusals)
+
+			// The next scan succeeds.
+			if _, err, _ := e.Scan(context.Background(), nil, nil, true); err != nil {
+				t.Error("scan failed:", err)
+			}
+		})
+	}
 }

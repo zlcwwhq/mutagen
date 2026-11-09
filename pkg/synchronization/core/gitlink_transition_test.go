@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -45,8 +47,9 @@ func testingGitTransitionRoot(t *testing.T, content map[string]string) (string, 
 }
 
 // testingTransitionGitMode performs transitions in Git mode, with files
-// provided from the specified content map. It verifies that no files are
-// reported missing and that no temporary directories are left behind.
+// provided from the specified content map, and without a limit on the entries
+// that populations yield. It verifies that no files are reported missing and
+// that no temporary directories are left behind.
 func testingTransitionGitMode(
 	t *testing.T,
 	ctx context.Context,
@@ -71,6 +74,7 @@ func testingTransitionGitMode(
 		false,
 		provider,
 		gitProvider,
+		math.MaxUint64,
 	)
 	if missingFiles {
 		t.Error("files reported missing")
@@ -273,6 +277,115 @@ func TestTransitionPopulate(t *testing.T) {
 			testingVerifyFile(t, root, "sub/ignored", tF3Content)
 			testingVerifyFile(t, root, "sub/.git/HEAD", "ref: refs/heads/main\n")
 			testingVerifyMissing(t, root, "sub/c")
+		})
+	}
+}
+
+// TestTransitionPopulationAllowance tests that a population whose clone has
+// more entries than the larger of its target and its old content is only
+// performed if the difference fits within the allowance, which populations
+// share, and that it's refused otherwise, leaving the old content in place.
+func TestTransitionPopulationAllowance(t *testing.T) {
+	// The target has four entries, and the clone yields five, so a population
+	// in place of nothing or of a file exceeds the target by one entry, whereas
+	// a population in place of a directory with five entries doesn't exceed
+	// anything.
+	tests := []struct {
+		// description is a human readable description of the test case.
+		description string
+		// content is the content of the root.
+		content map[string]string
+		// old maps the paths of the populations to their old content.
+		old map[string]*Entry
+		// allowance is the allowance.
+		allowance uint64
+		// refused are the paths of the populations that are expected to be
+		// refused, sorted.
+		refused []string
+	}{
+		{
+			description: "excess within allowance",
+			old:         map[string]*Entry{"sub": nil},
+			allowance:   1,
+		},
+		{
+			description: "excess beyond allowance",
+			old:         map[string]*Entry{"sub": nil},
+			refused:     []string{"sub"},
+		},
+		{
+			description: "excess of replacement beyond allowance",
+			content:     map[string]string{"sub": tF1Content},
+			old:         map[string]*Entry{"sub": tF1},
+			refused:     []string{"sub"},
+		},
+		{
+			description: "no excess over larger old content",
+			content:     map[string]string{"sub/a": tF1Content, "sub/b": tF1Content, "sub/c": tF1Content, "sub/d": tF1Content},
+			old:         map[string]*Entry{"sub": {Contents: map[string]*Entry{"a": tF1, "b": tF1, "c": tF1, "d": tF1}}},
+		},
+		{
+			description: "allowance shared by populations",
+			old:         map[string]*Entry{"sub": nil, "sub2": nil},
+			allowance:   1,
+			refused:     []string{"sub2"},
+		},
+	}
+
+	// Process test cases.
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			// Perform the populations, in order of their paths.
+			root, cache := testingGitTransitionRoot(t, test.content)
+			var transitions []*Change
+			for _, path := range slices.Sorted(maps.Keys(test.old)) {
+				transitions = append(transitions, &Change{Path: path, Old: test.old[path], New: testingPopulationTarget})
+			}
+			provider := &testingProvider{storage: t.TempDir(), hasher: newTestingHasher()}
+			results, problems, _ := TransitionGitMode(
+				context.Background(),
+				root,
+				transitions,
+				cache,
+				newTestingHasher(),
+				SymbolicLinkMode_SymbolicLinkModePortable,
+				0600,
+				0700,
+				nil,
+				false,
+				provider,
+				newTestingPopulationProvider(),
+				test.allowance,
+			)
+
+			// Verify the results and the problems.
+			var expected []*Problem
+			for r, transition := range transitions {
+				if slices.Contains(test.refused, transition.Path) {
+					expected = append(expected, &Problem{Path: transition.Path, Error: errPopulationExceedsEntryCount.Error()})
+					if results[r] != transition.Old {
+						t.Errorf("incorrect result for refused population at %s: %v", transition.Path, results[r])
+					}
+				} else {
+					expected = append(expected, &Problem{Path: transition.Path, Error: "fell back to the default branch", Warning: true})
+					if !results[r].Equal(testingPopulation, true) {
+						t.Errorf("incorrect result for population at %s: %v", transition.Path, results[r])
+					}
+				}
+			}
+			testingVerifyProblems(t, problems, expected)
+
+			// Verify that refused populations left their old content in place.
+			for _, path := range test.refused {
+				if test.old[path] == nil {
+					testingVerifyMissing(t, root, path)
+				} else {
+					testingVerifyFile(t, root, path, tF1Content)
+				}
+			}
+			if temporary := testingTemporaryClones(t, root); len(temporary) > 0 {
+				t.Error("temporary directories left behind:", temporary)
+			}
 		})
 	}
 }
@@ -1053,6 +1166,7 @@ func TestTransitionPopulateRemovesStaleTemporaryClones(t *testing.T) {
 		false,
 		provider,
 		newTestingPopulationProvider(),
+		math.MaxUint64,
 	)
 	if results[0].gitLink() == nil {
 		t.Errorf("submodule not populated: %v", results[0])
@@ -1119,6 +1233,7 @@ func TestTransitionRemovalWithTemporaryClones(t *testing.T) {
 		false,
 		provider,
 		&testingGitProvider{},
+		math.MaxUint64,
 	)
 
 	// Verify the results. A directory with a temporary directory that's in use

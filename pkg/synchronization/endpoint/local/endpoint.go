@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"path/filepath"
 	"strings"
 	"time"
@@ -1498,8 +1499,10 @@ func (e *endpoint) Supply(paths []string, signatures []*rsync.Signature, receive
 // transition performs transitions on the synchronization root using the
 // endpoint's transition parameters. It returns the results of core.Transition.
 // In Git mode, the transitions must be limited to what the endpoint may write
-// (see applyTransitions). It doesn't require the scan lock (see Transition).
-func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool) {
+// (see applyTransitions), and the number of entries by which populations may
+// exceed what the transitions request has to be specified (see
+// core.TransitionGitMode). It doesn't require the scan lock (see Transition).
+func (e *endpoint) transition(ctx context.Context, transitions []*core.Change, populationAllowance uint64) ([]*core.Entry, []*core.Problem, bool) {
 	if e.gitMode {
 		return core.TransitionGitMode(
 			ctx,
@@ -1514,6 +1517,7 @@ func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) (
 			e.lastReturnedScanSnapshotDecomposesUnicode,
 			e.stager,
 			e.gitProvider,
+			populationAllowance,
 		)
 	}
 	return core.Transition(
@@ -1558,6 +1562,16 @@ func (e *endpoint) transition(ctx context.Context, transitions []*core.Change) (
 // failed (e.g. due to modifications since the last scan), and admit the
 // remaining transitions only while the entry count that would result if they
 // all succeeded remains within the maximum.
+//
+// The exception to the bound above is a population of a submodule, which
+// leaves what its clone contains, however many entries that is. Thus, each
+// phase allows populations to exceed what they were charged for by the room
+// that remains beneath the maximum (see core.TransitionGitMode). For the first
+// phase, that's computed from the entry count before the transitions, which
+// still includes everything that they remove, and for the second phase, it's
+// what the admitted transitions leave. Since the entry count is recomputed
+// from the results of the first phase, what its populations add counts against
+// the transitions of the second.
 func (e *endpoint) transitionWithinMaximumEntryCount(
 	ctx context.Context,
 	transitions []*core.Change,
@@ -1589,7 +1603,7 @@ func (e *endpoint) transitionWithinMaximumEntryCount(
 	// place, which can't underflow because the entry count covers all of the
 	// entries that the transitions remove.
 	if len(nonIncreasing) > 0 {
-		phaseResults, phaseProblems, phaseMissingFiles := e.transition(ctx, nonIncreasing)
+		phaseResults, phaseProblems, phaseMissingFiles := e.transition(ctx, nonIncreasing, e.remainingEntryCount(entryCount))
 		for r, result := range phaseResults {
 			results[nonIncreasingIndices[r]] = result
 		}
@@ -1633,7 +1647,7 @@ func (e *endpoint) transitionWithinMaximumEntryCount(
 
 	// Perform the admitted transitions.
 	if len(admitted) > 0 {
-		phaseResults, phaseProblems, phaseMissingFiles := e.transition(ctx, admitted)
+		phaseResults, phaseProblems, phaseMissingFiles := e.transition(ctx, admitted, e.remainingEntryCount(entryCount))
 		for r, result := range phaseResults {
 			results[admittedIndices[r]] = result
 		}
@@ -1646,6 +1660,18 @@ func (e *endpoint) transitionWithinMaximumEntryCount(
 
 	// Done.
 	return results, problems, stagerMissingFiles
+}
+
+// remainingEntryCount returns the number of entries that can be added to the
+// root without exceeding the maximum entry count, given its entry count. Like
+// applyTransitions, it treats a maximum of zero as no maximum.
+func (e *endpoint) remainingEntryCount(entryCount uint64) uint64 {
+	if e.maximumEntryCount == 0 {
+		return math.MaxUint64
+	} else if entryCount >= e.maximumEntryCount {
+		return 0
+	}
+	return e.maximumEntryCount - entryCount
 }
 
 // applyTransitions determines what to apply for each of the transitions and
@@ -1703,7 +1729,9 @@ func (e *endpoint) applyTransitions(
 		(entryCount > e.maximumEntryCount ||
 			maximumIncrease > e.maximumEntryCount-entryCount)
 
-	// Perform the changes.
+	// Perform the changes. If they aren't restricted, then populations may
+	// exceed what they request by whatever remains beneath the maximum once all
+	// of the changes have succeeded (see transitionWithinMaximumEntryCount).
 	var results []*core.Entry
 	var transitionProblems []*core.Problem
 	var stagerMissingFiles bool
@@ -1712,7 +1740,9 @@ func (e *endpoint) applyTransitions(
 			ctx, applicable, entryCount,
 		)
 	} else {
-		results, transitionProblems, stagerMissingFiles = e.transition(ctx, applicable)
+		results, transitionProblems, stagerMissingFiles = e.transition(
+			ctx, applicable, e.remainingEntryCount(entryCount+maximumIncrease),
+		)
 	}
 	problems = append(problems, transitionProblems...)
 

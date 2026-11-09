@@ -81,6 +81,11 @@ var (
 	// nowhere else, such as unpushed commits and stashes, and it isn't
 	// synchronized, so its removal is never performed automatically.
 	errGitLinkRemovalRefused = errors.New("submodule isn't removed automatically; remove it manually")
+	// errPopulationExceedsEntryCount indicates that a population was refused
+	// because its clone has more entries than the endpoint can accommodate (see
+	// transitioner.populationAllowance). It's the problem that endpoints report
+	// for any change that would exceed their maximum entry count.
+	errPopulationExceedsEntryCount = errors.New("applying change would exceed allowed entry count")
 )
 
 // Provider defines the interface that higher-level logic can use to provide
@@ -129,6 +134,14 @@ type transitioner struct {
 	// gitProvider obtains submodules. If it's nil, then transitions to
 	// submodules fail, since there's no way to obtain them.
 	gitProvider GitProvider
+	// populationAllowance is the number of entries by which the content that
+	// populations yield may exceed, in total, what the transitions requested
+	// for them (see populateIn). A population yields what its clone contains,
+	// rather than the new content of its transition, which is what endpoints
+	// hold against their maximum entry count, so this is the room that remains
+	// beneath the maximum once the transitions have been accounted for.
+	// Populations draw from it before their clones are moved into place.
+	populationAllowance uint64
 	// problems are the problems encountered during transition operations.
 	problems []*Problem
 	// providerMissingFiles indicates that the staged file provider returned an
@@ -1222,9 +1235,9 @@ func (t *transitioner) populateIn(parent *filesystem.Directory, name, path strin
 		content.Contents = make(map[string]*Entry, 1)
 	}
 
-	// Record the population in the clone, identified by a seed that the Git
-	// entry carries, and which is unique, so that it's never mistaken for a
-	// previous population of the same submodule.
+	// Identify the population by a seed that the Git entry carries, and which
+	// is unique, so that it's never mistaken for a previous population of the
+	// same submodule.
 	seed, err := newSeed()
 	if err != nil {
 		t.removeTemporaryClone(path, temporary)
@@ -1234,6 +1247,29 @@ func (t *transitioner) populateIn(parent *filesystem.Directory, name, path strin
 	link = link.Copy(EntryCopyBehaviorSlim)
 	link.Seed = seed
 	content.Contents[GitLinkName] = link
+
+	// The population yields the clone's content, which can have many more
+	// entries than the target (e.g. if the other endpoint's working tree lacks
+	// most of the commit's files), whereas the endpoint only admitted the
+	// transition for the larger of the target and the old content, as for any
+	// other transition (which leaves at most that many entries in place). The
+	// difference has to fit within what remains beneath the endpoint's maximum
+	// entry count, or every scan would fail from then on for exceeding it, so
+	// that nothing could be synchronized, not even the deletions that would
+	// bring the endpoint back beneath it. If the population fails after this,
+	// then what it drew isn't returned, which only errs towards refusing.
+	admitted := max(target.Count(), old.Count())
+	if count := content.Count(); count > admitted {
+		if excess := count - admitted; excess > t.populationAllowance {
+			t.removeTemporaryClone(path, temporary)
+			t.recordProblem(path, errPopulationExceedsEntryCount)
+			return old
+		} else {
+			t.populationAllowance -= excess
+		}
+	}
+
+	// Record the population in the clone.
 	if err := t.gitProvider.RecordSeed(t.ctx, temporary, content); err != nil {
 		t.removeTemporaryClone(path, temporary)
 		t.recordGitProblem(path, fmt.Errorf("unable to record population: %w", err))
@@ -1594,11 +1630,16 @@ func Transition(
 		recomposeUnicode,
 		provider,
 		nil,
+		0,
 	)
 }
 
 // TransitionGitMode is a variant of Transition for sessions in Git mode, which
-// obtains submodules using the specified provider.
+// obtains submodules using the specified provider. Since a population yields
+// what its clone contains rather than its transition's new content, the number
+// of entries by which populations may exceed what their transitions requested,
+// in total, has to be specified as well. A population that would exceed it is
+// refused.
 func TransitionGitMode(
 	ctx context.Context,
 	root string,
@@ -1612,6 +1653,7 @@ func TransitionGitMode(
 	recomposeUnicode bool,
 	provider Provider,
 	gitProvider GitProvider,
+	populationAllowance uint64,
 ) ([]*Entry, []*Problem, bool) {
 	return transition(
 		ctx,
@@ -1626,6 +1668,7 @@ func TransitionGitMode(
 		recomposeUnicode,
 		provider,
 		gitProvider,
+		populationAllowance,
 	)
 }
 
@@ -1643,6 +1686,7 @@ func transition(
 	recomposeUnicode bool,
 	provider Provider,
 	gitProvider GitProvider,
+	populationAllowance uint64,
 ) ([]*Entry, []*Problem, bool) {
 	// Extract the cancellation channel.
 	cancelled := ctx.Done()
@@ -1662,6 +1706,7 @@ func transition(
 		recomposeUnicode:     recomposeUnicode,
 		provider:             provider,
 		gitProvider:          gitProvider,
+		populationAllowance:  populationAllowance,
 	}
 
 	// Set up results.
