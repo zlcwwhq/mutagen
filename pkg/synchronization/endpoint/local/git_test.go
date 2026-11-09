@@ -220,6 +220,47 @@ func TestGitModeEventRelevant(t *testing.T) {
 	}
 }
 
+// TestGitEntryEventDirectory tests gitEntryEventDirectory.
+func TestGitEntryEventDirectory(t *testing.T) {
+	tests := []struct {
+		path      string
+		directory string
+		expected  bool
+	}{
+		// Git entries themselves, in any case.
+		{".git", "", true},
+		{"sub/.git", "sub", true},
+		{"a/b/.git", "a/b", true},
+		{".GIT", "", true},
+		{"sub/.Git", "sub", true},
+
+		// Content in Git directories, including other Git entries.
+		{".git/HEAD", "", false},
+		{"sub/.git/index", "", false},
+		{".git/modules/x/.git", "", false},
+		{"sub/.git/.git", "", false},
+
+		// Anything else.
+		{"", "", false},
+		{"file", "", false},
+		{"sub/file", "", false},
+		{".gitignore", "", false},
+		{"directory.git", "", false},
+		{"a.git/b", "", false},
+
+		// Git entries in temporary directories.
+		{".mutagen-temporary-x/.git", "", false},
+		{"a/.mutagen-temporary-x/.git", "", false},
+	}
+	for _, test := range tests {
+		if directory, ok := gitEntryEventDirectory(test.path); ok != test.expected {
+			t.Errorf("incorrect result for %q: %t != %t", test.path, ok, test.expected)
+		} else if directory != test.directory {
+			t.Errorf("incorrect directory for %q: %q != %q", test.path, directory, test.directory)
+		}
+	}
+}
+
 // TestContainsGitRulePath tests containsGitRulePath, which unlike what's
 // delivered has to include the exclude files of the root repository and of
 // nested repositories, since local edits to them change what's ignored. Every

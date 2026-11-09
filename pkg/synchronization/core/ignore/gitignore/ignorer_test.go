@@ -802,14 +802,21 @@ func TestExcludeFileLocation(t *testing.T) {
 				t.Fatal("unable to create root:", err)
 			}
 			expected := test.setup(t, root)
-			repository, actual, err := excludeFileLocation(root)
+			location, err := excludeFileLocation(root)
 			if err != nil {
 				t.Fatal("unable to locate exclude file:", err)
-			} else if actual != expected {
-				t.Errorf("location did not match expected: %q != %q", actual, expected)
+			} else if location.exclude != expected {
+				t.Errorf("location did not match expected: %q != %q", location.exclude, expected)
 			}
-			if repository != test.repository {
-				t.Errorf("repository status did not match expected: %v != %v", repository, test.repository)
+			if location.repository != test.repository {
+				t.Errorf("repository status did not match expected: %v != %v", location.repository, test.repository)
+			}
+
+			// The presence of a ".git" entry is reported whether or not Git
+			// accepts it.
+			_, err = os.Lstat(filepath.Join(root, ".git"))
+			if present := err == nil; location.present != present {
+				t.Errorf("presence did not match expected: %v != %v", location.present, present)
 			}
 		})
 	}

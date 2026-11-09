@@ -1005,10 +1005,21 @@ WatchEstablishment:
 				// In Git mode, we also have to filter Git's own activity. Scans
 				// don't include it, so it couldn't change anything, and a
 				// command that fails but updates files in a Git directory would
-				// otherwise wake the session in a loop.
+				// otherwise wake the session in a loop. An event for a Git
+				// entry itself is relevant if it changed what the directory
+				// containing it contributes to the rules, such as when a Git
+				// directory is moved into a directory, which can be all that
+				// the watcher reports. Its path then makes an accelerated scan
+				// re-check the directory, which notices the change (see scan).
 				ignore := strings.HasPrefix(path, filesystem.TemporaryNamePrefix) ||
-					strings.HasPrefix(fastpath.Base(path), filesystem.TemporaryNamePrefix) ||
-					(e.gitMode && !gitModeEventRelevant(path))
+					strings.HasPrefix(fastpath.Base(path), filesystem.TemporaryNamePrefix)
+				if !ignore && e.gitMode {
+					if directory, ok := gitEntryEventDirectory(path); ok {
+						ignore = !e.gitEntryChanged(directory)
+					} else {
+						ignore = !gitModeEventRelevant(path)
+					}
+				}
 				if ignore {
 					logger.Tracef("Ignoring event path: \"%s\"", path)
 					continue
@@ -1098,6 +1109,26 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 	}
 	if err != nil {
 		return err
+	}
+
+	// In Git mode, a scan with a baseline reuses the decisions of the scans
+	// before it beneath the directories that it doesn't re-check, which were
+	// made for what repositories contributed to the rules then. If the scan's
+	// ignorer found something else for a directory that it re-checked, then
+	// whatever the scan reused beneath that directory may be stale, so we
+	// perform a full scan instead. This is how a directory that has become the
+	// top level of a nested repository is noticed, whose subdirectories the
+	// scan would otherwise reuse with the decisions of an ordinary directory,
+	// and how a change during the scan to one that the scans before it found is
+	// noticed right away.
+	if e.gitMode && baseline != nil {
+		reused := func(directory string) bool {
+			return isDirectoryInSnapshot(baseline.Content, directory)
+		}
+		if !e.gitRepositories.Agrees(gitIgnorer, reused) {
+			e.logger.Debug("Repositories changed since the baseline, performing full scan")
+			return e.scan(ctx, nil, nil)
+		}
 	}
 
 	// Update the snapshot.
@@ -1216,7 +1247,10 @@ func (e *endpoint) lockAndScan(ctx context.Context, full bool) (*core.Snapshot, 
 	// whose Git directory is outside of the root (such as when the root is a
 	// linked worktree), or to whether or not a directory is the top level of a
 	// repository, which the watcher can't report, so we check what the
-	// repositories found by earlier scans contribute directly.
+	// repositories found by earlier scans contribute directly. A directory that
+	// those scans didn't find to have a ".git" entry, but which now has one, is
+	// noticed by the accelerated scan itself, if it re-checks the directory
+	// (see scan and gitEntryChanged).
 	if e.accelerate && !full {
 		if e.watchMode == reifiedWatchModeRecursive {
 			e.logger.Debug("Performing accelerated scan with", len(e.recheckPaths), "recheck paths")

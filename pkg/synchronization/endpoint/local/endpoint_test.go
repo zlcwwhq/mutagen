@@ -815,6 +815,116 @@ func TestEndpointGitModeAcceleratedOutsideExclude(t *testing.T) {
 	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{"sub/file": core.EntryKind_Untracked})
 }
 
+// moveGitDirectoryInto creates a repository without commits in a new directory
+// within a base directory, with the specified exclude file, and moves its Git
+// directory into another directory, as one does to make a directory that
+// already has content a repository's working tree (with git clone
+// --no-checkout <url> <temporary> and mv <temporary>/.git <directory>).
+func moveGitDirectoryInto(t *testing.T, base, directory, exclude string) {
+	t.Helper()
+	prepared, err := os.MkdirTemp(base, "prepared-")
+	if err != nil {
+		t.Fatal("unable to create repository directory:", err)
+	}
+	initializeRepository(t, prepared)
+	writeTree(t, prepared, map[string]string{".git/info/exclude": exclude})
+	if err := os.Rename(filepath.Join(prepared, ".git"), filepath.Join(directory, ".git")); err != nil {
+		t.Fatal("unable to move Git directory:", err)
+	}
+}
+
+// TestEndpointGitModeAcceleratedRepositoryAppears tests that scans accelerated
+// by recursive watching don't reuse decisions from the baseline beneath a
+// directory that has become the top level of a nested repository's working
+// tree since, such as because a Git directory was moved into it. The nested
+// repository's rules then apply beneath it in place of those above it.
+// Otherwise, a file that its exclude file excludes would remain in snapshots,
+// and its deletion on the other endpoint would remove it. The watcher may
+// report nothing but the directory's Git entry, which then has to be relevant,
+// and which has to make the scan look at the directory, or a scan may find the
+// repository in a directory that it re-checks for another reason, and it then
+// mustn't reuse that directory's subdirectories. This test simulates recursive
+// watching, which isn't available on all platforms.
+func TestEndpointGitModeAcceleratedRepositoryAppears(t *testing.T) {
+	// Create content in two directories that will become nested repositories,
+	// and an ignored one with a nested repository.
+	isolateGit(t)
+	base := realTemporaryDirectory(t)
+	root := filepath.Join(base, "root")
+	files := map[string]string{".gitignore": "ignored/\n", "other/a": "a"}
+	for _, directory := range []string{"reported", "rechecked"} {
+		files[directory+"/kept"] = "kept"
+		files[directory+"/data/f"] = "f"
+		files[directory+"/deep/x.log"] = "x"
+	}
+	writeTree(t, root, files)
+	initializeRepository(t, filepath.Join(root, "ignored", "repository"))
+
+	// Create an endpoint with a baseline for accelerated scanning.
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	verifyKinds(t, scanEndpoint(t, e, true), map[string]core.EntryKind{
+		"ignored":              core.EntryKind_Untracked,
+		"reported/data/f":      core.EntryKind_File,
+		"rechecked/deep/x.log": core.EntryKind_File,
+	})
+	e.watchMode = reifiedWatchModeRecursive
+	e.accelerate = true
+	e.recheckPaths = make(map[string]bool)
+
+	// Events for Git entries that don't change anything aren't relevant,
+	// including those of repositories in ignored directories.
+	for _, directory := range []string{"", "reported", "ignored/repository"} {
+		if e.gitEntryChanged(directory) {
+			t.Errorf("event for the Git entry of %q is relevant", directory)
+		}
+	}
+
+	// Move a Git directory into a directory. The event for its Git entry has
+	// to be relevant, and to make the scan apply the nested repository's
+	// rules beneath it.
+	moveGitDirectoryInto(t, base, filepath.Join(root, "reported"), "data/\n*.log\n")
+	if !e.gitEntryChanged("reported") {
+		t.Error("event for a new Git entry isn't relevant")
+	}
+	e.recheckPaths = map[string]bool{"reported/.git": true}
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		"reported/.git":       core.EntryKind_Untracked,
+		"reported/kept":       core.EntryKind_File,
+		"reported/data":       core.EntryKind_Untracked,
+		"reported/deep/x.log": core.EntryKind_Untracked,
+	})
+	if e.gitEntryChanged("reported") {
+		t.Error("event for the Git entry of a known nested repository is relevant")
+	}
+
+	// Move a Git directory into another directory, which a scan re-checks for
+	// another reason, as recursive watchers that report the creation of an
+	// entry as a change to its parent do. The scan has to notice the nested
+	// repository and apply its rules beneath it too.
+	moveGitDirectoryInto(t, base, filepath.Join(root, "rechecked"), "data/\n*.log\n")
+	writeTree(t, root, map[string]string{"rechecked/kept": "changed"})
+	e.recheckPaths = map[string]bool{"rechecked/kept": true}
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		"rechecked/kept":       core.EntryKind_File,
+		"rechecked/data":       core.EntryKind_Untracked,
+		"rechecked/deep/x.log": core.EntryKind_Untracked,
+	})
+
+	// Remove a nested repository's Git directory. Its event is relevant, and
+	// the scan applies the rules above the directory beneath it again.
+	if err := os.RemoveAll(filepath.Join(root, "reported", ".git")); err != nil {
+		t.Fatal("unable to remove Git directory:", err)
+	}
+	if !e.gitEntryChanged("reported") {
+		t.Error("event for a removed Git entry isn't relevant")
+	}
+	e.recheckPaths = map[string]bool{"reported/.git": true}
+	verifyKinds(t, scanEndpoint(t, e, false), map[string]core.EntryKind{
+		"reported/data/f":     core.EntryKind_File,
+		"reported/deep/x.log": core.EntryKind_File,
+	})
+}
+
 // TestEndpointNoGitModeRetainsIgnoreCache tests that the ignore cache continues
 // to be used without Git mode, in which rule files aren't read.
 func TestEndpointNoGitModeRetainsIgnoreCache(t *testing.T) {

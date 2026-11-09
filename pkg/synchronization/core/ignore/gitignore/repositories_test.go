@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 )
 
 // record evaluates the specified directories with a new ignorer and returns
@@ -98,6 +100,49 @@ func TestRepositoriesTopLevel(t *testing.T) {
 	expectChanged(t, repositories, true)
 }
 
+// TestRepositoriesUnacceptedGitEntries tests that changes to directories whose
+// ".git" entries Git doesn't accept are detected, even though those directories
+// aren't the top levels of repositories' working trees: such an entry becoming
+// one that Git accepts, whether because the Git directory that a ".git" file
+// points to is created, which happens outside of the root, or because a Git
+// directory is repaired, a ".git" file being pointed elsewhere, and the removal
+// of such an entry.
+func TestRepositoriesUnacceptedGitEntries(t *testing.T) {
+	// Create a root with a ".git" file that points to a Git directory that
+	// doesn't exist yet, and an empty ".git" directory.
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	writeTree(t, root, map[string]string{"dangling/.git": "gitdir: ../../elsewhere\n", "empty/.git/x": ""})
+	directories := []string{"", "dangling", "empty"}
+	repositories := record(t, root, directories...)
+	expectChanged(t, repositories, false)
+
+	// The Git directory that the ".git" file points to is created.
+	writeTree(t, base, withGitDirectories(nil, "elsewhere"))
+	expectChanged(t, repositories, true)
+
+	// The empty Git directory is completed.
+	repositories = record(t, root, directories...)
+	expectChanged(t, repositories, false)
+	writeTree(t, root, withGitDirectories(nil, "empty/.git"))
+	expectChanged(t, repositories, true)
+
+	// The ".git" file is pointed to another Git directory that doesn't exist.
+	writeTree(t, root, map[string]string{"dangling/.git": "gitdir: ../../nowhere\n"})
+	repositories = record(t, root, directories...)
+	expectChanged(t, repositories, false)
+	writeTree(t, root, map[string]string{"dangling/.git": "gitdir: ../../other\n"})
+	expectChanged(t, repositories, true)
+
+	// The ".git" file is removed.
+	repositories = record(t, root, directories...)
+	expectChanged(t, repositories, false)
+	if err := os.Remove(filepath.Join(root, "dangling", ".git")); err != nil {
+		t.Fatal(err)
+	}
+	expectChanged(t, repositories, true)
+}
+
 // TestRepositoriesFailures tests that a failure to read an exclude file is
 // recorded, so that it only counts as a change if it changes.
 func TestRepositoriesFailures(t *testing.T) {
@@ -116,16 +161,21 @@ func TestRepositoriesFailures(t *testing.T) {
 }
 
 // TestRepositoriesRecordedDirectories tests which directories are recorded:
-// the root and the top levels of nested repositories that have been evaluated,
-// but not other directories, so that only those are examined again.
+// the root and the directories with ".git" entries that have been evaluated,
+// whether or not Git accepts those entries, but not other directories, so that
+// only those are examined again.
 func TestRepositoriesRecordedDirectories(t *testing.T) {
 	root := t.TempDir()
-	writeTree(t, root, withGitDirectories(map[string]string{"plain/x": "", "invalid/.git/x": ""}, "sub/.git", "unevaluated/.git"))
-	repositories := record(t, root, "", "plain", "invalid", "sub")
-	if len(repositories.states) != 2 {
+	writeTree(t, root, withGitDirectories(map[string]string{
+		"plain/x":        "",
+		"invalid/.git/x": "",
+		"dangling/.git":  "gitdir: nowhere\n",
+	}, "sub/.git", "unevaluated/.git"))
+	repositories := record(t, root, "", "plain", "invalid", "dangling", "sub")
+	if len(repositories.states) != 4 {
 		t.Errorf("incorrect number of recorded directories: %d", len(repositories.states))
 	}
-	for _, directory := range []string{"", "sub"} {
+	for _, directory := range []string{"", "invalid", "dangling", "sub"} {
 		if _, ok := repositories.states[directory]; !ok {
 			t.Errorf("directory %q not recorded", directory)
 		}
@@ -174,4 +224,108 @@ func TestRepositoriesInclude(t *testing.T) {
 	var missing *Repositories
 	missing.Include(other)
 	expectChanged(t, missing, true)
+}
+
+// TestRepositoriesChangedAt tests that changes are detected for individual
+// directories, whether or not they're recorded, with directories that aren't
+// recorded taken to have no ".git" entry.
+func TestRepositoriesChangedAt(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, withGitDirectories(map[string]string{"plain/x": ""}, "sub/.git"))
+	repositories := record(t, root, "", "sub", "plain")
+	for _, directory := range []string{"", "sub", "plain", "unevaluated", "missing"} {
+		if repositories.ChangedAt(directory) {
+			t.Errorf("unchanged directory %q reported as changed", directory)
+		}
+	}
+
+	// A directory that wasn't recorded gets a ".git" entry, which Git doesn't
+	// even have to accept.
+	writeTree(t, root, map[string]string{"plain/.git": "gitdir: nowhere\n"})
+	if !repositories.ChangedAt("plain") {
+		t.Error("new Git entry not detected")
+	} else if repositories.ChangedAt("sub") {
+		t.Error("other directory reported as changed")
+	}
+
+	// A recorded directory's Git entry is removed.
+	if err := os.RemoveAll(filepath.Join(root, "sub", ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if !repositories.ChangedAt("sub") {
+		t.Error("removed Git entry not detected")
+	}
+
+	// A nil record always counts as changed.
+	var missing *Repositories
+	if !missing.ChangedAt("") {
+		t.Error("nil record not reported as changed")
+	}
+}
+
+// evaluate evaluates the specified directories with a new ignorer and returns
+// the ignorer.
+func evaluate(root string, directories ...string) ignore.DirectoryIgnorer {
+	ignorer := NewIgnorer(root, nil)
+	for _, directory := range directories {
+		ignorer.EnsureDirectory(directory)
+	}
+	return ignorer
+}
+
+// TestRepositoriesAgrees tests that an ignorer agrees with a record if it found
+// the same for the recorded directories that it evaluated, and if the other
+// directories in which it found ".git" entries aren't ones beneath which
+// decisions were reused.
+func TestRepositoriesAgrees(t *testing.T) {
+	// Create a record, and ignorers that evaluate the same directories, or only
+	// some of them.
+	root := t.TempDir()
+	writeTree(t, root, withGitDirectories(map[string]string{"plain/x": "", "other/x": ""}, "sub/.git"))
+	repositories := record(t, root, "", "sub", "plain", "other")
+	never := func(string) bool { return false }
+	always := func(string) bool { return true }
+	if !repositories.Agrees(evaluate(root, "", "sub", "plain"), always) {
+		t.Error("identical evaluation doesn't agree")
+	} else if !repositories.Agrees(evaluate(root, "sub"), always) {
+		t.Error("partial evaluation doesn't agree")
+	}
+
+	// A directory that wasn't recorded becomes a repository's top level. That
+	// only agrees if no decisions were reused beneath it.
+	writeTree(t, root, withGitDirectories(nil, "plain/.git"))
+	if !repositories.Agrees(evaluate(root, "", "plain"), never) {
+		t.Error("new repository doesn't agree without reused decisions")
+	} else if repositories.Agrees(evaluate(root, "", "plain"), func(directory string) bool { return directory == "plain" }) {
+		t.Error("new repository agrees with reused decisions")
+	} else if !repositories.Agrees(evaluate(root, "", "other"), always) {
+		t.Error("evaluation without the new repository doesn't agree")
+	}
+
+	// A recorded directory's exclude file changes, which never agrees.
+	writeTree(t, root, map[string]string{"sub/.git/info/exclude": "x\n"})
+	if repositories.Agrees(evaluate(root, "sub"), never) {
+		t.Error("changed exclude file agrees")
+	}
+
+	// A recorded directory's Git entry is removed, which never agrees either,
+	// unless the directory isn't evaluated.
+	repositories = record(t, root, "", "sub")
+	if err := os.RemoveAll(filepath.Join(root, "sub", ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if repositories.Agrees(evaluate(root, "sub"), never) {
+		t.Error("removed Git entry agrees")
+	} else if !repositories.Agrees(evaluate(root, "other"), never) {
+		t.Error("evaluation without the removed Git entry doesn't agree")
+	}
+
+	// Other ignorers agree, while a nil receiver doesn't.
+	if !repositories.Agrees(nil, always) {
+		t.Error("nil ignorer doesn't agree")
+	}
+	var missing *Repositories
+	if missing.Agrees(evaluate(root, ""), never) {
+		t.Error("nil receiver agrees")
+	}
 }

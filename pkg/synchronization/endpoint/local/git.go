@@ -969,9 +969,88 @@ func containsGitRulePath(recheckPaths map[string]bool) bool {
 	return false
 }
 
+// gitEntryEventDirectory determines whether or not the watch-root-relative,
+// slash-separated path of a filesystem event identifies a Git entry itself (as
+// "sub/.git" does), rather than something within one or anything else, and if
+// it does, returns the path of the directory that contains the entry. Git
+// entries are recognized as gitModeEventRelevant recognizes them, and those in
+// temporary directories don't count.
+func gitEntryEventDirectory(path string) (string, bool) {
+	components := strings.Split(path, "/")
+	for c, component := range components {
+		if strings.HasPrefix(component, filesystem.TemporaryNamePrefix) {
+			return "", false
+		} else if strings.EqualFold(component, ".git") {
+			if c != len(components)-1 {
+				return "", false
+			}
+			return strings.Join(components[:c], "/"), true
+		}
+	}
+	return "", false
+}
+
+// gitEntryChanged determines whether or not an event for the Git entry of a
+// directory, specified by its root-relative path, is relevant in Git mode,
+// which is the case if the Git entry changed what the directory contributes to
+// the rules since the last scan (see gitignore.Repositories.ChangedAt), such as
+// by making the directory the top level of a nested repository's working tree.
+// Most events for a Git directory itself don't: recursive watchers can report
+// one whenever an entry is created or removed in it, which happens continuously
+// due to lock files, so they're dropped like the events for the lock files
+// themselves. Events are also dropped for directories that the last scan
+// ignored, or that are beneath one, whose contents aren't scanned, and before a
+// scan has succeeded, since the next scan is a full one anyway. If scans
+// aren't accelerated, then each one is a full one, and all of them are dropped,
+// without waiting for the scan lock, which watching doesn't otherwise need
+// then. Otherwise, it acquires the scan lock.
+func (e *endpoint) gitEntryChanged(directory string) bool {
+	if !e.accelerationAllowed {
+		return false
+	}
+	e.lockScanLock(context.Background())
+	defer e.unlockScanLock()
+	if e.gitRepositories == nil || e.snapshot == nil || isIgnoredInSnapshot(e.snapshot.Content, directory) {
+		return false
+	}
+	return e.gitRepositories.ChangedAt(directory)
+}
+
+// isIgnoredInSnapshot determines whether or not the content of a snapshot has an
+// untracked entry at a root-relative path, or at one of the path's parents.
+func isIgnoredInSnapshot(content *core.Entry, path string) bool {
+	entry := content
+	if path != "" {
+		for _, component := range strings.Split(path, "/") {
+			if entry == nil || entry.Kind == core.EntryKind_Untracked {
+				break
+			}
+			entry = entry.Contents[component]
+		}
+	}
+	return entry != nil && entry.Kind == core.EntryKind_Untracked
+}
+
+// isDirectoryInSnapshot determines whether or not the content of a snapshot has
+// a directory at a root-relative path, whose contents a scan that uses the
+// snapshot as its baseline may reuse.
+func isDirectoryInSnapshot(content *core.Entry, path string) bool {
+	entry := content
+	if path != "" {
+		for _, component := range strings.Split(path, "/") {
+			if entry == nil || entry.Kind != core.EntryKind_Directory {
+				return false
+			}
+			entry = entry.Contents[component]
+		}
+	}
+	return entry != nil && entry.Kind == core.EntryKind_Directory
+}
+
 // gitModeEventRelevant determines whether or not a filesystem event from a
 // recursive watcher should wake a session in Git mode. The path is specified in
-// its watch-root-relative, slash-separated form.
+// its watch-root-relative, slash-separated form. Events for Git entries
+// themselves are handled separately (see gitEntryEventDirectory).
 //
 // The contents of temporary directories are never relevant, wherever they are
 // in the hierarchy, because they aren't scanned. Their contents may have
@@ -1010,9 +1089,10 @@ func gitModeEventRelevant(path string) bool {
 	}
 	components = components[gitDirectory+1:]
 
-	// The Git directory itself isn't relevant. Events are reported for it when
-	// entries are created or removed within it, which happens continuously due
-	// to lock files.
+	// The Git directory itself isn't relevant by itself. Events are reported
+	// for it when entries are created or removed within it, which happens
+	// continuously due to lock files. The caller only lets through those that
+	// change something (see gitEntryChanged).
 	if len(components) == 0 {
 		return false
 	}

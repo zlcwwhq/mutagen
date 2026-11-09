@@ -490,13 +490,13 @@ func isEntryName(component string) bool {
 // error, and the directory counts as a repository's top level, so that the
 // error replaces any rules that would otherwise apply beneath it. The caller is
 // responsible for retaining the result, so that the file is only read once.
-// The result is recorded for the root and for the top levels of repositories
-// (see Repositories).
+// The result is recorded for the root and for every directory that has a
+// ".git" entry, whether or not Git accepts it (see Repositories).
 func (i *ignorer) repositoryRules(directory string) (bool, *ruleSet) {
 	// Read the exclude file and record the result.
-	repository, contents, err := readExcludeFile(i.root, directory)
-	if directory == "" || repository {
-		i.repositories[directory] = newRepositoryState(repository, contents, err)
+	location, contents, err := readExcludeFile(i.root, directory)
+	if directory == "" || location.present {
+		i.repositories[directory] = newRepositoryState(location, contents, err)
 	}
 	if err != nil {
 		return true, &ruleSet{err: err}
@@ -505,41 +505,43 @@ func (i *ignorer) repositoryRules(directory string) (bool, *ruleSet) {
 	// Parse the exclude file.
 	rules := parseRules(contents)
 	if len(rules) == 0 {
-		return repository, nil
+		return location.repository, nil
 	}
 	var prefixLength int
 	if directory != "" {
 		prefixLength = len(directory) + 1
 	}
-	return repository, &ruleSet{rules: rules, prefixLength: prefixLength}
+	return location.repository, &ruleSet{rules: rules, prefixLength: prefixLength}
 }
 
-// readExcludeFile determines whether or not a directory, specified by its
-// root-relative path (which is empty for the synchronization root), is the top
-// level of a repository's working tree (see excludeFileLocation), and reads the
-// exclude file of its repository, if that file's rules apply beneath it. A
-// nested repository that Git doesn't accept has no rules of its own, but the
-// root's exclude file is read wherever it can be located, since the root is the
-// top level of whatever repository it's in, and its exclude file can only add
-// rules. The contents are nil if there's no exclude file to read. If the
-// exclude file can't be located or read, including because the directory's
-// ".git" entry can't be examined, then the directory counts as a repository's
-// top level, and the error is returned.
-func readExcludeFile(root, directory string) (bool, []byte, error) {
+// readExcludeFile locates the repository of a directory, specified by its
+// root-relative path (which is empty for the synchronization root), which
+// determines whether or not the directory is the top level of a repository's
+// working tree (see excludeFileLocation), and reads the exclude file of that
+// repository, if that file's rules apply beneath it. A nested repository that
+// Git doesn't accept has no rules of its own, but the root's exclude file is
+// read wherever it can be located, since the root is the top level of whatever
+// repository it's in, and its exclude file can only add rules. The contents are
+// nil if there's no exclude file to read. If the exclude file can't be located
+// or read, including because the directory's ".git" entry can't be examined,
+// then the directory counts as a repository's top level, and the error is
+// returned.
+func readExcludeFile(root, directory string) (repositoryLocation, []byte, error) {
 	// Locate the exclude file.
-	repository, path, err := excludeFileLocation(filepath.Join(root, filepath.FromSlash(directory)))
+	location, err := excludeFileLocation(filepath.Join(root, filepath.FromSlash(directory)))
 	if err != nil {
-		return true, nil, fmt.Errorf("unable to locate ignore rules: %w", err)
-	} else if path == "" || (directory != "" && !repository) {
-		return repository, nil, nil
+		return location, nil, fmt.Errorf("unable to locate ignore rules: %w", err)
+	} else if location.exclude == "" || (directory != "" && !location.repository) {
+		return location, nil, nil
 	}
 
 	// Read the exclude file.
-	contents, err := readRegularFile(path, maximumRuleFileSize)
+	contents, err := readRegularFile(location.exclude, maximumRuleFileSize)
 	if err != nil {
-		return true, nil, fmt.Errorf("unable to read ignore rules: %w", err)
+		location.repository = true
+		return location, nil, fmt.Errorf("unable to read ignore rules: %w", err)
 	}
-	return repository, contents, nil
+	return location, contents, nil
 }
 
 // readRegularFile reads a file if (and only if) it is a regular file (i.e. not
@@ -579,16 +581,34 @@ func readRegularFile(path string, limit int64) ([]byte, error) {
 	return contents, nil
 }
 
+// repositoryLocation is what a directory's ".git" entry locates (see
+// excludeFileLocation).
+type repositoryLocation struct {
+	// present indicates whether or not the directory has a ".git" entry, which
+	// is assumed if the entry can't be examined.
+	present bool
+	// repository indicates whether or not the directory is the top level of a
+	// repository's working tree.
+	repository bool
+	// gitDirectory is the location of the Git directory that the ".git" entry
+	// points to, whether or not Git accepts it, or an empty string if it
+	// doesn't point anywhere.
+	gitDirectory string
+	// exclude is the location of the exclude file of the Git directory's
+	// repository, or an empty string if there's no Git directory.
+	exclude string
+}
+
 // excludeFileLocation determines whether or not a directory is the top level of
 // a repository's working tree, as Git determines it, along with the location of
-// the exclude file of the repository that the directory's ".git" entry points
-// to. The ".git" entry may either be a directory, which is then the Git
-// directory, or a file that points to the Git directory (as is the case for
-// submodules and linked worktrees, see parseGitFile). If the Git directory in
-// turn points to a common directory (as is the case for linked worktrees),
-// then that is where the exclude file is found. The location is an empty
-// string if there's no ".git" entry, or if a ".git" file doesn't point
-// anywhere.
+// the Git directory that the directory's ".git" entry points to, and that of
+// the exclude file of its repository. The ".git" entry may either be a
+// directory, which is then the Git directory, or a file that points to the Git
+// directory (as is the case for submodules and linked worktrees, see
+// parseGitFile). If the Git directory in turn points to a common directory (as
+// is the case for linked worktrees), then that is where the exclude file is
+// found. The locations are empty strings if there's no ".git" entry, or if a
+// ".git" file doesn't point anywhere.
 //
 // Like Git, we only consider the directory the top level of a repository's
 // working tree if its ".git" entry locates a Git directory that Git accepts
@@ -608,45 +628,49 @@ func readRegularFile(path string, limit int64) ([]byte, error) {
 // is then treated as an ordinary one. The entry is looked up by name, so
 // whether ".GIT" counts depends on whether the filesystem distinguishes case,
 // as it does for Git.
-func excludeFileLocation(directory string) (bool, string, error) {
+func excludeFileLocation(directory string) (repositoryLocation, error) {
 	// Check the type of the directory's ".git" entry. We deliberately don't
 	// follow symbolic links.
 	dotGit := filepath.Join(directory, gitEntryName)
 	info, err := os.Lstat(dotGit)
 	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
-		return false, "", nil
+		return repositoryLocation{}, nil
 	} else if err != nil {
-		return true, "", err
+		return repositoryLocation{present: true, repository: true}, err
 	}
 
 	// Determine the location of the Git directory. If a ".git" file has been
 	// replaced by something other than a regular file in the meantime, then
 	// it's treated as one that doesn't point anywhere.
-	var gitDirectory string
+	location := repositoryLocation{present: true}
 	if info.IsDir() {
-		gitDirectory = dotGit
+		location.gitDirectory = dotGit
 	} else if !info.Mode().IsRegular() {
-		return false, "", nil
+		return location, nil
 	} else if contents, err := readRegularFile(dotGit, maximumPointerFileSize); err != nil {
-		return true, "", err
+		location.repository = true
+		return location, err
 	} else if pointer, ok := parseGitFile(contents); !ok {
-		return false, "", nil
+		return location, nil
 	} else {
-		gitDirectory = resolvePath(directory, pointer)
+		location.gitDirectory = resolvePath(directory, pointer)
 	}
 
 	// Check whether or not the Git directory points to a common directory.
-	commonDirectory := gitDirectory
-	if contents, err := readRegularFile(filepath.Join(gitDirectory, "commondir"), maximumPointerFileSize); err != nil {
-		return true, "", err
+	commonDirectory := location.gitDirectory
+	if contents, err := readRegularFile(filepath.Join(location.gitDirectory, "commondir"), maximumPointerFileSize); err != nil {
+		location.repository = true
+		return location, err
 	} else if contents != nil {
 		if pointer, ok := parsePointer(contents, ""); ok {
-			commonDirectory = resolvePath(gitDirectory, pointer)
+			commonDirectory = resolvePath(location.gitDirectory, pointer)
 		}
 	}
 
 	// Determine whether or not Git accepts the Git directory.
-	return isGitDirectory(gitDirectory, commonDirectory), filepath.Join(commonDirectory, "info", "exclude"), nil
+	location.repository = isGitDirectory(location.gitDirectory, commonDirectory)
+	location.exclude = filepath.Join(commonDirectory, "info", "exclude")
+	return location, nil
 }
 
 // parseGitFile extracts the location of a Git directory from the contents of a
