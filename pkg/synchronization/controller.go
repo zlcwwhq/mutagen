@@ -1238,19 +1238,62 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		// the saving of the ancestor that it yielded. That content is the merge
 		// base for the submodule, without which the other endpoint's changes to
 		// it (such as uncommitted edits and deletions) would conflict with the
-		// clone or be undone by it, so we put it in the ancestor before
-		// reconciling. The changes are also recorded as ancestor changes, so
-		// that the ancestor is saved at the end of this cycle, because the
-		// endpoint discards its record once a scan sees the ancestor carry it.
-		var seedChanges []*core.Change
+		// clone or be undone by it, so the ancestor has to absorb it before
+		// anything is reconciled.
+		//
+		// The endpoint keeps its record of a population, and reports it in its
+		// snapshots, until a scan sees the ancestor carry the population's seed,
+		// so the ancestor must still carry the seed when the next scan happens.
+		// Reconciliation can't guarantee that: once the population is the
+		// merge base, the submodule's Git entry may follow the other endpoint's
+		// commit, which replaces the seeded entry, or the submodule may be
+		// untracked on the other endpoint, which clears the ancestor at its
+		// path. A record that outlived its absorption would be absorbed again
+		// by a later cycle, which would replace the ancestor's content for the
+		// whole submodule with the clone's, although that's no longer the merge
+		// base, so that changes made since then would conflict, be overwritten
+		// (in the two-way-resolved mode), or be undone.
+		//
+		// Thus, absorption takes a cycle of its own: we save the ancestor with
+		// the populations and start another cycle right away, whose scans see
+		// the seeds and discard the records before anything is reconciled. If
+		// the session stops after the save, then the next scan discards them.
+		// The ancestor has to carry every reported seed after the absorption,
+		// or the next cycle would do the same thing again, which can only fail
+		// to happen if both endpoints report a population at the same path. A
+		// record is only written by a transition, and the first cycle after a
+		// restart transitions nothing until the ancestor has absorbed what's
+		// reported, so that can't happen, but if it did, then neither
+		// population could be trusted to be the merge base.
 		if gitMode {
-			if seedChanges = core.SeedChanges(ancestor, αSnapshot.Seeds, βSnapshot.Seeds); len(seedChanges) > 0 {
+			if seedChanges := core.SeedChanges(ancestor, αSnapshot.Seeds, βSnapshot.Seeds); len(seedChanges) > 0 {
 				c.logger.Debugf("Absorbing %d change(s) from unabsorbed submodule populations", len(seedChanges))
-				if seeded, err := core.Apply(ancestor, seedChanges); err != nil {
+				seeded, err := core.Apply(ancestor, seedChanges)
+				if err != nil {
 					return fmt.Errorf("unable to absorb submodule populations: %w", err)
-				} else {
-					ancestor = seeded
 				}
+				absorbed := make(map[string]bool)
+				for _, seed := range seeded.GitLinkSeeds() {
+					absorbed[seed] = true
+				}
+				for _, seeds := range []map[string]*core.Entry{αSnapshot.Seeds, βSnapshot.Seeds} {
+					for path, population := range seeds {
+						if !absorbed[population.Contents[core.GitLinkName].Seed] {
+							return fmt.Errorf("unable to absorb submodule populations, because both endpoints report one at \"%s\"", path)
+						}
+					}
+				}
+				if err := seeded.EnsureValid(true); err != nil {
+					return fmt.Errorf("ancestor with absorbed submodule populations is invalid: %w", err)
+				}
+				c.logger.Debug("Saving ancestor with absorbed submodule populations")
+				archive.Content = seeded
+				if err := encoding.MarshalAndSaveProtobuf(c.archivePath, archive); err != nil {
+					return fmt.Errorf("unable to save ancestor: %w", err)
+				}
+				ancestor = seeded
+				skipPolling = true
+				continue
 			}
 		}
 
@@ -1478,10 +1521,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		populatedSubmodules := gitMode && populatesSubmodules(ancestor, αResults, βResults)
 
 		// Fold applied changes into the ancestor's change list and update the
-		// ancestor if any changes are present. Any changes that absorb
-		// populations come first, since the other changes were computed against
-		// an ancestor that included them.
-		ancestorChanges = append(seedChanges, ancestorChanges...)
+		// ancestor if any changes are present.
 		ancestorChanges = append(ancestorChanges, αChanges...)
 		ancestorChanges = append(ancestorChanges, βChanges...)
 		if len(ancestorChanges) > 0 {

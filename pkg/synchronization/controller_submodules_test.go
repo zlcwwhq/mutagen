@@ -286,9 +286,10 @@ func TestSynchronizeAbsorbsReportedPopulation(t *testing.T) {
 }
 
 // TestSynchronizeSavesAbsorbedPopulation tests that a population that an
-// endpoint reports in its snapshot is saved to the ancestor even if nothing
-// else changes, so that the endpoint can discard its record of the population,
-// which it does once a scan receives the population's seed.
+// endpoint reports in its snapshot is saved to the ancestor before anything is
+// reconciled, even if nothing else changes, and that the scans of the cycle
+// that follows right away receive the population's seed, so that the endpoint
+// discards its record of the population.
 func TestSynchronizeSavesAbsorbedPopulation(t *testing.T) {
 	// The ancestor has the same content as both endpoints, but from an earlier
 	// population, as it would if the submodule had been removed with git
@@ -304,17 +305,15 @@ func TestSynchronizeSavesAbsorbedPopulation(t *testing.T) {
 	loop.waitForPolling()
 
 	// Verify that nothing was transitioned, but that the ancestor was saved
-	// with the new seed.
+	// with the new seed. The cycle that only absorbed the population doesn't
+	// count as a synchronization cycle.
 	loop.verify(1, nil, nil)
 	if seed := loop.ancestor().GetContents()["sub"].GetContents()[core.GitLinkName].GetSeed(); seed != "new" {
 		t.Errorf("incorrect seed in saved ancestor: %q", seed)
 	}
 
-	// Verify that the next cycle's scans receive the new seed, after which beta
-	// no longer reports the population.
-	loop.wakeFromPolling()
-	loop.waitForPolling()
-	loop.verify(2, nil, nil)
+	// Verify that the scans after the absorption received the new seed, after
+	// which beta no longer reports the population.
 	for name, endpoint := range map[string]*testingEndpoint{"alpha": alpha, "beta": beta} {
 		endpoint.update(func() {
 			expected := [][]string{{"old"}, {"new"}}
@@ -328,4 +327,124 @@ func TestSynchronizeSavesAbsorbedPopulation(t *testing.T) {
 			t.Errorf("population still reported: %v", beta.seeds)
 		}
 	})
+}
+
+// TestSynchronizeAbsorbsPopulationBeforeFollowing tests that a population that
+// an endpoint reports in its snapshot is absorbed, and its record discarded,
+// before the submodule's Git entry follows the other endpoint's commit, which
+// replaces the seeded Git entry in the ancestor. If the record outlived the
+// follow, then the endpoint would report it again, and a later cycle would make
+// the clone the merge base for changes made since, so that in the
+// two-way-resolved mode, an edit on beta would look like a conflict that
+// alpha's copy wins.
+func TestSynchronizeAbsorbsPopulationBeforeFollowing(t *testing.T) {
+	// Alpha populated a submodule with a clone, and the session stopped before
+	// saving the ancestor, which thus doesn't have the submodule. Meanwhile,
+	// beta checked out another commit, which the clone has, and made an
+	// uncommitted change.
+	other := &core.Entry{Kind: core.EntryKind_GitLink, Digest: []byte{0xc1}, Url: testingLink.Url}
+	clone := testingSubmodule(testingSeededLink("seed"), map[string]*core.Entry{"f": testingClonedFile})
+	alpha := newTestingEndpoint(map[string]*core.Entry{"sub": clone})
+	alpha.seeds = map[string]*core.Entry{"sub": clone}
+	beta := newTestingEndpoint(map[string]*core.Entry{
+		"sub": testingSubmodule(other, map[string]*core.Entry{"f": testingFile}),
+	})
+	configuration := &Configuration{
+		GitMode:             GitMode_GitModeEnabled,
+		SynchronizationMode: core.SynchronizationMode_SynchronizationModeTwoWayResolved,
+	}
+	loop := startTestingLoopWithAncestor(t, configuration, testingDirectory(), alpha, beta)
+	loop.waitForPolling()
+
+	// Verify that alpha's record was discarded by the scan of the cycle that
+	// followed beta's commit and synchronized beta's change, and that nothing
+	// was transitioned on beta.
+	loop.verifyCycles(1)
+	loop.verifyOperations("beta", beta, nil, nil)
+	alpha.update(func() {
+		if len(alpha.seeds) != 0 {
+			t.Errorf("population still reported: %v", alpha.seeds)
+		}
+		expected := [][]string{{}, {"seed"}}
+		if !slices.EqualFunc(alpha.scanSeeds, expected, slices.Equal[[]string]) {
+			t.Errorf("incorrect seeds received: %v != %v", alpha.scanSeeds, expected)
+		}
+		sub := alpha.contents["sub"]
+		if !sub.Contents["f"].Equal(testingFile, true) || !sub.Contents[core.GitLinkName].Equal(other, true) {
+			t.Fatalf("beta's submodule not synchronized: %v", sub)
+		}
+	})
+
+	// Verify that another edit on beta reaches alpha rather than being
+	// overwritten.
+	edited := &core.Entry{Kind: core.EntryKind_File, Digest: []byte{3}}
+	beta.update(func() {
+		sub := beta.contents["sub"].Copy(core.EntryCopyBehaviorShallow)
+		sub.Contents["f"] = edited
+		beta.contents["sub"] = sub
+	})
+	loop.wakeFromPolling()
+	loop.waitForPolling()
+	loop.verifyCycles(2)
+	for name, endpoint := range map[string]*testingEndpoint{"alpha": alpha, "beta": beta} {
+		endpoint.update(func() {
+			if f := endpoint.contents["sub"].Contents["f"]; !f.Equal(edited, true) {
+				t.Errorf("incorrect content on %s: %v", name, f)
+			}
+		})
+	}
+}
+
+// TestSynchronizeAbsorbsPopulationBeforeUntracking tests that a population
+// that an endpoint reports in its snapshot is absorbed, and its record
+// discarded, before the ancestor is cleared at the submodule's path because the
+// other endpoint's rules ignore it. If the record outlived that, then the
+// endpoint would report it again, and once the other endpoint tracked the
+// submodule again, the clone would be the merge base, so that a file that the
+// other endpoint deleted meanwhile would be deleted on this one too, whereas
+// formerly untracked content is reconciled without a merge base, which can't
+// propagate a deletion.
+func TestSynchronizeAbsorbsPopulationBeforeUntracking(t *testing.T) {
+	// Alpha populated a submodule with a clone, and the session stopped before
+	// saving the ancestor, while beta's rules ignore the submodule.
+	clone := testingSubmodule(testingSeededLink("seed"), map[string]*core.Entry{
+		"x": testingClonedFile,
+		"y": testingClonedFile,
+	})
+	ancestor := testingDirectory(testingFileRules)
+	alpha := newTestingEndpoint(map[string]*core.Entry{testingFileRules: testingFile, "sub": clone})
+	alpha.seeds = map[string]*core.Entry{"sub": clone}
+	beta := newTestingEndpoint(map[string]*core.Entry{
+		testingFileRules: testingFile,
+		"sub":            testingSubmodule(testingLink, map[string]*core.Entry{"x": testingClonedFile, "y": testingClonedFile}),
+	}, "sub")
+	loop := startTestingLoopWithAncestor(t, testingGitMode, ancestor, alpha, beta)
+	loop.waitForPolling()
+
+	// Verify that alpha's record was discarded, and that the ancestor no longer
+	// has the submodule.
+	loop.verify(1, nil, nil)
+	alpha.update(func() {
+		if len(alpha.seeds) != 0 {
+			t.Errorf("population still reported: %v", alpha.seeds)
+		}
+	})
+	if sub := loop.ancestor().GetContents()["sub"]; sub != nil {
+		t.Errorf("ancestor still has untracked submodule: %v", sub)
+	}
+
+	// While its submodule is untracked, beta deletes a file, and then beta's
+	// rules stop ignoring the submodule. Without a merge base, the file is
+	// restored on beta rather than deleted on alpha.
+	beta.update(func() {
+		sub := beta.contents["sub"].Copy(core.EntryCopyBehaviorShallow)
+		delete(sub.Contents, "y")
+		beta.contents["sub"] = sub
+		beta.ruleTargets = nil
+	})
+	loop.wakeFromPolling()
+	loop.waitForPolling()
+	loop.verifyCycles(2)
+	loop.verifyOperations("alpha", alpha, nil, nil)
+	loop.verifyOperations("beta", beta, [][]string{{"sub/y"}}, [][]string{{"sub/y"}})
 }
