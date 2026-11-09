@@ -13,7 +13,8 @@ import (
 // nothing but objects to a repository, even when the commit can't be requested
 // by its identifier, so that what the remote's configuration names is fetched
 // instead, and even if the repository's configuration would fetch or prune
-// tags or prune its remote-tracking references.
+// tags or prune its remote-tracking references, or if the remote's HEAD
+// reference is missing.
 func TestGitProviderFetchCommitKeepsReferences(t *testing.T) {
 	upstream := newGitUpstream(t, "upstream")
 	ctx := context.Background()
@@ -26,7 +27,9 @@ func TestGitProviderFetchCommitKeepsReferences(t *testing.T) {
 
 	// Give the clone a tag that only it has and configuration that prunes, and
 	// change the server's branches and tags in ways that a fetch with the
-	// remote's configured refspecs would reflect.
+	// remote's configured refspecs would reflect. The clone also loses the
+	// remote's HEAD reference, which such a fetch creates (since Git 2.48).
+	mustGit(t, directory, "remote", "set-head", "origin", "--delete")
 	mustGit(t, directory, "tag", "local-only")
 	mustGit(t, directory, "config", "fetch.prune", "true")
 	mustGit(t, directory, "config", "fetch.pruneTags", "true")

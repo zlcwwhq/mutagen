@@ -254,9 +254,15 @@ func (g *gitProvider) runNetwork(ctx context.Context, directory, url string, arg
 	return &git.CommandError{Err: err, Output: output.Message()}
 }
 
+// gitFetchConfiguration is the configuration that the fetches that fetchCommit
+// performs run with. Since Git 2.48, a fetch with a remote's configured
+// refspecs creates the remote's HEAD reference if it's missing, which this
+// disables. Older versions of Git don't know the setting and ignore it.
+var gitFetchConfiguration = []string{"-c", "remote.origin.followRemoteHEAD=never"}
+
 // gitFetchOptions are the options of the fetches that fetchCommit performs,
-// which make sure that they add nothing but objects to the repository, whatever
-// its configuration says.
+// which, along with gitFetchConfiguration, make sure that they add nothing but
+// objects to the repository, whatever its configuration says.
 var gitFetchOptions = []string{
 	"--no-write-fetch-head",
 	"--no-tags",
@@ -285,7 +291,7 @@ func (g *gitProvider) fetchCommit(ctx context.Context, directory, remote, url, c
 	// Try to fetch only the commit that we need. The options override any
 	// configuration that would fetch or prune tags, or fetch into nested
 	// submodules, none of which is wanted.
-	err := g.runNetwork(ctx, directory, url, slices.Concat([]string{"fetch"}, gitFetchOptions, []string{"--", remote, commit})...)
+	err := g.runNetwork(ctx, directory, url, slices.Concat(gitFetchConfiguration, []string{"fetch"}, gitFetchOptions, []string{"--", remote, commit})...)
 	if err == nil {
 		return nil
 	}
@@ -307,7 +313,7 @@ func (g *gitProvider) fetchCommit(ctx context.Context, directory, remote, url, c
 	// references. If we're fetching from a URL rather than a remote, then
 	// there's no configuration to indicate what to fetch, and Git will only
 	// fetch the repository's default branch.
-	err = g.runNetwork(ctx, directory, url, slices.Concat([]string{"fetch", "--dry-run"}, gitFetchOptions, []string{"--", remote})...)
+	err = g.runNetwork(ctx, directory, url, slices.Concat(gitFetchConfiguration, []string{"fetch", "--dry-run"}, gitFetchOptions, []string{"--", remote})...)
 	if errors.As(err, &stall) {
 		return err
 	} else if ctx.Err() != nil {
@@ -467,8 +473,11 @@ func (g *gitProvider) cloneAndResolveOnce(ctx context.Context, directory, url, c
 	// Clone the repository without checking anything out, since what the
 	// default branch has checked out isn't what we're after. If we've been
 	// given a URL with credentials, then we don't use them, though nothing that
-	// we report would.
-	arguments := slices.Concat([]string{"clone", "--no-checkout", "--progress"}, cloneOptions(target), []string{"--", url, "."})
+	// we report would. The remote is named origin, whatever the user's
+	// clone.defaultRemoteName says, since that's the name under which
+	// everything else looks for it, including Probe, which wouldn't recognize
+	// the result as a submodule otherwise.
+	arguments := slices.Concat([]string{"clone", "--no-checkout", "--progress", "--origin", "origin"}, cloneOptions(target), []string{"--", url, "."})
 	if err := g.runNetwork(ctx, directory, url, arguments...); err != nil {
 		var stall *gitStallError
 		if errors.As(err, &stall) || ctx.Err() != nil {

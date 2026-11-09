@@ -695,6 +695,64 @@ func TestEndpointGitModePopulateFallback(t *testing.T) {
 	}
 }
 
+// useGlobalGitConfiguration points Git's global configuration at a file with
+// the specified content for the rest of a test.
+func useGlobalGitConfiguration(t *testing.T, content string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal("unable to write global configuration:", err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", path)
+}
+
+// TestEndpointGitModeDefaultRemoteName tests that the repositories that
+// populations and attachments clone have an origin even if the user's
+// configuration gives clones' remotes another name, since the next scan only
+// sees a submodule in a repository with an origin, and since the fallback to
+// the default branch looks for the origin's.
+func TestEndpointGitModeDefaultRemoteName(t *testing.T) {
+	for _, attach := range []bool{false, true} {
+		name := "populate"
+		if attach {
+			name = "attach"
+		}
+		t.Run(name, func(t *testing.T) {
+			// Create an upstream with a commit that hasn't been pushed, which
+			// leads to the default branch, and make clones name their remote
+			// upstream by default.
+			upstream := newGitUpstream(t, "upstream")
+			pushed := upstream.head
+			unpushed := upstream.commit("second", "second")
+			useGlobalGitConfiguration(t, "[clone]\n\tdefaultRemoteName = upstream\n")
+			root := newGitRoot(t, map[string]string{"sub/file": "first"})
+			if !attach {
+				root = newGitRoot(t, nil)
+			}
+			e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+
+			// Clone the repository.
+			change := &core.Change{Path: "sub", New: submodule(upstream.entry(unpushed), nil)}
+			if attach {
+				change = &core.Change{Path: "sub/.git", New: upstream.entry(unpushed)}
+			}
+			_, problems := transitionEndpoint(t, context.Background(), e, change)
+			verifySingleWarning(t, problems, change.Path, "default branch", gitShortCommit(pushed))
+
+			// The clone's remote is the origin, and the next scan sees the
+			// submodule.
+			directory := filepath.Join(root, "sub")
+			if remotes := mustGit(t, directory, "remote"); remotes != "origin" {
+				t.Errorf("incorrect remotes: %q", remotes)
+			}
+			verifyDetachedAt(t, directory, pushed)
+			if link := gitLinkAt(t, scanEndpoint(t, e, true), "sub"); hex.EncodeToString(link.Digest) != pushed {
+				t.Errorf("incorrect commit: %x", link.Digest)
+			}
+		})
+	}
+}
+
 // TestEndpointGitModePopulateWithoutFilters tests that a checkout that fails
 // because of a required filter is performed again without filters, with a
 // warning, and that the attributes that disable them don't stay behind.
