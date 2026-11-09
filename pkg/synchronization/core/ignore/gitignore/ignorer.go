@@ -206,6 +206,9 @@ type ruleSet struct {
 type ignorer struct {
 	// root is the synchronization root.
 	root string
+	// gitRoot is the synchronization root with any symbolic links in it
+	// resolved, from which repositories are located (see readExcludeFile).
+	gitRoot string
 	// session is the session-specific ignorer, if any.
 	session ignore.Ignorer
 	// directories maps root-relative directory paths to the chain of rule sets
@@ -255,9 +258,15 @@ type ignorer struct {
 // its parent. A failure to read them still applies beneath it, though, and the
 // session ignorer and the exclusion of ".git" entries apply everywhere. See
 // load for details.
+//
+// Repositories are located from the physical location of the root, as Git
+// locates them from that of its working directory, so that the result doesn't
+// depend on whether or not the root is specified by a symbolic link (see
+// readExcludeFile).
 func NewIgnorer(root string, session ignore.Ignorer) ignore.DirectoryIgnorer {
 	return &ignorer{
 		root:          root,
+		gitRoot:       physicalPath(root),
 		session:       session,
 		directories:   make(map[string]*ruleSet),
 		untraversable: make(map[string]bool),
@@ -494,7 +503,7 @@ func isEntryName(component string) bool {
 // ".git" entry, whether or not Git accepts it (see Repositories).
 func (i *ignorer) repositoryRules(directory string) (bool, *ruleSet) {
 	// Read the exclude file and record the result.
-	location, contents, err := readExcludeFile(i.root, directory)
+	location, contents, err := readExcludeFile(i.gitRoot, directory)
 	if directory == "" || location.present {
 		i.repositories[directory] = newRepositoryState(location, contents, err)
 	}
@@ -526,6 +535,16 @@ func (i *ignorer) repositoryRules(directory string) (bool, *ruleSet) {
 // or read, including because the directory's ".git" entry can't be examined,
 // then the directory counts as a repository's top level, and the error is
 // returned.
+//
+// The root has to be specified by its physical location (see physicalPath).
+// Git resolves a relative location in a ".git" file against the physical
+// location of the directory that contains the file, so a parent reference
+// ("..") in it leads to the parent of the directory's physical location. That
+// matters for a root that's specified by a symbolic link, since a submodule's
+// ".git" file refers to its Git directory by a relative location that leads
+// out of its working tree (such as "../.git/modules/<name>"), and so can a
+// linked worktree's. Directories beneath the root that a scan reaches aren't
+// symbolic links.
 func readExcludeFile(root, directory string) (repositoryLocation, []byte, error) {
 	// Locate the exclude file.
 	location, err := excludeFileLocation(filepath.Join(root, filepath.FromSlash(directory)))
@@ -658,7 +677,7 @@ func excludeFileLocation(directory string) (repositoryLocation, error) {
 
 	// Check whether or not the Git directory points to a common directory.
 	commonDirectory := location.gitDirectory
-	if contents, err := readRegularFile(filepath.Join(location.gitDirectory, "commondir"), maximumPointerFileSize); err != nil {
+	if contents, err := readRegularFile(joinPath(location.gitDirectory, "commondir"), maximumPointerFileSize); err != nil {
 		location.repository = true
 		return location, err
 	} else if contents != nil {
@@ -669,7 +688,7 @@ func excludeFileLocation(directory string) (repositoryLocation, error) {
 
 	// Determine whether or not Git accepts the Git directory.
 	location.repository = isGitDirectory(location.gitDirectory, commonDirectory)
-	location.exclude = filepath.Join(commonDirectory, "info", "exclude")
+	location.exclude = joinPath(commonDirectory, "info", "exclude")
 	return location, nil
 }
 
@@ -695,9 +714,9 @@ func parseGitFile(contents []byte) (string, bool) {
 // isSearchable). Like Git, we treat any failure to examine them as meaning that
 // the Git directory isn't one.
 func isGitDirectory(gitDirectory, commonDirectory string) bool {
-	return isValidHead(filepath.Join(gitDirectory, "HEAD")) &&
-		isSearchable(filepath.Join(commonDirectory, "objects")) &&
-		isSearchable(filepath.Join(commonDirectory, "refs"))
+	return isValidHead(joinPath(gitDirectory, "HEAD")) &&
+		isSearchable(joinPath(commonDirectory, "objects")) &&
+		isSearchable(joinPath(commonDirectory, "refs"))
 }
 
 // maximumHeadLength is the number of bytes of a HEAD file that Git examines to
@@ -780,13 +799,42 @@ func parsePointer(contents []byte, prefix string) (string, bool) {
 }
 
 // resolvePath resolves a slash-separated path that may be relative to a base
-// directory.
+// directory, as Git resolves the locations in ".git" files and "commondir"
+// files: by appending a relative path to the base directory, without any
+// lexical processing (see joinPath).
 func resolvePath(base, path string) string {
 	path = filepath.FromSlash(path)
 	if filepath.IsAbs(path) {
-		return filepath.Clean(path)
+		return path
 	}
-	return filepath.Join(base, path)
+	return joinPath(base, path)
+}
+
+// joinPath appends path components to a path, separating them as necessary,
+// without the lexical processing of filepath.Join, which would cancel a parent
+// reference ("..") with the component before it. The system resolves a parent
+// reference after following any symbolic link that the component before it is,
+// on POSIX systems, which leads to the parent of the link's target, and that's
+// what Git does too, since it passes such paths to the system as they are. On
+// Windows, the system resolves parent references lexically, as Git for Windows
+// does.
+func joinPath(base string, components ...string) string {
+	for _, component := range components {
+		if base != "" && !os.IsPathSeparator(base[len(base)-1]) {
+			base += string(filepath.Separator)
+		}
+		base += component
+	}
+	return base
+}
+
+// physicalPath returns a path with any symbolic links in it resolved, or the
+// path as it is if they can't be resolved.
+func physicalPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
 }
 
 // parseRules parses the contents of a rule file.

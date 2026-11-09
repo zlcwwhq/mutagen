@@ -106,13 +106,15 @@ func (r *Repositories) Include(other *Repositories) {
 // entry, and a ".git" entry that Git didn't accept becoming one that it does,
 // such as when the Git directory that a ".git" file points to is created. Only
 // the recorded directories are checked. A nil record counts as changed, since
-// nothing is known about the rules.
+// nothing is known about the rules. Like a new ignorer, it locates repositories
+// from the root's physical location as it is now (see NewIgnorer).
 func (r *Repositories) Changed() bool {
 	if r == nil {
 		return true
 	}
+	root := physicalPath(r.root)
 	for directory, state := range r.states {
-		if newRepositoryState(readExcludeFile(r.root, directory)) != state {
+		if newRepositoryState(readExcludeFile(root, directory)) != state {
 			return true
 		}
 	}
@@ -133,7 +135,7 @@ func (r *Repositories) ChangedAt(directory string) bool {
 	if !ok {
 		state = newRepositoryState(repositoryLocation{}, nil, nil)
 	}
-	return newRepositoryState(readExcludeFile(r.root, directory)) != state
+	return newRepositoryState(readExcludeFile(physicalPath(r.root), directory)) != state
 }
 
 // Agrees determines whether or not an ignorer created by NewIgnorer for a scan

@@ -801,12 +801,15 @@ func TestExcludeFileLocation(t *testing.T) {
 			if err := os.Mkdir(root, 0o755); err != nil {
 				t.Fatal("unable to create root:", err)
 			}
+			// Locations are resolved as Git resolves them, without lexical
+			// processing, so they're cleaned for the comparison, which is
+			// equivalent here, since the test doesn't involve symbolic links.
 			expected := test.setup(t, root)
 			location, err := excludeFileLocation(root)
 			if err != nil {
 				t.Fatal("unable to locate exclude file:", err)
-			} else if location.exclude != expected {
-				t.Errorf("location did not match expected: %q != %q", location.exclude, expected)
+			} else if actual := location.exclude; actual != expected && filepath.Clean(actual) != expected {
+				t.Errorf("location did not match expected: %q != %q", actual, expected)
 			}
 			if location.repository != test.repository {
 				t.Errorf("repository status did not match expected: %v != %v", location.repository, test.repository)

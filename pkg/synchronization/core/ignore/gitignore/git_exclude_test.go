@@ -2,8 +2,10 @@ package gitignore
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
@@ -153,6 +155,104 @@ func TestGitExcludeWorktree(t *testing.T) {
 			// Run the test, using the exclude file in the common directory.
 			runExcludeCase(t, h, root, filepath.Join(repository, ".git", "info", "exclude"), c)
 		})
+	}
+}
+
+// TestGitExcludeSymbolicLinkRoot tests exclude files in repositories whose
+// working tree is the root, specified by a symbolic link in another directory,
+// and whose ".git" file refers to the Git directory by a relative location that
+// leads out of the working tree, as those of submodules do, and as those of
+// linked worktrees do with relative paths. Git resolves such a location against
+// the working tree's physical location, rather than cancelling the link's name
+// with the parent reference, and so must the ignorer, whether it's given the
+// root as specified, as scans are, or with the link resolved, as remote is.
+// Git for Windows resolves parent references lexically, against the location
+// as specified, so the test doesn't apply there.
+func TestGitExcludeSymbolicLinkRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Git for Windows resolves parent references lexically")
+	}
+	h := newGitHarness(t)
+	layouts := []struct {
+		name string
+		// setup creates the working tree in a base directory and returns its
+		// location and that of its exclude file.
+		setup func(t *testing.T, base string) (string, string)
+	}{
+		{"submodule", func(t *testing.T, base string) (string, string) {
+			superproject := filepath.Join(base, "super")
+			work := filepath.Join(superproject, "sub")
+			gitDirectory := filepath.Join(superproject, ".git", "modules", "sub")
+			if err := os.MkdirAll(work, 0o755); err != nil {
+				t.Fatal("unable to create working tree:", err)
+			}
+			h.initialize(superproject)
+			if err := os.MkdirAll(filepath.Dir(gitDirectory), 0o755); err != nil {
+				t.Fatal("unable to create Git directory parent:", err)
+			}
+			h.run(work, nil, "init", "--quiet", "--separate-git-dir", gitDirectory)
+			if err := os.WriteFile(filepath.Join(work, ".git"), []byte("gitdir: ../.git/modules/sub\n"), 0o644); err != nil {
+				t.Fatal("unable to write Git file:", err)
+			}
+			return work, filepath.Join(gitDirectory, "info", "exclude")
+		}},
+		{"relative worktree", func(t *testing.T, base string) (string, string) {
+			repository := filepath.Join(base, "main")
+			if err := os.Mkdir(repository, 0o755); err != nil {
+				t.Fatal("unable to create repository:", err)
+			}
+			h.initialize(repository)
+			h.run(
+				repository, nil,
+				"-c", "user.name=Test", "-c", "user.email=test@example.com",
+				"commit", "--quiet", "--allow-empty", "--message=initial",
+			)
+			work := filepath.Join(base, "work")
+			h.run(repository, nil, "worktree", "add", "--quiet", "--detach", work)
+			if err := os.WriteFile(filepath.Join(work, ".git"), []byte("gitdir: ../main/.git/worktrees/work\n"), 0o644); err != nil {
+				t.Fatal("unable to write Git file:", err)
+			}
+			return work, filepath.Join(repository, ".git", "info", "exclude")
+		}},
+		{"parent reference after a symbolic link", func(t *testing.T, base string) (string, string) {
+			work := filepath.Join(base, "work")
+			gitDirectory := filepath.Join(base, "real", "deep", "git")
+			if err := os.MkdirAll(work, 0o755); err != nil {
+				t.Fatal("unable to create working tree:", err)
+			} else if err := os.MkdirAll(filepath.Join(base, "real", "deep", "target"), 0o755); err != nil {
+				t.Fatal("unable to create link target:", err)
+			} else if err := os.Symlink(filepath.Join(base, "real", "deep", "target"), filepath.Join(base, "hop")); err != nil {
+				t.Skip("unable to create symbolic link:", err)
+			}
+			h.run(work, nil, "init", "--quiet", "--separate-git-dir", gitDirectory)
+			if err := os.WriteFile(filepath.Join(work, ".git"), []byte("gitdir: ../hop/../git\n"), 0o644); err != nil {
+				t.Fatal("unable to write Git file:", err)
+			}
+			return work, filepath.Join(gitDirectory, "info", "exclude")
+		}},
+	}
+	for _, layout := range layouts {
+		for _, c := range excludeCases {
+			t.Run(layout.name+" "+c.name, func(t *testing.T) {
+				// Create the working tree and a symbolic link to it with
+				// another name in another directory.
+				base := t.TempDir()
+				work, exclude := layout.setup(t, base)
+				root := filepath.Join(base, "links", "root")
+				if err := os.Mkdir(filepath.Dir(root), 0o755); err != nil {
+					t.Fatal("unable to create link directory:", err)
+				} else if err := os.Symlink(work, root); err != nil {
+					t.Skip("unable to create symbolic link:", err)
+				}
+
+				// Compare the ignorer for the root as specified with Git run
+				// in it, and with the ignorer for the working tree itself.
+				runExcludeCase(t, h, root, exclude, c)
+				if !maps.Equal(scan(t, root, NewIgnorer(root, nil)), scan(t, work, NewIgnorer(work, nil))) {
+					t.Error("ignorers for the root and for the working tree disagree")
+				}
+			})
+		}
 	}
 }
 
