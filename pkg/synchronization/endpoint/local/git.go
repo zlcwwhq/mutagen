@@ -195,7 +195,7 @@ func (g *gitProvider) runNetwork(ctx context.Context, directory, url string, arg
 	// Start the command in a context that we can cancel if it stalls.
 	commandCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	command := git.Command(commandCtx, directory, args...)
+	command := git.NetworkCommand(commandCtx, directory, args...)
 	output := git.NewOutputRecorder()
 	command.Stdout, command.Stderr = output, output
 	if err := command.Start(); err != nil {
@@ -266,7 +266,11 @@ var gitFetchOptions = []string{
 }
 
 // hasCommit determines whether or not the repository in a directory has a
-// commit, specified by its hexadecimal identifier.
+// commit, specified by its hexadecimal identifier. A partial clone doesn't
+// have a commit that it would have to fetch from its promisor remote, because
+// commands that don't use the network can't fetch it (see git.Command), so
+// that it's fetched by fetchMissing instead, as it would be in any other
+// repository.
 func (g *gitProvider) hasCommit(ctx context.Context, directory, commit string) bool {
 	_, err := git.Run(ctx, directory, "cat-file", "-e", commit+"^{commit}")
 	return err == nil
@@ -551,9 +555,11 @@ func (g *gitProvider) Clone(ctx context.Context, directory string, target *core.
 func (g *gitProvider) checkout(ctx context.Context, directory, commit string) (string, error) {
 	// Check out the commit. Progress has to be requested because the output
 	// isn't a terminal, and checking out a large repository can take a while,
-	// though nothing watches for stalls here.
+	// though nothing watches for stalls here. The checkout may use the network
+	// through the filters that the repository's attributes ask for (such as
+	// that of Git LFS).
 	arguments := slices.Concat([]string{"checkout", "--progress"}, gitCheckoutOptions, []string{commit})
-	_, err := git.Run(ctx, directory, arguments...)
+	_, err := git.NetworkRun(ctx, directory, arguments...)
 	if err == nil {
 		return "", nil
 	} else if ctx.Err() != nil {
@@ -580,7 +586,7 @@ func (g *gitProvider) checkout(ctx context.Context, directory, commit string) (s
 		return "", fmt.Errorf("unable to check out commit %s: %w", gitShortCommit(commit), err)
 	}
 	forced := slices.Concat([]string{"checkout", "--progress", "--force"}, gitCheckoutOptions, []string{commit})
-	_, retryErr := git.Run(ctx, directory, forced...)
+	_, retryErr := git.NetworkRun(ctx, directory, forced...)
 	removeErr := os.Remove(attributes)
 	if retryErr != nil {
 		if ctx.Err() != nil {

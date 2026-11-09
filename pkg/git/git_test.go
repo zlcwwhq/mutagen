@@ -49,7 +49,17 @@ func realTemporaryDirectory(t *testing.T) string {
 // runCommand runs a command created by Command and returns its trimmed standard
 // output, along with its standard error in any error that it returns.
 func runCommand(directory string, args ...string) (string, error) {
-	command := Command(context.Background(), directory, args...)
+	return runTestCommand(Command(context.Background(), directory, args...))
+}
+
+// runNetworkCommand is like runCommand, but for a command created by
+// NetworkCommand.
+func runNetworkCommand(directory string, args ...string) (string, error) {
+	return runTestCommand(NetworkCommand(context.Background(), directory, args...))
+}
+
+// runTestCommand implements runCommand and runNetworkCommand.
+func runTestCommand(command *exec.Cmd) (string, error) {
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	if err := command.Run(); err != nil {
@@ -241,6 +251,8 @@ func TestCommandEnvironment(t *testing.T) {
 	t.Setenv("GCM_INTERACTIVE", "always")
 	t.Setenv("LC_ALL", "de_DE.UTF-8")
 	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Join(parent, "other"))
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	t.Setenv("GIT_NO_LAZY_FETCH", "0")
 
 	// Create the command.
 	command := Command(context.Background(), directory, "status", "--short")
@@ -276,6 +288,8 @@ func TestCommandEnvironment(t *testing.T) {
 		"GCM_INTERACTIVE":         "never",
 		"LC_ALL":                  "C",
 		"GIT_CEILING_DIRECTORIES": parent,
+		"GIT_ALLOW_PROTOCOL":      "",
+		"GIT_NO_LAZY_FETCH":       "1",
 	} {
 		if values := environmentValues(command.Env, name); !slices.Equal(values, []string{expected}) {
 			t.Errorf("%s incorrect: %v (expected %s)", name, values, expected)
@@ -399,29 +413,110 @@ func TestCommandNoAskPass(t *testing.T) {
 	}
 }
 
-// TestCommandAllowedProtocols verifies that commands use a restrictive
-// default list of protocols and respect one that's already set.
+// TestCommandAllowedProtocols verifies that commands that use the network use
+// a restrictive default list of protocols and respect one that's already set,
+// and that other commands can't use any protocol and can't fetch lazily.
 func TestCommandAllowedProtocols(t *testing.T) {
 	// Verify that the default list is used if nothing is set.
 	unsetEnvironmentVariable(t, "GIT_ALLOW_PROTOCOL")
-	command := Command(context.Background(), t.TempDir(), "version")
+	unsetEnvironmentVariable(t, "GIT_NO_LAZY_FETCH")
+	command := NetworkCommand(context.Background(), t.TempDir(), "version")
 	if values := environmentValues(command.Env, "GIT_ALLOW_PROTOCOL"); !slices.Equal(values, []string{"https:http:ssh:git"}) {
 		t.Errorf("incorrect default allowed protocols: %v", values)
+	} else if values := environmentValues(command.Env, "GIT_NO_LAZY_FETCH"); len(values) != 0 {
+		t.Errorf("lazy fetching disabled for network command: %v", values)
 	}
 
 	// Verify that values that are already set are respected, including an
-	// empty one, which is a deliberate choice to allow no protocols.
+	// empty one, which is a deliberate choice to allow no protocols, and that
+	// commands that don't use the network never allow any.
 	for _, value := range []string{"file", "file:https", ""} {
 		t.Setenv("GIT_ALLOW_PROTOCOL", value)
-		command := Command(context.Background(), t.TempDir(), "version")
+		command := NetworkCommand(context.Background(), t.TempDir(), "version")
 		if values := environmentValues(command.Env, "GIT_ALLOW_PROTOCOL"); !slices.Equal(values, []string{value}) {
 			t.Errorf("allowed protocols %q not respected: %v", value, values)
+		}
+		command = Command(context.Background(), t.TempDir(), "version")
+		if values := environmentValues(command.Env, "GIT_ALLOW_PROTOCOL"); !slices.Equal(values, []string{""}) {
+			t.Errorf("allowed protocols %q used for command without network: %v", value, values)
+		} else if values := environmentValues(command.Env, "GIT_NO_LAZY_FETCH"); !slices.Equal(values, []string{"1"}) {
+			t.Errorf("lazy fetching not disabled: %v", values)
 		}
 	}
 }
 
+// TestCommandNoLazyFetch verifies, with Git itself, that commands that don't
+// use the network don't fetch the objects that a partial clone lacks from its
+// promisor remote, both with versions of Git that know GIT_NO_LAZY_FETCH and,
+// as simulated by removing it, with those that don't, while commands that use
+// the network do.
+func TestCommandNoLazyFetch(t *testing.T) {
+	requireGit(t)
+	isolate(t)
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+
+	// Create a repository with a commit, which serves partial clones.
+	root := realTemporaryDirectory(t)
+	upstream := filepath.Join(root, "upstream")
+	initializeRepository(t, upstream)
+	if err := os.WriteFile(filepath.Join(upstream, "file"), []byte("contents"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, arguments := range [][]string{
+		{"add", "file"},
+		{"commit", "--quiet", "--no-gpg-sign", "-m", "commit"},
+		{"config", "uploadpack.allowFilter", "true"},
+	} {
+		if _, err := runCommand(upstream, arguments...); err != nil {
+			t.Fatal("unable to set up upstream:", err)
+		}
+	}
+	blob, err := runCommand(upstream, "rev-parse", "HEAD:file")
+	if err != nil {
+		t.Fatal("unable to determine blob:", err)
+	}
+	upstreamURL := filepath.ToSlash(upstream)
+	if !strings.HasPrefix(upstreamURL, "/") {
+		upstreamURL = "/" + upstreamURL
+	}
+	upstreamURL = "file://" + upstreamURL
+
+	// Create a partial clone without the file's contents.
+	clone := filepath.Join(root, "clone")
+	command := NetworkCommand(context.Background(), root, "clone", "--quiet", "--no-checkout", "--filter=blob:none", "--", upstreamURL, clone)
+	if output, err := command.CombinedOutput(); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("file URLs are not supported:", err)
+		}
+		t.Fatalf("unable to create partial clone: %v: %s", err, output)
+	}
+
+	// Verify that the blob is missing, with and without GIT_NO_LAZY_FETCH.
+	for _, withVariable := range []bool{true, false} {
+		command := Command(context.Background(), clone, "cat-file", "-e", blob)
+		if !withVariable {
+			command.Env = slices.DeleteFunc(command.Env, func(entry string) bool {
+				return strings.HasPrefix(entry, "GIT_NO_LAZY_FETCH=")
+			})
+		}
+		if output, err := command.CombinedOutput(); err == nil {
+			t.Errorf("blob fetched lazily (with GIT_NO_LAZY_FETCH: %t)", withVariable)
+		} else {
+			t.Logf("blob missing (with GIT_NO_LAZY_FETCH: %t): %s", withVariable, strings.TrimSpace(string(output)))
+		}
+	}
+
+	// Verify that a command that uses the network fetches it, which shows
+	// that the test is effective.
+	if output, err := NetworkCommand(context.Background(), clone, "cat-file", "-e", blob).CombinedOutput(); err != nil {
+		t.Errorf("blob not fetched lazily by network command: %v: %s", err, output)
+	}
+}
+
 // TestCommandFileProtocol verifies, with Git itself, that the file protocol
-// is disallowed by default and can be enabled by the environment.
+// is disallowed by default for commands that use the network and can be
+// enabled by the environment, while commands that don't use the network can't
+// use it either way.
 func TestCommandFileProtocol(t *testing.T) {
 	requireGit(t)
 
@@ -439,15 +534,19 @@ func TestCommandFileProtocol(t *testing.T) {
 	// is due to the protocol rather than the repository is established by the
 	// same command succeeding when the environment enables the protocol.
 	unsetEnvironmentVariable(t, "GIT_ALLOW_PROTOCOL")
-	if _, err := runCommand(root, "ls-remote", "--", remoteURL); err == nil {
+	if _, err := runNetworkCommand(root, "ls-remote", "--", remoteURL); err == nil {
 		t.Error("file protocol allowed by default")
 	} else {
 		t.Log("default protocols reject the file protocol:", err)
 	}
 
-	// Verify that the environment can enable it.
+	// Verify that the environment can enable it, but only for commands that
+	// use the network.
 	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
-	if _, err := runCommand(root, "ls-remote", "--", remoteURL); err != nil {
+	if _, err := runCommand(root, "ls-remote", "--", remoteURL); err == nil {
+		t.Error("file protocol allowed for command without network")
+	}
+	if _, err := runNetworkCommand(root, "ls-remote", "--", remoteURL); err != nil {
 		if runtime.GOOS == "windows" {
 			t.Skip("file URLs are not supported:", err)
 		}

@@ -40,10 +40,12 @@ func realTemporaryDirectory(t *testing.T) string {
 	return directory
 }
 
-// runGit runs a command created by git.Command and returns its trimmed standard
-// output, along with its standard error in any error that it returns.
+// runGit runs a command created by git.NetworkCommand, so that it can use the
+// transports that tests allow (such as for pushing to an upstream), and returns
+// its trimmed standard output, along with its standard error in any error that
+// it returns.
 func runGit(directory string, args ...string) (string, error) {
-	command := git.Command(context.Background(), directory, args...)
+	command := git.NetworkCommand(context.Background(), directory, args...)
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	if err := command.Run(); err != nil {

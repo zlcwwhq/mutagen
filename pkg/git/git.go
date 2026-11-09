@@ -44,9 +44,9 @@ const (
 	// error message that comes from a command's output.
 	maximumMessageSize = 1024
 	// defaultAllowedProtocols is the value of GIT_ALLOW_PROTOCOL that
-	// Command uses if it isn't already set. It permits the transports that
-	// reach remote hosts, but not the file and ext transports, which can name
-	// local paths or execute arbitrary programs and thus have no business
+	// NetworkCommand uses if it isn't already set. It permits the transports
+	// that reach remote hosts, but not the file and ext transports, which can
+	// name local paths or execute arbitrary programs and thus have no business
 	// being selected by a URL found in a repository.
 	defaultAllowedProtocols = "https:http:ssh:git"
 )
@@ -119,9 +119,11 @@ func (e *ceilingError) Error() string {
 }
 
 // environment computes the environment of a Git command run in the
-// specified directory, which is based on that of the current process. See
-// Command for details. It fails if the directory can't be confined.
-func environment(directory string) ([]string, error) {
+// specified directory, which is based on that of the current process, and
+// which depends on whether or not the command may use the network. See
+// Command and NetworkCommand for details. It fails if the directory can't be
+// confined.
+func environment(directory string, network bool) ([]string, error) {
 	// Prevent Git from searching the parent of the directory for a repository.
 	// Git only treats a directory as a repository if it contains a valid Git
 	// directory, so a directory whose .git entry is invalid (such as an empty
@@ -150,10 +152,10 @@ func environment(directory string) ([]string, error) {
 
 	// Copy the current environment, omitting variables that are either removed
 	// or overridden below. If the caller has chosen the protocols that Git may
-	// use, then respect their choice, including for tests that need to enable
-	// the file transport.
+	// use for a command that uses the network, then respect their choice,
+	// including for tests that need to enable the file transport.
 	current := os.Environ()
-	result := make([]string, 0, len(current)+4)
+	result := make([]string, 0, len(current)+8)
 	allowProtocolSet := false
 	for _, entry := range current {
 		name, _, _ := strings.Cut(entry, "=")
@@ -161,7 +163,9 @@ func environment(directory string) ([]string, error) {
 			allowProtocolSet = true
 		}
 		omit := sameVariable(name, "LC_ALL") ||
-			sameVariable(name, "GIT_CEILING_DIRECTORIES")
+			sameVariable(name, "GIT_CEILING_DIRECTORIES") ||
+			(!network && sameVariable(name, "GIT_ALLOW_PROTOCOL")) ||
+			(!network && sameVariable(name, "GIT_NO_LAZY_FETCH"))
 		for _, variable := range inheritedVariables {
 			omit = omit || sameVariable(name, variable)
 		}
@@ -191,17 +195,34 @@ func environment(directory string) ([]string, error) {
 		"LC_ALL=C",
 		"GIT_CEILING_DIRECTORIES="+ceiling,
 	)
-	if !allowProtocolSet {
+
+	// A command that doesn't use the network mustn't start using it either.
+	// In a partial clone (one made with --filter, which lacks objects that it
+	// can fetch from a promisor remote, such as its origin), Git fetches
+	// missing objects on demand (lazily) from within any command that needs
+	// them, including those that only look at the repository, which would then
+	// wait on the network, without the stall detection, throttling, and
+	// backoff that commands that use the network deliberately get. That's
+	// what GIT_NO_LAZY_FETCH prevents, but only from Git 2.45 on. Earlier
+	// versions run a fetch in a child process, which inherits an empty
+	// GIT_ALLOW_PROTOCOL, so that the fetch fails at once, without contacting
+	// anything, because it may use none of the transports. Either way, the
+	// command proceeds as if the objects didn't exist. Nothing else that
+	// commands that don't use the network do involves a transport.
+	if !network {
+		result = append(result, "GIT_ALLOW_PROTOCOL=", "GIT_NO_LAZY_FETCH=1")
+	} else if !allowProtocolSet {
 		result = append(result, "GIT_ALLOW_PROTOCOL="+defaultAllowedProtocols)
 	}
 	return result, nil
 }
 
-// Command creates a git command that runs in directory with the specified
-// arguments, which follow Git's global options and thus begin with a
-// subcommand, or with any further global options. The command is hardened for
-// operating on repositories that Mutagen doesn't control, and which may be only
-// partially present or controlled by another party:
+// Command creates a git command that doesn't use the network, which runs in
+// directory with the specified arguments, which follow Git's global options
+// and thus begin with a subcommand, or with any further global options. The
+// command is hardened for operating on repositories that Mutagen doesn't
+// control, and which may be only partially present or controlled by another
+// party:
 //
 //   - Repository discovery is confined to the directory: variables that
 //     redirect Git to another repository are removed from the environment, and
@@ -219,8 +240,10 @@ func environment(directory string) ([]string, error) {
 //     that commands which only read don't interfere with other Git processes
 //     (or with the file watching that notices them).
 //   - Git's output is in the C locale.
-//   - Git is limited to the transports that GIT_ALLOW_PROTOCOL lists, which is
-//     the default list unless the caller's environment sets it.
+//   - Git can't use any transport, whatever the caller's environment says, so
+//     it can't fetch the objects that a partial clone lacks on demand, which
+//     it otherwise does from within any command that needs them. Commands
+//     proceed as if the objects didn't exist.
 //
 // The command is stopped when ctx is canceled, along with its helper processes
 // where the platform supports that, which includes giving them a moment to
@@ -229,6 +252,21 @@ func environment(directory string) ([]string, error) {
 // than a few seconds after that on processes that are still running. The
 // command is returned unstarted, so callers can set up its I/O.
 func Command(ctx context.Context, directory string, args ...string) *exec.Cmd {
+	return command(ctx, directory, false, args)
+}
+
+// NetworkCommand is like Command, but it creates a command that uses the
+// network, such as one that clones or fetches, or one that runs filters that
+// may (such as Git LFS's). It has the same hardening, except that Git is
+// limited to the transports that GIT_ALLOW_PROTOCOL lists, which is a default
+// list of those that reach remote hosts unless the caller's environment sets
+// it, and that it fetches missing objects on demand.
+func NetworkCommand(ctx context.Context, directory string, args ...string) *exec.Cmd {
+	return command(ctx, directory, true, args)
+}
+
+// command implements Command and NetworkCommand.
+func command(ctx context.Context, directory string, network bool, args []string) *exec.Cmd {
 	// Prepend Git's global options. They must come before the subcommand.
 	arguments := make([]string, 0, len(args)+7)
 	arguments = append(arguments,
@@ -242,7 +280,7 @@ func Command(ctx context.Context, directory string, args ...string) *exec.Cmd {
 	// Create the command.
 	command := exec.CommandContext(ctx, "git", arguments...)
 	command.Dir = directory
-	if environment, err := environment(directory); err != nil {
+	if environment, err := environment(directory, network); err != nil {
 		if command.Err == nil {
 			command.Err = err
 		}
@@ -370,11 +408,21 @@ func (r *OutputRecorder) Message() string {
 	return strings.ToValidUTF8(message, "�")
 }
 
-// Run runs a Git command that doesn't use the network and returns its
-// standard output, without any trailing line endings. Any error is a
-// *CommandError.
+// Run runs a Git command that doesn't use the network (see Command) and
+// returns its standard output, without any trailing line endings. Any error is
+// a *CommandError.
 func Run(ctx context.Context, directory string, args ...string) (string, error) {
-	command := Command(ctx, directory, args...)
+	return run(Command(ctx, directory, args...))
+}
+
+// NetworkRun is like Run, but for a command that may use the network (see
+// NetworkCommand).
+func NetworkRun(ctx context.Context, directory string, args ...string) (string, error) {
+	return run(NetworkCommand(ctx, directory, args...))
+}
+
+// run implements Run and NetworkRun.
+func run(command *exec.Cmd) (string, error) {
 	var stdout bytes.Buffer
 	stderr := NewOutputRecorder()
 	command.Stdout, command.Stderr = &stdout, stderr

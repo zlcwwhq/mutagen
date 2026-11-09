@@ -387,6 +387,65 @@ func TestEndpointGitModeFetchStall(t *testing.T) {
 	verifyDetachedAt(t, clone.directory, third)
 }
 
+// TestEndpointGitModeFollowPartialClone tests that following a commit that a
+// partial clone lacks doesn't make Git fetch it from within the transition,
+// which Git otherwise does on demand from the promisor remote, without the
+// stall detection and throttling of the background fetch, holding up the
+// synchronization cycle. The commit is fetched in the background instead,
+// after which HEAD follows.
+func TestEndpointGitModeFollowPartialClone(t *testing.T) {
+	// Create a partial clone, whose origin (its promisor remote) never
+	// responds, and a commit that's available from the URL that the other
+	// endpoint has.
+	transport := newHangingTransport(t)
+	upstream := newGitUpstream(t, "upstream")
+	t.Setenv("GIT_ALLOW_PROTOCOL", "ext:file")
+	mustGit(t, upstream.bare, "--git-dir=.", "config", "uploadpack.allowFilter", "true")
+	root := newGitRoot(t, nil)
+	directory := filepath.Join(root, "sub")
+	mustGit(t, root, "clone", "--quiet", "--filter=blob:none", "--", upstream.url, directory)
+	mustGit(t, directory, "config", "remote.origin.url", transport.url)
+	second := upstream.commit("second", "second")
+	upstream.push()
+	const stallTimeout = 5 * time.Second
+	e := newGitModeEndpoint(t, root, synchronization.WatchMode_WatchModeNoWatch)
+	useShortStallDurations(t, e, stallTimeout, time.Hour)
+	drainPollSignal(e)
+	target := upstream.entry(second)
+
+	// The first attempt to follow the commit requests the fetch and returns
+	// promptly. The transition is bounded in case Git fetches lazily.
+	old := gitLinkAt(t, scanEndpoint(t, e, true), "sub")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*stallTimeout)
+	defer cancel()
+	start := time.Now()
+	results, problems, _, err := e.Transition(ctx, []*core.Change{{Path: "sub/.git", Old: old, New: target}})
+	if err != nil {
+		t.Fatal("transition failed:", err)
+	} else if elapsed := time.Since(start); elapsed >= stallTimeout {
+		t.Errorf("transition held up by the network: %s", elapsed)
+	} else if results[0] != old {
+		t.Error("incorrect result:", results[0])
+	}
+	verifySingleWarning(t, problems, "sub/.git", "being fetched")
+
+	// The background fetch stalls on the origin, which is thus contacted only
+	// once, and then fetches the commit from the other URL, after which HEAD
+	// follows.
+	waitForPollSignal(t, e)
+	transport.verifyExited(t)
+	_, result, problems := follow(t, e, target, nil)
+	if len(problems) != 0 {
+		t.Fatal("unexpected problems:", problems)
+	} else if result != target {
+		t.Error("incorrect result:", result)
+	}
+	verifyDetachedAt(t, directory, second)
+	if count := transport.count(t); count != 1 {
+		t.Errorf("incorrect number of attempts to contact the origin: %d", count)
+	}
+}
+
 // TestEndpointGitModeFetchShutdown tests that shutting an endpoint down stops
 // a background fetch, including its transport, without waiting for it to
 // stall, and without trying anything else.
