@@ -1583,6 +1583,27 @@ func TestRuleReadFailures(t *testing.T) {
 	}
 }
 
+// TestRuleFileComplexity tests that a rule file whose compiled rules would
+// exceed maximumCompiledRuleSize is a failure to read its rules, rather than
+// something that takes a great deal of memory, although the file is within the
+// size limit. Short bracket expressions take the most memory relative to their
+// size.
+func TestRuleFileComplexity(t *testing.T) {
+	count := maximumCompiledRuleSize/(ruleSize+tokenSize+byteSetSize) + 1
+	contents := strings.Repeat("[a]\n", int(count))
+	for _, path := range []string{".gitignore", ".git/info/exclude"} {
+		t.Run(path, func(t *testing.T) {
+			root := t.TempDir()
+			writeTree(t, root, map[string]string{path: contents})
+			if err := NewIgnorer(root, nil).EnsureDirectory(""); err == nil {
+				t.Fatal("rules exceeding the complexity limit accepted")
+			} else if !strings.Contains(err.Error(), "exceeds the rule file complexity limit") {
+				t.Error("incorrect error:", err)
+			}
+		})
+	}
+}
+
 // TestIgnorerSymbolicLinkDirectories tests that rules aren't read through
 // symbolic links, which scans don't traverse, but which can be in the way of a
 // directory that a transition is about to create. The rules of the parents of a

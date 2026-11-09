@@ -2,6 +2,7 @@ package gitignore
 
 import (
 	"strings"
+	"unsafe"
 )
 
 // ruleKind identifies the strategy used to evaluate a rule.
@@ -17,7 +18,9 @@ const (
 	ruleKindGeneral
 )
 
-// rule is a single compiled line of a rule file.
+// rule is a single compiled line of a rule file. A rule file can contain
+// millions of rules, so its fields are ordered to keep it compact, and its
+// strings refer to the rule file's contents where possible.
 type rule struct {
 	// negated indicates that the rule re-includes paths that it matches.
 	negated bool
@@ -28,6 +31,9 @@ type rule struct {
 	anchored bool
 	// kind is the evaluation strategy.
 	kind ruleKind
+	// minimumLength is the minimum length of text matched by tokens. It can't
+	// overflow, since it's less than the length of a rule file.
+	minimumLength int32
 	// literal is, depending on kind, the entire text to match (for literal
 	// rules), the suffix to match (for suffix rules), or the literal text that
 	// precedes the first wildcard (for general rules).
@@ -38,8 +44,6 @@ type rule struct {
 	// suffix is literal text that every match must end with. It's used by
 	// general rules to quickly reject text that can't match.
 	suffix string
-	// minimumLength is the minimum length of text matched by tokens.
-	minimumLength int
 }
 
 // trimTrailingSpaces removes trailing spaces from a line, except for those that
@@ -73,22 +77,77 @@ func trimTrailingSpaces(line string) string {
 	return line[:end]
 }
 
+// mayProduceRule returns false if a line of a rule file can't produce a rule,
+// because it's blank or a comment, as parseRule determines first. It's cheap,
+// which allows the rules in a file to be counted (from above) before they're
+// parsed.
+func mayProduceRule(line string) bool {
+	return line != "" && line[0] != '#' && trimTrailingSpaces(line) != ""
+}
+
 // parseRule parses a single line of a rule file, which must already have had
 // its line ending removed. It returns false if the line doesn't produce a rule,
 // either because it's blank, a comment, or malformed. A malformed line is one
 // that could never match anything (e.g. due to an unterminated bracket
-// expression), so omitting it is equivalent to retaining it.
+// expression), so omitting it is equivalent to retaining it. It also returns
+// false if the rule would exceed maximumCompiledRuleSize on its own.
 func parseRule(line string) (rule, bool) {
-	// Skip blank lines and comments.
-	if line == "" || line[0] == '#' {
-		return rule{}, false
-	}
+	parser := newRuleParser(maximumCompiledRuleSize)
+	r, ok, _ := parser.parse(line)
+	return r, ok
+}
 
-	// Remove trailing spaces and check whether or not there's anything left.
-	line = trimTrailingSpaces(line)
-	if line == "" {
-		return rule{}, false
+const (
+	// ruleSize, tokenSize, and byteSetSize are the sizes of a rule, a token,
+	// and a bracket expression's set of bytes, which make up the memory that
+	// compiled rules take (see maximumCompiledRuleSize).
+	ruleSize    = uint64(unsafe.Sizeof(rule{}))
+	tokenSize   = uint64(unsafe.Sizeof(token{}))
+	byteSetSize = uint64(unsafe.Sizeof(byteSet{}))
+)
+
+// compiledSize returns the amount of memory that a compiled rule takes, apart
+// from its strings, which are no longer than its line, and which usually refer
+// to the rule file's contents.
+func (r *rule) compiledSize() uint64 {
+	size := ruleSize + uint64(len(r.tokens))*tokenSize
+	for i := range r.tokens {
+		if r.tokens[i].kind == tokenClass {
+			size += byteSetSize
+		}
 	}
+	return size
+}
+
+// ruleParser parses the rules of a rule file (see parseRule), keeping their
+// compiled size within a limit. It retains working storage between rules, so
+// that a rule doesn't allocate more than its compiled form.
+type ruleParser struct {
+	// limit is the amount of memory that the rules can take in all (see
+	// rule.compiledSize), which also limits the working storage.
+	limit uint64
+	// remaining is the amount of memory that the rules that are still to be
+	// parsed can take.
+	remaining uint64
+	// tokens is the storage in which tokens are accumulated.
+	tokens []token
+}
+
+// newRuleParser creates a parser for rules that can take the specified amount
+// of memory in all.
+func newRuleParser(limit uint64) *ruleParser {
+	return &ruleParser{limit: limit, remaining: limit}
+}
+
+// parse implements parseRule, and it subtracts the size of the rule that it
+// yields from the amount of memory that remains. If the rule would exceed that,
+// then it fails with errRuleFileComplexity.
+func (p *ruleParser) parse(line string) (rule, bool, error) {
+	// Skip blank lines and comments, and remove trailing spaces.
+	if !mayProduceRule(line) {
+		return rule{}, false, nil
+	}
+	line = trimTrailingSpaces(line)
 
 	// Handle negation.
 	var r rule
@@ -113,26 +172,38 @@ func parseRule(line string) (rule, bool) {
 
 	// An empty pattern can't match anything.
 	if line == "" {
-		return rule{}, false
+		return rule{}, false, nil
 	}
 
-	// Compile the pattern text.
-	if !r.compile(line) {
-		return rule{}, false
+	// Compile the pattern text, which can't accumulate more tokens than the
+	// limit allows for in all, and account for the result.
+	var ok bool
+	var err error
+	if p.tokens, ok, err = r.compile(line, p.tokens[:0], p.limit); err != nil || !ok {
+		return rule{}, false, err
+	} else if size := r.compiledSize(); size > p.remaining {
+		return rule{}, false, errRuleFileComplexity
+	} else {
+		p.remaining -= size
 	}
-	return r, true
+	return r, true, nil
 }
 
 // compile compiles the pattern text of a rule, which must be non-empty and
 // stripped of negation, leading slash, and trailing slash. It sets the kind,
 // literal, tokens, suffix, and minimumLength fields of the rule and returns
-// false if the pattern can never match.
+// false if the pattern can never match. Tokens are accumulated in the specified
+// storage, which is returned for reuse, and the rule only retains a copy of
+// those that it needs. If the tokens (and the sets of bytes of their bracket
+// expressions) would take more memory than the specified limit, which no rule
+// within the limit can have, then it fails with errRuleFileComplexity, before
+// they do.
 //
 // The literal text that opens the pattern (i.e. everything that precedes the
 // first asterisk, question mark, opening bracket, or backslash) is recorded
 // separately, so that it can be compared with a single string operation before
 // any wildcards are considered. It has no effect on what the pattern matches.
-func (r *rule) compile(pattern string) bool {
+func (r *rule) compile(pattern string, tokens []token, limit uint64) ([]token, bool, error) {
 	// Split the pattern into its leading literal text and the remainder.
 	split := strings.IndexAny(pattern, "*?[\\")
 	if split < 0 {
@@ -141,15 +212,16 @@ func (r *rule) compile(pattern string) bool {
 	r.literal = pattern[:split]
 	remainder := pattern[split:]
 
-	// Convert the remainder to tokens.
-	var tokens []token
+	// Convert the remainder to tokens, keeping track of how many of them are
+	// bracket expressions.
+	var classes uint64
 	for i := 0; i < len(remainder); {
 		switch current := remainder[i]; current {
 		case '\\':
 			// An escaped byte is a literal. A backslash at the end of the
 			// pattern escapes nothing, so the pattern is malformed.
 			if i+1 >= len(remainder) {
-				return false
+				return tokens, false, nil
 			}
 			tokens = append(tokens, token{kind: tokenLiteral, value: remainder[i+1]})
 			i += 2
@@ -159,9 +231,10 @@ func (r *rule) compile(pattern string) bool {
 		case '[':
 			class, next, ok := parseClass(remainder, i)
 			if !ok {
-				return false
+				return tokens, false, nil
 			}
 			tokens = append(tokens, token{kind: tokenClass, class: class})
+			classes++
 			i = next
 		case '*':
 			// Find the end of the run of asterisks.
@@ -210,11 +283,17 @@ func (r *rule) compile(pattern string) bool {
 			tokens = append(tokens, token{kind: tokenLiteral, value: current})
 			i++
 		}
+
+		// Stop once the tokens take more memory than the limit allows.
+		if uint64(len(tokens))*tokenSize+classes*byteSetSize > limit {
+			return tokens, false, errRuleFileComplexity
+		}
 	}
 
 	// If the rule consists only of literal bytes, then it can be evaluated by
 	// comparing strings. Escaped bytes have to be folded into the literal text
-	// for this to work.
+	// for this to work, and the remainder can only consist of literal bytes if
+	// it's empty or begins with an escape.
 	allLiteral := true
 	for i := range tokens {
 		if tokens[i].kind != tokenLiteral {
@@ -223,14 +302,17 @@ func (r *rule) compile(pattern string) bool {
 		}
 	}
 	if allLiteral {
-		var builder strings.Builder
-		builder.WriteString(r.literal)
-		for i := range tokens {
-			builder.WriteByte(tokens[i].value)
-		}
 		r.kind = ruleKindLiteral
-		r.literal = builder.String()
-		return true
+		if len(tokens) > 0 {
+			var builder strings.Builder
+			builder.Grow(len(r.literal) + len(tokens))
+			builder.WriteString(r.literal)
+			for i := range tokens {
+				builder.WriteByte(tokens[i].value)
+			}
+			r.literal = builder.String()
+		}
+		return tokens, true, nil
 	}
 
 	// Check for a rule that consists only of an asterisk and literal bytes,
@@ -238,26 +320,26 @@ func (r *rule) compile(pattern string) bool {
 	// comparison.
 	if r.literal == "" && tokens[0].kind == tokenStar {
 		suffix := true
-		var builder strings.Builder
 		for i := 1; i < len(tokens); i++ {
 			if tokens[i].kind != tokenLiteral {
 				suffix = false
 				break
 			}
-			builder.WriteByte(tokens[i].value)
 		}
 		if suffix {
 			r.kind = ruleKindSuffix
-			r.literal = builder.String()
+			r.literal = literalText(remainder, tokens[1:])
 			r.tokens = nil
-			return true
+			return tokens, true, nil
 		}
 	}
 
 	// Record the information needed to quickly reject text that can't match
-	// the tokens.
+	// the tokens. The rule keeps a copy of its tokens, since their storage is
+	// reused.
 	r.kind = ruleKindGeneral
-	r.tokens = tokens
+	r.tokens = make([]token, len(tokens))
+	copy(r.tokens, tokens)
 	for i := range tokens {
 		switch tokens[i].kind {
 		case tokenLiteral, tokenAnyByte, tokenClass:
@@ -269,13 +351,35 @@ func (r *rule) compile(pattern string) bool {
 		trailing--
 	}
 	if trailing < len(tokens) {
-		suffix := make([]byte, 0, len(tokens)-trailing)
-		for _, t := range tokens[trailing:] {
-			suffix = append(suffix, t.value)
-		}
-		r.suffix = string(suffix)
+		r.suffix = literalText(remainder, tokens[trailing:])
 	}
-	return true
+	return tokens, true, nil
+}
+
+// literalText returns the text that a list of literal tokens matches, which are
+// the last tokens of the specified pattern text. If they correspond to the end
+// of the text (i.e. none of them were escaped, or the escapes happen to have
+// the same text), then that's what's returned, so that it refers to the rule
+// file's contents rather than being a copy.
+func literalText(pattern string, tokens []token) string {
+	if len(tokens) <= len(pattern) {
+		end := pattern[len(pattern)-len(tokens):]
+		same := true
+		for i := range tokens {
+			if end[i] != tokens[i].value {
+				same = false
+				break
+			}
+		}
+		if same {
+			return end
+		}
+	}
+	text := make([]byte, len(tokens))
+	for i := range tokens {
+		text[i] = tokens[i].value
+	}
+	return string(text)
 }
 
 // endsWithAnyDirectories returns true if a list of tokens ends with the pair of
@@ -315,7 +419,7 @@ func (r *rule) matches(base, relative string, directory bool, m *matcher) bool {
 			return false
 		}
 		text = text[len(r.literal):]
-		if len(text) < r.minimumLength || !strings.HasSuffix(text, r.suffix) {
+		if len(text) < int(r.minimumLength) || !strings.HasSuffix(text, r.suffix) {
 			return false
 		}
 		return m.matches(r.tokens, text)

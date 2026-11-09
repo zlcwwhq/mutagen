@@ -1,6 +1,7 @@
 package gitignore
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -197,7 +198,10 @@ func TestParseRules(t *testing.T) {
 		{" #a\n", []string{" #a"}},
 	}
 	for _, test := range tests {
-		rules := parseRules([]byte(test.contents))
+		rules, err := parseRules([]byte(test.contents))
+		if err != nil {
+			t.Fatalf("parsing %q failed: %v", test.contents, err)
+		}
 		var literals []string
 		for _, r := range rules {
 			if r.kind != ruleKindLiteral {
@@ -633,7 +637,10 @@ var matchTests = []matchTest{
 func TestRuleMatching(t *testing.T) {
 	var m matcher
 	for _, test := range matchTests {
-		rules := parseRules([]byte(test.rules))
+		rules, err := parseRules([]byte(test.rules))
+		if err != nil {
+			t.Fatalf("parsing %q failed: %v", test.rules, err)
+		}
 		var ignored bool
 		base := test.path[strings.LastIndexByte(test.path, '/')+1:]
 		for i := len(rules) - 1; i >= 0; i-- {
@@ -761,5 +768,141 @@ func TestMatcherReuse(t *testing.T) {
 		if short.matches("c", "a/b/c", false, &m) {
 			t.Error("short pattern unexpectedly matched")
 		}
+	}
+}
+
+// TestByteSetAddRange tests that adding a range to a set adds exactly the bytes
+// in the range, for every range.
+func TestByteSetAddRange(t *testing.T) {
+	for low := 0; low < 256; low++ {
+		for high := 0; high < 256; high++ {
+			var set byteSet
+			set.addRange(byte(low), byte(high))
+			for b := 0; b < 256; b++ {
+				if expected := b >= low && b <= high; set.contains(byte(b)) != expected {
+					t.Fatalf("range %d-%d: incorrect membership for %d: %t", low, high, b, !expected)
+				}
+			}
+		}
+	}
+}
+
+// TestParseClassLinear tests that parsing a bracket expression examines each
+// byte a bounded number of times, even if it contains many "[:" that don't
+// begin class names, each of which needs to find the next closing bracket to
+// determine that.
+func TestParseClassLinear(t *testing.T) {
+	tests := []struct {
+		// pattern is the pattern.
+		pattern string
+		// members are bytes that are expected to be members of the expression,
+		// or empty if the expression is expected to be unterminated.
+		members string
+		// others are bytes that aren't expected to be members.
+		others string
+	}{
+		{"[" + strings.Repeat("[:a", 10000) + "]", "[:a", "bz"},
+		{"[[:alpha:]" + strings.Repeat("[:0", 10000) + "]", "[:0az", "1"},
+		{"[" + strings.Repeat("[:a", 10000), "", ""},
+	}
+	for _, test := range tests {
+		var parser classParser
+		class, next, ok := parser.parse(test.pattern, 0)
+		if parser.searched > len(test.pattern) {
+			t.Errorf("searches examined %d bytes of a %d-byte pattern", parser.searched, len(test.pattern))
+		}
+		if test.members == "" {
+			if ok {
+				t.Error("unterminated expression parsed")
+			}
+			continue
+		} else if !ok || next != len(test.pattern) {
+			t.Fatalf("expression not parsed: %t, %d", ok, next)
+		}
+		for _, b := range []byte(test.members) {
+			if !class.contains(b) {
+				t.Errorf("%q not a member", b)
+			}
+		}
+		for _, b := range []byte(test.others) {
+			if class.contains(b) {
+				t.Errorf("%q is a member", b)
+			}
+		}
+	}
+}
+
+// TestParseRulesMemory tests that parsing rules doesn't allocate much more
+// memory than their compiled form takes (see rule.compiledSize), so that the
+// memory that a rule file takes is proportional to its size, which is limited,
+// and that the compiled size is limited too.
+func TestParseRulesMemory(t *testing.T) {
+	tests := []struct {
+		// line is the line that the rule file repeats.
+		line string
+		// tokens is the number of tokens that each rule retains.
+		tokens uint64
+		// classes is the number of bracket expressions in each rule.
+		classes uint64
+	}{
+		{"x", 0, 0},
+		{"build/", 0, 0},
+		{"*.log", 0, 0},
+		{"[a]", 1, 1},
+		{"?abcdefg", 8, 0},
+		{"a[0-9]*.[ch]", 4, 2},
+	}
+	const count = 8192
+	for _, test := range tests {
+		// Parse a rule file and measure what that allocates. Besides the rules,
+		// it copies the contents.
+		contents := []byte(strings.Repeat(test.line+"\n", count))
+		size := ruleSize + test.tokens*tokenSize + test.classes*byteSetSize
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		rules, err := parseRules(contents)
+		runtime.ReadMemStats(&after)
+		if err != nil {
+			t.Fatalf("unable to parse %q rules: %v", test.line, err)
+		} else if len(rules) != count {
+			t.Fatalf("incorrect number of %q rules: %d", test.line, len(rules))
+		} else if actual := rules[0].compiledSize(); actual != size {
+			t.Errorf("incorrect compiled size of %q rule: %d != %d", test.line, actual, size)
+		}
+
+		// Allow for a few small allocations per rule, which is far less than
+		// what a rule takes, and for some overhead.
+		allocated := after.TotalAlloc - before.TotalAlloc
+		if limit := uint64(len(contents)) + count*(size+32) + 64*1024; allocated > limit {
+			t.Errorf("%d %q rules allocated %d bytes (%d per rule) rather than at most %d",
+				count, test.line, allocated, allocated/count, limit)
+		}
+
+		// The same rules exceed a limit that's just less than what they take.
+		total := count * size
+		if _, err := parseRulesWithin(contents, total); err != nil {
+			t.Errorf("%q rules exceeded their own size: %v", test.line, err)
+		}
+		if _, err := parseRulesWithin(contents, total-1); err != errRuleFileComplexity {
+			t.Errorf("%q rules didn't exceed a smaller limit: %v", test.line, err)
+		}
+	}
+
+	// A single rule with many tokens doesn't accumulate many more of them than
+	// the limit allows before it's refused. Its tokens would take 16 times the
+	// size of its line, but parsing only takes a small multiple of the limit
+	// beyond copying the line.
+	contents := []byte("?" + strings.Repeat("a", 1<<20))
+	limit := 1024 * tokenSize
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err := parseRulesWithin(contents, limit)
+	runtime.ReadMemStats(&after)
+	if err != errRuleFileComplexity {
+		t.Error("long rule didn't exceed limit:", err)
+	} else if allocated := after.TotalAlloc - before.TotalAlloc; allocated > uint64(len(contents))+8*limit {
+		t.Errorf("long rule allocated %d bytes before being refused", allocated)
 	}
 }

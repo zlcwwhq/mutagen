@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"unicode/utf8"
@@ -28,11 +29,24 @@ const (
 	// Larger files cause an error, preventing synchronization without their
 	// rules while bounding memory consumption.
 	maximumRuleFileSize = 100 * 1024 * 1024
+	// maximumCompiledRuleSize is the maximum amount of memory that the compiled
+	// rules of a rule file can take (see parseRules). Rules take more memory
+	// than the lines that they're compiled from, particularly short ones, so
+	// maximumRuleFileSize doesn't bound that on its own: a file within it that
+	// consists of short lines would take gigabytes. A file whose rules exceed
+	// this causes an error, just like a file that exceeds maximumRuleFileSize.
+	// It allows for about two million rules, far more than any real file has,
+	// and for a file with typical lines as large as maximumRuleFileSize.
+	maximumCompiledRuleSize = 128 * 1024 * 1024
 	// maximumPointerFileSize is the maximum size of the files that point to the
 	// location of a Git directory (a ".git" file or a "commondir" file) that
 	// will be read.
 	maximumPointerFileSize = 64 * 1024
 )
+
+// errRuleFileComplexity indicates that the compiled rules of a rule file would
+// exceed maximumCompiledRuleSize.
+var errRuleFileComplexity = errors.New("exceeds the rule file complexity limit")
 
 // IsGitEntry returns true if a name is that of Git's own entry in a directory,
 // which is either a directory or a file that points to one, or if a filesystem
@@ -439,7 +453,9 @@ func (i *ignorer) load(directory string) *ruleSet {
 			path := filepath.Join(i.root, filepath.FromSlash(directory), ruleFileName)
 			if contents, err := readRegularFile(path, maximumRuleFileSize); err != nil {
 				rules = &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
-			} else if parsed := parseRules(contents); len(parsed) > 0 {
+			} else if parsed, err := parseRules(contents); err != nil {
+				rules = &ruleSet{err: fmt.Errorf("unable to read ignore rules: %s %w", path, err)}
+			} else if len(parsed) > 0 {
 				rules = &ruleSet{rules: parsed, prefixLength: prefixLength, parent: base}
 			}
 		}
@@ -512,8 +528,10 @@ func (i *ignorer) repositoryRules(directory string) (bool, *ruleSet) {
 	}
 
 	// Parse the exclude file.
-	rules := parseRules(contents)
-	if len(rules) == 0 {
+	rules, err := parseRules(contents)
+	if err != nil {
+		return true, &ruleSet{err: fmt.Errorf("unable to read ignore rules: the repository's exclude file %w", err)}
+	} else if len(rules) == 0 {
 		return location.repository, nil
 	}
 	var prefixLength int
@@ -854,36 +872,70 @@ func physicalPath(path string) string {
 	return path
 }
 
-// parseRules parses the contents of a rule file.
-func parseRules(contents []byte) []rule {
+// nextLine extracts the next line from the contents of a rule file, without its
+// line ending, and returns it along with the rest of the contents. Only a
+// single carriage return is considered part of the line ending, and a null
+// byte terminates the line.
+func nextLine(text string) (string, string) {
+	var line string
+	if newline := strings.IndexByte(text, '\n'); newline >= 0 {
+		line, text = text[:newline], text[newline+1:]
+	} else {
+		line, text = text, ""
+	}
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+	if null := strings.IndexByte(line, 0); null >= 0 {
+		line = line[:null]
+	}
+	return line, text
+}
+
+// parseRules parses the contents of a rule file. It fails if the compiled rules
+// would exceed maximumCompiledRuleSize, which only happens for files with more
+// rules than any real one has.
+func parseRules(contents []byte) ([]rule, error) {
+	return parseRulesWithin(contents, maximumCompiledRuleSize)
+}
+
+// parseRulesWithin implements parseRules with the specified limit on the size
+// of the compiled rules.
+func parseRulesWithin(contents []byte, limit uint64) ([]rule, error) {
 	// Skip any UTF-8 byte order mark.
 	contents = bytes.TrimPrefix(contents, []byte("\xef\xbb\xbf"))
+	text := string(contents)
+
+	// Count the lines that may produce rules, so that storage for the rules is
+	// allocated once, rather than growing (and being copied) as they're parsed,
+	// which would take several times as much memory in all. There can't be
+	// more rules than the limit allows, so neither can the storage.
+	var count uint64
+	for remaining := text; remaining != ""; {
+		var line string
+		line, remaining = nextLine(remaining)
+		if mayProduceRule(line) {
+			count++
+		}
+	}
+	rules := make([]rule, 0, min(count, limit/ruleSize))
 
 	// Parse each line.
-	var rules []rule
-	text := string(contents)
-	for len(text) > 0 {
-		// Extract the next line, without its line ending. Only a single
-		// carriage return is considered part of the line ending.
+	parser := newRuleParser(limit)
+	for remaining := text; remaining != ""; {
 		var line string
-		if newline := strings.IndexByte(text, '\n'); newline >= 0 {
-			line, text = text[:newline], text[newline+1:]
-		} else {
-			line, text = text, ""
-		}
-		if len(line) > 0 && line[len(line)-1] == '\r' {
-			line = line[:len(line)-1]
-		}
-
-		// A null byte terminates the line.
-		if null := strings.IndexByte(line, 0); null >= 0 {
-			line = line[:null]
-		}
-
-		// Parse the rule.
-		if r, ok := parseRule(line); ok {
+		line, remaining = nextLine(remaining)
+		if r, ok, err := parser.parse(line); err != nil {
+			return nil, err
+		} else if ok {
 			rules = append(rules, r)
 		}
 	}
-	return rules
+
+	// If many of the lines didn't produce rules after all, because they were
+	// malformed, then release the unused storage.
+	if len(rules) < cap(rules)/2 {
+		rules = slices.Clone(rules)
+	}
+	return rules, nil
 }

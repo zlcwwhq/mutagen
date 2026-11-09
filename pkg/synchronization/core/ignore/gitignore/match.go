@@ -40,28 +40,58 @@ type token struct {
 	kind tokenKind
 	// value is the byte matched by a literal token.
 	value byte
-	// class is the table of bytes matched by a class token.
-	class *[256]bool
+	// class is the set of bytes matched by a class token.
+	class *byteSet
 }
 
-// posixClasses maps the names of POSIX character classes to functions that
-// test membership. Only ASCII bytes are ever members of a class. The classes
-// are those of Git's own character table rather than those of the C library,
-// which only makes a difference for "space": Git's excludes the vertical tab
-// and the form feed.
-var posixClasses = map[string]func(byte) bool{
-	"alnum":  func(b byte) bool { return isAlpha(b) || isDigit(b) },
-	"alpha":  isAlpha,
-	"blank":  func(b byte) bool { return b == ' ' || b == '\t' },
-	"cntrl":  func(b byte) bool { return b < 32 || b == 127 },
-	"digit":  isDigit,
-	"graph":  func(b byte) bool { return b > 32 && b < 127 },
-	"lower":  func(b byte) bool { return b >= 'a' && b <= 'z' },
-	"print":  func(b byte) bool { return b >= 32 && b < 127 },
-	"punct":  func(b byte) bool { return b > 32 && b < 127 && !isAlpha(b) && !isDigit(b) },
-	"space":  func(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' },
-	"upper":  func(b byte) bool { return b >= 'A' && b <= 'Z' },
-	"xdigit": func(b byte) bool { return isDigit(b) || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F') },
+// byteSet is a set of bytes, represented as a bitmap. It's the compiled form of
+// a bracket expression, which has to be compact, since a rule file within the
+// size limit can contain millions of them.
+type byteSet [4]uint64
+
+// add adds a byte to the set.
+func (s *byteSet) add(b byte) {
+	s[b>>6] |= 1 << (b & 63)
+}
+
+// remove removes a byte from the set.
+func (s *byteSet) remove(b byte) {
+	s[b>>6] &^= 1 << (b & 63)
+}
+
+// contains returns true if a byte is a member of the set.
+func (s *byteSet) contains(b byte) bool {
+	return s[b>>6]&(1<<(b&63)) != 0
+}
+
+// newByteSet creates a set of the bytes for which a function returns true.
+func newByteSet(member func(byte) bool) byteSet {
+	var set byteSet
+	for b := 0; b < 256; b++ {
+		if member(byte(b)) {
+			set.add(byte(b))
+		}
+	}
+	return set
+}
+
+// posixClasses maps the names of POSIX character classes to their members.
+// Only ASCII bytes are ever members of a class. The classes are those of Git's
+// own character table rather than those of the C library, which only makes a
+// difference for "space": Git's excludes the vertical tab and the form feed.
+var posixClasses = map[string]byteSet{
+	"alnum":  newByteSet(func(b byte) bool { return isAlpha(b) || isDigit(b) }),
+	"alpha":  newByteSet(isAlpha),
+	"blank":  newByteSet(func(b byte) bool { return b == ' ' || b == '\t' }),
+	"cntrl":  newByteSet(func(b byte) bool { return b < 32 || b == 127 }),
+	"digit":  newByteSet(isDigit),
+	"graph":  newByteSet(func(b byte) bool { return b > 32 && b < 127 }),
+	"lower":  newByteSet(func(b byte) bool { return b >= 'a' && b <= 'z' }),
+	"print":  newByteSet(func(b byte) bool { return b >= 32 && b < 127 }),
+	"punct":  newByteSet(func(b byte) bool { return b > 32 && b < 127 && !isAlpha(b) && !isDigit(b) }),
+	"space":  newByteSet(func(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }),
+	"upper":  newByteSet(func(b byte) bool { return b >= 'A' && b <= 'Z' }),
+	"xdigit": newByteSet(func(b byte) bool { return isDigit(b) || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F') }),
 }
 
 // isAlpha returns true if the byte is an ASCII letter.
@@ -74,8 +104,20 @@ func isDigit(b byte) bool {
 	return b >= '0' && b <= '9'
 }
 
+// addRange adds the bytes from low to high (inclusive) to the set, a word at a
+// time. If high is less than low, then it adds nothing.
+func (s *byteSet) addRange(low, high byte) {
+	for b := int(low); b <= int(high); b = (b | 63) + 1 {
+		last := 63
+		if int(high)>>6 == b>>6 {
+			last = int(high) & 63
+		}
+		s[b>>6] |= (^uint64(0) << (b & 63)) & (^uint64(0) >> (63 - last))
+	}
+}
+
 // parseClass parses the bracket expression that begins at pattern[start],
-// which must be an opening bracket. It returns a table of the bytes that the
+// which must be an opening bracket. It returns the set of bytes that the
 // expression matches, as well as the index of the first byte following the
 // expression. If the expression is unterminated or names an unknown POSIX
 // class, then parseClass returns false, in which case the pattern containing
@@ -88,7 +130,26 @@ func isDigit(b byte) bool {
 // "[:name:]" denotes a POSIX character class. A bracket expression never
 // matches a slash. A range with reversed bounds, such as "c-a", contains no
 // bytes other than its lower bound, which is a member like any other.
-func parseClass(pattern string, start int) (*[256]bool, int, bool) {
+func parseClass(pattern string, start int) (*byteSet, int, bool) {
+	var parser classParser
+	return parser.parse(pattern, start)
+}
+
+// classParser implements parseClass. Parsing takes time proportional to the
+// length of the expression, because each byte is examined a bounded number of
+// times, which matters because rules are parsed by every scan and a rule file
+// can be large.
+type classParser struct {
+	// closing is the index of the closing bracket that the last search for
+	// one found (see parse), or zero if there hasn't been a search.
+	closing int
+	// searched is the number of bytes that searches for closing brackets have
+	// examined, which never exceeds the length of the pattern.
+	searched int
+}
+
+// parse implements parseClass.
+func (p *classParser) parse(pattern string, start int) (*byteSet, int, bool) {
 	// Skip the opening bracket and check for negation.
 	index := start + 1
 	var negated bool
@@ -98,7 +159,7 @@ func parseClass(pattern string, start int) (*[256]bool, int, bool) {
 	}
 
 	// Accumulate members until we reach the closing bracket.
-	var members [256]bool
+	members := new(byteSet)
 	first := true
 	for {
 		// If we've run out of pattern, then the expression is unterminated.
@@ -120,27 +181,34 @@ func parseClass(pattern string, start int) (*[256]bool, int, bool) {
 		var low byte
 		switch {
 		case current == '[' && index+1 < len(pattern) && pattern[index+1] == ':':
-			// Find the end of what might be a POSIX class name. If there isn't
-			// a closing bracket, then the expression is unterminated. If the
-			// text up to the next closing bracket doesn't end with a colon,
-			// then this isn't a class name and the opening bracket is just a
-			// literal member.
-			end := strings.IndexByte(pattern[index+2:], ']')
-			if end < 0 {
-				return nil, 0, false
+			// Find the end of what might be a POSIX class name, which is the
+			// next closing bracket. If there isn't one, then the expression is
+			// unterminated. If the text up to it doesn't end with a colon, then
+			// this isn't a class name and the opening bracket is just a literal
+			// member. A closing bracket that an earlier search found beyond
+			// this point is the next one, since that search examined what's in
+			// between, so we only search again once we've passed it, which
+			// keeps parsing linear when an expression contains many "[:" that
+			// don't begin class names.
+			if p.closing < index+2 {
+				end := strings.IndexByte(pattern[index+2:], ']')
+				if end < 0 {
+					p.searched += len(pattern) - (index + 2)
+					return nil, 0, false
+				}
+				p.searched += end + 1
+				p.closing = index + 2 + end
 			}
-			name := pattern[index+2 : index+2+end]
+			name := pattern[index+2 : p.closing]
 			if len(name) > 0 && name[len(name)-1] == ':' {
-				test, ok := posixClasses[name[:len(name)-1]]
+				class, ok := posixClasses[name[:len(name)-1]]
 				if !ok {
 					return nil, 0, false
 				}
-				for b := 0; b < 256; b++ {
-					if test(byte(b)) {
-						members[b] = true
-					}
+				for w := range members {
+					members[w] |= class[w]
 				}
-				index += 2 + end + 1
+				index = p.closing + 1
 				continue
 			}
 			low = current
@@ -170,23 +238,21 @@ func parseClass(pattern string, start int) (*[256]bool, int, bool) {
 				high = pattern[index+1]
 				index += 2
 			}
-			for b := int(low); b <= int(high); b++ {
-				members[b] = true
-			}
+			members.addRange(low, high)
 		}
-		members[low] = true
+		members.add(low)
 	}
 
 	// Apply negation and ensure that slashes never match.
 	if negated {
-		for b := range members {
-			members[b] = !members[b]
+		for w := range members {
+			members[w] = ^members[w]
 		}
 	}
-	members['/'] = false
+	members.remove('/')
 
 	// Success.
-	return &members, index, true
+	return members, index, true
 }
 
 // matcher matches compiled patterns against text. It simulates a
@@ -286,7 +352,7 @@ func (m *matcher) matches(tokens []token, text string) bool {
 					m.add(tokens, state+1)
 				}
 			case tokenClass:
-				if tokens[state].class[b] {
+				if tokens[state].class.contains(b) {
 					m.add(tokens, state+1)
 				}
 			case tokenStar:
