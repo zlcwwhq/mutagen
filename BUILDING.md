@@ -60,10 +60,16 @@ be built as part of the `go generate` command.
 
 ## Fork CI and releases
 
-The `zlcwwhq/mutagen` fork runs CI for pushes to `master` and
-`release-branch-*`, pull requests, and manual workflow dispatches. Ordinary
-builds use slim bundles; release tags build the complete platform matrix on
-macOS. Sidecar container images are not built or published by this workflow.
+The `zlcwwhq/mutagen` fork runs CI for pull requests, release tags, and manual
+workflow dispatches. Pushes to branches don't run it. Every pull request runs
+commit verification. A pull request that changes more than 1,000 lines also
+runs the Linux tests on the newest supported Go version. Adding the `full-ci`
+label to a pull request runs the full matrix on it: macOS, Windows, 32-bit
+tests, and every supported Go version. Manual dispatches always run the full
+matrix. Pull requests that only touch Markdown files or the skill submodule
+don't run CI. Ordinary builds use slim bundles; release tags build the complete
+platform matrix on macOS. Sidecar container images are not built or published
+by this workflow.
 
 Create a release by tagging a commit with the upstream version followed by
 `-zlcwwhq.X.Y.Z`. For example, when the upstream numeric version in

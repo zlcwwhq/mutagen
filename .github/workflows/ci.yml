@@ -1,22 +1,19 @@
 # Set the workflow name.
 name: CI
 
-# Execute the workflow on pushes to primary/release branches, version
-# tag pushes, pull requests, and manual dispatch. Changes that only touch
-# documentation or the skill submodule don't run it, since no job reads
-# either. Path filters aren't evaluated for tag pushes, so releases always
-# run.
+# Execute the workflow on version tag pushes, pull requests, and manual
+# dispatch. Pushes to branches don't run it: most changes run nothing but
+# commit verification (see the tier job), and a release's commit runs the
+# full matrix before it's tagged. Pull requests also run when they're
+# labeled, so that adding the full-ci label starts the full matrix. Pull
+# requests that only touch documentation or the skill submodule don't run
+# it, since no job reads either.
 on:
   push:
-    branches:
-      - master
-      - 'release-branch-*'
     tags:
       - 'v*-zlcwwhq.*'
-    paths-ignore:
-      - '**.md'
-      - 'skills/**'
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths-ignore:
       - '**.md'
       - 'skills/**'
@@ -28,17 +25,58 @@ permissions:
   contents: read
 
 # Cancel in-progress runs for the same ref, except for tag builds
-# (which should always run to completion for releases).
+# (which should always run to completion for releases). Adding any label
+# other than full-ci starts a run that does nothing, so it gets a group of
+# its own and can't cancel the pull request's real run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'full-ci') && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 # Define the workflow jobs.
 jobs:
+  # Decide how much of the workflow runs:
+  # - full: the full matrix, for tags, manual dispatches, and pull requests
+  #   with the full-ci label.
+  # - fast: Linux on the newest Go version, for other pull requests that
+  #   change more than FAST_CI_LINES lines.
+  # - none: nothing but commit verification, for the remaining pull
+  #   requests.
+  # Pull request events carry the labels and the size of the change, so
+  # this needs no checkout. The other jobs need this one, so a run started
+  # by any other label skips them all.
+  tier:
+    name: CI Tier
+    runs-on: ubuntu-latest
+    if: github.event.action != 'labeled' || github.event.label.name == 'full-ci'
+    timeout-minutes: 5
+    env:
+      FAST_CI_LINES: 1000
+    outputs:
+      tier: ${{ steps.tier.outputs.tier }}
+    steps:
+      - id: tier
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
+              tier="full"
+          elif jq -e '.pull_request.labels | any(.name == "full-ci")' "${GITHUB_EVENT_PATH}" > /dev/null; then
+              tier="full"
+          elif [[ "$(jq '.pull_request.additions + .pull_request.deletions' "${GITHUB_EVENT_PATH}")" -gt "${FAST_CI_LINES}" ]]; then
+              tier="fast"
+          else
+              tier="none"
+          fi
+          echo "tier=${tier}" >> "${GITHUB_OUTPUT}"
+          echo "CI tier: ${tier}" >> "${GITHUB_STEP_SUMMARY}"
+  # Validate the release version. The platform jobs need this job, so it
+  # also passes the tier on to them.
   version:
     name: Release Version Validation
+    needs: tier
+    if: needs.tier.outputs.tier != 'none'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      tier: ${{ needs.tier.outputs.tier }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
@@ -51,7 +89,9 @@ jobs:
   verification:
     name: Commit Verification
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'full-ci')
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -67,9 +107,10 @@ jobs:
           scripts/ci/verify_commits.sh
   macos:
     needs: version
+    if: needs.version.outputs.tier == 'full'
     name: macOS
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
@@ -105,7 +146,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        goversion: ['1.25.9', '1.26.2']
+        goversion: ${{ fromJSON(needs.version.outputs.tier == 'full' && '["1.25.9", "1.26.2"]' || '["1.26.2"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
@@ -121,9 +162,11 @@ jobs:
       - run: scripts/ci/analyze.sh
       - run: scripts/ci/test.sh
       - run: scripts/ci/test_386.sh
+        if: needs.version.outputs.tier == 'full'
       - run: scripts/ci/build.sh
   windows:
     needs: version
+    if: needs.version.outputs.tier == 'full'
     name: Windows
     runs-on: windows-latest
     timeout-minutes: 60
