@@ -13,11 +13,11 @@ else
     go run scripts/build.go --mode=local
 fi
 
-# Run tests and generate a coverage profile.
+# Run tests.
 if [[ "${MUTAGEN_TEST_ENABLE_SSPL}" == "true" ]]; then
-    go test -tags mutagensspl -p 1 -timeout 20m -v -coverpkg=./pkg/... -coverprofile=coverage.txt ./pkg/...
+    go test -tags mutagensspl -p 1 -timeout 20m -v ./pkg/...
 else
-    go test -p 1 -timeout 20m -v -coverpkg=./pkg/... -coverprofile=coverage.txt ./pkg/...
+    go test -p 1 -timeout 20m -v ./pkg/...
 fi
 
 # Run tests with the race detector enabled. We use a slim end-to-end test since
