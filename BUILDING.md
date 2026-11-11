@@ -67,9 +67,21 @@ runs the Linux tests on the newest supported Go version. Adding the `full-ci`
 label to a pull request runs the full matrix on it: macOS, Windows, 32-bit
 tests, and every supported Go version. Manual dispatches always run the full
 matrix. Pull requests that only touch Markdown files or the skill submodule
-don't run CI. Ordinary builds use slim bundles; release tags build the complete
-platform matrix on macOS. Sidecar container images are not built or published
-by this workflow.
+don't run CI. Ordinary builds use slim bundles. Sidecar container images are not
+built or published by this workflow.
+
+A tag doesn't change any code, so release tags don't rerun the tests. Before
+tagging a release, run the full matrix on its commit, with the `full-ci` label
+on its pull request or by dispatching the workflow on a branch at that commit:
+
+```sh
+gh workflow run ci.yml --ref master
+```
+
+The tag's run first checks that the full matrix passed for the tagged commit,
+and fails without building anything if it hasn't. In that case, run the full
+matrix and then rerun the tag's run. Otherwise it builds the complete platform
+matrix of release bundles on macOS.
 
 Create a release by tagging a commit with the upstream version followed by
 `-zlcwwhq.X.Y.Z`. For example, when the upstream numeric version in
@@ -98,7 +110,7 @@ For an equivalent local release build, first run:
 go run ./scripts/ci/releaseversion -tag v0.19.0-zlcwwhq.0.1.0 -write
 ```
 
-After all platform jobs pass, CI creates a **draft GitHub Release** containing
+After the macOS build passes, CI creates a **draft GitHub Release** containing
 CLI bundles (each with the remote executable and the matching agent bundle) and
 `SHA256SUMS`. Review the draft and publish it in GitHub. Reruns can replace draft assets but
 will not overwrite a published release. macOS code signing, Apple notarization,

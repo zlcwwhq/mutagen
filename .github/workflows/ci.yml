@@ -35,8 +35,12 @@ concurrency:
 # Define the workflow jobs.
 jobs:
   # Decide how much of the workflow runs:
-  # - full: the full matrix, for tags, manual dispatches, and pull requests
-  #   with the full-ci label.
+  # - release: for tags, only the release build on macOS and the release
+  #   itself. Tags don't change any code, so they don't rerun the tests:
+  #   instead the version job requires that the full matrix passed for the
+  #   tagged commit.
+  # - full: the full matrix, for manual dispatches and pull requests with
+  #   the full-ci label.
   # - fast: Linux on the newest Go version, for other pull requests that
   #   change more than FAST_CI_LINES lines.
   # - none: nothing but commit verification, for the remaining pull
@@ -56,7 +60,9 @@ jobs:
     steps:
       - id: tier
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+              tier="release"
+          elif [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
               tier="full"
           elif jq -e '.pull_request.labels | any(.name == "full-ci")' "${GITHUB_EVENT_PATH}" > /dev/null; then
               tier="full"
@@ -67,13 +73,17 @@ jobs:
           fi
           echo "tier=${tier}" >> "${GITHUB_OUTPUT}"
           echo "CI tier: ${tier}" >> "${GITHUB_STEP_SUMMARY}"
-  # Validate the release version. The platform jobs need this job, so it
-  # also passes the tier on to them.
+  # Validate the release version, and for releases check that the full
+  # matrix passed for the tagged commit. The platform jobs need this job,
+  # so it also passes the tier on to them.
   version:
     name: Release Version Validation
     needs: tier
     if: needs.tier.outputs.tier != 'none'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     timeout-minutes: 5
     outputs:
       tier: ${{ needs.tier.outputs.tier }}
@@ -86,6 +96,11 @@ jobs:
       - name: Validate release tag
         if: github.ref_type == 'tag'
         run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME"
+      - name: Require the full matrix for the tagged commit
+        if: needs.tier.outputs.tier == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/require_full_ci.sh "$(git rev-parse HEAD)"
   verification:
     name: Commit Verification
     runs-on: ubuntu-latest
@@ -107,7 +122,7 @@ jobs:
           scripts/ci/verify_commits.sh
   macos:
     needs: version
-    if: needs.version.outputs.tier == 'full'
+    if: needs.version.outputs.tier == 'full' || needs.version.outputs.tier == 'release'
     name: macOS
     runs-on: macos-15
     timeout-minutes: 45
@@ -124,9 +139,13 @@ jobs:
         run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME" -write
       - run: scripts/ci/setup_go.sh
       - run: scripts/ci/setup_ssh.sh
+        if: needs.version.outputs.tier == 'full'
       - run: scripts/ci/setup_partitions_darwin.sh
+        if: needs.version.outputs.tier == 'full'
       - run: scripts/ci/analyze.sh
+        if: needs.version.outputs.tier == 'full'
       - run: scripts/ci/test.sh
+        if: needs.version.outputs.tier == 'full'
       - run: scripts/ci/build.sh
       - run: scripts/ci/sha256sum.sh
         if: github.ref_type == 'tag'
@@ -140,6 +159,7 @@ jobs:
           if-no-files-found: error
   linux:
     needs: version
+    if: needs.version.outputs.tier == 'fast' || needs.version.outputs.tier == 'full'
     name: Linux
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -206,8 +226,8 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    if: github.ref_type == 'tag'
-    needs: [macos, linux, windows]
+    needs: [version, macos]
+    if: needs.version.outputs.tier == 'release'
     permissions:
       contents: write
     timeout-minutes: 20
