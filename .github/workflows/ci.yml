@@ -2,7 +2,10 @@
 name: CI
 
 # Execute the workflow on pushes to primary/release branches, version
-# tag pushes, pull requests, and manual dispatch.
+# tag pushes, pull requests, and manual dispatch. Changes that only touch
+# documentation or the skill submodule don't run it, since no job reads
+# either. Path filters aren't evaluated for tag pushes, so releases always
+# run.
 on:
   push:
     branches:
@@ -10,7 +13,13 @@ on:
       - 'release-branch-*'
     tags:
       - 'v*-zlcwwhq.*'
+    paths-ignore:
+      - '**.md'
+      - 'skills/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'skills/**'
   workflow_dispatch:
 
 # Restrict default token permissions. Jobs that need write access
