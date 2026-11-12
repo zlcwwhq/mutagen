@@ -44,9 +44,9 @@ it whenever you upgrade: `mutagen` refuses agents from another release.
 
 Only the system that runs the daemon needs an installation. On Linux, macOS,
 and FreeBSD,
-[`install.sh`](https://github.com/zlcwwhq/mutagen-remote-skill/blob/main/skills/mutagen-setup/scripts/install.sh)
-from the `mutagen-setup` skill downloads, verifies, and installs or upgrades
-to the latest release.
+[`install.sh`](https://github.com/zlcwwhq/mutagen-remote-skill/blob/main/skills/setup/scripts/install.sh)
+from the `setup` agent skill (see below) downloads, verifies, and installs or
+upgrades to the latest release.
 
 
 ## Quick start
@@ -79,12 +79,14 @@ such as conda before each command, use a
 
 ## Agent skills
 
-The [mutagen-remote-skill](https://github.com/zlcwwhq/mutagen-remote-skill)
-plugin holds two skills. `mutagen-remote` teaches coding agents to use
-`remote`. `mutagen-setup` installs or upgrades this fork, starts the daemon,
-writes `mutagen.yml`, starts the sessions, and makes `remote` available on the
-endpoints. Install the plugin on each
-system where agents submit commands or set up Mutagen.
+The `mutagen-remote` plugin from
+[mutagen-remote-skill](https://github.com/zlcwwhq/mutagen-remote-skill) holds
+two skills, which agents see as `mutagen-remote:remote` and
+`mutagen-remote:setup`. The `remote` skill teaches coding agents to use the
+`remote` executable. The `setup` skill installs or upgrades this fork, starts
+the daemon, writes `mutagen.yml`, starts the sessions, and makes `remote`
+available on the endpoints. Install the plugin on each system where agents
+submit commands or set up Mutagen.
 
 Claude Code:
 

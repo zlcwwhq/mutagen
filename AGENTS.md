@@ -99,8 +99,9 @@ follow the code and update this file.
   `scan_bench` and `watch_demo`.
 - `skills/mutagen-remote` is a Git submodule of
   `zlcwwhq/mutagen-remote-skill`, which holds the agent skills that
-  teach agents to use `remote` (`mutagen-remote`) and to set up
-  Mutagen (`mutagen-setup`), and the Claude Code plugin marketplace
+  teach agents to use `remote` and to set up Mutagen (`remote` and
+  `setup`, which agents see as `mutagen-remote:remote` and
+  `mutagen-remote:setup`), and the Claude Code plugin marketplace
   that distributes them. It pins the skill version matching this
   code; run `git submodule update --init` to check it out.
 - `sspl/` contains optional SSPL-licensed code paths.
@@ -190,7 +191,7 @@ compliance before committing:
   them. Installations update from the skill's `main` branch, so
   changes for unreleased behavior go on another branch until the fork
   release that supports them is published. Likewise, update the
-  `mutagen-setup` skill when release assets, the installation layout,
+  `setup` skill when release assets, the installation layout,
   project configuration, or daemon commands change.
 - Keep `README.md` an overview. Details belong in `docs/`: when
   changing behavior that a page there documents, update the page.
