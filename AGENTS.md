@@ -6,7 +6,8 @@ follow the code and update this file.
 
 ## Source Of Truth
 
-- `README.md` provides the public project overview.
+- `README.md` provides the public project overview, and `docs/`
+  documents the fork's features in detail.
 - `BUILDING.md` describes the build flow and protobuf regeneration.
 - `CONTRIBUTING.md` defines coding style, testing expectations, DCO
   requirements, and commit message guidelines.
@@ -182,16 +183,17 @@ compliance before committing:
   sidecar-specific.
 - When changing `remote` behavior (options, exit statuses, working
   directory mapping, synchronization, ignores, Git mode, prologues, or
-  conflicts), update
-  its help text in `cmd/remote/cli/cli.go` and
-  `cmd/remote/cli/help.go`, `README.md`, and the skill together.
-  Commit skill changes in the skill repository, following its
+  conflicts), update its help text in `cmd/remote/cli/cli.go` and
+  `cmd/remote/cli/help.go`, the pages under `docs/`, and the skill
+  together. Commit skill changes in the skill repository, following its
   `CLAUDE.md`, and point the `skills/mutagen-remote` submodule at
   them. Installations update from the skill's `main` branch, so
   changes for unreleased behavior go on another branch until the fork
   release that supports them is published. Likewise, update the
   `mutagen-setup` skill when release assets, the installation layout,
   project configuration, or daemon commands change.
+- Keep `README.md` an overview. Details belong in `docs/`: when
+  changing behavior that a page there documents, update the page.
 - External pull requests are not accepted for code under `sspl/`.
 - Public docs in this repository should not describe local scratch
   files, untracked helper scripts, or internal-only workflow
