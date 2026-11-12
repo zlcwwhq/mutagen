@@ -111,7 +111,10 @@ follow the code and update this file.
 - Use `go run scripts/build.go --mode=local` for a local CLI and
   agent build.
 - Use `go run scripts/build.go` for the default slim build.
-- `release` builds require macOS. On other platforms, `slim` and
+- `release` builds that include macOS require macOS. With
+  `--platforms=other`, a `release` build of the other platforms runs
+  anywhere, and `--mode=assemble` combines it with a
+  `--platforms=darwin` build. On other platforms, `slim` and
   `release-slim` builds continue without cgo-enabled macOS agents.
 - The agent bundle is a separate `mutagen-agents.tar.gz` artifact.
   It ships alongside the CLI or in `libexec`; it is not embedded in

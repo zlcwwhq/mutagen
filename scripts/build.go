@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"debug/buildinfo"
 	"errors"
 	"fmt"
 	"io"
@@ -47,6 +48,10 @@ const (
 	// releaseBuildSubdirectoryName is the name of the build subdirectory where
 	// release bundles are built.
 	releaseBuildSubdirectoryName = "release"
+	// releaseAgentsSubdirectoryName is the name of the release build
+	// subdirectory where release builds of a subset of platforms leave their
+	// agent binaries for assembly into the agent bundle.
+	releaseAgentsSubdirectoryName = "agents"
 
 	// agentBaseName is the name of the Mutagen agent binary without any path or
 	// extension.
@@ -167,6 +172,22 @@ func (t Target) IncludeAgentInSlimBuildModes() bool {
 		(t.GOOS == "windows" && t.GOARCH == "amd64") ||
 		(t.GOOS == "linux" && (t.GOARCH == "amd64" || t.GOARCH == "arm64")) ||
 		(t.GOOS == "freebsd" && t.GOARCH == "amd64")
+}
+
+// IncludedInPlatforms indicates whether or not a release build of the specified
+// platforms ("all", "darwin", or "other") includes the target. Release builds
+// are split along macOS because only macOS can build macOS binaries with cgo,
+// while every other target is built without cgo and can thus be built
+// anywhere.
+func (t Target) IncludedInPlatforms(platforms string) bool {
+	switch platforms {
+	case "darwin":
+		return t.GOOS == "darwin"
+	case "other":
+		return t.GOOS != "darwin"
+	default:
+		return true
+	}
 }
 
 // BuildBundleInReleaseSlimMode indicates whether or not the target should have
@@ -541,17 +562,239 @@ func copyFile(sourcePath, destinationPath string) error {
 	return nil
 }
 
-var usage = `usage: build [-h|--help] [-m|--mode=<mode>] [--sspl]
+// buildAgentBundle builds an agent bundle at bundlePath from the agent binaries
+// for the specified targets, which are stored in agentsPath under the targets'
+// names. Its first entry records the version of its agents, which the CLI
+// verifies before extracting an agent.
+func buildAgentBundle(bundlePath, agentsPath string, agentTargets []Target) error {
+	// Create the bundle.
+	bundle, err := NewArchiveBuilder(bundlePath)
+	if err != nil {
+		return fmt.Errorf("unable to create agent bundle archive builder: %w", err)
+	}
+
+	// Record the version.
+	if err := bundle.AddContents(agent.BundleVersionEntryName, []byte(mutagen.Version), 0644); err != nil {
+		bundle.Close()
+		return fmt.Errorf("unable to add version to agent bundle: %w", err)
+	}
+
+	// Add the agents.
+	for _, target := range agentTargets {
+		agentPath := filepath.Join(agentsPath, target.Name())
+		if err := bundle.Add(target.Name(), agentPath, 0755); err != nil {
+			bundle.Close()
+			return fmt.Errorf("unable to add agent to bundle: %w", err)
+		}
+	}
+
+	// Finalize the bundle.
+	if err := bundle.Close(); err != nil {
+		return fmt.Errorf("unable to finalize agent bundle: %w", err)
+	}
+
+	// Success.
+	return nil
+}
+
+// verifyXCOFF64 verifies that the file at path starts with the magic number of
+// 64-bit XCOFF executables.
+func verifyXCOFF64(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("unable to open file: %w", err)
+	}
+	defer file.Close()
+	magic := make([]byte, 2)
+	if _, err := io.ReadFull(file, magic); err != nil {
+		return fmt.Errorf("unable to read magic number: %w", err)
+	} else if magic[0] != 0x01 || magic[1] != 0xf7 {
+		return fmt.Errorf("not a 64-bit XCOFF executable (magic number %#02x%02x)", magic[0], magic[1])
+	}
+	return nil
+}
+
+// agentBuildSettingsThatAgree are the build settings that every agent in a
+// release has in common, since they're all built from the same source with the
+// same options. They're compared when assembling the agent bundle from release
+// builds of separate platforms, to make sure that those builds match. Builds
+// with -trimpath, such as release builds, don't record -ldflags or the cgo
+// flags, so those aren't compared: the commit determines them, since this
+// script sets them.
+var agentBuildSettingsThatAgree = []string{
+	"-buildmode",
+	"-compiler",
+	"-tags",
+	"-trimpath",
+	"vcs",
+	"vcs.modified",
+	"vcs.revision",
+	"vcs.time",
+}
+
+// assemble completes a release whose platforms were built separately, in
+// release builds of a subset of platforms whose release directories were then
+// merged. It builds the agent bundle from the agents that those builds left in
+// the release directory, and then removes them. It first verifies that the
+// release directory contains a release bundle of this version for every target
+// and nothing else, and that every agent was built for the platform it's named
+// after, macOS agents with cgo and others without, from the same commit with
+// the same toolchain and options.
+func assemble(releaseBuildSubdirectoryPath string) error {
+	// Verify that the release directory contains the release bundles of every
+	// target and nothing else. Windows bundles are also released as zip
+	// archives, which CI creates from them.
+	expectedEntries := map[string]bool{releaseAgentsSubdirectoryName: true}
+	optionalEntries := make(map[string]bool)
+	for _, target := range targets {
+		name := fmt.Sprintf("mutagen_%s_v%s", target.Name(), mutagen.Version)
+		expectedEntries[name+".tar.gz"] = true
+		if target.GOOS == "windows" {
+			optionalEntries[name+".zip"] = true
+		}
+	}
+	releaseEntries, err := os.ReadDir(releaseBuildSubdirectoryPath)
+	if err != nil {
+		return fmt.Errorf("unable to read release directory: %w", err)
+	}
+	present := make(map[string]bool, len(releaseEntries))
+	for _, entry := range releaseEntries {
+		if !expectedEntries[entry.Name()] && !optionalEntries[entry.Name()] {
+			return fmt.Errorf("unexpected entry in release directory: %s", entry.Name())
+		}
+		present[entry.Name()] = true
+	}
+	for name := range expectedEntries {
+		if !present[name] {
+			return fmt.Errorf("release directory is missing %s", name)
+		}
+	}
+
+	// Verify that the agents are those of every target and nothing else.
+	agentsPath := filepath.Join(releaseBuildSubdirectoryPath, releaseAgentsSubdirectoryName)
+	agentEntries, err := os.ReadDir(agentsPath)
+	if err != nil {
+		return fmt.Errorf("unable to read agents: %w", err)
+	}
+	agentNames := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		agentNames[target.Name()] = true
+	}
+	for _, entry := range agentEntries {
+		if !agentNames[entry.Name()] {
+			return fmt.Errorf("unexpected agent: %s", entry.Name())
+		}
+	}
+
+	// Verify each agent's build information. The first agent's toolchain and
+	// settings serve as the reference for the others.
+	var referenceTarget Target
+	var referenceToolchain string
+	var referenceSettings map[string]string
+	for _, target := range targets {
+		// debug/buildinfo can't read XCOFF executables, so AIX agents are only
+		// verified to be 64-bit XCOFF executables, which only aix/ppc64 builds.
+		// They're built together with other platforms, whose agents are
+		// verified in full.
+		agentPath := filepath.Join(agentsPath, target.Name())
+		if target.GOOS == "aix" {
+			if err := verifyXCOFF64(agentPath); err != nil {
+				return fmt.Errorf("agent for %s isn't valid: %w", target, err)
+			}
+			continue
+		}
+
+		// Read the build information.
+		information, err := buildinfo.ReadFile(agentPath)
+		if err != nil {
+			return fmt.Errorf("unable to read build information of agent for %s: %w", target, err)
+		}
+		settings := make(map[string]string, len(information.Settings))
+		for _, setting := range information.Settings {
+			settings[setting.Key] = setting.Value
+		}
+
+		// Verify the platform. macOS agents need cgo for FSEvents, so a macOS
+		// agent without it was built on another platform.
+		if settings["GOOS"] != target.GOOS || settings["GOARCH"] != target.GOARCH {
+			return fmt.Errorf("agent for %s was built for %s/%s", target, settings["GOOS"], settings["GOARCH"])
+		}
+		expectedCgo := "0"
+		if target.GOOS == "darwin" {
+			expectedCgo = "1"
+		}
+		if settings["CGO_ENABLED"] != expectedCgo {
+			return fmt.Errorf("agent for %s was built with CGO_ENABLED=%s", target, settings["CGO_ENABLED"])
+		}
+
+		// Verify that the agent records the commit that it was built from,
+		// without which the comparison below couldn't tell whether the agents
+		// were built from the same source.
+		if settings["vcs.revision"] == "" {
+			return fmt.Errorf("agent for %s doesn't record the commit that it was built from", target)
+		}
+
+		// Verify that the agent agrees with the reference.
+		if referenceSettings == nil {
+			referenceTarget = target
+			referenceToolchain = information.GoVersion
+			referenceSettings = settings
+			continue
+		}
+		if information.GoVersion != referenceToolchain {
+			return fmt.Errorf("agent for %s was built with %s, but agent for %s with %s",
+				target, information.GoVersion, referenceTarget, referenceToolchain,
+			)
+		}
+		for _, key := range agentBuildSettingsThatAgree {
+			if settings[key] != referenceSettings[key] {
+				return fmt.Errorf("agent for %s was built with %s=%q, but agent for %s with %q",
+					target, key, settings[key], referenceTarget, referenceSettings[key],
+				)
+			}
+		}
+	}
+
+	// Build the agent bundle for release.
+	log.Println("Building agent bundle for release...")
+	releaseAgentBundlePath := filepath.Join(
+		releaseBuildSubdirectoryPath,
+		fmt.Sprintf("%s_v%s.tar.gz", strings.TrimSuffix(agent.BundleName, ".tar.gz"), mutagen.Version),
+	)
+	if err := buildAgentBundle(releaseAgentBundlePath, agentsPath, targets); err != nil {
+		return err
+	}
+
+	// Remove the agents, so that the release directory contains only what's
+	// released.
+	if err := os.RemoveAll(agentsPath); err != nil {
+		return fmt.Errorf("unable to remove agents: %w", err)
+	}
+
+	// Success.
+	return nil
+}
+
+var usage = `usage: build [-h|--help] [-m|--mode=<mode>] [--platforms=<platforms>] [--sspl]
        [--macos-codesign-identity=<identity>]
 
-The mode flag accepts four values: 'local', 'slim', 'release', and
-'release-slim'. 'local' will build CLI and agent binaries only for the current
+The mode flag accepts five values: 'local', 'slim', 'release', 'release-slim',
+and 'assemble'. 'local' will build CLI and agent binaries only for the current
 platform. 'slim' will build the CLI binary for only the current platform and
 agents for a common subset of platforms. 'release' will build CLI and agent
 binaries for all platforms and package for release, with a release bundle of
 the CLI and remote executables for each platform and the agent bundle released
 separately. 'release-slim' is the same as release but only builds release
-bundles for a small subset of platforms. The default mode is 'slim'.
+bundles for a small subset of platforms. 'assemble' completes a release that
+was built in parts with --platforms (see below). The default mode is 'slim'.
+
+The platforms flag restricts a release build to 'darwin' (macOS) or 'other'
+(every other platform), instead of 'all' (the default). Only macOS can build
+macOS binaries, which need cgo, but the other platforms can be built anywhere,
+so a release can be built in two parts on separate systems. Such a build leaves
+its agents in an 'agents' subdirectory of the release directory instead of
+building the agent bundle. Merge the release directories of both parts, then
+run an 'assemble' build to verify the agents and bundle them.
 
 If --sspl is specified, then SSPL-licensed enhancements will be included in the
 build output. By default, only MIT-licensed code is included in builds.
@@ -568,9 +811,10 @@ func build() error {
 	// Parse command line arguments.
 	flagSet := pflag.NewFlagSet("build", pflag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
-	var mode, macosCodesignIdentity string
+	var mode, platforms, macosCodesignIdentity string
 	var enableSSPLEnhancements bool
 	flagSet.StringVarP(&mode, "mode", "m", "slim", "specify the build mode")
+	flagSet.StringVar(&platforms, "platforms", "all", "specify the platforms of a release build")
 	flagSet.StringVar(&macosCodesignIdentity, "macos-codesign-identity", "", "specify the macOS code signing identity")
 	flagSet.BoolVar(&enableSSPLEnhancements, "sspl", false, "enable SSPL-licensed enhancements")
 	if err := flagSet.Parse(os.Args[1:]); err != nil {
@@ -581,18 +825,26 @@ func build() error {
 			return fmt.Errorf("unable to parse command line: %w", err)
 		}
 	}
-	if !(mode == "local" || mode == "slim" || mode == "release" || mode == "release-slim") {
+	if !(mode == "local" || mode == "slim" || mode == "release" || mode == "release-slim" || mode == "assemble") {
 		return fmt.Errorf("invalid build mode: %s", mode)
+	}
+	if !(platforms == "all" || platforms == "darwin" || platforms == "other") {
+		return fmt.Errorf("invalid platforms: %s", platforms)
+	} else if platforms != "all" && mode != "release" {
+		return errors.New("platforms can only be restricted for release builds")
+	}
+	if mode == "assemble" && (enableSSPLEnhancements || macosCodesignIdentity != "") {
+		return errors.New("assemble builds don't build anything, so they don't accept build options")
 	}
 
 	// The only platform really suited to cross-compiling for every other
 	// platform at the moment is macOS. This is because FSEvents is used for
 	// file monitoring and that is a C-based API, not accessible purely via
 	// system calls. All of the other platforms can operate with pure Go
-	// compilation.
+	// compilation, so a release build of only those can run anywhere.
 	if runtime.GOOS != "darwin" {
-		if mode == "release" {
-			return errors.New("macOS is required for release builds")
+		if mode == "release" && platforms != "other" {
+			return errors.New("macOS is required for release builds of macOS (use --platforms=other for the rest)")
 		} else if mode == "slim" || mode == "release-slim" {
 			cmd.Warning("macOS agents will be built without cgo support")
 		}
@@ -624,17 +876,23 @@ func build() error {
 		return errors.New("build script run outside Mutagen source tree")
 	}
 
-	// Compute the path to the build directory and ensure that it exists.
+	// Compute the path to the build directory and its subdirectories.
 	buildPath := filepath.Join(mutagenSourcePath, mutagen.BuildDirectoryName)
-	if err := os.MkdirAll(buildPath, 0700); err != nil {
-		return fmt.Errorf("unable to create build directory: %w", err)
-	}
-
-	// Create the necessary build directory hierarchy.
 	agentBuildSubdirectoryPath := filepath.Join(buildPath, agentBuildSubdirectoryName)
 	cliBuildSubdirectoryPath := filepath.Join(buildPath, cliBuildSubdirectoryName)
 	remoteBuildSubdirectoryPath := filepath.Join(buildPath, remoteBuildSubdirectoryName)
 	releaseBuildSubdirectoryPath := filepath.Join(buildPath, releaseBuildSubdirectoryName)
+
+	// Assembly doesn't build anything, it only completes the release that
+	// release builds of each set of platforms left in the release directory.
+	if mode == "assemble" {
+		return assemble(releaseBuildSubdirectoryPath)
+	}
+
+	// Create the necessary build directory hierarchy.
+	if err := os.MkdirAll(buildPath, 0700); err != nil {
+		return fmt.Errorf("unable to create build directory: %w", err)
+	}
 	if err := os.MkdirAll(agentBuildSubdirectoryPath, 0700); err != nil {
 		return fmt.Errorf("unable to create agent build subdirectory: %w", err)
 	}
@@ -660,6 +918,8 @@ func build() error {
 			continue
 		} else if (mode == "slim" || mode == "release-slim") && !target.IncludeAgentInSlimBuildModes() {
 			continue
+		} else if !target.IncludedInPlatforms(platforms) {
+			continue
 		}
 		agentTargets = append(agentTargets, target)
 	}
@@ -670,6 +930,8 @@ func build() error {
 		if (mode == "local" || mode == "slim") && target.IsCrossTarget() {
 			continue
 		} else if mode == "release-slim" && !target.BuildBundleInReleaseSlimMode() {
+			continue
+		} else if !target.IncludedInPlatforms(platforms) {
 			continue
 		}
 		cliTargets = append(cliTargets, target)
@@ -725,27 +987,28 @@ func build() error {
 		}
 	}
 
-	// Build the agent bundle. Its first entry records the version of its
-	// agents, which the CLI verifies before extracting an agent.
-	log.Println("Building agent bundle...")
+	// Build the agent bundle, unless this is a release build of only some
+	// platforms, whose agents can't make up a complete bundle. Such a build
+	// leaves its agents in the release directory instead, where assembly
+	// collects those of every platform into the bundle.
 	agentBundlePath := filepath.Join(buildPath, agent.BundleName)
-	agentBundleBuilder, err := NewArchiveBuilder(agentBundlePath)
-	if err != nil {
-		return fmt.Errorf("unable to create agent bundle archive builder: %w", err)
-	}
-	if err := agentBundleBuilder.AddContents(agent.BundleVersionEntryName, []byte(mutagen.Version), 0644); err != nil {
-		agentBundleBuilder.Close()
-		return fmt.Errorf("unable to add version to agent bundle: %w", err)
-	}
-	for _, target := range agentTargets {
-		agentBuildPath := filepath.Join(agentBuildSubdirectoryPath, target.Name())
-		if err := agentBundleBuilder.Add(target.Name(), agentBuildPath, 0755); err != nil {
-			agentBundleBuilder.Close()
-			return fmt.Errorf("unable to add agent to bundle: %w", err)
+	if platforms == "all" {
+		log.Println("Building agent bundle...")
+		if err := buildAgentBundle(agentBundlePath, agentBuildSubdirectoryPath, agentTargets); err != nil {
+			return err
 		}
-	}
-	if err := agentBundleBuilder.Close(); err != nil {
-		return fmt.Errorf("unable to finalize agent bundle: %w", err)
+	} else {
+		log.Println("Copying agents for assembly...")
+		releaseAgentsPath := filepath.Join(releaseBuildSubdirectoryPath, releaseAgentsSubdirectoryName)
+		if err := os.MkdirAll(releaseAgentsPath, 0700); err != nil {
+			return fmt.Errorf("unable to create release agents subdirectory: %w", err)
+		}
+		for _, target := range agentTargets {
+			agentBuildPath := filepath.Join(agentBuildSubdirectoryPath, target.Name())
+			if err := copyFile(agentBuildPath, filepath.Join(releaseAgentsPath, target.Name())); err != nil {
+				return fmt.Errorf("unable to copy agent for assembly: %w", err)
+			}
+		}
 	}
 
 	// Build release bundles if necessary. Each platform's release bundle only
@@ -754,13 +1017,15 @@ func build() error {
 	// bundle, is released once, alongside the platform bundles, rather than in
 	// each of them, with the version in its name like theirs.
 	if mode == "release" || mode == "release-slim" {
-		log.Println("Copying agent bundle for release...")
-		releaseAgentBundlePath := filepath.Join(
-			releaseBuildSubdirectoryPath,
-			fmt.Sprintf("%s_v%s.tar.gz", strings.TrimSuffix(agent.BundleName, ".tar.gz"), mutagen.Version),
-		)
-		if err := copyFile(agentBundlePath, releaseAgentBundlePath); err != nil {
-			return fmt.Errorf("unable to copy agent bundle for release: %w", err)
+		if platforms == "all" {
+			log.Println("Copying agent bundle for release...")
+			releaseAgentBundlePath := filepath.Join(
+				releaseBuildSubdirectoryPath,
+				fmt.Sprintf("%s_v%s.tar.gz", strings.TrimSuffix(agent.BundleName, ".tar.gz"), mutagen.Version),
+			)
+			if err := copyFile(agentBundlePath, releaseAgentBundlePath); err != nil {
+				return fmt.Errorf("unable to copy agent bundle for release: %w", err)
+			}
 		}
 
 		log.Println("Building release bundles...")
@@ -791,7 +1056,11 @@ func build() error {
 		}
 	}
 
-	// Relocate the CLI and remote binaries for the current platform.
+	// Relocate the CLI and remote binaries for the current platform, unless
+	// this is a release build of platforms that don't include it.
+	if !localTarget.IncludedInPlatforms(platforms) {
+		return nil
+	}
 	log.Println("Copying binaries for testing")
 	localCLIBuildPath := filepath.Join(cliBuildSubdirectoryPath, localTarget.Name())
 	localCLIRelocationPath := filepath.Join(buildPath, localTarget.ExecutableName(cliBaseName))

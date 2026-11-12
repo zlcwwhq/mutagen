@@ -24,9 +24,13 @@ The build script can do four different types of builds: `local` (with support
 for the local system only), `slim` (the default - with support for a selection
 of common platforms used in testing), `release` (used for generating complete
 release artifacts), and `release-slim` (used for generating complete release
-artifacts for a selection of common platforms used in testing). macOS is
-currently the only platform that supports doing `release` builds, because the
-macOS binaries require cgo support for filesystem monitoring.
+artifacts for a selection of common platforms used in testing). A fifth mode,
+`assemble`, completes a `release` build made in parts. A `release`
+build of the macOS binaries requires macOS, because they need cgo support for
+filesystem monitoring, while the other platforms are built without cgo and can
+be built anywhere. So `--platforms` can split a `release` build into a macOS
+part (`darwin`) and one of every other platform (`other`), and an `assemble`
+build then verifies the agents of both parts and bundles them.
 
 All artifacts from the build are placed in a `build` directory at the root of
 the Mutagen source tree. As a convenience, artifacts built for the current
@@ -62,13 +66,13 @@ be built as part of the `go generate` command.
 
 The `zlcwwhq/mutagen` fork runs CI for pull requests, release tags, and manual
 workflow dispatches. Pushes to branches don't run it. Every pull request runs
-commit verification. A pull request that changes more than 1,000 lines also
-runs the Linux tests on the newest supported Go version. Adding the `full-ci`
-label to a pull request runs the full matrix on it: macOS, Windows, 32-bit
-tests, and every supported Go version. Manual dispatches always run the full
-matrix. Pull requests that only touch Markdown files or the skill submodule
-don't run CI. Ordinary builds use slim bundles. Sidecar container images are not
-built or published by this workflow.
+commit verification. A pull request that changes more than 1,000 lines also runs
+the Linux tests on the newest supported Go version. Adding the `full-ci` label
+to a pull request runs the full matrix on it: macOS, Windows, 32-bit tests, and
+every supported Go version. Manual dispatches run the full matrix, unless they
+test the release build (see below). Pull requests that only touch Markdown files
+or the skill submodule don't run CI. Ordinary builds use slim bundles. Sidecar
+container images are not built or published by this workflow.
 
 A tag doesn't change any code, so release tags don't rerun the tests. Before
 tagging a release, run the full matrix on its commit, with the `full-ci` label
@@ -80,8 +84,21 @@ gh workflow run ci.yml --ref master
 
 The tag's run first checks that the full matrix passed for the tagged commit,
 and fails without building anything if it hasn't. In that case, run the full
-matrix and then rerun the tag's run. Otherwise it builds the complete platform
-matrix of release bundles on macOS.
+matrix and then rerun the tag's run. Otherwise it builds the release in two
+parts at the same time: macOS on a macOS runner, and every other platform on
+Linux. macOS jobs, including the full matrix's tests, run on Intel runners,
+since arm64 runners are often unavailable for a while; the Intel runner builds
+both macOS architectures. If a build fails, rerun the failed jobs with
+`gh run rerun <run> --failed`, which doesn't need a new tag.
+
+To test the release build without a tag, dispatch the workflow with the
+`release` input. It builds and assembles the release like a tag's run, without
+the version stamp, and uploads it as the run's `bundles` artifact instead of
+creating a release:
+
+```sh
+gh workflow run ci.yml --ref <branch> -f release=true
+```
 
 Create a release by tagging a commit with the upstream version followed by
 `-zlcwwhq.X.Y.Z`. For example, when the upstream numeric version in
@@ -110,13 +127,14 @@ For an equivalent local release build, first run:
 go run ./scripts/ci/releaseversion -tag v0.19.0-zlcwwhq.0.1.0 -write
 ```
 
-After the macOS build passes, CI creates a **draft GitHub Release** containing
-CLI bundles (each with the remote executable and the matching agent bundle) and
-`SHA256SUMS`. Review the draft and publish it in GitHub. Reruns can replace draft assets but
-will not overwrite a published release. macOS code signing, Apple notarization,
-and GPG checksum signing are disabled; no signing secrets or Docker registry
-credentials are needed. The release job uses the repository's `GITHUB_TOKEN`
-with `contents: write`; all other jobs have read-only repository access.
+Once the release is assembled, CI creates a **draft GitHub Release** containing
+a CLI bundle for each platform (with the remote executable), the agent bundle,
+and `SHA256SUMS`. Review the draft and publish it in GitHub. Reruns can replace
+draft assets but will not overwrite a published release. macOS code signing,
+Apple notarization, and GPG checksum signing are disabled; no signing secrets or
+Docker registry credentials are needed. The release job uses the repository's
+`GITHUB_TOKEN` with `contents: write`; all other jobs have read-only repository
+access.
 
 If GitHub disables Actions after forking, open the repository's Actions tab
 and enable workflows. Pushes of upstream tags without `-zlcwwhq.X.Y.Z` do not

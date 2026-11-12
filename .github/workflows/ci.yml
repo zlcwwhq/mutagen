@@ -7,7 +7,9 @@ name: CI
 # full matrix before it's tagged. Pull requests also run when they're
 # labeled, so that adding the full-ci label starts the full matrix. Pull
 # requests that only touch documentation or the skill submodule don't run
-# it, since no job reads either.
+# it, since no job reads either. A manual dispatch with the release input
+# builds and assembles a release without publishing it, to test release
+# builds without a tag.
 on:
   push:
     tags:
@@ -18,6 +20,11 @@ on:
       - '**.md'
       - 'skills/**'
   workflow_dispatch:
+    inputs:
+      release:
+        description: 'Build and assemble a release, without publishing it, instead of running the tests'
+        type: boolean
+        default: false
 
 # Restrict default token permissions. Jobs that need write access
 # (e.g., release) escalate explicitly.
@@ -27,20 +34,23 @@ permissions:
 # Cancel in-progress runs for the same ref, except for tag builds
 # (which should always run to completion for releases). Adding any label
 # other than full-ci starts a run that does nothing, so it gets a group of
-# its own and can't cancel the pull request's real run.
+# its own and can't cancel the pull request's real run. Release dry runs
+# get a group of their own too, so that dispatching one doesn't cancel a
+# full run of the same commit, which a release of it needs, or the reverse.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'full-ci') && format('-{0}', github.run_id) || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'full-ci') && format('-{0}', github.run_id) || '' }}${{ inputs.release && '-release' || '' }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 # Define the workflow jobs.
 jobs:
   # Decide how much of the workflow runs:
-  # - release: for tags, only the release build on macOS and the release
-  #   itself. Tags don't change any code, so they don't rerun the tests:
-  #   instead the version job requires that the full matrix passed for the
-  #   tagged commit.
-  # - full: the full matrix, for manual dispatches and pull requests with
-  #   the full-ci label.
+  # - release: for tags, only the release build and the release itself.
+  #   Tags don't change any code, so they don't rerun the tests: instead the
+  #   version job requires that the full matrix passed for the tagged
+  #   commit. Manual dispatches with the release input get the same build,
+  #   without the release.
+  # - full: the full matrix, for other manual dispatches and pull requests
+  #   with the full-ci label.
   # - fast: Linux on the newest Go version, for other pull requests that
   #   change more than FAST_CI_LINES lines.
   # - none: nothing but commit verification, for the remaining pull
@@ -55,12 +65,15 @@ jobs:
     timeout-minutes: 5
     env:
       FAST_CI_LINES: 1000
+      RELEASE_INPUT: ${{ inputs.release }}
     outputs:
       tier: ${{ steps.tier.outputs.tier }}
     steps:
       - id: tier
         run: |
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+              tier="release"
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${RELEASE_INPUT}" == "true" ]]; then
               tier="release"
           elif [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
               tier="full"
@@ -97,7 +110,7 @@ jobs:
         if: github.ref_type == 'tag'
         run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME"
       - name: Require the full matrix for the tagged commit
-        if: needs.tier.outputs.tier == 'release'
+        if: github.ref_type == 'tag' && needs.tier.outputs.tier == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/ci/require_full_ci.sh "$(git rev-parse HEAD)"
@@ -120,43 +133,26 @@ jobs:
 
           # Perform verification.
           scripts/ci/verify_commits.sh
+  # macOS jobs run on Intel runners, since arm64 runners are often
+  # unavailable for a while: jobs for them stay queued until GitHub cancels
+  # them, about 15 minutes later.
   macos:
     needs: version
-    if: needs.version.outputs.tier == 'full' || needs.version.outputs.tier == 'release'
+    if: needs.version.outputs.tier == 'full'
     name: macOS
-    runs-on: macos-15
-    timeout-minutes: 45
+    runs-on: macos-15-intel
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: '1.26.2'
-      - name: "Install sha256sum"
-        run: brew install coreutils
-      - name: Set release version
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME" -write
       - run: scripts/ci/setup_go.sh
       - run: scripts/ci/setup_ssh.sh
-        if: needs.version.outputs.tier == 'full'
       - run: scripts/ci/setup_partitions_darwin.sh
-        if: needs.version.outputs.tier == 'full'
       - run: scripts/ci/analyze.sh
-        if: needs.version.outputs.tier == 'full'
       - run: scripts/ci/test.sh
-        if: needs.version.outputs.tier == 'full'
       - run: scripts/ci/build.sh
-      - run: scripts/ci/sha256sum.sh
-        if: github.ref_type == 'tag'
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: github.ref_type == 'tag'
-        with:
-          name: bundles
-          path: build/release/*
-          retention-days: 7
-          compression-level: 0
-          if-no-files-found: error
   linux:
     needs: version
     if: needs.version.outputs.tier == 'fast' || needs.version.outputs.tier == 'full'
@@ -172,10 +168,6 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: ${{ matrix.goversion }}
-      - name: Set release version
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME" -write
       - run: scripts/ci/setup_go.sh
       - run: scripts/ci/setup_ssh.sh
       - run: scripts/ci/setup_docker.sh
@@ -195,10 +187,6 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: '1.26.2'
-      - name: Set release version
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME" -write
       - run: scripts/ci/setup_go.sh
         shell: bash
       - run: scripts/ci/setup_docker.sh
@@ -223,27 +211,114 @@ jobs:
         shell: bash
       - run: scripts/ci/build.sh
         shell: bash
+  # Build the macOS part of a release. Only macOS can build macOS binaries,
+  # since they need cgo for FSEvents. The Intel runner builds both
+  # architectures (see the macOS job for why it's Intel).
+  release-darwin:
+    needs: version
+    if: needs.version.outputs.tier == 'release'
+    name: Release Build (macOS)
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: '1.26.2'
+      - name: Set release version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME" -write
+      - run: scripts/ci/setup_go.sh
+      - run: scripts/ci/build_release.sh darwin
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-darwin
+          path: build/release
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+  # Build every other platform's part of a release, in parallel with macOS.
+  # These platforms are built without cgo, so Linux can build them.
+  release-other:
+    needs: version
+    if: needs.version.outputs.tier == 'release'
+    name: Release Build (other platforms)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: '1.26.2'
+      - name: Set release version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME" -write
+      - run: scripts/ci/setup_go.sh
+      - run: scripts/ci/build_release.sh other
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-other
+          path: build/release
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+  # Assemble the release from its parts. For tag pushes, create a draft
+  # release with it. For manual dispatches, even on a tag, upload it as an
+  # artifact instead.
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [version, macos]
+    needs: [version, release-darwin, release-other]
     if: needs.version.outputs.tier == 'release'
     permissions:
       contents: write
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
+      # This job can write to the repository, but it runs the repository's
+      # code and that of its modules, so don't leave the token in the
+      # checkout's Git configuration. The GitHub CLI steps get it from their
+      # environment instead.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: '1.26.2'
+      - name: Set release version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: go run ./scripts/ci/releaseversion -tag "$GITHUB_REF_NAME" -write
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: release-other
+          path: parts/other
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-darwin
+          path: parts/darwin
+      - name: Assemble the release
+        run: scripts/ci/assemble_release.sh parts/other parts/darwin
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name != 'push'
+        with:
           name: bundles
-          path: bundles
+          path: build/release
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
       - name: Create draft release and upload bundles
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          # Verify archive integrity before uploading. A draft keeps partially
-          # uploaded assets out of published releases if the upload fails.
-          (cd bundles && sha256sum --check SHA256SUMS)
+          # A draft keeps partially uploaded assets out of published releases
+          # if the upload fails.
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             if [[ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" != "true" ]]; then
               echo "Refusing to replace assets on a published release" >&2
@@ -253,4 +328,4 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
               --title "$GITHUB_REF_NAME" --generate-notes
           fi
-          gh release upload "$GITHUB_REF_NAME" bundles/* --clobber
+          gh release upload "$GITHUB_REF_NAME" build/release/* --clobber
