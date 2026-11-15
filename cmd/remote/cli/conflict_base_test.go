@@ -113,6 +113,29 @@ func TestFindBase(t *testing.T) {
 	if source, data, err := find(""); err != nil || !strings.Contains(source, "index") || data != "base\n" {
 		t.Fatalf("staged base not found: %q: %v", source, err)
 	}
+
+	// Files below the repository's root are found too, although Git runs
+	// without discovering repositories above its directory.
+	nested := filepath.Join(directory, "sub", "file")
+	if err := os.Mkdir(filepath.Dir(nested), 0700); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(nested, []byte("base\n"), 0600)
+	git("add", "sub")
+	git("commit", "-q", "-m", "nested")
+	os.WriteFile(nested, []byte("local\n"), 0600)
+	destination := filepath.Join(t.TempDir(), "base")
+	if source, err := findBase(ctx, conflict, nested, "", destination); err != nil || !strings.Contains(source, "HEAD") {
+		t.Fatalf("nested base not found: %q: %v", source, err)
+	}
+
+	// An invalid .git entry closer to the file makes Git fail rather than
+	// read the enclosing repository.
+	if err := os.Mkdir(filepath.Join(filepath.Dir(nested), ".git"), 0700); err != nil {
+		t.Fatal(err)
+	} else if source, err := findBase(ctx, conflict, nested, "", destination); err != nil || source != "" {
+		t.Fatalf("base read through an invalid repository: %q: %v", source, err)
+	}
 	conflict.BaseDigest = fmt.Sprintf("%x", sha1.Sum([]byte("unknown\n")))
 	if source, _, err := find(""); err != nil || source != "" {
 		t.Fatalf("unverified base found: %q: %v", source, err)

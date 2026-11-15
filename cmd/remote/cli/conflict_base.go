@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 
+	"github.com/mutagen-io/mutagen/pkg/git"
 	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/hashing"
 )
@@ -23,17 +23,37 @@ type baseCandidate struct {
 }
 
 // gitCandidate returns a candidate read from Git by running git cat-file in a
-// file's directory, which outputs a blob as stored, without running filters,
-// hooks, or the file system monitor.
-func gitCandidate(ctx context.Context, git, local, revision, source string) baseCandidate {
+// repository's root, which outputs a blob as stored, without running filters,
+// with the hardening of git.Command.
+func gitCandidate(ctx context.Context, repository, object, source string) baseCandidate {
 	return baseCandidate{source: source, write: func(output io.Writer) error {
-		command := exec.CommandContext(ctx, git, "-c", "core.fsmonitor=false", "--no-optional-locks",
-			"cat-file", "blob", revision+":./"+filepath.ToSlash(filepath.Base(local)))
-		command.Dir = filepath.Dir(local)
-		command.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		command := git.Command(ctx, repository, "cat-file", "blob", object)
 		command.Stdout = output
 		return command.Run()
 	}}
+}
+
+// repository finds the root of the Git repository whose work tree contains a
+// local file: the closest directory above the file with a .git entry, since
+// git.Command doesn't look further. It returns the file's slash-separated path
+// relative to the root.
+func repository(local string) (string, string, bool) {
+	root := filepath.Dir(local)
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	relative := filepath.Base(local)
+	for {
+		if _, err := os.Lstat(filepath.Join(root, ".git")); err == nil {
+			return root, filepath.ToSlash(relative), true
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			return "", "", false
+		}
+		relative = filepath.Join(filepath.Base(root), relative)
+		root = parent
+	}
 }
 
 // listedAlgorithm returns the session's hashing algorithm, which computed the
@@ -87,10 +107,10 @@ func findBase(ctx context.Context, conflict *remote.ConflictRoot, local, explici
 			_, err = io.Copy(output, input)
 			return err
 		}})
-	} else if git, err := exec.LookPath("git"); err == nil {
+	} else if root, relative, ok := repository(local); ok {
 		candidates = append(candidates,
-			gitCandidate(ctx, git, local, "HEAD", "Git's HEAD commit"),
-			gitCandidate(ctx, git, local, "", "Git's index"),
+			gitCandidate(ctx, root, "HEAD:"+relative, "Git's HEAD commit"),
+			gitCandidate(ctx, root, ":"+relative, "Git's index"),
 		)
 	}
 	for _, candidate := range candidates {
