@@ -132,7 +132,7 @@ func newStarFixture(t *testing.T, local ...bool) *starFixture {
 func (f *starFixture) available(directory, from string, expected ...string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	connection, _, err := (&remote.Selection{Workspace: true}).Submit(ctx, directory, &remote.Submission{Operation: remote.OperationNodes})
+	connection, _, err := (&remote.Selection{}).Submit(ctx, directory, &remote.Submission{Operation: remote.OperationNodes})
 	if err != nil {
 		return false
 	}

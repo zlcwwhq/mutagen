@@ -143,17 +143,13 @@ func TestDialSelection(t *testing.T) {
 		t.Fatal("older registration selected:", last)
 	}
 
-	// Among distinct sessions with the same root, the session created first is
-	// used, with ties broken by identifier, unless one is selected explicitly.
+	// Distinct sessions with the same root are ambiguous, rather than chosen
+	// by creation order, unless one is selected explicitly.
 	registerTest(t, &Endpoint{Session: "sync_other", Root: outer, SessionCreated: time.Now()}, "other", &accepted, &lock)
-	if target, err := dial(filepath.Join(outer, "y"), ""); err != nil || target.Session != "sync_outer" {
-		t.Fatalf("incorrect selection among equally specific roots: %+v, %v", target, err)
+	if _, err := dial(filepath.Join(outer, "y"), ""); err == nil || !strings.Contains(err.Error(), "ambiguous source node") {
+		t.Fatal("ambiguity among equally specific roots not reported:", err)
 	} else if target, err := dial(filepath.Join(outer, "y"), "sync_other"); err != nil || target.Session != "sync_other" {
 		t.Fatalf("explicit selection not used: %+v, %v", target, err)
-	}
-	registerTest(t, &Endpoint{Session: "sync_another", Root: outer}, "another", &accepted, &lock)
-	if target, err := dial(filepath.Join(outer, "y"), ""); err != nil || target.Session != "sync_another" {
-		t.Fatalf("tie not broken by identifier: %+v, %v", target, err)
 	}
 
 	// Registrations of crashed processes are pruned.
@@ -172,11 +168,9 @@ func TestDialSelection(t *testing.T) {
 		}
 	}
 
-	// Registrations from other versions are explained.
-	data, _ := json.Marshal(&record{Version: "0.0.1", Session: "sync_old", Root: outside})
-	if err := os.WriteFile(filepath.Join(registry, "old"+recordExtension), data, 0600); err != nil {
-		t.Fatal(err)
-	} else if _, err := dial(outside, ""); err == nil ||
+	// Live registrations from other versions are explained.
+	registerIncompatible(t, registry, "sync_old", outside)
+	if _, err := dial(outside, ""); err == nil ||
 		!strings.Contains(err.Error(), "registered by Mutagen 0.0.1, but this is Mutagen "+mutagen.Version) {
 		t.Fatal("version mismatch not explained:", err)
 	}
@@ -334,7 +328,7 @@ func TestDialPinned(t *testing.T) {
 	// A pinned selection follows the endpoint when it reconnects, and ignores
 	// other selection criteria.
 	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: inner}, "reconnected", &accepted, &lock)
-	pinned := &Selection{Workspace: true, Target: target}
+	pinned := &Selection{Target: target}
 	if reconnected, err := dialTest(pinned, directory); err != nil || reconnected.Session != "sync_inner" || reconnected.Path != "x" {
 		t.Fatalf("pinned selection didn't follow the reconnected endpoint: %+v, %v", reconnected, err)
 	}
@@ -542,7 +536,7 @@ func TestAgentChannel(t *testing.T) {
 	if !installed {
 		t.Fatal("remote executable not installed")
 	}
-	if _, registered, _, err := relate(filepath.Join(root, "sub")); err != nil || len(registered) != 1 ||
+	if registered, _, err := relate(filepath.Join(root, "sub")); err != nil || len(registered) != 1 ||
 		registered[0].ExecutionHost != "opposite-host" || registered[0].ExecutionRoot != opposite || registered[0].path != "sub" {
 		t.Fatalf("agent initialization lost execution metadata: %+v, %v", registered, err)
 	}

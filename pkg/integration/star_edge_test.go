@@ -146,7 +146,7 @@ func waitForStarCenter(t *testing.T, root string) {
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		connection, _, err := (&remote.Selection{Workspace: true}).Submit(ctx, root, &remote.Submission{Operation: remote.OperationNodes})
+		connection, _, err := (&remote.Selection{}).Submit(ctx, root, &remote.Submission{Operation: remote.OperationNodes})
 		var graph *remote.NodeGraph
 		if err == nil {
 			graph, err = remote.ListNodes(ctx, connection)

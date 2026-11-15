@@ -51,9 +51,9 @@ type Endpoint struct {
 	ExecutionRoot string `json:",omitempty"`
 	// Alpha indicates whether the endpoint is alpha.
 	Alpha bool
-	// SessionCreated is the session's creation time, which determines the
-	// preferred session among those whose roots contain a submission directory
-	// equally specifically.
+	// SessionCreated is the session's creation time, which orders the sessions
+	// whose roots contain a path equally specifically in diagnostics (see
+	// Synchronizing).
 	SessionCreated time.Time
 	// Submit indicates whether invocations on the endpoint's system may submit
 	// commands to the opposite endpoint.

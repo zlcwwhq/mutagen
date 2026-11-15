@@ -180,7 +180,7 @@ func TestStarFakeSSH(t *testing.T) {
 
 	// Wait for the center to reach both nodes.
 	for {
-		connection, _, err := (&remote.Selection{Workspace: true}).Submit(ctx, local, &remote.Submission{Operation: remote.OperationNodes})
+		connection, _, err := (&remote.Selection{}).Submit(ctx, local, &remote.Submission{Operation: remote.OperationNodes})
 		var graph *remote.NodeGraph
 		if err == nil {
 			graph, err = remote.ListNodes(ctx, connection)

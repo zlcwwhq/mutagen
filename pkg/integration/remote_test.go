@@ -23,13 +23,13 @@ import (
 
 // runRemoteCommand submits a command from the specified directory, retrying
 // while command channels are still connecting. As with the remote executable,
-// the executing endpoint's prologue is requested when the directory lies inside
-// the submitting root.
+// the daemon resolves the destination, and the executing endpoint's prologue
+// is requested when the directory lies inside the submitting root.
 func runRemoteCommand(directory string, arguments ...string) (string, int, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		connection, target, err := (&remote.Selection{}).Dial(ctx, directory, remote.OperationExecute)
+		connection, target, err := (&remote.Selection{Resolve: true}).Dial(ctx, directory, remote.OperationExecute)
 		var output bytes.Buffer
 		var code int
 		if err == nil {
@@ -52,7 +52,7 @@ func flushRemote(directory string) (*remote.Report, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		connection, _, err := (&remote.Selection{}).Dial(ctx, directory, remote.OperationFlush)
+		connection, _, err := (&remote.Selection{Resolve: true}).Dial(ctx, directory, remote.OperationFlush)
 		var report *remote.Report
 		if err == nil {
 			report, err = remote.Flush(ctx, connection)
@@ -847,7 +847,7 @@ func TestRemoteProgress(t *testing.T) {
 			// status when it starts waiting.
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			connection, _, err := (&remote.Selection{}).Submit(ctx, submitting, &remote.Submission{Operation: remote.OperationFlush, Progress: true})
+			connection, _, err := (&remote.Selection{Resolve: true}).Submit(ctx, submitting, &remote.Submission{Operation: remote.OperationFlush, Progress: true})
 			if err != nil {
 				t.Fatal("unable to submit flush:", err)
 			}

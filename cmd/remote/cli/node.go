@@ -10,7 +10,7 @@ import (
 // requested node's edge is used, so that the operation doesn't depend on
 // other edges (see remote.Selection).
 func (o *options) selection(corresponding bool) *remote.Selection {
-	return &remote.Selection{Workspace: true, WorkspaceOutside: o.node != "", Corresponding: corresponding, Node: o.node, Resolve: true}
+	return &remote.Selection{WorkspaceOutside: o.node != "", Corresponding: corresponding, Node: o.node, Resolve: true}
 }
 
 // followUpCommand returns the start of the remote command lines that remote

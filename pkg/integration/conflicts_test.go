@@ -445,7 +445,7 @@ func TestRemoteConflictLateRequests(t *testing.T) {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		connection, _, err := (&remote.Selection{}).Dial(ctx, alpha.directory, operation)
+		connection, _, err := (&remote.Selection{Resolve: true}).Dial(ctx, alpha.directory, operation)
 		if err != nil {
 			t.Fatal(err)
 		}

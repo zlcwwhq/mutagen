@@ -428,7 +428,7 @@ func TestResolvedRouteIgnoresKnowRoot(t *testing.T) {
 	t.Cleanup(func() { channel.Close(); handlers.Wait() })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	selection := &Selection{Workspace: true, Node: "b", Resolve: true, Corresponding: true}
+	selection := &Selection{Node: "b", Resolve: true, Corresponding: true}
 	connection, target, err := selection.Submit(ctx, filepath.Join(root, "sub", "src"), &Submission{Operation: OperationFlush})
 	if err != nil {
 		t.Fatal(err)

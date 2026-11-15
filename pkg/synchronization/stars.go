@@ -281,7 +281,7 @@ func (s *commandStars) starHasNode(identifier, name string) bool {
 // redirected to another edge, so that they don't depend on any other edge. At
 // a star's center, where every edge registers the center's workspace, remote
 // submits through the selected node's own edge (see
-// remote.Selection.Workspace). A submission that enters through another edge,
+// remote.Selection). A submission that enters through another edge,
 // because the selected edge's registration isn't live, is refused as a
 // connection failure, just as operations on a pair fail while its local
 // registration isn't live. Other errors, such as an unknown node or a star

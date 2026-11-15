@@ -16,7 +16,7 @@ import (
 // nodes that it can reach. Discovery never flushes or opens an executor,
 // including for offline targets.
 func queryNodes(ctx context.Context, directory string) (*remote.NodeGraph, error) {
-	selection := &remote.Selection{Workspace: true, WorkspaceOutside: true}
+	selection := &remote.Selection{WorkspaceOutside: true}
 	connection, _, err := selection.Submit(ctx, directory, &remote.Submission{Operation: remote.OperationNodes})
 	if err != nil {
 		return nil, err

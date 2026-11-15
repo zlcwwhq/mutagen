@@ -272,7 +272,7 @@ func (s *gitModeSession) waitForRemoteCommands() {
 	defer cancel()
 	for {
 		available := false
-		connection, _, err := (&remote.Selection{Workspace: true}).Submit(ctx, s.alpha, &remote.Submission{Operation: remote.OperationNodes})
+		connection, _, err := (&remote.Selection{}).Submit(ctx, s.alpha, &remote.Submission{Operation: remote.OperationNodes})
 		if err == nil {
 			if graph, err := remote.ListNodes(ctx, connection); err == nil {
 				for _, node := range graph.Nodes {

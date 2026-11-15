@@ -51,7 +51,7 @@ func TestStarSourceSelection(t *testing.T) {
 	}
 	add("center-b", "project", "center", root)
 	add("center-c", "project", "center", root)
-	selection := &Selection{Workspace: true}
+	selection := &Selection{}
 	if target, err := locateWorkspaceTest(selection, root); err != nil || target.Root != root || target.SourceNode != "center" || !target.Star {
 		t.Fatalf("a star's edges did not select its center as one source node: %+v %v", target, err)
 	}
@@ -104,12 +104,12 @@ func TestStarSourceEntersSelectedEdge(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		for _, peer := range order {
-			if target, err := locateWorkspaceTest(&Selection{Workspace: true, Node: peer}, root); err != nil || target.SourceSession != "center-"+peer || target.Node != peer {
+			if target, err := locateWorkspaceTest(&Selection{Node: peer}, root); err != nil || target.SourceSession != "center-"+peer || target.Node != peer {
 				t.Fatalf("submission for node %s didn't enter through its edge (order %v): %+v %v", peer, order, target, err)
 			}
 		}
 		for _, node := range []string{"", "missing"} {
-			if target, err := locateWorkspaceTest(&Selection{Workspace: true, Node: node}, root); err != nil || target.SourceNode != "center" {
+			if target, err := locateWorkspaceTest(&Selection{Node: node}, root); err != nil || target.SourceNode != "center" {
 				t.Fatalf("center not located for node %q: %+v %v", node, target, err)
 			}
 		}
@@ -125,7 +125,7 @@ func TestStarSourceEntersSelectedEdge(t *testing.T) {
 		// located, through which the daemon refuses the submission (see
 		// TestStarUnavailableNodeIgnores).
 		channels["c"].Close()
-		if target, err := locateWorkspaceTest(&Selection{Workspace: true, Node: "c"}, root); err != nil || target.SourceSession != "center-b" {
+		if target, err := locateWorkspaceTest(&Selection{Node: "c"}, root); err != nil || target.SourceSession != "center-b" {
 			t.Fatalf("center not located for a node whose registration isn't live: %+v %v", target, err)
 		}
 
@@ -197,7 +197,7 @@ func TestStarUnavailableNodeIgnores(t *testing.T) {
 	submit := func(node, directory string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		selection := &Selection{Workspace: true, Node: node, Resolve: true, Corresponding: true}
+		selection := &Selection{Node: node, Resolve: true, Corresponding: true}
 		connection, target, err := selection.Submit(ctx, filepath.Join(root, directory), &Submission{Operation: OperationFlush})
 		if err == nil {
 			connection.Close()
@@ -264,16 +264,16 @@ func TestWorkspaceVersionMismatch(t *testing.T) {
 	// reporting that no workspace contains it.
 	registerIncompatible(t, registry, "sync_old", root)
 	for _, directory := range []string{root, nested} {
-		if _, err := locateWorkspaceTest(&Selection{Workspace: true}, directory); !mismatch(err, "the workspaces containing this directory are") {
+		if _, err := locateWorkspaceTest(&Selection{}, directory); !mismatch(err, "the workspaces containing this directory are") {
 			t.Errorf("version mismatch not explained from %s: %v", directory, err)
 		}
 	}
 
 	// Outside every root, it's only explained for selections that may apply
 	// outside every root.
-	if _, err := locateWorkspaceTest(&Selection{Workspace: true}, outside); err == nil || !strings.Contains(err.Error(), "no connected node contains") {
+	if _, err := locateWorkspaceTest(&Selection{}, outside); err == nil || !strings.Contains(err.Error(), "no connected node contains") {
 		t.Error("directory outside every root not reported:", err)
-	} else if _, err := locateWorkspaceTest(&Selection{Workspace: true, WorkspaceOutside: true}, outside); !mismatch(err, "the workspaces on this system are") {
+	} else if _, err := locateWorkspaceTest(&Selection{WorkspaceOutside: true}, outside); !mismatch(err, "the workspaces on this system are") {
 		t.Error("version mismatch not explained outside every root:", err)
 	}
 
@@ -283,21 +283,21 @@ func TestWorkspaceVersionMismatch(t *testing.T) {
 	var lock sync.Mutex
 	var accepted []string
 	registerTest(t, &Endpoint{Session: "sync_outside", Root: outside}, "outside", &accepted, &lock)
-	if _, err := locateWorkspaceTest(&Selection{Workspace: true, WorkspaceOutside: true}, nested); !mismatch(err, "a workspace containing this directory is") {
+	if _, err := locateWorkspaceTest(&Selection{WorkspaceOutside: true}, nested); !mismatch(err, "a workspace containing this directory is") {
 		t.Error("workspace outside every root masked another version's workspace:", err)
 	}
 	registerTest(t, &Endpoint{Session: "sync_enclosing", Root: base}, "enclosing", &accepted, &lock)
-	if _, err := locateWorkspaceTest(&Selection{Workspace: true}, nested); !mismatch(err, "a more specific workspace containing this directory is") {
+	if _, err := locateWorkspaceTest(&Selection{}, nested); !mismatch(err, "a more specific workspace containing this directory is") {
 		t.Error("enclosing workspace masked another version's workspace:", err)
 	}
 	registerTest(t, &Endpoint{Session: "sync_same", Root: root}, "same", &accepted, &lock)
-	if _, err := locateWorkspaceTest(&Selection{Workspace: true}, nested); !mismatch(err, "another workspace with the same root is") {
+	if _, err := locateWorkspaceTest(&Selection{}, nested); !mismatch(err, "another workspace with the same root is") {
 		t.Error("equally specific workspace masked another version's workspace:", err)
 	}
 
 	// Workspaces of this version that are more specific are used.
 	registerTest(t, &Endpoint{Session: "sync_nested", Root: nested}, "nested", &accepted, &lock)
-	if target, err := locateWorkspaceTest(&Selection{Workspace: true}, nested); err != nil || target.Session != "sync_nested" {
+	if target, err := locateWorkspaceTest(&Selection{}, nested); err != nil || target.Session != "sync_nested" {
 		t.Errorf("more specific workspace not used: %+v, %v", target, err)
 	}
 
@@ -309,7 +309,7 @@ func TestWorkspaceVersionMismatch(t *testing.T) {
 	} else if err := os.WriteFile(filepath.Join(registry, "stale"+recordExtension), data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if target, err := locateWorkspaceTest(&Selection{Workspace: true}, nested); err != nil || target.Session != "sync_nested" {
+	if target, err := locateWorkspaceTest(&Selection{}, nested); err != nil || target.Session != "sync_nested" {
 		t.Errorf("stale registration by another version blocked selection: %+v, %v", target, err)
 	} else if registered(t, registry, "sync_stale") {
 		t.Error("stale registration by another version not pruned")
@@ -328,7 +328,7 @@ func TestWorkspaceDeadNestedRegistration(t *testing.T) {
 	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"inner"}}
 	registerTest(t, &Endpoint{Session: "sync_outer", Star: "project", Node: "a", Root: outer, Alpha: true, Ignores: ignores}, "outer", &accepted, &lock)
 	nested := registerTest(t, &Endpoint{Session: "sync_inner", Star: "nested", Node: "b", Root: inner}, "inner", &accepted, &lock)
-	if target, err := locateWorkspaceTest(&Selection{Workspace: true}, directory); err != nil || target.Session != "sync_inner" || target.SourceNode != "b" {
+	if target, err := locateWorkspaceTest(&Selection{}, directory); err != nil || target.Session != "sync_inner" || target.SourceNode != "b" {
 		t.Fatalf("incorrect nested selection: %+v, %v", target, err)
 	}
 
@@ -339,7 +339,7 @@ func TestWorkspaceDeadNestedRegistration(t *testing.T) {
 	nested.listener.(*registeredListener).Listener.Close()
 	<-nested.done
 	for attempt := 0; attempt < 2; attempt++ {
-		if target, err := locateWorkspaceTest(&Selection{Workspace: true}, directory); err != nil ||
+		if target, err := locateWorkspaceTest(&Selection{}, directory); err != nil ||
 			target.Session != "sync_outer" || target.SourceNode != "a" || target.Path != "inner/x" {
 			t.Fatalf("enclosing workspace not located (attempt %d): %+v, %v", attempt, target, err)
 		}
@@ -350,10 +350,10 @@ func TestWorkspaceDeadNestedRegistration(t *testing.T) {
 
 	// Operations corresponding to the directory are still refused through the
 	// enclosing workspace, whose ignores exclude the nested workspace's root.
-	if _, err := dialTest(&Selection{Workspace: true, Corresponding: true}, directory); err == nil ||
+	if _, err := dialTest(&Selection{Corresponding: true}, directory); err == nil ||
 		!strings.Contains(err.Error(), "inner/x is inside inner, which session") {
 		t.Error("corresponding operation submitted through an ignoring workspace:", err)
-	} else if target, err := dialTest(&Selection{Workspace: true, Corresponding: true}, filepath.Join(outer, "y")); err != nil || target.Path != "y" {
+	} else if target, err := dialTest(&Selection{Corresponding: true}, filepath.Join(outer, "y")); err != nil || target.Path != "y" {
 		t.Errorf("synchronized directory refused: %+v, %v", target, err)
 	}
 }

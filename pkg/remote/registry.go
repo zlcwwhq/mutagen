@@ -399,17 +399,16 @@ type Target struct {
 const SessionVariable = "MUTAGEN_REMOTE_SESSION"
 
 // Selection determines the session, and the endpoint of that session, through
-// which Dial submits an operation from a directory.
+// which Dial submits an operation from a directory. Unless Target pins it, the
+// source workspace is selected by node rather than by session: the most
+// specific live workspace containing the directory, which may be registered by
+// several endpoints only if they identify the same node of the same star, as
+// the edges at its center do (see locateWorkspace). Neither creation order nor
+// session names choose among distinct workspaces. Among the registrations of
+// one star node, the one whose peer is Node is used, if any, since the daemon
+// only accepts operations that cross the edge through which they were
+// submitted.
 type Selection struct {
-	// Workspace selects the source workspace by node rather than by session:
-	// the most specific live workspace containing the directory, which may be
-	// registered by several endpoints only if they identify the same node of
-	// the same star, as the edges at its center do (see locateWorkspace). Neither
-	// creation order nor session names choose among distinct workspaces. Among
-	// the registrations of one star node, the one whose peer is Node is used,
-	// if any, since the daemon only accepts operations that cross the edge
-	// through which they were submitted. It's ignored if Target is non-nil.
-	Workspace bool
 	// WorkspaceOutside allows a workspace selection from a directory outside
 	// all live workspaces, such as for an explicit node selection, in which
 	// case the only live workspace on this system is used, and its root
@@ -440,7 +439,7 @@ type Selection struct {
 	// reach different sessions as sessions connect and disconnect in between.
 	// Dial then fails if that registration is no longer live, rather than
 	// selecting another, even another registration of the same star node,
-	// and Workspace is ignored; Corresponding still validates the first
+	// and WorkspaceOutside is ignored; Corresponding still validates the first
 	// submission.
 	Target *Target
 }
@@ -503,10 +502,10 @@ func versions(candidates []*candidate) []string {
 // mismatchedVersions explains that the endpoints that a submission would
 // otherwise have been made through, which the specified candidates registered
 // by other versions of Mutagen describe, can't be used by this version, with
-// the specified subject (such as "matching sessions are"). Running the remote
-// executable of another version, such as an outdated one that's still on the
-// PATH after an upgrade, is the most common cause of failing to locate an
-// endpoint, so the wording ("registered by Mutagen X, but this is Mutagen Y")
+// the specified subject (such as "the workspaces on this system are"). Running
+// the remote executable of another version, such as an outdated one that's
+// still on the PATH after an upgrade, is the most common cause of failing to
+// locate an endpoint, so the wording ("registered by Mutagen X, but this is Mutagen Y")
 // is relied on by troubleshooting documentation and should be kept.
 func mismatchedVersions(subject string, candidates []*candidate) error {
 	return ConnectionError(fmt.Errorf("%s registered by Mutagen %s, but this is Mutagen %s; use the remote executable installed with that version",
@@ -598,9 +597,9 @@ func locate(ctx context.Context, candidates []*candidate) ([]liveEndpoint, error
 }
 
 // precedes orders candidates whose roots contain the submission directory
-// equally specifically: the session created first is preferred, with ties
-// broken by identifier, so that the preference doesn't change as sessions
-// reconnect or more sessions are created.
+// equally specifically: the session created first comes first, with ties
+// broken by identifier, so that the order in which they're described doesn't
+// change as sessions reconnect or more sessions are created.
 func precedes(a, b *candidate) bool {
 	if !a.SessionCreated.Equal(b.SessionCreated) {
 		return a.SessionCreated.Before(b.SessionCreated)
@@ -610,7 +609,7 @@ func precedes(a, b *candidate) bool {
 
 // synchronizingSessions returns one live registration for each session among
 // candidates whose roots contain the submission directory, most specific
-// first, and then in the order of preference (see precedes). Dead
+// first, and then in a stable order (see precedes). Dead
 // registrations are pruned, while registrations whose liveness can't be
 // determined are assumed to be live. Registrations are only probed for
 // liveness, without a version handshake, so registrations by other versions of
@@ -715,15 +714,12 @@ func excludedError(c *candidate, session, excluded string) error {
 }
 
 // relate loads the registrations and relates each one to the specified
-// directory, returning the directory with symbolic links resolved and the
-// candidates registered by this version of Mutagen and by other versions.
-// Registrations by other versions can't be used, but they can still indicate
-// that the directory is synchronized, and they're mentioned if no route is
-// found.
-func relate(directory string) (string, []*candidate, []*candidate, error) {
-	directory = resolveSymbolicLinks(directory)
-	compatible, incompatible, err := relateResolved(registryDirectoryName, directory)
-	return directory, compatible, incompatible, err
+// directory, with symbolic links resolved, returning the candidates registered
+// by this version of Mutagen and by other versions. Registrations by other
+// versions can't be used, but they can still indicate that the directory is
+// synchronized, and they're mentioned if no route is found.
+func relate(directory string) ([]*candidate, []*candidate, error) {
+	return relateResolved(registryDirectoryName, resolveSymbolicLinks(directory))
 }
 
 // relateResolved relates the registrations in the registry with the specified
@@ -775,13 +771,13 @@ func (s *Selection) Dial(ctx context.Context, directory string, operation Operat
 // Submit is Dial with the specified submission header, which can request more
 // than the operation (see Submission).
 func (s *Selection) Submit(ctx context.Context, directory string, header *Submission) (net.Conn, *Target, error) {
-	directory, compatible, incompatible, err := relate(directory)
+	compatible, incompatible, err := relate(directory)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// Locate the endpoint.
-	endpoint, err := s.locate(ctx, directory, compatible, incompatible)
+	endpoint, err := s.locate(ctx, compatible, incompatible)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -904,11 +900,11 @@ func (c *candidate) target() *Target {
 // ignores that exclude the directory don't prevent it from being located (see
 // Selection.Corresponding).
 func (s *Selection) Locate(ctx context.Context, directory string) (*Target, error) {
-	directory, compatible, incompatible, err := relate(directory)
+	compatible, incompatible, err := relate(directory)
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := s.locate(ctx, directory, compatible, incompatible)
+	endpoint, err := s.locate(ctx, compatible, incompatible)
 	if err != nil {
 		return nil, err
 	}
@@ -990,8 +986,8 @@ func Synchronizing(ctx context.Context, path string, directory bool) ([]string, 
 	return result, nil
 }
 
-// locateWorkspace selects the source workspace for a workspace selection (see
-// Selection.Workspace), given the registrations related to the submission
+// locateWorkspace selects the source workspace for a selection that no target
+// pins (see Selection), given the registrations related to the submission
 // directory that are compatible with this version of Mutagen and those that
 // aren't. The most specific live workspace containing the directory is used,
 // or, if outside is true and no live workspace contains it, the only live
@@ -1106,10 +1102,10 @@ func locateWorkspace(ctx context.Context, compatible, incompatible []*candidate,
 	return &chosen, nil
 }
 
-// locate connects to the endpoint through which to submit an operation from the
-// specified directory, given the registrations related to it that are
-// compatible with this version of Mutagen and those that aren't.
-func (s *Selection) locate(ctx context.Context, directory string, compatible, incompatible []*candidate) (*liveEndpoint, error) {
+// locate connects to the endpoint through which to submit an operation from a
+// directory, given the registrations related to it that are compatible with
+// this version of Mutagen and those that aren't.
+func (s *Selection) locate(ctx context.Context, compatible, incompatible []*candidate) (*liveEndpoint, error) {
 	// A pinned selection only considers the source registration that it
 	// identifies, which may have reconnected in the meantime, and fails rather
 	// than falling back to another endpoint, including another registration
@@ -1141,32 +1137,6 @@ func (s *Selection) locate(ctx context.Context, directory string, compatible, in
 		return &live[0], nil
 	}
 
-	// A workspace selection is resolved by node (see locateWorkspace).
-	if s.Workspace {
-		return locateWorkspace(ctx, compatible, incompatible, s.WorkspaceOutside, s.Node)
-	}
-
-	// Otherwise, the most specific containing root is used, and among equally
-	// specific roots, the preferred session (see precedes).
-	live, err := locate(ctx, filter(compatible, containing))
-	if err != nil {
-		return nil, err
-	} else if len(live) == 0 {
-		if mismatched := filter(incompatible, containing); len(mismatched) > 0 {
-			return nil, mismatchedVersions("matching sessions are", mismatched)
-		}
-		return nil, ConnectionError(fmt.Errorf("no connected session with remote commands enabled contains %s", directory))
-	}
-	best := 0
-	for l := range live {
-		if precedes(live[l].candidate, live[best].candidate) {
-			best = l
-		}
-	}
-	for l := range live {
-		if l != best {
-			live[l].connection.Close()
-		}
-	}
-	return &live[best], nil
+	// Otherwise, the workspace is selected by node (see locateWorkspace).
+	return locateWorkspace(ctx, compatible, incompatible, s.WorkspaceOutside, s.Node)
 }
