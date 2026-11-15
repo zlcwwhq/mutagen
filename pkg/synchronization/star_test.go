@@ -389,7 +389,7 @@ func TestStarNodes(t *testing.T) {
 	}
 	if graph, err := stars.nodes(relays["gpu"], 0); err != nil {
 		t.Fatal(err)
-	} else if node := starTestNode(t, graph, "server"); node.Available || node.Reason != centerUnavailableReason {
+	} else if node := starTestNode(t, graph, "server"); node.Available || node.Reason != errCenterUnavailable.Error() {
 		t.Fatalf("node whose edge is disconnected at the center misreported: %+v", node)
 	} else if node := starTestNode(t, graph, "gpu"); !node.Available {
 		t.Fatalf("other node affected by a disconnected edge: %+v", node)
@@ -415,10 +415,10 @@ func TestStarNodes(t *testing.T) {
 // it are refused as operation errors.
 func TestStarNodesExecution(t *testing.T) {
 	disabled := func(node remote.Node) bool {
-		return !node.Available && node.Reason == executionDisabledReason
+		return !node.Available && node.Reason == errExecutionDisabled.Error()
 	}
 	refused := func(err error) bool {
-		return err != nil && remote.ClassifyError(err) == remote.ErrorKindOperation && strings.Contains(err.Error(), executionDisabledReason)
+		return err != nil && remote.ClassifyError(err) == remote.ErrorKindOperation && strings.Contains(err.Error(), errExecutionDisabled.Error())
 	}
 
 	// A star edge on which only the center executes commands.
