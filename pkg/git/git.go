@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -440,7 +442,19 @@ func NetworkRun(ctx context.Context, directory string, args ...string) (string, 
 	return run(NetworkCommand(ctx, directory, args...))
 }
 
-// run implements Run and NetworkRun.
+// RunWithIndex is like Run, but the command uses the specified file as the
+// index in place of the repository's own (via GIT_INDEX_FILE, which Command
+// otherwise removes from the environment). A relative path is relative to the
+// directory.
+func RunWithIndex(ctx context.Context, directory, index string, args ...string) (string, error) {
+	command := Command(ctx, directory, args...)
+	if command.Env != nil {
+		command.Env = append(command.Env, "GIT_INDEX_FILE="+index)
+	}
+	return run(command)
+}
+
+// run implements Run, NetworkRun, and RunWithIndex.
 func run(command *exec.Cmd) (string, error) {
 	var stdout bytes.Buffer
 	stderr := NewOutputRecorder()
@@ -632,29 +646,10 @@ func Probe(ctx context.Context, directory string) (*Repository, error) {
 		return nil, err
 	}
 
-	// Read the URL and the line ending settings. We look at the configuration,
-	// rather than asking Git for the remote's URL, because the latter would
-	// apply this system's insteadOf rewrites, while the other endpoint should
-	// apply its own. If no setting is found, then the exit code is one. Each
-	// entry consists of the name, a newline, and the value (which is omitted,
-	// along with the newline, for a boolean setting without a value), followed
-	// by a null byte. The last value of a setting is the one that applies,
-	// except for remote.origin.url, which can have several values: Git
-	// fetches from the first, and the others are only used for pushing.
-	output, err = Run(ctx, directory, "config", "-z", "--get-regexp", probeSettings)
-	if err != nil && !ExitedWith(err, 1) {
+	// Read the URL and the line ending settings.
+	settings, err := readProbeSettings(ctx, directory)
+	if err != nil {
 		return nil, probeError(ctx, directory, err)
-	}
-	settings := make(map[string]string)
-	for _, entry := range strings.Split(output, "\x00") {
-		if name, value, ok := strings.Cut(entry, "\n"); ok {
-			if _, ok := settings[name]; ok && name == "remote.origin.url" {
-				continue
-			}
-			settings[name] = value
-		} else if entry != "" {
-			settings[entry] = "true"
-		}
 	}
 
 	// Without an origin there's nothing to fetch from, so it can't be a
@@ -678,6 +673,191 @@ func Probe(ctx context.Context, directory string) (*Repository, error) {
 		repository.EOL = value
 	}
 	return repository, nil
+}
+
+// readProbeSettings reads the settings that probeSettings matches from the
+// configuration of the repository in a directory, keyed by their names. We
+// look at the configuration, rather than asking Git for the origin's URL,
+// because the latter would apply this system's insteadOf rewrites, while the
+// other endpoint should apply its own. If no setting is found, then the exit
+// code is one. Each entry consists of the name, a newline, and the value (which
+// is omitted, along with the newline, for a boolean setting without a value),
+// followed by a null byte. The last value of a setting is the one that applies,
+// except for remote.origin.url, which can have several values: Git fetches
+// from the first, and the others are only used for pushing.
+func readProbeSettings(ctx context.Context, directory string) (map[string]string, error) {
+	output, err := Run(ctx, directory, "config", "-z", "--get-regexp", probeSettings)
+	if err != nil && !ExitedWith(err, 1) {
+		return nil, err
+	}
+	settings := make(map[string]string)
+	for _, entry := range strings.Split(output, "\x00") {
+		if name, value, ok := strings.Cut(entry, "\n"); ok {
+			if _, ok := settings[name]; ok && name == "remote.origin.url" {
+				continue
+			}
+			settings[name] = value
+		} else if entry != "" {
+			settings[entry] = "true"
+		}
+	}
+	return settings, nil
+}
+
+// RootRepository describes the repository at a synchronization root, as
+// examined by ProbeRoot.
+type RootRepository struct {
+	// Commit is the commit that HEAD identifies, in its raw form, or empty if
+	// HEAD is unborn (i.e. if the repository has no commits yet).
+	Commit []byte
+	// Branch is the short name of the branch (beneath refs/heads/) that HEAD
+	// refers to, or empty if HEAD is detached. HEAD can refer to something
+	// other than a branch, but only Git's plumbing can do that, and Git treats
+	// such a HEAD as detached, as we do.
+	Branch string
+	// URL is the URL of the repository's origin, without credentials, or empty
+	// if it doesn't have one, or if it can't be used elsewhere (see UsableURL).
+	URL string
+	// AutoCRLF is the value of the core.autocrlf setting that applies to the
+	// repository, or empty if it's unset or unusable (see UsableSetting).
+	AutoCRLF string
+	// EOL is the value of the core.eol setting, in the same way.
+	EOL string
+}
+
+// ProbeRoot examines the repository at a synchronization root, for a session
+// in Git mode, which keeps the commits and branches that the repositories at
+// both endpoints have checked out the same. If the directory doesn't have a
+// .git entry, then the result is nil. An error means that the directory has a
+// .git entry, but that its repository can't be examined or used, and its
+// message tells the user what to do about it. Unlike a nested repository (see
+// Probe), the repository doesn't need an origin, or even a commit.
+func ProbeRoot(ctx context.Context, directory string) (*RootRepository, error) {
+	// Check for a .git entry, which is the common case for an endpoint that
+	// only receives content, without involving Git. A root that's a file has
+	// no repository either.
+	if _, err := os.Lstat(filepath.Join(directory, ".git")); err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("unable to look for a .git entry at the root: %w", err)
+	}
+
+	// Bound the duration of the commands.
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	// Determine whether this is a usable repository whose working tree is at
+	// this directory, as Probe does.
+	output, err := Run(ctx, directory, "rev-parse", "--is-inside-work-tree", "--show-prefix")
+	if err != nil {
+		return nil, probeRootError(ctx, directory, err)
+	} else if output != "true" {
+		return nil, errors.New("the .git entry at the root is for a repository whose working tree isn't the root; fix it, or move it aside to have the other endpoint's repository attached in its place")
+	}
+
+	// Determine what HEAD identifies. If it doesn't resolve to a commit, then
+	// that's expected if it refers to a branch that doesn't exist yet, i.e. if
+	// there aren't any commits on it, but otherwise, it refers to a commit that
+	// the repository doesn't have. Only the former is checked for separately,
+	// since it's rare.
+	commit, branch, err := Head(ctx, directory)
+	if err != nil {
+		return nil, probeRootError(ctx, directory, err)
+	} else if commit == nil {
+		if branch == "" {
+			return nil, errors.New("the repository at the root is damaged: HEAD doesn't identify a commit that it has; repair it")
+		} else if _, err := Run(ctx, directory, "rev-parse", "--verify", "--quiet", "HEAD"); err == nil {
+			return nil, fmt.Errorf("the repository at the root is damaged: branch %s doesn't identify a commit that it has; repair it", branch)
+		} else if !ExitedWith(err, 1) {
+			return nil, probeRootError(ctx, directory, err)
+		}
+	}
+
+	// Read the URL and the line ending settings. Settings that can't be used
+	// elsewhere are left out, which means that the other endpoint uses its
+	// own.
+	settings, err := readProbeSettings(ctx, directory)
+	if err != nil {
+		return nil, probeRootError(ctx, directory, err)
+	}
+	repository := &RootRepository{Commit: commit, Branch: branch}
+	if url := settings["remote.origin.url"]; url != "" {
+		if usable, err := UsableURL(url); err == nil {
+			repository.URL = usable
+		}
+	}
+	if value := settings["core.autocrlf"]; UsableSetting(value) {
+		repository.AutoCRLF = value
+	}
+	if value := settings["core.eol"]; UsableSetting(value) {
+		repository.EOL = value
+	}
+
+	// Success.
+	return repository, nil
+}
+
+// Head determines what HEAD identifies in the repository in a directory: the
+// commit, in its raw form, and the short name of the branch (beneath
+// refs/heads/) that HEAD refers to. The commit is nil if HEAD doesn't resolve
+// to a commit, such as if it refers to a branch that doesn't exist yet, and the
+// branch is empty if HEAD is detached (see RootRepository). It runs two
+// commands, and any error is a *CommandError.
+func Head(ctx context.Context, directory string) ([]byte, string, error) {
+	// Determine the branch that HEAD refers to. Git answers with an exit code
+	// of one if HEAD is detached.
+	var branch string
+	output, err := Run(ctx, directory, "symbolic-ref", "--quiet", "HEAD")
+	if err == nil {
+		if name, ok := strings.CutPrefix(output, "refs/heads/"); ok {
+			branch = name
+		}
+	} else if !ExitedWith(err, 1) {
+		return nil, "", err
+	}
+
+	// Determine the commit. Failure with an exit code of one (which is how
+	// --verify --quiet reports a failure) means that HEAD doesn't resolve to a
+	// commit.
+	output, err = Run(ctx, directory, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+	if ExitedWith(err, 1) {
+		return nil, branch, nil
+	} else if err != nil {
+		return nil, "", err
+	}
+	commit, err := CommitFromOutput(output)
+	if err != nil {
+		return nil, "", &CommandError{Err: err}
+	}
+	return commit, branch, nil
+}
+
+// probeRootError converts the failure of a command run by ProbeRoot to an
+// error whose message tells the user what to do, as probeError does for Probe.
+func probeRootError(ctx context.Context, directory string, err error) error {
+	// Handle the case where we've been unable to get an answer.
+	if ctx.Err() != nil {
+		return fmt.Errorf("unable to examine the repository at the root: %w", ctx.Err())
+	}
+
+	// Handle the case where Git isn't available.
+	if errors.Is(err, exec.ErrNotFound) {
+		return errors.New("the root has a .git entry, but git isn't installed on this system, and it's required to keep HEAD at the other endpoint's commit; install it")
+	}
+
+	// Look for the failures that we know about.
+	message := err.Error()
+	if strings.Contains(message, "dubious ownership") {
+		return fmt.Errorf("Git refuses to use the repository at the root, because it's owned by someone else; if you trust it, run: git config --global --add safe.directory %s", directory)
+	} else if strings.Contains(message, "unknown option") {
+		return fmt.Errorf("the version of Git on this system is too old to keep HEAD at the other endpoint's commit, which requires Git 2.29 or later: %s", message)
+	}
+
+	// Otherwise, Git can't use the repository. Its commits and branches may
+	// exist nowhere else, so the advice is to move it aside rather than to
+	// remove it.
+	return fmt.Errorf("the .git entry at the root isn't a valid repository (%s); repair it, or move it aside to have the other endpoint's repository attached in its place", message)
 }
 
 // maximumSettingLength is the maximum length of a setting's value that

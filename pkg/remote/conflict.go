@@ -115,6 +115,9 @@ type Listing struct {
 	// paths that are no longer conflict roots, such as those of unfinished
 	// resolutions.
 	Checkouts []Checkout
+	// Repository is the conflict between the repositories at the endpoints'
+	// roots in Git mode, if any, which remote can't resolve.
+	Repository *RepositoryConflict
 }
 
 // conflictsMessage is a message of a conflict listing, which consists of one
@@ -135,6 +138,9 @@ type conflictsMessage struct {
 	Checkout *Checkout `json:",omitempty"`
 	// Done indicates the end of a complete listing.
 	Done bool `json:",omitempty"`
+	// Repository is the listing's repository conflict, if any, which is sent
+	// with Done, so that clients that predate it ignore it.
+	Repository *RepositoryConflict `json:",omitempty"`
 	// Progress is set, and nothing else, by progress messages.
 	Progress *Progress `json:",omitempty"`
 }
@@ -171,7 +177,7 @@ func RespondWithConflicts(connection io.ReadWriteCloser, listing *Listing, err e
 			return err
 		}
 	}
-	if err := writeMessage(writer, &conflictsMessage{Done: true}); err != nil {
+	if err := writeMessage(writer, &conflictsMessage{Done: true, Repository: listing.Repository}); err != nil {
 		return err
 	}
 	return writer.Flush()
@@ -204,6 +210,7 @@ func ListConflictsWithProgress(ctx context.Context, connection io.ReadWriteClose
 		} else if message.Error != "" {
 			return nil, receivedError(message.ErrorKind, errors.New(message.Error))
 		} else if message.Done {
+			listing.Repository = message.Repository
 			return listing, nil
 		} else if message.Conflict != nil {
 			listing.Conflicts = append(listing.Conflicts, *message.Conflict)

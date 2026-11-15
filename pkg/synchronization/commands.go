@@ -479,10 +479,11 @@ func (c *controller) remoteReport() *remote.Report {
 		{false, core.CopyProblems(c.state.BetaState.ScanProblems), maximumListScanProblems},
 		{false, core.CopyProblems(c.state.BetaState.TransitionProblems), maximumListTransitionProblems},
 	}
+	repositoryConflict := c.state.RepositoryConflict
 	c.stateLock.UnlockWithoutNotify()
 
 	// Convert conflicts.
-	report := &remote.Report{}
+	report := &remote.Report{Repository: c.remoteRepositoryConflict(repositoryConflict)}
 	core.SortConflicts(conflicts)
 	if len(conflicts) > maximumListConflicts {
 		report.ExcludedConflicts = uint64(len(conflicts) - maximumListConflicts)
@@ -534,9 +535,13 @@ func (c *controller) remoteConflicts(algorithm string) (*remote.Listing, error) 
 		{false, c.state.BetaState.ScanProblems},
 		{false, c.state.BetaState.TransitionProblems},
 	}
+	repositoryConflict := c.state.RepositoryConflict
 	c.stateLock.UnlockWithoutNotify()
 	core.SortConflicts(conflicts)
-	listing := &remote.Listing{Conflicts: make([]remote.ConflictRoot, len(conflicts))}
+	listing := &remote.Listing{
+		Conflicts:  make([]remote.ConflictRoot, len(conflicts)),
+		Repository: c.remoteRepositoryConflict(repositoryConflict),
+	}
 	for c, conflict := range conflicts {
 		listing.Conflicts[c] = resolution(conflict, algorithm)
 	}
@@ -556,6 +561,32 @@ func (c *controller) remoteConflicts(algorithm string) (*remote.Listing, error) 
 	}
 	listing.Checkouts = checkouts
 	return listing, nil
+}
+
+// remoteRepositoryConflict converts a repository conflict, which is immutable,
+// for remote reports and listings.
+func (c *controller) remoteRepositoryConflict(conflict *core.RepositoryConflict) *remote.RepositoryConflict {
+	if conflict == nil {
+		return nil
+	}
+	repository := func(repository *core.Repository) remote.Repository {
+		return remote.Repository{Commit: fmt.Sprintf("%x", repository.Commit), Branch: repository.Branch}
+	}
+	mode := c.session.Configuration.SynchronizationMode
+	if mode.IsDefault() {
+		mode = c.session.Version.DefaultSynchronizationMode()
+	}
+	result := &remote.RepositoryConflict{
+		Alpha: repository(conflict.Alpha),
+		Beta:  repository(conflict.Beta),
+		OneWay: mode == core.SynchronizationMode_SynchronizationModeOneWaySafe ||
+			mode == core.SynchronizationMode_SynchronizationModeOneWayReplica,
+	}
+	if conflict.Ancestor != nil {
+		ancestor := repository(conflict.Ancestor)
+		result.Ancestor = &ancestor
+	}
+	return result
 }
 
 // resolution determines how remote can resolve a conflict in a safe

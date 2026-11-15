@@ -4,7 +4,9 @@ Git mode makes a session follow the conventions of Git working trees:
 
 - `.gitignore` files decide what's synchronized, so `ignore.paths` no longer
   needs to repeat them.
-- `.git` entries are never synchronized.
+- `.git` entries are never synchronized as files.
+- Every endpoint has the root repository at the same commit and branch, so Git
+  works on all of them.
 - Submodules have their files synchronized, and the other endpoint follows the
   commit that they have checked out.
 
@@ -16,6 +18,7 @@ It's disabled by default.
 - [Enabling Git mode](#enabling-git-mode)
 - [Ignores](#ignores)
 - [Changing rules](#changing-rules)
+- [Root repository](#root-repository)
 - [Submodules](#submodules)
 - [Nested repositories](#nested-repositories)
 - [Warnings](#warnings)
@@ -72,8 +75,8 @@ Rules always match case-sensitively, so that both endpoints agree.
 
 Each endpoint reads the rule files in its own copy of the tree, anew at each
 scan, so changes apply at the next scan. `.git/info/exclude` is inside `.git`,
-which is never synchronized, so it only applies on endpoints that have the
-repository. Put ignores that both endpoints should share in `.gitignore`.
+which is never synchronized, so it only applies on the endpoint where it's
+written. Put ignores that both endpoints should share in `.gitignore`.
 
 **`ignore.paths` takes precedence.** A pattern such as `!.env` synchronizes a
 file that a rule ignores, and a rule can't unignore what a pattern ignores.
@@ -81,8 +84,9 @@ file that a rule ignores, and a rule can't unignore what a pattern ignores.
 **`.git` is never synchronized.** Entries named `.git` (files, as used by
 submodules and worktrees, as well as directories) can't be unignored, and
 neither can names that Windows or macOS treat as `.git`, such as `.git.` and
-`git~1`, which Git refuses to track. A submodule's commit is synchronized
-instead; see [Submodules](#submodules).
+`git~1`, which Git refuses to track. The root repository's commit and branch
+are synchronized instead, and so is a submodule's commit; see
+[Root repository](#root-repository) and [Submodules](#submodules).
 
 **Tracked files that rules ignore** aren't synchronized either. The endpoint
 that has the repository reports a problem that suggests the `ignore.paths`
@@ -134,6 +138,80 @@ elsewhere is still removed.
 the problem, and nothing else synchronizes until it's fixed. If a rule file
 can't be read, the session reports the problem and doesn't synchronize its
 directory until it's fixed.
+
+
+## Root repository
+
+The working tree of the repository at the synchronization root is synchronized
+like any other content, and every endpoint has the repository at the same
+commit and branch, so `git status`, `git log`, `git diff`, and `git commit` work
+on all of them. Only `HEAD` is kept the same: its commit and the branch that it
+names. Other branches, tags, the index, stashes, hooks, and configuration stay
+on each endpoint.
+
+**An endpoint without `.git` at its root gets one,** with the other endpoint's
+commit and its history, checked out on the same branch (or detached), and the
+other endpoint's `origin` URL (without credentials) and `core.autocrlf` and
+`core.eol` settings. Its files are left as they are, so `git status` shows the
+same changes as on the other endpoint. In one-way modes, only beta gets one.
+
+**Commits follow.** When one endpoint commits, amends, resets, or checks out
+another branch or commit, the other moves its `HEAD` and branch to the same
+commit without touching any file; the files arrive like any other changes.
+Mutagen copies commits that the other endpoint doesn't have, so they don't need
+to be pushed, and the repository doesn't need an `origin`.
+
+- Staged changes on the following endpoint stay staged where Git can keep them,
+  and otherwise become unstaged, with a warning.
+- Following never runs hooks or writes `ORIG_HEAD`. The reflog records it as
+  `mutagen: follow`.
+- Another branch is created on the following endpoint, or fast-forwarded. If
+  that endpoint has a branch of the same name with commits that the target
+  doesn't contain, or has it checked out in another worktree, its `HEAD` stays,
+  and the problem names the branch: rename or delete it there.
+- While a Git operation is in progress on either endpoint (a rebase, a merge, a
+  cherry-pick, or a commit whose message is being edited), or another Git
+  command holds the index of the endpoint that would follow, `HEAD` stays, with
+  a warning, and follows once that's over. So the other endpoint doesn't follow
+  each step of a rebase.
+
+### Diverging commits
+
+If both endpoints move `HEAD` on the same branch before either follows the
+other, the endpoint whose commit contains the other's wins, and the other
+fast-forwards. If neither contains the other, or if they moved to different
+branches, `two-way-safe` sessions report a conflict, which
+`mutagen sync list` and `remote --conflicts` show with both commits and
+branches. Files are still synchronized, but neither `HEAD` moves until both
+agree. Each endpoint has the other's commit by then, so resolve it on one of
+them:
+
+```sh
+git reset <the other endpoint's commit>   # keeps every file as it is
+git commit                                # commit what's left, again
+```
+
+`remote --conflicts` prints these commands with the commit filled in, preceded
+by a `git switch` to the other endpoint's branch if the branches differ.
+
+- `two-way-resolved` sessions follow alpha's commit.
+- `one-way-safe` sessions report a conflict if beta has commits that alpha
+  doesn't, and `one-way-replica` sessions move beta to alpha's commit.
+- If the endpoints have never agreed (a new session, or one created by an
+  earlier release), a commit that doesn't contain the other's is a conflict in
+  every mode, rather than overwritten.
+
+### Limits
+
+- Both endpoints need Git 2.29 or later, and the same object format (SHA-1 or
+  SHA-256).
+- Commits are copied only from complete repositories. A shallow clone (or a
+  partial one, missing objects) can follow the other endpoint but can't be
+  followed until it has the missing history, such as after
+  `git fetch --unshallow`.
+- The first copy to an endpoint without `.git` transfers the whole history.
+- Filters such as Git LFS's must be installed on both endpoints for `git status`
+  to agree.
 
 
 ## Submodules
@@ -281,6 +359,9 @@ system where it runs:
   `--pull` refuses, since it can't tell whether the session synchronizes the
   path.
 - Directories that rules ignore require an explicit `--cwd`.
+
+`remote --conflicts` also lists a disagreement between the root repositories
+(see [Diverging commits](#diverging-commits)).
 
 See [Remote commands](remote.md#ignored-paths).
 

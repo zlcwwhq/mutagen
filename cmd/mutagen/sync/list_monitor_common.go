@@ -301,6 +301,23 @@ func printConflicts(conflicts []*core.Conflict, excludedConflicts uint64) {
 	}
 }
 
+// formatRepository formats the commit and branch of a repository for display.
+func formatRepository(repository *core.Repository) string {
+	branch := "detached"
+	if repository.Branch != "" {
+		branch = terminal.NeutralizeControlCharacters(repository.Branch)
+	}
+	return fmt.Sprintf("%x (%s)", repository.Commit[:min(len(repository.Commit), 6)], branch)
+}
+
+// printRepositoryConflict prints a conflict between the repositories at the
+// endpoints' synchronization roots.
+func printRepositoryConflict(conflict *core.RepositoryConflict) {
+	color.Red("Repository conflict: alpha at %s, beta at %s\n",
+		formatRepository(conflict.Alpha), formatRepository(conflict.Beta),
+	)
+}
+
 // printSession prints the configuration and status of a synchronization
 // session and its endpoints.
 func printSession(state *synchronization.State, mode common.SessionDisplayMode) {
@@ -492,6 +509,11 @@ func printSession(state *synchronization.State, mode common.SessionDisplayMode) 
 		} else if mode == common.SessionDisplayModeListLong {
 			printConflicts(state.Conflicts, state.ExcludedConflicts)
 		}
+	}
+
+	// Print the repository conflict, if any.
+	if state.RepositoryConflict != nil {
+		printRepositoryConflict(state.RepositoryConflict)
 	}
 
 	// Print the last error, if any.

@@ -223,6 +223,14 @@ type endpoint struct {
 	// contents of files whose cached digests are racy. It's separate from
 	// hasher, which background scans use without coordinating with Transition.
 	transitionHasher hash.Hash
+	// repositoryReceiver is the receiver returned by the last call to
+	// StageRepository, if it hasn't been finished yet. Like stager, it's only
+	// used by the methods of Endpoint (and by Shutdown).
+	repositoryReceiver *repositoryReceiver
+	// repositoryProblem explains why the objects that the last call to
+	// StageRepository requested didn't arrive, if they didn't, for use by
+	// TransitionRepository.
+	repositoryProblem string
 }
 
 // NewEndpoint creates a new local endpoint instance using the specified session
@@ -652,6 +660,10 @@ func (e *endpoint) watchPoll(ctx context.Context, pollingInterval uint32, nonRec
 	// Track the previous snapshot.
 	previous := &core.Snapshot{}
 
+	// In Git mode, track what HEAD identified in the repository at the root at
+	// the time of the previous scan (see rootHeadFingerprint).
+	var previousHead string
+
 	// If non-recursive watching is available, then set up a non-recursive
 	// watcher (and ensure its termination). Since non-recursive watching is a
 	// best-effort basis to reduce latency, we don't try to re-establish this
@@ -814,6 +826,20 @@ func (e *endpoint) watchPoll(ctx context.Context, pollingInterval uint32, nonRec
 
 		// Check for modifications.
 		modified := !snapshot.Equal(previous)
+
+		// In Git mode, a commit or a change of branch in the repository at the
+		// root doesn't change anything that scans see, since the root's Git
+		// directory isn't scanned, but the session still has to propagate it,
+		// so we check whether what HEAD identifies has changed as well. This is
+		// subject to the same treatment of the first iteration as the scan.
+		if e.gitMode {
+			head := e.rootHeadFingerprint(ctx)
+			if head != previousHead {
+				logger.Debug("HEAD changed in the repository at the root")
+				modified = true
+			}
+			previousHead = head
+		}
 
 		// If we have a working non-recursive watcher, or we're performing trace
 		// logging, then perform a full diff to determine what's changed. This
@@ -1176,14 +1202,15 @@ func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, submodules map[strin
 	}
 
 	// In Git mode, process the records of submodule populations, describe the
-	// working trees of submodules that have moved to another commit, and
-	// attach warnings about the content of the snapshot. Doing this here means
-	// that it happens once per synchronization cycle and not for the watching
-	// Goroutines' scans. We've released the scan lock by this point so that
-	// running Git doesn't get in the way of the watching Goroutines. Since the
-	// snapshot may be the baseline of the next scan, and it's compared with
-	// previous snapshots by poll-based watching, it stays free of seeds,
-	// statuses, and warnings, and we only return a copy of it that has them.
+	// working trees of submodules that have moved to another commit, attach
+	// warnings about the content of the snapshot, and examine the repository
+	// at the root. Doing this here means that it happens once per
+	// synchronization cycle and not for the watching Goroutines' scans. We've
+	// released the scan lock by this point so that running Git doesn't get in
+	// the way of the watching Goroutines. Since the snapshot may be the
+	// baseline of the next scan, and it's compared with previous snapshots by
+	// poll-based watching, it stays free of seeds, statuses, warnings, and the
+	// repository, and we only return a copy of it that has them.
 	// The statuses have to be determined after the scan, so that a file that
 	// Git says is the commit's either was the commit's when it was scanned or
 	// has changed since, in which case transitions refuse to replace it.
@@ -1211,6 +1238,9 @@ func (e *endpoint) Scan(ctx context.Context, _ *core.Entry, submodules map[strin
 		}
 		if len(statuses) > 0 {
 			snapshot = snapshot.WithSubmoduleStatuses(statuses)
+		}
+		if repository := e.rootRepository(ctx); repository != nil {
+			snapshot = snapshot.WithRepository(repository)
 		}
 	}
 
@@ -1946,6 +1976,10 @@ func (e *endpoint) Shutdown() error {
 	if e.gitFetcherDone != nil {
 		<-e.gitFetcherDone
 	}
+
+	// Stop receiving objects for the repository at the root, if that's still
+	// in progress.
+	e.abandonRepositoryReceiver()
 
 	// Terminate the polling coalescer.
 	e.pollSignal.Terminate()

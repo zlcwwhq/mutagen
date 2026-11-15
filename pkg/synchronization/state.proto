@@ -8,6 +8,7 @@ import "synchronization/rsync/receive.proto";
 import "synchronization/session.proto";
 import "synchronization/core/conflict.proto";
 import "synchronization/core/problem.proto";
+import "synchronization/core/repository.proto";
 
 // Status encodes the status of a synchronization session.
 enum Status {
@@ -129,4 +130,8 @@ message State {
     EndpointState alphaState = 7;
     // BetaState encodes the state of the beta endpoint. It is always non-nil.
     EndpointState betaState = 8;
+    // RepositoryConflict is the disagreement between the repositories at the
+    // endpoints' synchronization roots in Git mode that reconciliation
+    // couldn't resolve, if any.
+    core.RepositoryConflict repositoryConflict = 9;
 }

@@ -189,6 +189,13 @@ func (s *State) EnsureValid() error {
 		return errors.New("excluded conflicts reported with no conflicts reported")
 	}
 
+	// Ensure that the repository conflict is valid, if there is one.
+	if s.RepositoryConflict != nil {
+		if err := s.RepositoryConflict.EnsureValid(); err != nil {
+			return fmt.Errorf("invalid repository conflict: %w", err)
+		}
+	}
+
 	// Ensure that endpoint states are valid.
 	if err := s.AlphaState.ensureValid(); err != nil {
 		return fmt.Errorf("invalid alpha endpoint state: %w", err)

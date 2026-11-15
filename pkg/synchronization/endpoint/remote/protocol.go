@@ -16,6 +16,10 @@ const (
 	// controlStreamCompressorBufferSize is the buffer size to use for
 	// compressor input and decompressor output.
 	controlStreamUncompressedBufferSize = 64 * 1024
+	// maximumRepositoryChunkSize is the maximum size of the data in a
+	// RepositoryChunk, which bounds the size of the messages that transmit
+	// packs.
+	maximumRepositoryChunkSize = 256 * 1024
 )
 
 // ensureValid ensures that the InitializeSynchronizationRequest's invariants
@@ -355,8 +359,160 @@ func (r *EndpointRequest) ensureValid() error {
 	if r.Transition != nil {
 		set++
 	}
+	if r.StageRepository != nil {
+		set++
+	}
+	if r.SupplyRepository != nil {
+		set++
+	}
+	if r.TransitionRepository != nil {
+		set++
+	}
 	if set != 1 {
 		return errors.New("invalid number of fields set")
+	}
+
+	// Success.
+	return nil
+}
+
+// validCommit determines whether or not a commit identifier has the length of
+// a SHA-1 or a SHA-256 commit identifier.
+func validCommit(commit []byte) bool {
+	return len(commit) == 20 || len(commit) == 32
+}
+
+// ensureValid ensures that StageRepositoryRequest's invariants are respected.
+func (r *StageRepositoryRequest) ensureValid() error {
+	// A nil repository staging request is not valid.
+	if r == nil {
+		return errors.New("nil repository staging request")
+	}
+
+	// Ensure that the action is valid.
+	if err := r.Action.EnsureValid(); err != nil {
+		return fmt.Errorf("invalid repository action: %w", err)
+	}
+
+	// Success.
+	return nil
+}
+
+// ensureValid ensures that StageRepositoryResponse's invariants are respected.
+func (r *StageRepositoryResponse) ensureValid() error {
+	// A nil repository staging response is not valid.
+	if r == nil {
+		return errors.New("nil repository staging response")
+	}
+
+	// Ensure that the commits are valid.
+	for _, commit := range r.Haves {
+		if !validCommit(commit) {
+			return errors.New("invalid commit")
+		}
+	}
+
+	// Ensure that nothing else is present if there's an error.
+	if r.Error != "" && (len(r.Haves) > 0 || r.Receive) {
+		return errors.New("commits or pack request present on error")
+	}
+
+	// Success.
+	return nil
+}
+
+// ensureValid ensures that SupplyRepositoryRequest's invariants are respected.
+func (r *SupplyRepositoryRequest) ensureValid() error {
+	// A nil repository supply request is not valid.
+	if r == nil {
+		return errors.New("nil repository supply request")
+	}
+
+	// Ensure that the commits are valid.
+	if !validCommit(r.Commit) {
+		return errors.New("invalid commit")
+	}
+	for _, commit := range r.Haves {
+		if !validCommit(commit) {
+			return errors.New("invalid commit")
+		}
+	}
+
+	// Success.
+	return nil
+}
+
+// ensureValid ensures that RepositoryChunk's invariants are respected.
+func (c *RepositoryChunk) ensureValid() error {
+	// A nil repository chunk is not valid.
+	if c == nil {
+		return errors.New("nil repository chunk")
+	}
+
+	// Ensure that the chunk either carries data or ends the pack, and that
+	// only the end of the pack carries a problem.
+	if len(c.Data) > maximumRepositoryChunkSize {
+		return errors.New("repository chunk too large")
+	} else if c.Done && len(c.Data) > 0 {
+		return errors.New("data present at end of pack")
+	} else if !c.Done && c.Problem != "" {
+		return errors.New("problem present before end of pack")
+	}
+
+	// Success.
+	return nil
+}
+
+// ensureValid ensures that SupplyRepositoryResponse's invariants are respected.
+func (r *SupplyRepositoryResponse) ensureValid() error {
+	// A nil repository supply response is not valid.
+	if r == nil {
+		return errors.New("nil repository supply response")
+	}
+
+	// Ensure that the problem, if any, is valid.
+	if r.Problem != nil {
+		if err := r.Problem.EnsureValid(); err != nil {
+			return fmt.Errorf("invalid problem: %w", err)
+		}
+	}
+
+	// Success.
+	return nil
+}
+
+// ensureValid ensures that TransitionRepositoryRequest's invariants are
+// respected.
+func (r *TransitionRepositoryRequest) ensureValid() error {
+	// A nil repository transition request is not valid.
+	if r == nil {
+		return errors.New("nil repository transition request")
+	}
+
+	// Ensure that the action is valid.
+	if err := r.Action.EnsureValid(); err != nil {
+		return fmt.Errorf("invalid repository action: %w", err)
+	}
+
+	// Success.
+	return nil
+}
+
+// ensureValid ensures that TransitionRepositoryResponse's invariants are
+// respected.
+func (r *TransitionRepositoryResponse) ensureValid() error {
+	// A nil repository transition response is not valid.
+	if r == nil {
+		return errors.New("nil repository transition response")
+	}
+
+	// Ensure that there's either a valid result or an error.
+	if r.Error != "" {
+		if r.Result != nil {
+			return errors.New("result present on error")
+		}
+	} else if err := r.Result.EnsureValid(); err != nil {
+		return fmt.Errorf("invalid repository result: %w", err)
 	}
 
 	// Success.

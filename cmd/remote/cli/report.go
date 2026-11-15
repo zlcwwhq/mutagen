@@ -123,6 +123,9 @@ func (r *reporter) print(report *remote.Report) {
 		heading = fmt.Sprintf("these conflicts aren't synchronized until resolved (see %s --diff and remote --help conflicts):", r.followUp)
 	}
 	r.section(heading, conflicts)
+	if conflict := report.Repository; conflict != nil {
+		r.section(repositoryConflictHeading, r.describeRepositoryConflict(conflict))
+	}
 	var problems, byDesign []string
 	for _, problem := range report.Problems {
 		side := "remote"
@@ -192,6 +195,71 @@ func (r *reporter) describeConflict(conflict remote.Conflict) string {
 		changes = append(changes, fmt.Sprintf("...and %d more changes (specify paths with %s --diff to compare them)", conflict.ExcludedChanges, r.followUp))
 	}
 	return r.locator.display(conflict.Root) + ": " + strings.Join(changes, ", ")
+}
+
+// repositoryConflictHeading is the warning that introduces a repository
+// conflict.
+const repositoryConflictHeading = "the Git repositories conflict, so their commits and branches aren't synchronized until both sides have the same ones (files still are):"
+
+// describeRepositoryConflict describes a repository conflict from the
+// submitting endpoint's perspective on two lines: the repositories, such as
+// "local main at 1a2b3c4d5e6f, remote main at 6f5e4d3c2b1a (they last agreed
+// on main at 0123456789ab)", and how to resolve the conflict by giving one
+// side the other's commit and branch without changing the files, which both
+// sides still share, after which committing again keeps the changes of the
+// side that gave up its commit. Only beta can give up its commit in one-way
+// sessions, since alpha never takes beta's.
+func (r *reporter) describeRepositoryConflict(conflict *remote.RepositoryConflict) []string {
+	local, opposite := conflict.Alpha, conflict.Beta
+	if !r.alpha {
+		local, opposite = opposite, local
+	}
+	agreed := "they never agreed"
+	if conflict.Ancestor != nil {
+		agreed = "they last agreed on " + describeRepository(*conflict.Ancestor)
+	}
+	description := fmt.Sprintf("local %s, remote %s (%s)", describeRepository(local), describeRepository(opposite), agreed)
+	here := strings.Join(resetCommands("", local, opposite), ", then ")
+	remotely := strings.Join(resetCommands(r.followUp+" ", opposite, local), ", then ")
+	var resolution string
+	switch {
+	case !conflict.OneWay:
+		resolution = fmt.Sprintf("to resolve it, run %s here (which keeps the files) and commit again, or %s and commit again there", here, remotely)
+	case r.alpha:
+		resolution = fmt.Sprintf("to resolve it, run %s (which keeps the files there; alpha never takes beta's commits)", remotely)
+	default:
+		resolution = fmt.Sprintf("to resolve it, run %s here (which keeps the files; alpha never takes beta's commits)", here)
+	}
+	return []string{description, resolution}
+}
+
+// describeRepository describes a repository's commit and branch, such as "main
+// at 1a2b3c4d5e6f".
+func describeRepository(repository remote.Repository) string {
+	if repository.Branch == "" {
+		return "detached HEAD at " + shortRepositoryCommit(repository.Commit)
+	}
+	return neutralizeLine(repository.Branch) + " at " + shortRepositoryCommit(repository.Commit)
+}
+
+// shortRepositoryCommit abbreviates a hexadecimal commit identifier, with the
+// same length as the identifiers of submodule commits in reports.
+func shortRepositoryCommit(commit string) string {
+	return neutralizeLine(commit[:min(len(commit), 12)])
+}
+
+// resetCommands returns the Git commands, starting with prefix, that give a
+// repository another one's commit and branch without changing the files: a
+// switch to the other's branch at the current commit, if the branches differ,
+// followed by a reset to the other's commit.
+func resetCommands(prefix string, from, to remote.Repository) []string {
+	var commands []string
+	if from.Branch != to.Branch && to.Branch == "" {
+		commands = append(commands, prefix+"git switch --detach")
+	} else if from.Branch != to.Branch {
+		commands = append(commands, prefix+"git switch -C "+neutralizeLine(shellQuote(to.Branch)))
+	}
+	return append(commands, prefix+"git reset "+shortRepositoryCommit(to.Commit))
 }
 
 // describeChange describes a change, such as "modified file".

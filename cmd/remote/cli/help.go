@@ -191,6 +191,23 @@ between a star's center and one of its nodes:
     including any .gitignore files, still arrives. Files that Git tracks but
     rules ignore aren't synchronized: remote warns and suggests the pattern
     that unignores them.
+  - In Git mode, every endpoint has the root repository at the same commit
+    and branch, so git works on each; other branches, tags, the index,
+    stashes, and configuration stay per endpoint. An endpoint without .git
+    at its root gets one (only beta, in one-way modes), with the other's
+    history and origin URL, its files left as they are. When one endpoint
+    commits, amends, resets, or switches branches, the other moves HEAD and
+    its branch to that commit without touching files, keeping staged changes
+    where Git can (otherwise it warns), and Mutagen copies the commits, so
+    they needn't be pushed. HEAD stays, with a warning, while a rebase,
+    merge, or other Git operation is in progress on either endpoint, or
+    while the follower has a different branch of the same name. If both
+    endpoints commit and neither commit contains the other, or they switch
+    to different branches, remote
+    --conflicts lists a repository conflict and files keep synchronizing;
+    run git reset <other commit> on one endpoint (keeps files) and commit
+    again. Two-way-resolved sessions follow alpha's commit, but only after
+    the endpoints have agreed once.
   - In Git mode, a nested repository with a commit checked out and an origin,
     such as a submodule, has its files synchronized like any directory's,
     uncommitted changes included, but not its .git, so branches, stashes, and
@@ -428,6 +445,9 @@ changed since checkout; concurrent edits during apply can be overwritten.
 Each conflict has one checkout, through one endpoint. A workspace on your
 system may belong to someone else; only apply or discard your own checkouts.
 Directories require manual resolution. Other supported types require --take.
+In Git mode, root repositories whose commits diverged are listed as a
+repository conflict, which only Git resolves: on one endpoint, git reset to
+the other endpoint's commit (which keeps every file) and commit again.
 In Git mode, a submodule whose endpoints checked out different commits is
 listed as one conflict, which only Git resolves: check out the same commit on
 both endpoints, or delete the submodule on the endpoint to discard (beta, in

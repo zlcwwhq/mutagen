@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -883,6 +884,56 @@ func TestAutomaticCheckoutChecksTake(t *testing.T) {
 		if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%+v left a workspace: %v", test.options, err)
 		}
+	}
+}
+
+func TestRepositoryConflictListing(t *testing.T) {
+	// A repository conflict is listed as a conflict of the root's .git, with
+	// what resolves it, so that the listing doesn't say that there are no
+	// conflicts, and it's included in the JSON listing from the submitting
+	// endpoint's perspective.
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	ctx := context.Background()
+	root := t.TempDir()
+	target := &remote.Target{SourceSession: "session", SourceAlpha: false, Session: "session", Alpha: false, Root: root, Path: "sub", Contained: true}
+	alpha := remote.Repository{Commit: strings.Repeat("1a", 20), Branch: "main"}
+	beta := remote.Repository{Commit: strings.Repeat("2b", 20), Branch: "main"}
+	listing := &remote.Listing{Repository: &remote.RepositoryConflict{Alpha: alpha, Beta: beta}}
+	var output, errorOutput strings.Builder
+	if err := renderConflicts(ctx, root, &options{}, &output, &errorOutput, listing, target); err != nil {
+		t.Fatal("unable to list conflicts:", err)
+	}
+	expected := filepath.Join("..", ".git") + ": the commits and branches conflict, which remote can't resolve: " +
+		"local main at 2b2b2b2b2b2b, remote main at 1a1a1a1a1a1a (they never agreed); " +
+		"to resolve it, run git reset 1a1a1a1a1a1a here (which keeps the files) and commit again, " +
+		"or remote git reset 2b2b2b2b2b2b and commit again there\n"
+	if output.String() != expected {
+		t.Errorf("incorrect listing:\n%s\nexpected:\n%s", output.String(), expected)
+	} else if errorOutput.Len() != 0 {
+		t.Error("unexpected warnings:", errorOutput.String())
+	}
+
+	// The JSON listing describes it as well.
+	output.Reset()
+	if err := renderConflicts(ctx, root, &options{conflictOptions: conflictOptions{json: true}}, &output, &errorOutput, listing, target); err != nil {
+		t.Fatal("unable to list conflicts as JSON:", err)
+	}
+	var listed struct {
+		Repository *listedRepositoryConflict
+	}
+	if err := json.Unmarshal([]byte(output.String()), &listed); err != nil {
+		t.Fatal("unable to decode JSON listing:", err)
+	} else if listed.Repository == nil || listed.Repository.Local != beta || listed.Repository.Remote != alpha ||
+		listed.Repository.Ancestor != nil || !strings.Contains(listed.Repository.Resolution, "git reset 1a1a1a1a1a1a here") {
+		t.Errorf("incorrect JSON repository conflict: %+v", listed.Repository)
+	}
+
+	// Without a repository conflict, the key is omitted.
+	output.Reset()
+	if err := renderConflicts(ctx, root, &options{conflictOptions: conflictOptions{json: true}}, &output, &errorOutput, &remote.Listing{}, target); err != nil {
+		t.Fatal("unable to list conflicts as JSON:", err)
+	} else if strings.Contains(output.String(), "Repository") {
+		t.Error("repository conflict key present without a conflict:", output.String())
 	}
 }
 

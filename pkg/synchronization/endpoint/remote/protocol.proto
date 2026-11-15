@@ -11,6 +11,7 @@ import "synchronization/core/archive.proto";
 import "synchronization/core/change.proto";
 import "synchronization/core/entry.proto";
 import "synchronization/core/problem.proto";
+import "synchronization/core/repository.proto";
 
 // InitializeSynchronizationRequest encodes a request for endpoint
 // initialization.
@@ -143,6 +144,75 @@ message TransitionResponse {
     string error = 4;
 }
 
+// StageRepositoryRequest encodes a request to stage the objects that a
+// repository action needs.
+message StageRepositoryRequest {
+    // Action is the action that the objects are needed for.
+    core.RepositoryAction action = 1;
+}
+
+// StageRepositoryResponse encodes the results of repository staging
+// initialization. If Receive is set, then the client follows it with a pack,
+// as RepositoryChunk messages.
+message StageRepositoryResponse {
+    // Haves are the commits that the endpoint has, whose history a supplier
+    // can leave out of the pack.
+    repeated bytes haves = 1;
+    // Receive indicates whether or not the endpoint needs a pack.
+    bool receive = 2;
+    // Error is the error message (if any) resulting from repository staging
+    // initialization.
+    string error = 3;
+}
+
+// SupplyRepositoryRequest encodes a request for a pack of the objects that a
+// commit needs. The server responds with the pack, as RepositoryChunk
+// messages, followed by a SupplyRepositoryResponse.
+message SupplyRepositoryRequest {
+    // Commit is the commit that the objects are needed for.
+    bytes commit = 1;
+    // Haves are the commits that the receiving endpoint has.
+    repeated bytes haves = 2;
+}
+
+// RepositoryChunk is a part of a pack of Git objects. Chunks mirror the
+// operations of synchronization.RepositoryReceiver.
+message RepositoryChunk {
+    // Data is the next part of the pack, unless Done is set.
+    bytes data = 1;
+    // Done indicates the end of the pack.
+    bool done = 2;
+    // Problem is the reason that the pack couldn't be produced, if any, which
+    // can only be set along with Done.
+    string problem = 3;
+}
+
+// SupplyRepositoryResponse encodes the results of supplying a pack.
+message SupplyRepositoryResponse {
+    // Problem is the problem that prevented the endpoint from producing the
+    // pack, if any.
+    core.Problem problem = 1;
+    // Error is the error message (if any) resulting from supplying, which
+    // doesn't include problems producing the pack.
+    string error = 2;
+}
+
+// TransitionRepositoryRequest encodes a request to apply a repository action.
+message TransitionRepositoryRequest {
+    // Action is the action to apply.
+    core.RepositoryAction action = 1;
+}
+
+// TransitionRepositoryResponse encodes the results of applying a repository
+// action.
+message TransitionRepositoryResponse {
+    // Result is the result of the action, unless there's an error.
+    core.RepositoryResult result = 1;
+    // Error is the error message (if any) resulting from applying the action,
+    // which doesn't include failures to apply it, which the result reports.
+    string error = 2;
+}
+
 // EndpointRequest is a sum type that can transmit any type of endpoint request.
 // Only the sent request will be non-nil. We intentionally avoid using Protocol
 // Buffers' oneof feature because it generates really ugly code and an unwieldy
@@ -158,4 +228,10 @@ message EndpointRequest {
     SupplyRequest supply = 4;
     // Transition represents a transition request.
     TransitionRequest transition = 5;
+    // StageRepository represents a repository staging request.
+    StageRepositoryRequest stageRepository = 6;
+    // SupplyRepository represents a repository supply request.
+    SupplyRepositoryRequest supplyRepository = 7;
+    // TransitionRepository represents a repository transition request.
+    TransitionRepositoryRequest transitionRepository = 8;
 }

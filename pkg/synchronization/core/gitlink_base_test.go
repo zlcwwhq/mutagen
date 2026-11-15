@@ -406,6 +406,7 @@ func TestSnapshotWithSubmoduleStatuses(t *testing.T) {
 		Warnings:               []*Problem{{Path: "path", Error: "warning"}},
 		Seeds:                  map[string]*Entry{"path": tD1},
 		SubmoduleStatuses:      old,
+		Repository:             &Repository{Branch: "main"},
 	}
 	reflected := original.ProtoReflect()
 	fields := reflected.Descriptor().Fields()

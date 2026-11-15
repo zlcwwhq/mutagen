@@ -484,7 +484,10 @@ func testGitSubmodulePopulate(t *testing.T, transport gitSubmoduleTransport, bet
 		"sub/other":      "other",
 		"sub/untracked":  "untracked",
 	})
-	f.expectMissing(f.beta, ".git", "sub/deleted", "sub/debug.log")
+	f.expectMissing(f.beta, "sub/deleted", "sub/debug.log")
+	if head := gitModeHead(t, f.beta); head != gitModeHead(t, f.alpha) {
+		t.Errorf("superproject's repository on beta at %s instead of alpha's commit", head)
+	}
 	if url := gitModeRun(t, f.follower, "config", "--get", "remote.origin.url"); url != f.upstream.url {
 		t.Errorf("incorrect origin for clone: %s", url)
 	}
@@ -1628,7 +1631,7 @@ func testGitSubmoduleStar(t *testing.T, options gitSubmoduleStarOptions) {
 	}
 
 	// A flush provides each node with its own clone, with the center's
-	// changes.
+	// changes, and with the superproject's repository at the center's commit.
 	for _, state := range flush() {
 		verifyNoProblems(t, state)
 	}
@@ -1638,8 +1641,8 @@ func testGitSubmoduleStar(t *testing.T, options gitSubmoduleStarOptions) {
 				t.Errorf("incorrect content for %s on %s: %q, %v", file, name, contents, err)
 			}
 		}
-		if _, err := os.Lstat(filepath.Join(root, ".git")); !os.IsNotExist(err) {
-			t.Errorf("superproject's repository reached %s: %v", name, err)
+		if head := gitModeHead(t, root); head != gitModeHead(t, center) {
+			t.Errorf("superproject's repository on %s at %s instead of the center's commit", name, head)
 		}
 		if info, err := os.Lstat(filepath.Join(root, "sub", ".git")); err != nil || !info.IsDir() {
 			t.Errorf("no clone on %s: %v, %v", name, info, err)

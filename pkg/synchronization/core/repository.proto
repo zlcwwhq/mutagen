@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package core;
+
+option go_package = "github.com/mutagen-io/mutagen/pkg/synchronization/core";
+
+import "synchronization/core/problem.proto";
+
+// Repository describes the Git repository at an endpoint's synchronization
+// root in Git mode, which is the repository whose working tree the session
+// synchronizes. The session keeps the repositories at both endpoints at the
+// same commit and branch, while their other metadata (other branches, tags,
+// the index, stashes, configuration) stays with each endpoint. An endpoint
+// without a .git entry at its root has no Repository (nil).
+message Repository {
+    // Commit is the raw bytes of the commit that HEAD identifies (20 for
+    // SHA-1, 32 for SHA-256). It's empty if the repository has no commits yet
+    // (an unborn HEAD), in which case Branch is the branch that HEAD names.
+    bytes commit = 1;
+    // Branch is the short name of the branch (beneath refs/heads/) that HEAD
+    // refers to, or empty if HEAD is detached.
+    string branch = 2;
+    // URL is the URL of the repository's origin remote, without credentials,
+    // if it has one that another endpoint could use. An endpoint that attaches
+    // a repository configures it as its origin.
+    string url = 3;
+    // AutoCRLF is the repository's core.autocrlf setting, if it's set. An
+    // endpoint that attaches a repository uses it, so that Git considers the
+    // synchronized files unchanged.
+    string autoCRLF = 4;
+    // EOL is the repository's core.eol setting, if it's set, which is used
+    // like AutoCRLF.
+    string eol = 5;
+    // Unavailable explains why the endpoint can't move the repository's HEAD
+    // at the moment, such as because a Git operation (like a rebase) is in
+    // progress there, or because the repository couldn't be examined. The
+    // other fields are then unreliable, and the session leaves both
+    // repositories alone until the endpoint reports none.
+    string unavailable = 6;
+}
+
+// RepositoryPolicy specifies how an endpoint applies a RepositoryAction.
+enum RepositoryPolicy {
+    // RepositoryPolicy_Follow moves HEAD to the target unconditionally (as
+    // long as the endpoint's repository is still in its old state). It's used
+    // when only the other endpoint moved since both last agreed.
+    Follow = 0;
+    // RepositoryPolicy_FastForward moves HEAD to the target only if the target
+    // commit contains the endpoint's current commit (or is that commit).
+    // Otherwise, it reports whether the endpoint's commit contains the target
+    // (it's ahead) or neither contains the other (they've diverged).
+    FastForward = 1;
+    // RepositoryPolicy_FastForwardOrFollow is like FastForward, except that
+    // HEAD is moved to the target if the commits have diverged. It's used when
+    // the other endpoint's commit wins a disagreement.
+    FastForwardOrFollow = 2;
+}
+
+// RepositoryAction is a change to the repository at an endpoint's
+// synchronization root, which moves its HEAD to the commit and branch of the
+// other endpoint's repository, or attaches a repository there if it has none.
+message RepositoryAction {
+    // Old is the repository's state when the endpoint was scanned. The action
+    // is only applied if the repository is still in that state, so that
+    // changes made in the meantime (such as a commit) aren't overwritten. A
+    // nil Old means that the endpoint has no .git entry at its root, so that
+    // the action attaches a repository.
+    Repository old = 1;
+    // Target is the other endpoint's repository, whose commit and branch the
+    // endpoint's repository should have afterwards. Its commit must not be
+    // empty.
+    Repository target = 2;
+    // Policy specifies how the action is applied.
+    RepositoryPolicy policy = 3;
+}
+
+// RepositoryOutcome describes the outcome of a RepositoryAction.
+enum RepositoryOutcome {
+    // RepositoryOutcome_Failed indicates that the action couldn't be applied,
+    // for the reason that the result's problem gives.
+    Failed = 0;
+    // RepositoryOutcome_Moved indicates that HEAD was moved (or a repository
+    // attached) as requested.
+    Moved = 1;
+    // RepositoryOutcome_Ahead indicates that HEAD wasn't moved because its
+    // commit contains the target commit.
+    Ahead = 2;
+    // RepositoryOutcome_Diverged indicates that HEAD wasn't moved because
+    // neither its commit nor the target commit contains the other.
+    Diverged = 3;
+}
+
+// RepositoryResult is the result of applying a RepositoryAction.
+message RepositoryResult {
+    // Outcome is the outcome of the action.
+    RepositoryOutcome outcome = 1;
+    // Problem explains why the action failed, if the outcome is
+    // RepositoryOutcome_Failed. For other outcomes, it can be a warning about
+    // the result, such as that staged changes had to be unstaged.
+    Problem problem = 2;
+}
+
+// RepositoryConflict describes a disagreement between the repositories at the
+// endpoints' synchronization roots that the session can't resolve, such as
+// both endpoints having made commits since they last agreed. The working trees
+// are still synchronized, but HEAD isn't moved on either endpoint until both
+// have the same commit and branch.
+message RepositoryConflict {
+    // Ancestor is the commit and branch on which both endpoints last agreed, or
+    // nil if they never have.
+    Repository ancestor = 1;
+    // Alpha is the repository at alpha.
+    Repository alpha = 2;
+    // Beta is the repository at beta.
+    Repository beta = 3;
+}

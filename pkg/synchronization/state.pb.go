@@ -318,9 +318,13 @@ type State struct {
 	// AlphaState encodes the state of the alpha endpoint. It is always non-nil.
 	AlphaState *EndpointState `protobuf:"bytes,7,opt,name=alphaState,proto3" json:"alphaState,omitempty"`
 	// BetaState encodes the state of the beta endpoint. It is always non-nil.
-	BetaState     *EndpointState `protobuf:"bytes,8,opt,name=betaState,proto3" json:"betaState,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	BetaState *EndpointState `protobuf:"bytes,8,opt,name=betaState,proto3" json:"betaState,omitempty"`
+	// RepositoryConflict is the disagreement between the repositories at the
+	// endpoints' synchronization roots in Git mode that reconciliation
+	// couldn't resolve, if any.
+	RepositoryConflict *core.RepositoryConflict `protobuf:"bytes,9,opt,name=repositoryConflict,proto3" json:"repositoryConflict,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *State) Reset() {
@@ -409,11 +413,18 @@ func (x *State) GetBetaState() *EndpointState {
 	return nil
 }
 
+func (x *State) GetRepositoryConflict() *core.RepositoryConflict {
+	if x != nil {
+		return x.RepositoryConflict
+	}
+	return nil
+}
+
 var File_synchronization_state_proto protoreflect.FileDescriptor
 
 const file_synchronization_state_proto_rawDesc = "" +
 	"\n" +
-	"\x1bsynchronization/state.proto\x12\x0fsynchronization\x1a#synchronization/rsync/receive.proto\x1a\x1dsynchronization/session.proto\x1a#synchronization/core/conflict.proto\x1a\"synchronization/core/problem.proto\"\xf1\x03\n" +
+	"\x1bsynchronization/state.proto\x12\x0fsynchronization\x1a#synchronization/rsync/receive.proto\x1a\x1dsynchronization/session.proto\x1a#synchronization/core/conflict.proto\x1a\"synchronization/core/problem.proto\x1a%synchronization/core/repository.proto\"\xf1\x03\n" +
 	"\rEndpointState\x12\x1c\n" +
 	"\tconnected\x18\x01 \x01(\bR\tconnected\x12\x18\n" +
 	"\ascanned\x18\x02 \x01(\bR\ascanned\x12 \n" +
@@ -426,7 +437,7 @@ const file_synchronization_state_proto_rawDesc = "" +
 	"\x12transitionProblems\x18\t \x03(\v2\r.core.ProblemR\x12transitionProblems\x12>\n" +
 	"\x1aexcludedTransitionProblems\x18\n" +
 	" \x01(\x04R\x1aexcludedTransitionProblems\x12>\n" +
-	"\x0fstagingProgress\x18\v \x01(\v2\x14.rsync.ReceiverStateR\x0fstagingProgress\"\x90\x03\n" +
+	"\x0fstagingProgress\x18\v \x01(\v2\x14.rsync.ReceiverStateR\x0fstagingProgress\"\xda\x03\n" +
 	"\x05State\x122\n" +
 	"\asession\x18\x01 \x01(\v2\x18.synchronization.SessionR\asession\x12/\n" +
 	"\x06status\x18\x02 \x01(\x0e2\x17.synchronization.StatusR\x06status\x12\x1c\n" +
@@ -437,7 +448,8 @@ const file_synchronization_state_proto_rawDesc = "" +
 	"\n" +
 	"alphaState\x18\a \x01(\v2\x1e.synchronization.EndpointStateR\n" +
 	"alphaState\x12<\n" +
-	"\tbetaState\x18\b \x01(\v2\x1e.synchronization.EndpointStateR\tbetaState*\x97\x02\n" +
+	"\tbetaState\x18\b \x01(\v2\x1e.synchronization.EndpointStateR\tbetaState\x12H\n" +
+	"\x12repositoryConflict\x18\t \x01(\v2\x18.core.RepositoryConflictR\x12repositoryConflict*\x97\x02\n" +
 	"\x06Status\x12\x10\n" +
 	"\fDisconnected\x10\x00\x12\x17\n" +
 	"\x13HaltedOnRootEmptied\x10\x01\x12\x18\n" +
@@ -471,13 +483,14 @@ func file_synchronization_state_proto_rawDescGZIP() []byte {
 var file_synchronization_state_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_synchronization_state_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_synchronization_state_proto_goTypes = []any{
-	(Status)(0),                 // 0: synchronization.Status
-	(*EndpointState)(nil),       // 1: synchronization.EndpointState
-	(*State)(nil),               // 2: synchronization.State
-	(*core.Problem)(nil),        // 3: core.Problem
-	(*rsync.ReceiverState)(nil), // 4: rsync.ReceiverState
-	(*Session)(nil),             // 5: synchronization.Session
-	(*core.Conflict)(nil),       // 6: core.Conflict
+	(Status)(0),                     // 0: synchronization.Status
+	(*EndpointState)(nil),           // 1: synchronization.EndpointState
+	(*State)(nil),                   // 2: synchronization.State
+	(*core.Problem)(nil),            // 3: core.Problem
+	(*rsync.ReceiverState)(nil),     // 4: rsync.ReceiverState
+	(*Session)(nil),                 // 5: synchronization.Session
+	(*core.Conflict)(nil),           // 6: core.Conflict
+	(*core.RepositoryConflict)(nil), // 7: core.RepositoryConflict
 }
 var file_synchronization_state_proto_depIdxs = []int32{
 	3, // 0: synchronization.EndpointState.scanProblems:type_name -> core.Problem
@@ -488,11 +501,12 @@ var file_synchronization_state_proto_depIdxs = []int32{
 	6, // 5: synchronization.State.conflicts:type_name -> core.Conflict
 	1, // 6: synchronization.State.alphaState:type_name -> synchronization.EndpointState
 	1, // 7: synchronization.State.betaState:type_name -> synchronization.EndpointState
-	8, // [8:8] is the sub-list for method output_type
-	8, // [8:8] is the sub-list for method input_type
-	8, // [8:8] is the sub-list for extension type_name
-	8, // [8:8] is the sub-list for extension extendee
-	0, // [0:8] is the sub-list for field type_name
+	7, // 8: synchronization.State.repositoryConflict:type_name -> core.RepositoryConflict
+	9, // [9:9] is the sub-list for method output_type
+	9, // [9:9] is the sub-list for method input_type
+	9, // [9:9] is the sub-list for extension type_name
+	9, // [9:9] is the sub-list for extension extendee
+	0, // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_state_proto_init() }

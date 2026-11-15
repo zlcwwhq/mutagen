@@ -22,12 +22,42 @@ type Report struct {
 	// Resolution indicates whether remote can resolve the session's conflicts
 	// (see ListConflicts), which requires the two-way-safe mode.
 	Resolution bool `json:",omitempty"`
+	// Repository is the conflict between the repositories at the endpoints'
+	// synchronization roots in Git mode, if any.
+	Repository *RepositoryConflict `json:",omitempty"`
 }
 
 // Empty indicates whether the report contains no conflicts or problems.
 func (r *Report) Empty() bool {
 	return r == nil || (len(r.Conflicts) == 0 && r.ExcludedConflicts == 0 &&
-		len(r.Problems) == 0 && r.ExcludedProblems == 0)
+		len(r.Problems) == 0 && r.ExcludedProblems == 0 && r.Repository == nil)
+}
+
+// RepositoryConflict describes a disagreement between the commits and branches
+// of the repositories at the endpoints' synchronization roots in Git mode,
+// which the session can't resolve, such as both endpoints having committed
+// since they last agreed. Neither repository's HEAD follows the other's until
+// they agree again, while files are still synchronized.
+type RepositoryConflict struct {
+	// Alpha is the repository at alpha.
+	Alpha Repository
+	// Beta is the repository at beta.
+	Beta Repository
+	// Ancestor is the commit and branch on which the repositories last agreed,
+	// if they ever have.
+	Ancestor *Repository `json:",omitempty"`
+	// OneWay indicates that the session only synchronizes from alpha to beta,
+	// so that the conflict can only be resolved by giving beta alpha's commit
+	// and branch.
+	OneWay bool `json:",omitempty"`
+}
+
+// Repository describes the commit and branch of a repository.
+type Repository struct {
+	// Commit is the hexadecimal identifier of the commit that HEAD identifies.
+	Commit string
+	// Branch is the branch that HEAD refers to, or empty if HEAD is detached.
+	Branch string `json:",omitempty"`
 }
 
 // Conflict describes conflicting changes on the two endpoints, which prevent

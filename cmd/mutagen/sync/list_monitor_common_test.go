@@ -23,6 +23,25 @@ func TestFormatSubmodule(t *testing.T) {
 	}
 }
 
+// TestPrintRepositoryConflict tests that printRepositoryConflict identifies
+// both repositories' commits and branches.
+func TestPrintRepositoryConflict(t *testing.T) {
+	defer func(output io.Writer, noColor bool) {
+		color.Output, color.NoColor = output, noColor
+	}(color.Output, color.NoColor)
+	color.NoColor = true
+	var output bytes.Buffer
+	color.Output = &output
+	printRepositoryConflict(&core.RepositoryConflict{
+		Alpha: &core.Repository{Commit: bytes.Repeat([]byte{0x1a}, 20), Branch: "main"},
+		Beta:  &core.Repository{Commit: bytes.Repeat([]byte{0x2b}, 20)},
+	})
+	expected := "Repository conflict: alpha at 1a1a1a1a1a1a (main), beta at 2b2b2b2b2b2b (detached)\n"
+	if output.String() != expected {
+		t.Errorf("incorrect output: %q != %q", output.String(), expected)
+	}
+}
+
 // TestPrintProblems tests that printProblems lists warnings separately from
 // other problems, and that it counts excluded problems as what they must be.
 func TestPrintProblems(t *testing.T) {

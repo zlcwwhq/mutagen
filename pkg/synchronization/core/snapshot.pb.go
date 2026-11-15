@@ -71,8 +71,14 @@ type Snapshot struct {
 	// content that one endpoint has changed and the other hasn't. Like
 	// warnings, they aren't part of the snapshot's identity.
 	SubmoduleStatuses map[string]*SubmoduleStatus `protobuf:"bytes,10,rep,name=submoduleStatuses,proto3" json:"submoduleStatuses,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Repository is the repository at the synchronization root in Git mode,
+	// or nil if the root has no .git entry (or the session isn't in Git
+	// mode). Reconciliation compares it with the other endpoint's and the
+	// ancestor's, separately from the content. Like warnings, it isn't part of
+	// the snapshot's identity.
+	Repository    *Repository `protobuf:"bytes,11,opt,name=repository,proto3" json:"repository,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Snapshot) Reset() {
@@ -175,6 +181,13 @@ func (x *Snapshot) GetSubmoduleStatuses() map[string]*SubmoduleStatus {
 	return nil
 }
 
+func (x *Snapshot) GetRepository() *Repository {
+	if x != nil {
+		return x.Repository
+	}
+	return nil
+}
+
 // SubmoduleStatus describes how the working tree of a submodule differs from
 // the commit that it has checked out, according to Git (after its filters and
 // line ending conversions).
@@ -244,7 +257,7 @@ var File_synchronization_core_snapshot_proto protoreflect.FileDescriptor
 
 const file_synchronization_core_snapshot_proto_rawDesc = "" +
 	"\n" +
-	"#synchronization/core/snapshot.proto\x12\x04core\x1a synchronization/core/entry.proto\x1a\"synchronization/core/problem.proto\"\xf0\x04\n" +
+	"#synchronization/core/snapshot.proto\x12\x04core\x1a synchronization/core/entry.proto\x1a\"synchronization/core/problem.proto\x1a%synchronization/core/repository.proto\"\xa2\x05\n" +
 	"\bSnapshot\x12%\n" +
 	"\acontent\x18\x01 \x01(\v2\v.core.EntryR\acontent\x126\n" +
 	"\x16preservesExecutability\x18\x02 \x01(\bR\x16preservesExecutability\x12,\n" +
@@ -256,7 +269,10 @@ const file_synchronization_core_snapshot_proto_rawDesc = "" +
 	"\bwarnings\x18\b \x03(\v2\r.core.ProblemR\bwarnings\x12/\n" +
 	"\x05seeds\x18\t \x03(\v2\x19.core.Snapshot.SeedsEntryR\x05seeds\x12S\n" +
 	"\x11submoduleStatuses\x18\n" +
-	" \x03(\v2%.core.Snapshot.SubmoduleStatusesEntryR\x11submoduleStatuses\x1aE\n" +
+	" \x03(\v2%.core.Snapshot.SubmoduleStatusesEntryR\x11submoduleStatuses\x120\n" +
+	"\n" +
+	"repository\x18\v \x01(\v2\x10.core.RepositoryR\n" +
+	"repository\x1aE\n" +
 	"\n" +
 	"SeedsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12!\n" +
@@ -288,19 +304,21 @@ var file_synchronization_core_snapshot_proto_goTypes = []any{
 	nil,                     // 3: core.Snapshot.SubmoduleStatusesEntry
 	(*Entry)(nil),           // 4: core.Entry
 	(*Problem)(nil),         // 5: core.Problem
+	(*Repository)(nil),      // 6: core.Repository
 }
 var file_synchronization_core_snapshot_proto_depIdxs = []int32{
 	4, // 0: core.Snapshot.content:type_name -> core.Entry
 	5, // 1: core.Snapshot.warnings:type_name -> core.Problem
 	2, // 2: core.Snapshot.seeds:type_name -> core.Snapshot.SeedsEntry
 	3, // 3: core.Snapshot.submoduleStatuses:type_name -> core.Snapshot.SubmoduleStatusesEntry
-	4, // 4: core.Snapshot.SeedsEntry.value:type_name -> core.Entry
-	1, // 5: core.Snapshot.SubmoduleStatusesEntry.value:type_name -> core.SubmoduleStatus
-	6, // [6:6] is the sub-list for method output_type
-	6, // [6:6] is the sub-list for method input_type
-	6, // [6:6] is the sub-list for extension type_name
-	6, // [6:6] is the sub-list for extension extendee
-	0, // [0:6] is the sub-list for field type_name
+	6, // 4: core.Snapshot.repository:type_name -> core.Repository
+	4, // 5: core.Snapshot.SeedsEntry.value:type_name -> core.Entry
+	1, // 6: core.Snapshot.SubmoduleStatusesEntry.value:type_name -> core.SubmoduleStatus
+	7, // [7:7] is the sub-list for method output_type
+	7, // [7:7] is the sub-list for method input_type
+	7, // [7:7] is the sub-list for extension type_name
+	7, // [7:7] is the sub-list for extension extendee
+	0, // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_core_snapshot_proto_init() }
@@ -310,6 +328,7 @@ func file_synchronization_core_snapshot_proto_init() {
 	}
 	file_synchronization_core_entry_proto_init()
 	file_synchronization_core_problem_proto_init()
+	file_synchronization_core_repository_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

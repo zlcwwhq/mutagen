@@ -67,6 +67,9 @@ type SessionState struct {
 	// Conflicts due to truncation. This value can only be non-zero if conflicts
 	// is non-empty.
 	ExcludedConflicts uint64 `json:"excludedConflicts,omitempty"`
+	// RepositoryConflict is the conflict between the repositories at the
+	// endpoints' synchronization roots in Git mode, if any.
+	RepositoryConflict *RepositoryConflict `json:"repositoryConflict,omitempty"`
 }
 
 // loadFromInternal sets a session to match an internal Protocol Buffers session
@@ -113,10 +116,11 @@ func (s *Session) loadFromInternal(state *synchronization.State) {
 		s.SessionState = nil
 	} else {
 		s.SessionState = &SessionState{
-			LastError:         state.LastError,
-			SuccessfulCycles:  state.SuccessfulCycles,
-			Conflicts:         exportConflicts(state.Conflicts),
-			ExcludedConflicts: state.ExcludedConflicts,
+			LastError:          state.LastError,
+			SuccessfulCycles:   state.SuccessfulCycles,
+			Conflicts:          exportConflicts(state.Conflicts),
+			ExcludedConflicts:  state.ExcludedConflicts,
+			RepositoryConflict: exportRepositoryConflict(state.RepositoryConflict),
 		}
 	}
 }

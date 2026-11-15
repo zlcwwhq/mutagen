@@ -188,6 +188,18 @@ func (s *endpointServer) serve() error {
 			if err := s.serveTransition(request.Transition); err != nil {
 				return fmt.Errorf("unable to serve transition request: %w", err)
 			}
+		} else if request.StageRepository != nil {
+			if err := s.serveStageRepository(request.StageRepository); err != nil {
+				return fmt.Errorf("unable to serve repository staging request: %w", err)
+			}
+		} else if request.SupplyRepository != nil {
+			if err := s.serveSupplyRepository(request.SupplyRepository); err != nil {
+				return fmt.Errorf("unable to serve repository supply request: %w", err)
+			}
+		} else if request.TransitionRepository != nil {
+			if err := s.serveTransitionRepository(request.TransitionRepository); err != nil {
+				return fmt.Errorf("unable to serve repository transition request: %w", err)
+			}
 		} else {
 			// TODO: Should we panic here? The request validation already
 			// ensures that one and only one message component is set, so we

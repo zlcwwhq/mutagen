@@ -793,6 +793,404 @@ func (x *TransitionResponse) GetError() string {
 	return ""
 }
 
+// StageRepositoryRequest encodes a request to stage the objects that a
+// repository action needs.
+type StageRepositoryRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Action is the action that the objects are needed for.
+	Action        *core.RepositoryAction `protobuf:"bytes,1,opt,name=action,proto3" json:"action,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StageRepositoryRequest) Reset() {
+	*x = StageRepositoryRequest{}
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StageRepositoryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StageRepositoryRequest) ProtoMessage() {}
+
+func (x *StageRepositoryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StageRepositoryRequest.ProtoReflect.Descriptor instead.
+func (*StageRepositoryRequest) Descriptor() ([]byte, []int) {
+	return file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *StageRepositoryRequest) GetAction() *core.RepositoryAction {
+	if x != nil {
+		return x.Action
+	}
+	return nil
+}
+
+// StageRepositoryResponse encodes the results of repository staging
+// initialization. If Receive is set, then the client follows it with a pack,
+// as RepositoryChunk messages.
+type StageRepositoryResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Haves are the commits that the endpoint has, whose history a supplier
+	// can leave out of the pack.
+	Haves [][]byte `protobuf:"bytes,1,rep,name=haves,proto3" json:"haves,omitempty"`
+	// Receive indicates whether or not the endpoint needs a pack.
+	Receive bool `protobuf:"varint,2,opt,name=receive,proto3" json:"receive,omitempty"`
+	// Error is the error message (if any) resulting from repository staging
+	// initialization.
+	Error         string `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StageRepositoryResponse) Reset() {
+	*x = StageRepositoryResponse{}
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StageRepositoryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StageRepositoryResponse) ProtoMessage() {}
+
+func (x *StageRepositoryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StageRepositoryResponse.ProtoReflect.Descriptor instead.
+func (*StageRepositoryResponse) Descriptor() ([]byte, []int) {
+	return file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *StageRepositoryResponse) GetHaves() [][]byte {
+	if x != nil {
+		return x.Haves
+	}
+	return nil
+}
+
+func (x *StageRepositoryResponse) GetReceive() bool {
+	if x != nil {
+		return x.Receive
+	}
+	return false
+}
+
+func (x *StageRepositoryResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+// SupplyRepositoryRequest encodes a request for a pack of the objects that a
+// commit needs. The server responds with the pack, as RepositoryChunk
+// messages, followed by a SupplyRepositoryResponse.
+type SupplyRepositoryRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Commit is the commit that the objects are needed for.
+	Commit []byte `protobuf:"bytes,1,opt,name=commit,proto3" json:"commit,omitempty"`
+	// Haves are the commits that the receiving endpoint has.
+	Haves         [][]byte `protobuf:"bytes,2,rep,name=haves,proto3" json:"haves,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SupplyRepositoryRequest) Reset() {
+	*x = SupplyRepositoryRequest{}
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SupplyRepositoryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SupplyRepositoryRequest) ProtoMessage() {}
+
+func (x *SupplyRepositoryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SupplyRepositoryRequest.ProtoReflect.Descriptor instead.
+func (*SupplyRepositoryRequest) Descriptor() ([]byte, []int) {
+	return file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *SupplyRepositoryRequest) GetCommit() []byte {
+	if x != nil {
+		return x.Commit
+	}
+	return nil
+}
+
+func (x *SupplyRepositoryRequest) GetHaves() [][]byte {
+	if x != nil {
+		return x.Haves
+	}
+	return nil
+}
+
+// RepositoryChunk is a part of a pack of Git objects. Chunks mirror the
+// operations of synchronization.RepositoryReceiver.
+type RepositoryChunk struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Data is the next part of the pack, unless Done is set.
+	Data []byte `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
+	// Done indicates the end of the pack.
+	Done bool `protobuf:"varint,2,opt,name=done,proto3" json:"done,omitempty"`
+	// Problem is the reason that the pack couldn't be produced, if any, which
+	// can only be set along with Done.
+	Problem       string `protobuf:"bytes,3,opt,name=problem,proto3" json:"problem,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RepositoryChunk) Reset() {
+	*x = RepositoryChunk{}
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RepositoryChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RepositoryChunk) ProtoMessage() {}
+
+func (x *RepositoryChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RepositoryChunk.ProtoReflect.Descriptor instead.
+func (*RepositoryChunk) Descriptor() ([]byte, []int) {
+	return file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *RepositoryChunk) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *RepositoryChunk) GetDone() bool {
+	if x != nil {
+		return x.Done
+	}
+	return false
+}
+
+func (x *RepositoryChunk) GetProblem() string {
+	if x != nil {
+		return x.Problem
+	}
+	return ""
+}
+
+// SupplyRepositoryResponse encodes the results of supplying a pack.
+type SupplyRepositoryResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Problem is the problem that prevented the endpoint from producing the
+	// pack, if any.
+	Problem *core.Problem `protobuf:"bytes,1,opt,name=problem,proto3" json:"problem,omitempty"`
+	// Error is the error message (if any) resulting from supplying, which
+	// doesn't include problems producing the pack.
+	Error         string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SupplyRepositoryResponse) Reset() {
+	*x = SupplyRepositoryResponse{}
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SupplyRepositoryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SupplyRepositoryResponse) ProtoMessage() {}
+
+func (x *SupplyRepositoryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SupplyRepositoryResponse.ProtoReflect.Descriptor instead.
+func (*SupplyRepositoryResponse) Descriptor() ([]byte, []int) {
+	return file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *SupplyRepositoryResponse) GetProblem() *core.Problem {
+	if x != nil {
+		return x.Problem
+	}
+	return nil
+}
+
+func (x *SupplyRepositoryResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+// TransitionRepositoryRequest encodes a request to apply a repository action.
+type TransitionRepositoryRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Action is the action to apply.
+	Action        *core.RepositoryAction `protobuf:"bytes,1,opt,name=action,proto3" json:"action,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TransitionRepositoryRequest) Reset() {
+	*x = TransitionRepositoryRequest{}
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TransitionRepositoryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TransitionRepositoryRequest) ProtoMessage() {}
+
+func (x *TransitionRepositoryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TransitionRepositoryRequest.ProtoReflect.Descriptor instead.
+func (*TransitionRepositoryRequest) Descriptor() ([]byte, []int) {
+	return file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *TransitionRepositoryRequest) GetAction() *core.RepositoryAction {
+	if x != nil {
+		return x.Action
+	}
+	return nil
+}
+
+// TransitionRepositoryResponse encodes the results of applying a repository
+// action.
+type TransitionRepositoryResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Result is the result of the action, unless there's an error.
+	Result *core.RepositoryResult `protobuf:"bytes,1,opt,name=result,proto3" json:"result,omitempty"`
+	// Error is the error message (if any) resulting from applying the action,
+	// which doesn't include failures to apply it, which the result reports.
+	Error         string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TransitionRepositoryResponse) Reset() {
+	*x = TransitionRepositoryResponse{}
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TransitionRepositoryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TransitionRepositoryResponse) ProtoMessage() {}
+
+func (x *TransitionRepositoryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TransitionRepositoryResponse.ProtoReflect.Descriptor instead.
+func (*TransitionRepositoryResponse) Descriptor() ([]byte, []int) {
+	return file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *TransitionRepositoryResponse) GetResult() *core.RepositoryResult {
+	if x != nil {
+		return x.Result
+	}
+	return nil
+}
+
+func (x *TransitionRepositoryResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 // EndpointRequest is a sum type that can transmit any type of endpoint request.
 // Only the sent request will be non-nil. We intentionally avoid using Protocol
 // Buffers' oneof feature because it generates really ugly code and an unwieldy
@@ -808,14 +1206,20 @@ type EndpointRequest struct {
 	// Supply represents a supply request.
 	Supply *SupplyRequest `protobuf:"bytes,4,opt,name=supply,proto3" json:"supply,omitempty"`
 	// Transition represents a transition request.
-	Transition    *TransitionRequest `protobuf:"bytes,5,opt,name=transition,proto3" json:"transition,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Transition *TransitionRequest `protobuf:"bytes,5,opt,name=transition,proto3" json:"transition,omitempty"`
+	// StageRepository represents a repository staging request.
+	StageRepository *StageRepositoryRequest `protobuf:"bytes,6,opt,name=stageRepository,proto3" json:"stageRepository,omitempty"`
+	// SupplyRepository represents a repository supply request.
+	SupplyRepository *SupplyRepositoryRequest `protobuf:"bytes,7,opt,name=supplyRepository,proto3" json:"supplyRepository,omitempty"`
+	// TransitionRepository represents a repository transition request.
+	TransitionRepository *TransitionRepositoryRequest `protobuf:"bytes,8,opt,name=transitionRepository,proto3" json:"transitionRepository,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *EndpointRequest) Reset() {
 	*x = EndpointRequest{}
-	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[14]
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -827,7 +1231,7 @@ func (x *EndpointRequest) String() string {
 func (*EndpointRequest) ProtoMessage() {}
 
 func (x *EndpointRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[14]
+	mi := &file_synchronization_endpoint_remote_protocol_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -840,7 +1244,7 @@ func (x *EndpointRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EndpointRequest.ProtoReflect.Descriptor instead.
 func (*EndpointRequest) Descriptor() ([]byte, []int) {
-	return file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP(), []int{14}
+	return file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *EndpointRequest) GetPoll() *PollRequest {
@@ -878,11 +1282,32 @@ func (x *EndpointRequest) GetTransition() *TransitionRequest {
 	return nil
 }
 
+func (x *EndpointRequest) GetStageRepository() *StageRepositoryRequest {
+	if x != nil {
+		return x.StageRepository
+	}
+	return nil
+}
+
+func (x *EndpointRequest) GetSupplyRepository() *SupplyRepositoryRequest {
+	if x != nil {
+		return x.SupplyRepository
+	}
+	return nil
+}
+
+func (x *EndpointRequest) GetTransitionRepository() *TransitionRepositoryRequest {
+	if x != nil {
+		return x.TransitionRepository
+	}
+	return nil
+}
+
 var File_synchronization_endpoint_remote_protocol_proto protoreflect.FileDescriptor
 
 const file_synchronization_endpoint_remote_protocol_proto_rawDesc = "" +
 	"\n" +
-	".synchronization/endpoint/remote/protocol.proto\x12\x06remote\x1a\"synchronization/rsync/engine.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/version.proto\x1a\"synchronization/core/archive.proto\x1a!synchronization/core/change.proto\x1a synchronization/core/entry.proto\x1a\"synchronization/core/problem.proto\"\xe0\x01\n" +
+	".synchronization/endpoint/remote/protocol.proto\x12\x06remote\x1a\"synchronization/rsync/engine.proto\x1a#synchronization/configuration.proto\x1a\x1dsynchronization/version.proto\x1a\"synchronization/core/archive.proto\x1a!synchronization/core/change.proto\x1a synchronization/core/entry.proto\x1a\"synchronization/core/problem.proto\x1a%synchronization/core/repository.proto\"\xe0\x01\n" +
 	" InitializeSynchronizationRequest\x12\x18\n" +
 	"\asession\x18\x01 \x01(\tR\asession\x122\n" +
 	"\aversion\x18\x02 \x01(\x0e2\x18.synchronization.VersionR\aversion\x12D\n" +
@@ -930,7 +1355,28 @@ const file_synchronization_endpoint_remote_protocol_proto_rawDesc = "" +
 	"\aresults\x18\x01 \x03(\v2\r.core.ArchiveR\aresults\x12)\n" +
 	"\bproblems\x18\x02 \x03(\v2\r.core.ProblemR\bproblems\x12.\n" +
 	"\x12stagerMissingFiles\x18\x03 \x01(\bR\x12stagerMissingFiles\x12\x14\n" +
-	"\x05error\x18\x04 \x01(\tR\x05error\"\xf9\x01\n" +
+	"\x05error\x18\x04 \x01(\tR\x05error\"H\n" +
+	"\x16StageRepositoryRequest\x12.\n" +
+	"\x06action\x18\x01 \x01(\v2\x16.core.RepositoryActionR\x06action\"_\n" +
+	"\x17StageRepositoryResponse\x12\x14\n" +
+	"\x05haves\x18\x01 \x03(\fR\x05haves\x12\x18\n" +
+	"\areceive\x18\x02 \x01(\bR\areceive\x12\x14\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\"G\n" +
+	"\x17SupplyRepositoryRequest\x12\x16\n" +
+	"\x06commit\x18\x01 \x01(\fR\x06commit\x12\x14\n" +
+	"\x05haves\x18\x02 \x03(\fR\x05haves\"S\n" +
+	"\x0fRepositoryChunk\x12\x12\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\x12\x12\n" +
+	"\x04done\x18\x02 \x01(\bR\x04done\x12\x18\n" +
+	"\aproblem\x18\x03 \x01(\tR\aproblem\"Y\n" +
+	"\x18SupplyRepositoryResponse\x12'\n" +
+	"\aproblem\x18\x01 \x01(\v2\r.core.ProblemR\aproblem\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"M\n" +
+	"\x1bTransitionRepositoryRequest\x12.\n" +
+	"\x06action\x18\x01 \x01(\v2\x16.core.RepositoryActionR\x06action\"d\n" +
+	"\x1cTransitionRepositoryResponse\x12.\n" +
+	"\x06result\x18\x01 \x01(\v2\x16.core.RepositoryResultR\x06result\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"\xe9\x03\n" +
 	"\x0fEndpointRequest\x12'\n" +
 	"\x04poll\x18\x01 \x01(\v2\x13.remote.PollRequestR\x04poll\x12'\n" +
 	"\x04scan\x18\x02 \x01(\v2\x13.remote.ScanRequestR\x04scan\x12*\n" +
@@ -938,7 +1384,10 @@ const file_synchronization_endpoint_remote_protocol_proto_rawDesc = "" +
 	"\x06supply\x18\x04 \x01(\v2\x15.remote.SupplyRequestR\x06supply\x129\n" +
 	"\n" +
 	"transition\x18\x05 \x01(\v2\x19.remote.TransitionRequestR\n" +
-	"transitionBCZAgithub.com/mutagen-io/mutagen/pkg/synchronization/endpoint/remoteb\x06proto3"
+	"transition\x12H\n" +
+	"\x0fstageRepository\x18\x06 \x01(\v2\x1e.remote.StageRepositoryRequestR\x0fstageRepository\x12K\n" +
+	"\x10supplyRepository\x18\a \x01(\v2\x1f.remote.SupplyRepositoryRequestR\x10supplyRepository\x12W\n" +
+	"\x14transitionRepository\x18\b \x01(\v2#.remote.TransitionRepositoryRequestR\x14transitionRepositoryBCZAgithub.com/mutagen-io/mutagen/pkg/synchronization/endpoint/remoteb\x06proto3"
 
 var (
 	file_synchronization_endpoint_remote_protocol_proto_rawDescOnce sync.Once
@@ -952,7 +1401,7 @@ func file_synchronization_endpoint_remote_protocol_proto_rawDescGZIP() []byte {
 	return file_synchronization_endpoint_remote_protocol_proto_rawDescData
 }
 
-var file_synchronization_endpoint_remote_protocol_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_synchronization_endpoint_remote_protocol_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_synchronization_endpoint_remote_protocol_proto_goTypes = []any{
 	(*InitializeSynchronizationRequest)(nil),  // 0: remote.InitializeSynchronizationRequest
 	(*InitializeSynchronizationResponse)(nil), // 1: remote.InitializeSynchronizationResponse
@@ -968,39 +1417,55 @@ var file_synchronization_endpoint_remote_protocol_proto_goTypes = []any{
 	(*TransitionRequest)(nil),                 // 11: remote.TransitionRequest
 	(*TransitionCompletionRequest)(nil),       // 12: remote.TransitionCompletionRequest
 	(*TransitionResponse)(nil),                // 13: remote.TransitionResponse
-	(*EndpointRequest)(nil),                   // 14: remote.EndpointRequest
-	nil,                                       // 15: remote.ScanRequest.SubmodulesEntry
-	(synchronization.Version)(0),              // 16: synchronization.Version
-	(*synchronization.Configuration)(nil),     // 17: synchronization.Configuration
-	(*rsync.Signature)(nil),                   // 18: rsync.Signature
-	(*rsync.Operation)(nil),                   // 19: rsync.Operation
-	(*core.Change)(nil),                       // 20: core.Change
-	(*core.Archive)(nil),                      // 21: core.Archive
-	(*core.Problem)(nil),                      // 22: core.Problem
-	(*core.Entry)(nil),                        // 23: core.Entry
+	(*StageRepositoryRequest)(nil),            // 14: remote.StageRepositoryRequest
+	(*StageRepositoryResponse)(nil),           // 15: remote.StageRepositoryResponse
+	(*SupplyRepositoryRequest)(nil),           // 16: remote.SupplyRepositoryRequest
+	(*RepositoryChunk)(nil),                   // 17: remote.RepositoryChunk
+	(*SupplyRepositoryResponse)(nil),          // 18: remote.SupplyRepositoryResponse
+	(*TransitionRepositoryRequest)(nil),       // 19: remote.TransitionRepositoryRequest
+	(*TransitionRepositoryResponse)(nil),      // 20: remote.TransitionRepositoryResponse
+	(*EndpointRequest)(nil),                   // 21: remote.EndpointRequest
+	nil,                                       // 22: remote.ScanRequest.SubmodulesEntry
+	(synchronization.Version)(0),              // 23: synchronization.Version
+	(*synchronization.Configuration)(nil),     // 24: synchronization.Configuration
+	(*rsync.Signature)(nil),                   // 25: rsync.Signature
+	(*rsync.Operation)(nil),                   // 26: rsync.Operation
+	(*core.Change)(nil),                       // 27: core.Change
+	(*core.Archive)(nil),                      // 28: core.Archive
+	(*core.Problem)(nil),                      // 29: core.Problem
+	(*core.RepositoryAction)(nil),             // 30: core.RepositoryAction
+	(*core.RepositoryResult)(nil),             // 31: core.RepositoryResult
+	(*core.Entry)(nil),                        // 32: core.Entry
 }
 var file_synchronization_endpoint_remote_protocol_proto_depIdxs = []int32{
-	16, // 0: remote.InitializeSynchronizationRequest.version:type_name -> synchronization.Version
-	17, // 1: remote.InitializeSynchronizationRequest.configuration:type_name -> synchronization.Configuration
-	18, // 2: remote.ScanRequest.baselineSnapshotSignature:type_name -> rsync.Signature
-	15, // 3: remote.ScanRequest.submodules:type_name -> remote.ScanRequest.SubmodulesEntry
-	19, // 4: remote.ScanResponse.snapshotDelta:type_name -> rsync.Operation
-	18, // 5: remote.StageResponse.signatures:type_name -> rsync.Signature
-	18, // 6: remote.SupplyRequest.signatures:type_name -> rsync.Signature
-	20, // 7: remote.TransitionRequest.transitions:type_name -> core.Change
-	21, // 8: remote.TransitionResponse.results:type_name -> core.Archive
-	22, // 9: remote.TransitionResponse.problems:type_name -> core.Problem
-	2,  // 10: remote.EndpointRequest.poll:type_name -> remote.PollRequest
-	5,  // 11: remote.EndpointRequest.scan:type_name -> remote.ScanRequest
-	8,  // 12: remote.EndpointRequest.stage:type_name -> remote.StageRequest
-	10, // 13: remote.EndpointRequest.supply:type_name -> remote.SupplyRequest
-	11, // 14: remote.EndpointRequest.transition:type_name -> remote.TransitionRequest
-	23, // 15: remote.ScanRequest.SubmodulesEntry.value:type_name -> core.Entry
-	16, // [16:16] is the sub-list for method output_type
-	16, // [16:16] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	23, // 0: remote.InitializeSynchronizationRequest.version:type_name -> synchronization.Version
+	24, // 1: remote.InitializeSynchronizationRequest.configuration:type_name -> synchronization.Configuration
+	25, // 2: remote.ScanRequest.baselineSnapshotSignature:type_name -> rsync.Signature
+	22, // 3: remote.ScanRequest.submodules:type_name -> remote.ScanRequest.SubmodulesEntry
+	26, // 4: remote.ScanResponse.snapshotDelta:type_name -> rsync.Operation
+	25, // 5: remote.StageResponse.signatures:type_name -> rsync.Signature
+	25, // 6: remote.SupplyRequest.signatures:type_name -> rsync.Signature
+	27, // 7: remote.TransitionRequest.transitions:type_name -> core.Change
+	28, // 8: remote.TransitionResponse.results:type_name -> core.Archive
+	29, // 9: remote.TransitionResponse.problems:type_name -> core.Problem
+	30, // 10: remote.StageRepositoryRequest.action:type_name -> core.RepositoryAction
+	29, // 11: remote.SupplyRepositoryResponse.problem:type_name -> core.Problem
+	30, // 12: remote.TransitionRepositoryRequest.action:type_name -> core.RepositoryAction
+	31, // 13: remote.TransitionRepositoryResponse.result:type_name -> core.RepositoryResult
+	2,  // 14: remote.EndpointRequest.poll:type_name -> remote.PollRequest
+	5,  // 15: remote.EndpointRequest.scan:type_name -> remote.ScanRequest
+	8,  // 16: remote.EndpointRequest.stage:type_name -> remote.StageRequest
+	10, // 17: remote.EndpointRequest.supply:type_name -> remote.SupplyRequest
+	11, // 18: remote.EndpointRequest.transition:type_name -> remote.TransitionRequest
+	14, // 19: remote.EndpointRequest.stageRepository:type_name -> remote.StageRepositoryRequest
+	16, // 20: remote.EndpointRequest.supplyRepository:type_name -> remote.SupplyRepositoryRequest
+	19, // 21: remote.EndpointRequest.transitionRepository:type_name -> remote.TransitionRepositoryRequest
+	32, // 22: remote.ScanRequest.SubmodulesEntry.value:type_name -> core.Entry
+	23, // [23:23] is the sub-list for method output_type
+	23, // [23:23] is the sub-list for method input_type
+	23, // [23:23] is the sub-list for extension type_name
+	23, // [23:23] is the sub-list for extension extendee
+	0,  // [0:23] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_endpoint_remote_protocol_proto_init() }
@@ -1014,7 +1479,7 @@ func file_synchronization_endpoint_remote_protocol_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_synchronization_endpoint_remote_protocol_proto_rawDesc), len(file_synchronization_endpoint_remote_protocol_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   16,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

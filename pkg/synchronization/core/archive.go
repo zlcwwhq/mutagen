@@ -21,6 +21,11 @@ func (a *Archive) EnsureValid(synchronizable bool) error {
 		return fmt.Errorf("invalid archive content: %w", err)
 	}
 
+	// Ensure that the repository is a valid ancestor.
+	if err := a.Repository.ensureValidAncestor(); err != nil {
+		return fmt.Errorf("invalid archive repository: %w", err)
+	}
+
 	// Success.
 	return nil
 }

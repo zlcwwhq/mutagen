@@ -418,6 +418,11 @@ remote --conflict-apply src/app.go    # write it to both copies and verify
 - A failed apply keeps its workspace for a retry. Successful apply and
   `--conflict-discard` keep the original copies as backups.
 
+In [Git mode](git-mode.md), `remote --conflicts` also lists root repositories
+whose commits have [diverged](git-mode.md#diverging-commits), with the commands
+that resolve it: `git reset` to the other endpoint's commit on one endpoint
+(which keeps every file), then commit again.
+
 `remote --conflicts` exits with status 0 whenever it produces a listing. With
 nothing to list, it prints `No conflicts.`, unless some content couldn't be
 synchronized, which can hide conflicts: then it says that conflicts can't be

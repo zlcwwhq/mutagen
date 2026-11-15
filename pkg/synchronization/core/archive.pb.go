@@ -31,7 +31,12 @@ type Archive struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Content is the entry stored in the archive. It may be nil to indicate an
 	// absence of content.
-	Content       *Entry `protobuf:"bytes,1,opt,name=content,proto3" json:"content,omitempty"`
+	Content *Entry `protobuf:"bytes,1,opt,name=content,proto3" json:"content,omitempty"`
+	// Repository is the commit and branch on which the repositories at both
+	// endpoints' synchronization roots last agreed in Git mode, or nil if they
+	// never have. It's only set in the archive that stores a session's
+	// ancestor, not in the archives that wrap transition results.
+	Repository    *Repository `protobuf:"bytes,2,opt,name=repository,proto3" json:"repository,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -73,13 +78,23 @@ func (x *Archive) GetContent() *Entry {
 	return nil
 }
 
+func (x *Archive) GetRepository() *Repository {
+	if x != nil {
+		return x.Repository
+	}
+	return nil
+}
+
 var File_synchronization_core_archive_proto protoreflect.FileDescriptor
 
 const file_synchronization_core_archive_proto_rawDesc = "" +
 	"\n" +
-	"\"synchronization/core/archive.proto\x12\x04core\x1a synchronization/core/entry.proto\"0\n" +
+	"\"synchronization/core/archive.proto\x12\x04core\x1a synchronization/core/entry.proto\x1a%synchronization/core/repository.proto\"b\n" +
 	"\aArchive\x12%\n" +
-	"\acontent\x18\x01 \x01(\v2\v.core.EntryR\acontentB8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"
+	"\acontent\x18\x01 \x01(\v2\v.core.EntryR\acontent\x120\n" +
+	"\n" +
+	"repository\x18\x02 \x01(\v2\x10.core.RepositoryR\n" +
+	"repositoryB8Z6github.com/mutagen-io/mutagen/pkg/synchronization/coreb\x06proto3"
 
 var (
 	file_synchronization_core_archive_proto_rawDescOnce sync.Once
@@ -95,16 +110,18 @@ func file_synchronization_core_archive_proto_rawDescGZIP() []byte {
 
 var file_synchronization_core_archive_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_synchronization_core_archive_proto_goTypes = []any{
-	(*Archive)(nil), // 0: core.Archive
-	(*Entry)(nil),   // 1: core.Entry
+	(*Archive)(nil),    // 0: core.Archive
+	(*Entry)(nil),      // 1: core.Entry
+	(*Repository)(nil), // 2: core.Repository
 }
 var file_synchronization_core_archive_proto_depIdxs = []int32{
 	1, // 0: core.Archive.content:type_name -> core.Entry
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	2, // 1: core.Archive.repository:type_name -> core.Repository
+	2, // [2:2] is the sub-list for method output_type
+	2, // [2:2] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_core_archive_proto_init() }
@@ -113,6 +130,7 @@ func file_synchronization_core_archive_proto_init() {
 		return
 	}
 	file_synchronization_core_entry_proto_init()
+	file_synchronization_core_repository_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

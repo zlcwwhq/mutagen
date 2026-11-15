@@ -149,6 +149,87 @@ func TestReporterWarnings(t *testing.T) {
 	}
 }
 
+func TestReporterRepositoryConflict(t *testing.T) {
+	// Repository conflicts are described from the submitting endpoint's
+	// perspective, with the Git commands that resolve them on either side, or
+	// only on beta in one-way sessions.
+	alphaCommit, betaCommit := strings.Repeat("1a", 20), strings.Repeat("2b", 20)
+	ancestor := &remote.Repository{Commit: strings.Repeat("0c", 20), Branch: "main"}
+	report := func(alpha bool, conflict *remote.RepositoryConflict) string {
+		var output strings.Builder
+		newReporter(&output, &remote.Target{Root: t.TempDir(), Alpha: alpha, Contained: true}, "remote --node gpu").print(&remote.Report{Repository: conflict})
+		return output.String()
+	}
+	heading := "remote: warning: " + repositoryConflictHeading + "\n"
+	for _, test := range []struct {
+		description string
+		alpha       bool
+		conflict    *remote.RepositoryConflict
+		expected    string
+	}{
+		{
+			"diverged", true,
+			&remote.RepositoryConflict{
+				Alpha:    remote.Repository{Commit: alphaCommit, Branch: "main"},
+				Beta:     remote.Repository{Commit: betaCommit, Branch: "main"},
+				Ancestor: ancestor,
+			},
+			heading +
+				"remote:   local main at 1a1a1a1a1a1a, remote main at 2b2b2b2b2b2b (they last agreed on main at 0c0c0c0c0c0c)\n" +
+				"remote:   to resolve it, run git reset 2b2b2b2b2b2b here (which keeps the files) and commit again, " +
+				"or remote --node gpu git reset 1a1a1a1a1a1a and commit again there\n",
+		},
+		{
+			"different branches from beta", false,
+			&remote.RepositoryConflict{
+				Alpha: remote.Repository{Commit: alphaCommit, Branch: "main"},
+				Beta:  remote.Repository{Commit: betaCommit, Branch: "feature;x"},
+			},
+			heading +
+				"remote:   local feature;x at 2b2b2b2b2b2b, remote main at 1a1a1a1a1a1a (they never agreed)\n" +
+				"remote:   to resolve it, run git switch -C main, then git reset 1a1a1a1a1a1a here (which keeps the files) and commit again, " +
+				"or remote --node gpu git switch -C 'feature;x', then remote --node gpu git reset 2b2b2b2b2b2b and commit again there\n",
+		},
+		{
+			"detached", true,
+			&remote.RepositoryConflict{
+				Alpha: remote.Repository{Commit: alphaCommit},
+				Beta:  remote.Repository{Commit: betaCommit, Branch: "main"},
+			},
+			heading +
+				"remote:   local detached HEAD at 1a1a1a1a1a1a, remote main at 2b2b2b2b2b2b (they never agreed)\n" +
+				"remote:   to resolve it, run git switch -C main, then git reset 2b2b2b2b2b2b here (which keeps the files) and commit again, " +
+				"or remote --node gpu git switch --detach, then remote --node gpu git reset 1a1a1a1a1a1a and commit again there\n",
+		},
+		{
+			"one way from alpha", true,
+			&remote.RepositoryConflict{
+				Alpha:  remote.Repository{Commit: alphaCommit, Branch: "main"},
+				Beta:   remote.Repository{Commit: betaCommit, Branch: "main"},
+				OneWay: true,
+			},
+			heading +
+				"remote:   local main at 1a1a1a1a1a1a, remote main at 2b2b2b2b2b2b (they never agreed)\n" +
+				"remote:   to resolve it, run remote --node gpu git reset 1a1a1a1a1a1a (which keeps the files there; alpha never takes beta's commits)\n",
+		},
+		{
+			"one way from beta", false,
+			&remote.RepositoryConflict{
+				Alpha:  remote.Repository{Commit: alphaCommit, Branch: "main"},
+				Beta:   remote.Repository{Commit: betaCommit, Branch: "main"},
+				OneWay: true,
+			},
+			heading +
+				"remote:   local main at 2b2b2b2b2b2b, remote main at 1a1a1a1a1a1a (they never agreed)\n" +
+				"remote:   to resolve it, run git reset 1a1a1a1a1a1a here (which keeps the files; alpha never takes beta's commits)\n",
+		},
+	} {
+		if output := report(test.alpha, test.conflict); output != test.expected {
+			t.Errorf("%s: incorrect report:\n%s\nexpected:\n%s", test.description, output, test.expected)
+		}
+	}
+}
+
 func TestTruncatedConflict(t *testing.T) {
 	conflict := remote.Conflict{
 		Root:            "d",

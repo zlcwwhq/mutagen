@@ -7,6 +7,18 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
 )
 
+// RepositoryReceiver receives a pack of Git objects for the repository at an
+// endpoint's synchronization root (see Endpoint.StageRepository).
+type RepositoryReceiver interface {
+	// Receive receives the next part of the pack.
+	Receive(data []byte) error
+	// Finish ends the pack. A non-empty problem means that the supplier
+	// couldn't produce the pack, in which case the receiver discards what it
+	// has received. Failures to store the pack aren't errors: they leave the
+	// endpoint without the objects, which TransitionRepository reports.
+	Finish(problem string) error
+}
+
 // Endpoint defines the interface to which synchronization endpoints must
 // adhere for a single session. It provides all primitives necessary to support
 // synchronization. None of its methods should be considered safe for concurrent
@@ -80,6 +92,34 @@ type Endpoint interface {
 	// we're creating the root with a huge number of files and wouldn't catch
 	// cancellation until they're all done anyway.
 	Transition(ctx context.Context, transitions []*core.Change) ([]*core.Entry, []*core.Problem, bool, error)
+
+	// StageRepository prepares the endpoint, in Git mode, to apply an action
+	// to the repository at its synchronization root (see TransitionRepository)
+	// by receiving the Git objects that the action's target commit needs. It
+	// returns the commits that the endpoint has (such as its current commit),
+	// whose history a supplier can leave out, and a receiver for a pack of the
+	// rest. If the endpoint already has the objects, or if it can't apply the
+	// action anyway (such as because its root doesn't exist yet), then the
+	// receiver is nil, and TransitionRepository reports any problem. If the
+	// receiver is non-nil, then it must be finished (see SupplyRepository)
+	// before other methods are invoked. If the receiver fails, the endpoint
+	// should be considered tainted, like after a failed rsync receiver.
+	StageRepository(ctx context.Context, action *core.RepositoryAction) ([][]byte, RepositoryReceiver, error)
+
+	// SupplyRepository writes a pack with the objects that a commit needs in
+	// the repository at the endpoint's synchronization root, apart from those
+	// that the specified commits (which the receiving endpoint has) provide, to
+	// a receiver, and then finishes the receiver. Commits that the endpoint
+	// doesn't have are ignored. If the endpoint can't produce the pack (such as
+	// because its repository is shallow), then it finishes the receiver with a
+	// problem, which it also returns, rather than failing.
+	SupplyRepository(ctx context.Context, commit []byte, haves [][]byte, receiver RepositoryReceiver) (*core.Problem, error)
+
+	// TransitionRepository applies an action to the repository at the
+	// endpoint's synchronization root in Git mode, using the objects that
+	// StageRepository received. Failures to apply the action are reported in
+	// the result rather than as errors.
+	TransitionRepository(ctx context.Context, action *core.RepositoryAction) (*core.RepositoryResult, error)
 
 	// Shutdown terminates any resources associated with the endpoint. For local
 	// endpoints, Shutdown will not preempt calls, but for remote endpoints it

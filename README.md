@@ -23,8 +23,9 @@ that this fork doesn't change.
   it, and forwards its streams and exit status. It also runs detached jobs,
   copies ignored output back, and resolves conflicts.
 - [**Git mode**](docs/git-mode.md): `.gitignore` files decide what's
-  synchronized, `.git` never is, and submodules follow the commit checked out
-  on the other endpoint.
+  synchronized, `.git` never is, every endpoint has the root repository at the
+  same commit and branch, and submodules follow the commit checked out on the
+  other endpoint.
 - [**Star workspaces**](docs/stars.md): a project joins one center workspace to
   other workspaces, each through its own session.
 - [**`mutagen project apply`**](docs/project-apply.md) applies changes to

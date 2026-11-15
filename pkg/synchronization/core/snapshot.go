@@ -65,6 +65,11 @@ func (s *Snapshot) EnsureValid() error {
 		}
 	}
 
+	// Ensure that the repository is valid.
+	if err := s.Repository.EnsureValid(); err != nil {
+		return fmt.Errorf("invalid snapshot repository: %w", err)
+	}
+
 	// All values of behavioral metadata fields are valid.
 
 	// While there are some validations that we could perform on the statistical
@@ -112,6 +117,7 @@ func (s *Snapshot) WithWarnings(warnings []*Problem) *Snapshot {
 		Warnings:               warnings,
 		Seeds:                  s.Seeds,
 		SubmoduleStatuses:      s.SubmoduleStatuses,
+		Repository:             s.Repository,
 	}
 }
 
@@ -130,5 +136,14 @@ func (s *Snapshot) WithSeeds(seeds map[string]*Entry) *Snapshot {
 func (s *Snapshot) WithSubmoduleStatuses(statuses map[string]*SubmoduleStatus) *Snapshot {
 	result := s.WithWarnings(s.Warnings)
 	result.SubmoduleStatuses = statuses
+	return result
+}
+
+// WithRepository returns a shallow copy of the snapshot with the specified
+// repository in place of any that it has, for the same reason as WithWarnings.
+// Every other field is retained.
+func (s *Snapshot) WithRepository(repository *Repository) *Snapshot {
+	result := s.WithWarnings(s.Warnings)
+	result.Repository = repository
 	return result
 }

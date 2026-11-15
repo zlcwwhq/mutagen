@@ -5,6 +5,7 @@ package core;
 option go_package = "github.com/mutagen-io/mutagen/pkg/synchronization/core";
 
 import "synchronization/core/entry.proto";
+import "synchronization/core/repository.proto";
 
 // Archive is a wrapper that distinguishes between a nil Entry and a zero-valued
 // Entry when serializing. This is necessary because Protocol Buffers will
@@ -16,4 +17,9 @@ message Archive {
     // Content is the entry stored in the archive. It may be nil to indicate an
     // absence of content.
     Entry content = 1;
+    // Repository is the commit and branch on which the repositories at both
+    // endpoints' synchronization roots last agreed in Git mode, or nil if they
+    // never have. It's only set in the archive that stores a session's
+    // ancestor, not in the archives that wrap transition results.
+    Repository repository = 2;
 }

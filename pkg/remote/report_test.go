@@ -11,6 +11,21 @@ import (
 	"time"
 )
 
+func TestReportWithRepositoryConflict(t *testing.T) {
+	// A report with only a repository conflict isn't empty, and the conflict
+	// survives bounding.
+	conflict := &RepositoryConflict{
+		Alpha: Repository{Commit: strings.Repeat("1a", 20), Branch: "main"},
+		Beta:  Repository{Commit: strings.Repeat("2b", 20), Branch: "main"},
+	}
+	report := &Report{Repository: conflict}
+	if report.Empty() {
+		t.Fatal("report with repository conflict considered empty")
+	} else if bounded, err := boundReport(report); err != nil || bounded.Repository != conflict {
+		t.Fatal("repository conflict not retained:", err)
+	}
+}
+
 func TestFlushLargeReport(t *testing.T) {
 	// A single directory conflict can exceed the protocol limit despite
 	// truncation of the number of conflicts. Both change lists contribute.

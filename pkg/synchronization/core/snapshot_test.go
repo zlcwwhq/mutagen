@@ -138,6 +138,7 @@ func TestSnapshotWithWarnings(t *testing.T) {
 		Warnings:               []*Problem{{Path: "old", Error: "old warning"}},
 		Seeds:                  map[string]*Entry{"path": tD1},
 		SubmoduleStatuses:      map[string]*SubmoduleStatus{"path": {Commit: []byte{1}}},
+		Repository:             &Repository{Branch: "main"},
 	}
 	reflected := original.ProtoReflect()
 	fields := reflected.Descriptor().Fields()

@@ -1,16 +1,21 @@
 package synchronization
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/encoding"
+	"github.com/mutagen-io/mutagen/pkg/remote"
 	"github.com/mutagen-io/mutagen/pkg/state"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
@@ -81,6 +86,28 @@ type testingEndpoint struct {
 	seeds map[string]*core.Entry
 	// scanSeeds are the seeds that each scan has received, sorted.
 	scanSeeds [][]string
+	// repository is the repository at the root, which snapshots report.
+	repository *core.Repository
+	// commits maps the commits that the endpoint's repository has to their
+	// parents (with an empty parent for a commit without one), in their string
+	// forms. They determine the outcomes of fast-forwards, and the endpoint
+	// receives a pack (which consists of the history of the target commit)
+	// for an action whose target commit isn't among them.
+	commits map[string]string
+	// supplyProblem is the problem that prevents the endpoint from supplying
+	// objects, if any.
+	supplyProblem string
+	// repositoryFailure is the problem with which repository actions fail on
+	// the endpoint, if any.
+	repositoryFailure string
+	// repositoryActions are the repository actions that have been applied to
+	// the endpoint.
+	repositoryActions []*core.RepositoryAction
+	// repositoryActionScans are the numbers of scans that had been performed
+	// when each repository action was applied.
+	repositoryActionScans []int
+	// packs is the number of packs that the endpoint has received.
+	packs int
 }
 
 // newTestingEndpoint creates a new testing endpoint with the specified
@@ -144,9 +171,10 @@ func (e *testingEndpoint) Scan(_ context.Context, _ *core.Entry, submodules map[
 		reported = maps.Clone(e.seeds)
 	}
 	return &core.Snapshot{
-		Content:  &core.Entry{Kind: core.EntryKind_Directory, Contents: contents},
-		Warnings: e.warnings,
-		Seeds:    reported,
+		Content:    &core.Entry{Kind: core.EntryKind_Directory, Contents: contents},
+		Warnings:   e.warnings,
+		Seeds:      reported,
+		Repository: e.repository,
 	}, nil, false
 }
 
@@ -202,6 +230,157 @@ func (e *testingEndpoint) Transition(_ context.Context, transitions []*core.Chan
 	return results, problems, false, nil
 }
 
+// testingCommitSize is the size of commit identifiers in testing endpoints.
+const testingCommitSize = 20
+
+// testingCommit creates a commit identifier for a testing endpoint from a
+// non-zero number.
+func testingCommit(number byte) []byte {
+	return bytes.Repeat([]byte{number}, testingCommitSize)
+}
+
+// testingCommits creates the commits of a testing endpoint from the numbers of
+// commits (see testingCommit) and their parents, which are zero for commits
+// without a parent.
+func testingCommits(parents map[byte]byte) map[string]string {
+	commits := make(map[string]string, len(parents))
+	for commit, parent := range parents {
+		commits[string(testingCommit(commit))] = ""
+		if parent != 0 {
+			commits[string(testingCommit(commit))] = string(testingCommit(parent))
+		}
+	}
+	return commits
+}
+
+// testingRepositoryAt creates a repository with the specified branch and commit
+// (see testingCommit).
+func testingRepositoryAt(branch string, commit byte) *core.Repository {
+	return &core.Repository{Commit: testingCommit(commit), Branch: branch}
+}
+
+// contains determines whether or not a commit's history contains another
+// commit. The lock must be held.
+func (e *testingEndpoint) contains(descendant, ancestor string) bool {
+	for commit := descendant; commit != ""; commit = e.commits[commit] {
+		if commit == ancestor {
+			return true
+		}
+	}
+	return false
+}
+
+// testingRepositoryReceiver implements RepositoryReceiver for testingEndpoint.
+// Packs consist of pairs of commits and their parents, with zeroed parents for
+// commits without one.
+type testingRepositoryReceiver struct {
+	// endpoint is the endpoint receiving the pack.
+	endpoint *testingEndpoint
+	// pack is the pack data received so far.
+	pack []byte
+}
+
+// Receive implements RepositoryReceiver.Receive.
+func (r *testingRepositoryReceiver) Receive(data []byte) error {
+	r.pack = append(r.pack, data...)
+	return nil
+}
+
+// Finish implements RepositoryReceiver.Finish.
+func (r *testingRepositoryReceiver) Finish(problem string) error {
+	if problem != "" {
+		return nil
+	} else if len(r.pack)%(2*testingCommitSize) != 0 {
+		return errors.New("invalid pack")
+	}
+	r.endpoint.lock.Lock()
+	defer r.endpoint.lock.Unlock()
+	for len(r.pack) > 0 {
+		commit, parent := string(r.pack[:testingCommitSize]), string(r.pack[testingCommitSize:2*testingCommitSize])
+		if parent == string(make([]byte, testingCommitSize)) {
+			parent = ""
+		}
+		r.endpoint.commits[commit] = parent
+		r.pack = r.pack[2*testingCommitSize:]
+	}
+	r.endpoint.packs++
+	return nil
+}
+
+// StageRepository implements Endpoint.StageRepository.
+func (e *testingEndpoint) StageRepository(_ context.Context, action *core.RepositoryAction) ([][]byte, RepositoryReceiver, error) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	if _, ok := e.commits[string(action.Target.Commit)]; ok {
+		return nil, nil, nil
+	} else if e.commits == nil {
+		e.commits = make(map[string]string)
+	}
+	var haves [][]byte
+	if commit := e.repository.GetCommit(); len(commit) > 0 {
+		haves = append(haves, commit)
+	}
+	return haves, &testingRepositoryReceiver{endpoint: e}, nil
+}
+
+// SupplyRepository implements Endpoint.SupplyRepository.
+func (e *testingEndpoint) SupplyRepository(_ context.Context, commit []byte, _ [][]byte, receiver RepositoryReceiver) (*core.Problem, error) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	if e.supplyProblem != "" {
+		if err := receiver.Finish(e.supplyProblem); err != nil {
+			return nil, err
+		}
+		return &core.Problem{Path: ".git", Error: e.supplyProblem}, nil
+	}
+	var pack []byte
+	for current := string(commit); current != ""; current = e.commits[current] {
+		if _, ok := e.commits[current]; !ok {
+			break
+		}
+		pack = append(pack, current...)
+		if parent := e.commits[current]; parent != "" {
+			pack = append(pack, parent...)
+		} else {
+			pack = append(pack, make([]byte, testingCommitSize)...)
+		}
+	}
+	if err := receiver.Receive(pack); err != nil {
+		return nil, err
+	}
+	return nil, receiver.Finish("")
+}
+
+// TransitionRepository implements Endpoint.TransitionRepository.
+func (e *testingEndpoint) TransitionRepository(_ context.Context, action *core.RepositoryAction) (*core.RepositoryResult, error) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	if err := action.EnsureValid(); err != nil {
+		return nil, err
+	}
+	e.repositoryActions = append(e.repositoryActions, action)
+	e.repositoryActionScans = append(e.repositoryActionScans, e.scans)
+	failed := func(problem string) *core.RepositoryResult {
+		return &core.RepositoryResult{Problem: &core.Problem{Path: ".git", Error: problem}}
+	}
+	target, current := string(action.Target.Commit), string(e.repository.GetCommit())
+	if e.repositoryFailure != "" {
+		return failed(e.repositoryFailure), nil
+	} else if !action.Old.Equal(e.repository) {
+		return failed("the repository changed"), nil
+	} else if _, ok := e.commits[target]; !ok {
+		return failed("the target commit is missing"), nil
+	} else if action.Policy != core.RepositoryPolicy_Follow && current != "" && !e.contains(target, current) {
+		if e.contains(current, target) {
+			return &core.RepositoryResult{Outcome: core.RepositoryOutcome_Ahead}, nil
+		} else if action.Policy == core.RepositoryPolicy_FastForward {
+			return &core.RepositoryResult{Outcome: core.RepositoryOutcome_Diverged}, nil
+		}
+	}
+	e.repository = &core.Repository{Commit: action.Target.Commit, Branch: action.Target.Branch}
+	return &core.RepositoryResult{Outcome: core.RepositoryOutcome_Moved}, nil
+}
+
 // Shutdown implements Endpoint.Shutdown.
 func (e *testingEndpoint) Shutdown() error {
 	return nil
@@ -251,11 +430,18 @@ func startTestingLoopWithAncestor(t *testing.T, configuration *Configuration, an
 // session that has already saved a replica record, unless it's nil.
 func startTestingLoopWithRecord(t *testing.T, configuration *Configuration, ancestor *core.Entry, record *ReplicaRecord, alpha, beta *testingEndpoint) *testingLoop {
 	t.Helper()
+	return startTestingLoopWithArchive(t, configuration, &core.Archive{Content: ancestor}, record, alpha, beta)
+}
+
+// startTestingLoopWithArchive is a variant of startTestingLoopWithRecord for a
+// session with the specified archive.
+func startTestingLoopWithArchive(t *testing.T, configuration *Configuration, archive *core.Archive, record *ReplicaRecord, alpha, beta *testingEndpoint) *testingLoop {
+	t.Helper()
 
 	// Create the archive and the replica record.
 	directory := t.TempDir()
 	archivePath := filepath.Join(directory, "archive")
-	if err := encoding.MarshalAndSaveProtobuf(archivePath, &core.Archive{Content: ancestor}); err != nil {
+	if err := encoding.MarshalAndSaveProtobuf(archivePath, archive); err != nil {
 		t.Fatal("unable to create archive:", err)
 	}
 	replicaRecordPath := filepath.Join(directory, "replica")
@@ -1042,4 +1228,389 @@ func TestSynchronizeWarnings(t *testing.T) {
 	if len(alphaProblems) != 1 || alphaProblems[0].Path != "problematic" {
 		t.Errorf("incorrect alpha scan problems after warnings removed: %v", alphaProblems)
 	}
+}
+
+// repositoryAncestor loads the repository ancestor that the loop has saved.
+func (l *testingLoop) repositoryAncestor() *core.Repository {
+	l.t.Helper()
+	archive := &core.Archive{}
+	if err := encoding.LoadAndUnmarshalProtobuf(l.controller.archivePath, archive); err != nil {
+		l.t.Fatal("unable to load archive:", err)
+	}
+	return archive.Repository
+}
+
+// repositoryConflict returns the loop's repository conflict.
+func (l *testingLoop) repositoryConflict() *core.RepositoryConflict {
+	l.controller.stateLock.Lock()
+	defer l.controller.stateLock.UnlockWithoutNotify()
+	return l.controller.state.RepositoryConflict
+}
+
+// verifyRepositories verifies the repository ancestor that the loop has saved,
+// the repositories at the endpoints, and the loop's repository conflict, if
+// any, which must be between the specified repositories.
+func (l *testingLoop) verifyRepositories(ancestor, alpha, beta *core.Repository, conflict bool) {
+	l.t.Helper()
+	if actual := l.repositoryAncestor(); !actual.Equal(ancestor) {
+		l.t.Errorf("incorrect repository ancestor: %v != %v", actual, ancestor)
+	}
+	for _, endpoint := range []struct {
+		name       string
+		endpoint   *testingEndpoint
+		repository *core.Repository
+	}{{"alpha", l.alpha, alpha}, {"beta", l.beta, beta}} {
+		endpoint.endpoint.update(func() {
+			if !endpoint.endpoint.repository.Equal(endpoint.repository) ||
+				endpoint.endpoint.repository.GetUnavailable() != endpoint.repository.GetUnavailable() {
+				l.t.Errorf("incorrect %s repository: %v != %v", endpoint.name, endpoint.endpoint.repository, endpoint.repository)
+			}
+		})
+	}
+	actual := l.repositoryConflict()
+	if !conflict {
+		if actual != nil {
+			l.t.Errorf("unexpected repository conflict: %v", actual)
+		}
+	} else if actual == nil {
+		l.t.Error("repository conflict not reported")
+	} else if err := actual.EnsureValid(); err != nil {
+		l.t.Error("invalid repository conflict:", err)
+	} else if !actual.Alpha.Equal(alpha) || !actual.Beta.Equal(beta) || !actual.Ancestor.Equal(ancestor) {
+		l.t.Errorf("incorrect repository conflict: %v", actual)
+	}
+}
+
+// repositoryStatus returns the number of repository actions that have been
+// applied to an endpoint and the number of packs that it has received.
+func (e *testingEndpoint) repositoryStatus() (int, int) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	return len(e.repositoryActions), e.packs
+}
+
+// verifyRepositoryOperations verifies the number of repository actions that
+// have been applied to each endpoint and the number of packs that each has
+// received.
+func (l *testingLoop) verifyRepositoryOperations(alphaActions, alphaPacks, betaActions, betaPacks int) {
+	l.t.Helper()
+	if actions, packs := l.alpha.repositoryStatus(); actions != alphaActions || packs != alphaPacks {
+		l.t.Errorf("incorrect alpha repository operations: %d actions, %d packs", actions, packs)
+	}
+	if actions, packs := l.beta.repositoryStatus(); actions != betaActions || packs != betaPacks {
+		l.t.Errorf("incorrect beta repository operations: %d actions, %d packs", actions, packs)
+	}
+}
+
+// newTestingRepositoryEndpoint creates a testing endpoint with the specified
+// contents and repository, whose commits are specified as for testingCommits.
+func newTestingRepositoryEndpoint(contents map[string]*core.Entry, repository *core.Repository, commits map[byte]byte) *testingEndpoint {
+	endpoint := newTestingEndpoint(contents)
+	endpoint.repository = repository
+	endpoint.commits = testingCommits(commits)
+	return endpoint
+}
+
+// testingEmptyArchive is an archive for a session whose roots are empty
+// directories, with the specified repository ancestor.
+func testingEmptyArchive(repository *core.Repository) *core.Archive {
+	return &core.Archive{Content: testingDirectory(), Repository: repository}
+}
+
+// TestSynchronizeRepositoryAgreement tests that repositories that agree from the
+// start have their agreement recorded, even though no content changes.
+func TestSynchronizeRepositoryAgreement(t *testing.T) {
+	main1 := testingRepositoryAt("main", 1)
+	alpha := newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+	beta := newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+	loop := startTestingLoopWithArchive(t, testingGitMode, testingEmptyArchive(nil), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verify(1, nil, nil)
+	loop.verifyRepositories(main1, main1, main1, false)
+	loop.verifyRepositoryOperations(0, 0, 0, 0)
+	if !loop.ancestor().Equal(testingDirectory(), true) {
+		t.Error("incorrect content ancestor:", loop.ancestor())
+	}
+}
+
+// TestSynchronizeRepositoryFollow tests that a repository follows the other one
+// when only that one has moved, in either direction, receiving the objects that
+// it needs, and that a flush covers it.
+func TestSynchronizeRepositoryFollow(t *testing.T) {
+	main1, main2, main3 := testingRepositoryAt("main", 1), testingRepositoryAt("main", 2), testingRepositoryAt("main", 3)
+	alpha := newTestingRepositoryEndpoint(nil, main2, map[byte]byte{1: 0, 2: 1})
+	beta := newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+	loop := startTestingLoopWithArchive(t, testingGitMode, testingEmptyArchive(main1), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verifyRepositories(main2, main2, main2, false)
+	loop.verifyRepositoryOperations(0, 0, 1, 1)
+
+	// Commit on beta, which alpha follows, and then switch to another branch.
+	beta.update(func() {
+		beta.commits[string(testingCommit(3))] = string(testingCommit(2))
+		beta.repository = main3
+	})
+	loop.flush()
+	loop.verifyRepositories(main3, main3, main3, false)
+	loop.verifyRepositoryOperations(1, 1, 1, 1)
+	dev3 := testingRepositoryAt("dev", 3)
+	beta.update(func() { beta.repository = dev3 })
+	loop.flush()
+	loop.verifyRepositories(dev3, dev3, dev3, false)
+	loop.verifyRepositoryOperations(2, 1, 1, 1)
+}
+
+// TestSynchronizeRepositoryDivergence tests that repositories with commits that
+// have diverged conflict without either moving, while their content is still
+// synchronized, and that the conflict is resolved by resetting one of them to
+// the other's commit and committing again.
+func TestSynchronizeRepositoryDivergence(t *testing.T) {
+	main1, main2, main3, main4 := testingRepositoryAt("main", 1), testingRepositoryAt("main", 2),
+		testingRepositoryAt("main", 3), testingRepositoryAt("main", 4)
+	alpha := newTestingRepositoryEndpoint(map[string]*core.Entry{"new": testingFile}, main2, map[byte]byte{1: 0, 2: 1})
+	beta := newTestingRepositoryEndpoint(nil, main3, map[byte]byte{1: 0, 3: 1})
+	loop := startTestingLoopWithArchive(t, testingGitMode, testingEmptyArchive(main1), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verify(1, nil, [][]string{{"new"}})
+	loop.verifyRepositories(main1, main2, main3, true)
+
+	// Both endpoints have received each other's objects, so that either can
+	// be reset to the other's commit.
+	loop.verifyRepositoryOperations(1, 1, 1, 1)
+
+	// The conflict is reported to remote, both after flushes and in conflict
+	// listings.
+	expected := &remote.RepositoryConflict{
+		Alpha:    remote.Repository{Commit: strings.Repeat("02", 20), Branch: "main"},
+		Beta:     remote.Repository{Commit: strings.Repeat("03", 20), Branch: "main"},
+		Ancestor: &remote.Repository{Commit: strings.Repeat("01", 20), Branch: "main"},
+	}
+	if report := loop.controller.remoteReport(); !reflect.DeepEqual(report.Repository, expected) {
+		t.Errorf("incorrect reported repository conflict: %+v", report.Repository)
+	}
+	if listing, err := loop.controller.remoteConflicts("sha256"); err != nil {
+		t.Fatal("unable to list conflicts:", err)
+	} else if !reflect.DeepEqual(listing.Repository, expected) || len(listing.Conflicts) != 0 {
+		t.Errorf("incorrect listed repository conflict: %+v", listing.Repository)
+	}
+
+	// Further cycles report the conflict again, without transferring the
+	// objects again.
+	alpha.update(func() { alpha.contents["other"] = testingFile })
+	loop.flush()
+	loop.verify(2, nil, [][]string{{"new"}, {"other"}})
+	loop.verifyRepositories(main1, main2, main3, true)
+	loop.verifyRepositoryOperations(2, 1, 2, 1)
+
+	// Reset beta to alpha's commit and commit again, which alpha then
+	// fast-forwards to.
+	beta.update(func() {
+		beta.commits[string(testingCommit(4))] = string(testingCommit(2))
+		beta.repository = main4
+	})
+	loop.flush()
+	loop.verifyRepositories(main4, main4, main4, false)
+	loop.verifyRepositoryOperations(3, 2, 3, 1)
+}
+
+// TestSynchronizeRepositoryAttach tests that an endpoint without a repository
+// gets one, and that an endpoint without a commit gets the other's, but that
+// one-way modes never change alpha's repository.
+func TestSynchronizeRepositoryAttach(t *testing.T) {
+	main1 := testingRepositoryAt("main", 1)
+	unborn := &core.Repository{Branch: "main"}
+	modes := []core.SynchronizationMode{
+		core.SynchronizationMode_SynchronizationModeTwoWaySafe,
+		core.SynchronizationMode_SynchronizationModeOneWaySafe,
+	}
+	for _, mode := range modes {
+		configuration := &Configuration{GitMode: GitMode_GitModeEnabled, SynchronizationMode: mode}
+		for _, initial := range []*core.Repository{nil, unborn} {
+			// Attach a repository to beta, or give it alpha's commit.
+			alpha := newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+			beta := newTestingRepositoryEndpoint(nil, initial, nil)
+			loop := startTestingLoopWithArchive(t, configuration, testingEmptyArchive(nil), nil, alpha, beta)
+			loop.waitForPolling()
+			loop.verifyRepositories(main1, main1, main1, false)
+			loop.verifyRepositoryOperations(0, 0, 1, 1)
+
+			// The same happens to alpha, but only in two-way modes.
+			alpha = newTestingRepositoryEndpoint(nil, initial, nil)
+			beta = newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+			loop = startTestingLoopWithArchive(t, configuration, testingEmptyArchive(nil), nil, alpha, beta)
+			loop.waitForPolling()
+			if mode == core.SynchronizationMode_SynchronizationModeOneWaySafe {
+				loop.verifyRepositories(nil, initial, main1, false)
+				loop.verifyRepositoryOperations(0, 0, 0, 0)
+			} else {
+				loop.verifyRepositories(main1, main1, main1, false)
+				loop.verifyRepositoryOperations(1, 1, 0, 0)
+			}
+		}
+	}
+}
+
+// TestSynchronizeRepositoryOneWay tests that a commit on beta conflicts in the
+// one-way-safe mode, without changing alpha, and is undone in the
+// one-way-replica mode.
+func TestSynchronizeRepositoryOneWay(t *testing.T) {
+	main1, main2 := testingRepositoryAt("main", 1), testingRepositoryAt("main", 2)
+
+	// In the one-way-safe mode, beta's commit conflicts.
+	safe := &Configuration{
+		GitMode:             GitMode_GitModeEnabled,
+		SynchronizationMode: core.SynchronizationMode_SynchronizationModeOneWaySafe,
+	}
+	alpha := newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+	beta := newTestingRepositoryEndpoint(nil, main2, map[byte]byte{1: 0, 2: 1})
+	loop := startTestingLoopWithArchive(t, safe, testingEmptyArchive(main1), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verifyRepositories(main1, main1, main2, true)
+	loop.verifyRepositoryOperations(0, 0, 0, 0)
+	if report := loop.controller.remoteReport(); report.Repository == nil || !report.Repository.OneWay {
+		t.Errorf("repository conflict not reported as one-way: %+v", report.Repository)
+	}
+
+	// Resetting beta to alpha's commit resolves the conflict.
+	beta.update(func() { beta.repository = main1 })
+	loop.flush()
+	loop.verifyRepositories(main1, main1, main1, false)
+
+	// In the one-way-replica mode, beta goes back to alpha's commit.
+	alpha = newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+	beta = newTestingRepositoryEndpoint(nil, main2, map[byte]byte{1: 0, 2: 1})
+	loop = startTestingLoopWithArchive(t, testingReplica, testingEmptyArchive(main1), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verifyRepositories(main1, main1, main1, false)
+	loop.verifyRepositoryOperations(0, 0, 1, 0)
+}
+
+// TestSynchronizeRepositoryWithoutAncestor tests that repositories that have
+// never agreed, as in sessions created by earlier versions, are only
+// fast-forwarded, even in the two-way-resolved mode, and that commits that have
+// diverged conflict.
+func TestSynchronizeRepositoryWithoutAncestor(t *testing.T) {
+	main1, main2, main3 := testingRepositoryAt("main", 1), testingRepositoryAt("main", 2), testingRepositoryAt("main", 3)
+	resolved := &Configuration{
+		GitMode:             GitMode_GitModeEnabled,
+		SynchronizationMode: core.SynchronizationMode_SynchronizationModeTwoWayResolved,
+	}
+
+	// Beta is fast-forwarded to alpha's commit.
+	alpha := newTestingRepositoryEndpoint(nil, main2, map[byte]byte{1: 0, 2: 1})
+	beta := newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+	loop := startTestingLoopWithArchive(t, resolved, testingEmptyArchive(nil), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verifyRepositories(main2, main2, main2, false)
+
+	// Commits that have diverged conflict.
+	alpha = newTestingRepositoryEndpoint(nil, main2, map[byte]byte{1: 0, 2: 1})
+	beta = newTestingRepositoryEndpoint(nil, main3, map[byte]byte{1: 0, 3: 1})
+	loop = startTestingLoopWithArchive(t, resolved, testingEmptyArchive(nil), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verifyRepositories(nil, main2, main3, true)
+}
+
+// TestSynchronizeRepositoryUnavailable tests that nothing happens to the
+// repositories while one of them is unavailable, and that an existing conflict
+// is kept.
+func TestSynchronizeRepositoryUnavailable(t *testing.T) {
+	main1, main2, main3 := testingRepositoryAt("main", 1), testingRepositoryAt("main", 2), testingRepositoryAt("main", 3)
+	unavailable := &core.Repository{Unavailable: "a rebase is in progress"}
+
+	// Nothing follows an unavailable repository, or is followed by it.
+	alpha := newTestingRepositoryEndpoint(nil, main2, map[byte]byte{1: 0, 2: 1})
+	beta := newTestingRepositoryEndpoint(nil, unavailable, map[byte]byte{1: 0})
+	loop := startTestingLoopWithArchive(t, testingGitMode, testingEmptyArchive(main1), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verifyRepositories(main1, main2, unavailable, false)
+	loop.verifyRepositoryOperations(0, 0, 0, 0)
+
+	// A conflict is kept while a repository is unavailable, and it's
+	// reevaluated once it's available again.
+	alpha = newTestingRepositoryEndpoint(nil, main2, map[byte]byte{1: 0, 2: 1})
+	beta = newTestingRepositoryEndpoint(nil, main3, map[byte]byte{1: 0, 3: 1})
+	loop = startTestingLoopWithArchive(t, testingGitMode, testingEmptyArchive(main1), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verifyRepositories(main1, main2, main3, true)
+	beta.update(func() { beta.repository = unavailable })
+	loop.flush()
+	if conflict := loop.repositoryConflict(); conflict == nil || !conflict.Beta.Equal(main3) {
+		t.Error("conflict not kept:", conflict)
+	}
+	loop.verifyRepositoryOperations(1, 1, 1, 1)
+	beta.update(func() { beta.repository = main2 })
+	loop.flush()
+	loop.verifyRepositories(main2, main2, main2, false)
+}
+
+// TestSynchronizeRepositoryRuleOnlyCycle tests that repository actions aren't
+// held back by cycles that only deliver ignore rules.
+func TestSynchronizeRepositoryRuleOnlyCycle(t *testing.T) {
+	main1, main2 := testingRepositoryAt("main", 1), testingRepositoryAt("main", 2)
+	alpha := newTestingRepositoryEndpoint(
+		map[string]*core.Entry{testingFileRules: testingFile, "other": testingFile},
+		main2, map[byte]byte{1: 0, 2: 1},
+	)
+	beta := newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+	loop := startTestingLoopWithArchive(t, testingGitMode, testingEmptyArchive(main1), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verify(2, nil, [][]string{{testingFileRules}, {"other"}})
+	loop.verifyRepositories(main2, main2, main2, false)
+	beta.update(func() {
+		if !slices.Equal(beta.repositoryActionScans, []int{1}) {
+			t.Error("repository action not applied in the first cycle:", beta.repositoryActionScans)
+		}
+	})
+}
+
+// TestSynchronizeRepositoryProblems tests that problems supplying objects and
+// applying actions are reported for the endpoint that the action applies to,
+// leave the ancestor as it is without a conflict, and don't stop
+// synchronization, and that the action succeeds once they're gone.
+func TestSynchronizeRepositoryProblems(t *testing.T) {
+	main1, main2 := testingRepositoryAt("main", 1), testingRepositoryAt("main", 2)
+	alpha := newTestingRepositoryEndpoint(nil, main2, map[byte]byte{1: 0, 2: 1})
+	alpha.supplyProblem = "the repository is shallow"
+	beta := newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+	loop := startTestingLoopWithArchive(t, testingGitMode, testingEmptyArchive(main1), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verifyRepositories(main1, main2, main1, false)
+	loop.verifyRepositoryOperations(0, 0, 0, 0)
+	verifyProblem := func(message string) {
+		t.Helper()
+		if problems := loop.betaTransitionProblems(); len(problems) != 1 ||
+			problems[0].Path != ".git" || problems[0].Error != message {
+			t.Errorf("incorrect beta transition problems: %v", problems)
+		}
+	}
+	verifyProblem("the repository is shallow")
+
+	// A failing action is reported as well.
+	alpha.update(func() { alpha.supplyProblem = "" })
+	beta.update(func() { beta.repositoryFailure = "unable to lock the index" })
+	loop.flush()
+	loop.verifyRepositories(main1, main2, main1, false)
+	loop.verifyRepositoryOperations(0, 0, 1, 1)
+	verifyProblem("unable to lock the index")
+
+	// Once the problems are gone, beta follows.
+	beta.update(func() { beta.repositoryFailure = "" })
+	loop.flush()
+	loop.verifyRepositories(main2, main2, main2, false)
+	if problems := loop.betaTransitionProblems(); len(problems) != 0 {
+		t.Error("problems remain:", problems)
+	}
+}
+
+// TestSynchronizeRepositoryWithoutGitMode tests that repositories are left
+// alone if Git mode isn't enabled.
+func TestSynchronizeRepositoryWithoutGitMode(t *testing.T) {
+	main1, main2 := testingRepositoryAt("main", 1), testingRepositoryAt("main", 2)
+	alpha := newTestingRepositoryEndpoint(nil, main2, map[byte]byte{1: 0, 2: 1})
+	beta := newTestingRepositoryEndpoint(nil, main1, map[byte]byte{1: 0})
+	loop := startTestingLoopWithArchive(t, &Configuration{}, testingEmptyArchive(main1), nil, alpha, beta)
+	loop.waitForPolling()
+	loop.verifyRepositories(main1, main2, main1, false)
+	loop.verifyRepositoryOperations(0, 0, 0, 0)
 }

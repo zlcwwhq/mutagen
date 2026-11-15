@@ -922,6 +922,18 @@ type listedConflict struct {
 	changed string
 }
 
+// listedRepositoryConflict is a repository conflict as listed by --conflicts
+// --json, from the submitting endpoint's perspective.
+type listedRepositoryConflict struct {
+	// Local and Remote are the local and remote repositories.
+	Local  remote.Repository
+	Remote remote.Repository
+	// Ancestor is the commit and branch on which they last agreed, if any.
+	Ancestor *remote.Repository `json:",omitempty"`
+	// Resolution describes how to resolve the conflict with Git.
+	Resolution string
+}
+
 // pendingResolution is a workspace as listed by --conflicts --json whose
 // conflict is no longer listed, along with its location. If something was
 // applied, its resolution is unfinished, and it's finished by applying again.
@@ -1100,7 +1112,18 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 			RemotePending []string
 			Problems      []remote.Problem
 			Checkouts     []checkoutOwner
+			Repository    *listedRepositoryConflict `json:",omitempty"`
 		}{Conflicts: conflicts, Pending: make([]pendingResolution, len(pending)), RemotePending: make([]string, len(elsewhere)), Problems: make([]remote.Problem, len(listing.Problems)), Checkouts: make([]checkoutOwner, len(checkouts))}
+		if conflict := listing.Repository; conflict != nil {
+			local, opposite := conflict.Alpha, conflict.Beta
+			if !target.Alpha {
+				local, opposite = opposite, local
+			}
+			listed.Repository = &listedRepositoryConflict{
+				Local: local, Remote: opposite, Ancestor: conflict.Ancestor,
+				Resolution: reports.describeRepositoryConflict(conflict)[1],
+			}
+		}
 		copy(listed.Problems, listing.Problems)
 		for i := range listed.Problems {
 			listed.Problems[i].Path = l.local(listed.Problems[i].Path)
@@ -1128,13 +1151,22 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 	// because they describe content that isn't synchronized by design, such as
 	// paths that an endpoint's own rules exclude, and can persist for as long as
 	// a session runs, so they say nothing about conflicts.
-	if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 {
+	if len(conflicts) == 0 && len(pending) == 0 && len(elsewhere) == 0 && listing.Repository == nil {
 		message := "No conflicts."
 		if slices.ContainsFunc(listing.Problems, func(problem remote.Problem) bool { return !problem.Warning }) {
 			message = "Conflicts can't be ruled out, because some content couldn't be synchronized (see the warnings)."
 		}
 		_, err := fmt.Fprintln(output, message)
 		return err
+	}
+	// A repository conflict is listed first, as a conflict of the root's .git,
+	// which remote can't resolve.
+	if conflict := listing.Repository; conflict != nil {
+		lines := reports.describeRepositoryConflict(conflict)
+		line := fmt.Sprintf("%s: the commits and branches conflict, which remote can't resolve: %s; %s", l.display(".git"), lines[0], lines[1])
+		if _, err := fmt.Fprintln(output, line); err != nil {
+			return err
+		}
 	}
 	for c, conflict := range conflicts {
 		line := reports.describeConflict(limitChanges(listing.Conflicts[c].Changes(), listedChanges))

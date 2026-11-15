@@ -111,12 +111,28 @@ func TestListingIncludesCheckouts(t *testing.T) {
 		Conflicts: []ConflictRoot{{Path: "file", Files: true}},
 		Problems:  []Problem{{Path: "problem", Error: "unreadable"}, {Path: "warning", Error: "ignored", Warning: true}},
 		Checkouts: []Checkout{{Path: "file", Alpha: true, Token: "token"}, {Path: "unfinished", Token: "other"}},
+		Repository: &RepositoryConflict{
+			Alpha:    Repository{Commit: strings.Repeat("1a", 20), Branch: "main"},
+			Beta:     Repository{Commit: strings.Repeat("2b", 20)},
+			Ancestor: &Repository{Commit: strings.Repeat("0c", 20), Branch: "main"},
+			OneWay:   true,
+		},
 	}
 	client, server := net.Pipe()
 	go RespondWithConflicts(server, sent, nil)
 	if received, err := ListConflicts(ctx, client); err != nil || !reflect.DeepEqual(received, sent) {
 		t.Fatalf("listing received incorrectly: %+v, %v", received, err)
 	}
+
+	// The repository conflict is sent with the end of the listing, which
+	// clients that predate it accept.
+	client, server = net.Pipe()
+	go RespondWithConflicts(server, &Listing{Repository: sent.Repository}, nil)
+	var message struct{ Done bool }
+	if err := readMessage(client, &message); err != nil || !message.Done {
+		t.Fatalf("repository conflict not sent with the end of the listing: %+v, %v", message, err)
+	}
+	client.Close()
 }
 
 func TestListingBoundsChanges(t *testing.T) {

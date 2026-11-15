@@ -932,3 +932,230 @@ func TestProbe(t *testing.T) {
 		}
 	})
 }
+
+// mustRun runs a command created by Command that must succeed and returns its
+// trimmed output.
+func mustRun(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	output, err := runCommand(directory, args...)
+	if err != nil {
+		t.Fatalf("unable to run Git with arguments %v: %v", args, err)
+	}
+	return output
+}
+
+// verifyRootRepository verifies the result of ProbeRoot for a repository, with
+// the expected commit given in hexadecimal.
+func verifyRootRepository(t *testing.T, repository *RootRepository, commit, branch, url string) {
+	t.Helper()
+	if repository == nil {
+		t.Fatal("repository not found")
+	} else if hex.EncodeToString(repository.Commit) != commit {
+		t.Errorf("incorrect commit: %x != %s", repository.Commit, commit)
+	} else if repository.Branch != branch {
+		t.Errorf("incorrect branch: %q != %q", repository.Branch, branch)
+	} else if repository.URL != url {
+		t.Errorf("incorrect URL: %q != %q", repository.URL, url)
+	}
+}
+
+// TestProbeRoot tests the examination of the repository at a synchronization
+// root.
+func TestProbeRoot(t *testing.T) {
+	requireGit(t)
+	isolate(t)
+	base := realTemporaryDirectory(t)
+	ctx := context.Background()
+
+	// A directory without a .git entry has no repository, and neither does a
+	// root that's a file.
+	t.Run("absent", func(t *testing.T) {
+		directory := filepath.Join(base, "absent")
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if repository, err := ProbeRoot(ctx, directory); err != nil || repository != nil {
+			t.Errorf("repository found: %+v, %v", repository, err)
+		}
+		file := filepath.Join(base, "file")
+		if err := os.WriteFile(file, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if repository, err := ProbeRoot(ctx, file); err != nil || repository != nil {
+			t.Errorf("repository found in file: %+v, %v", repository, err)
+		}
+	})
+
+	// A repository without commits has an unborn HEAD, whose branch is
+	// reported without a commit.
+	t.Run("unborn", func(t *testing.T) {
+		directory := filepath.Join(base, "unborn")
+		initializeRepository(t, directory, "--initial-branch=trunk")
+		repository, err := ProbeRoot(ctx, directory)
+		if err != nil {
+			t.Fatal("probe failed:", err)
+		}
+		verifyRootRepository(t, repository, "", "trunk", "")
+		if repository.Commit != nil {
+			t.Errorf("unborn HEAD reported with commit: %x", repository.Commit)
+		}
+	})
+
+	// A repository with a commit reports it, along with its branch, unless
+	// HEAD is detached, and its origin, without credentials.
+	t.Run("branch and detached", func(t *testing.T) {
+		directory := newCommittedRepository(t, filepath.Join(base, "branch"), "https://user:secret@example.org/repository.git")
+		mustRun(t, directory, "checkout", "--quiet", "-b", "feature/x")
+		head := mustRun(t, directory, "rev-parse", "HEAD")
+		repository, err := ProbeRoot(ctx, directory)
+		if err != nil {
+			t.Fatal("probe failed:", err)
+		}
+		verifyRootRepository(t, repository, head, "feature/x", "https://example.org/repository.git")
+		if repository.AutoCRLF != "" || repository.EOL != "" {
+			t.Errorf("unset line ending settings reported: %q %q", repository.AutoCRLF, repository.EOL)
+		}
+		mustRun(t, directory, "checkout", "--quiet", "--detach")
+		repository, err = ProbeRoot(ctx, directory)
+		if err != nil {
+			t.Fatal("probe failed:", err)
+		}
+		verifyRootRepository(t, repository, head, "", "https://example.org/repository.git")
+	})
+
+	// An origin isn't required, and one that can't be used elsewhere is left
+	// out rather than being a failure.
+	t.Run("origins", func(t *testing.T) {
+		directory := newCommittedRepository(t, filepath.Join(base, "origins"), "")
+		head := mustRun(t, directory, "rev-parse", "HEAD")
+		repository, err := ProbeRoot(ctx, directory)
+		if err != nil {
+			t.Fatal("probe failed:", err)
+		}
+		branch := repository.Branch
+		verifyRootRepository(t, repository, head, branch, "")
+		for _, url := range []string{"-https://user:secret@example.org/repository.git", "relative/path"} {
+			mustRun(t, directory, "config", "remote.origin.url", url)
+			repository, err := ProbeRoot(ctx, directory)
+			if err != nil {
+				t.Fatalf("probe failed with origin %q: %v", url, err)
+			}
+			verifyRootRepository(t, repository, head, branch, "")
+		}
+	})
+
+	// The line ending settings are reported as they apply, as Probe reports
+	// them.
+	t.Run("line ending settings", func(t *testing.T) {
+		directory := newCommittedRepository(t, filepath.Join(base, "settings"), "")
+		mustRun(t, directory, "config", "core.autocrlf", "input")
+		mustRun(t, directory, "config", "core.eol", "lf")
+		repository, err := ProbeRoot(ctx, directory)
+		if err != nil {
+			t.Fatal("probe failed:", err)
+		} else if repository.AutoCRLF != "input" || repository.EOL != "lf" {
+			t.Errorf("incorrect line ending settings: %q %q", repository.AutoCRLF, repository.EOL)
+		}
+	})
+
+	// The root can be a linked worktree, which has its own HEAD.
+	t.Run("linked worktree", func(t *testing.T) {
+		directory := newCommittedRepository(t, filepath.Join(base, "main"), "https://example.org/repository.git")
+		worktree := filepath.Join(base, "linked")
+		mustRun(t, directory, "worktree", "add", "--quiet", "-b", "linked", worktree)
+		head := mustRun(t, worktree, "rev-parse", "HEAD")
+		repository, err := ProbeRoot(ctx, worktree)
+		if err != nil {
+			t.Fatal("probe failed:", err)
+		}
+		verifyRootRepository(t, repository, head, "linked", "https://example.org/repository.git")
+	})
+
+	// SHA-256 repositories have longer commit identifiers.
+	t.Run("SHA-256", func(t *testing.T) {
+		directory := filepath.Join(base, "sha256")
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		} else if _, err := runCommand(directory, "init", "--quiet", "--object-format=sha256", "--initial-branch=main"); err != nil {
+			t.Skip("SHA-256 repositories aren't supported:", err)
+		}
+		mustRun(t, directory, "commit", "--quiet", "--allow-empty", "--no-gpg-sign", "-m", "first")
+		head := mustRun(t, directory, "rev-parse", "HEAD")
+		repository, err := ProbeRoot(ctx, directory)
+		if err != nil {
+			t.Fatal("probe failed:", err)
+		} else if len(repository.Commit) != 32 {
+			t.Errorf("incorrect commit length: %d", len(repository.Commit))
+		}
+		verifyRootRepository(t, repository, head, "main", "")
+	})
+
+	// Anything that can't be used is a failure, rather than an absence of a
+	// repository, with a message that says what to do.
+	t.Run("invalid repository", func(t *testing.T) {
+		directory := filepath.Join(base, "invalid")
+		if err := os.MkdirAll(filepath.Join(directory, ".git"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		_, err := ProbeRoot(ctx, directory)
+		if err == nil {
+			t.Fatal("probe succeeded")
+		} else if !strings.Contains(err.Error(), "isn't a valid repository") || !strings.Contains(err.Error(), "move it aside") {
+			t.Error("incorrect error:", err)
+		}
+	})
+	t.Run("not top level", func(t *testing.T) {
+		directory := newCommittedRepository(t, filepath.Join(base, "nested", "repository"), "")
+		mustRun(t, directory, "config", "core.worktree", filepath.Dir(directory))
+		_, err := ProbeRoot(ctx, directory)
+		if err == nil {
+			t.Fatal("probe succeeded")
+		} else if !strings.Contains(err.Error(), "working tree isn't the root") {
+			t.Error("incorrect error:", err)
+		}
+	})
+	t.Run("damaged", func(t *testing.T) {
+		directory := newCommittedRepository(t, filepath.Join(base, "damaged"), "")
+		branch := mustRun(t, directory, "symbolic-ref", "--short", "HEAD")
+		missing := strings.Repeat("1", 40)
+		if err := os.WriteFile(filepath.Join(directory, ".git", "refs", "heads", branch), []byte(missing+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := ProbeRoot(ctx, directory)
+		if err == nil {
+			t.Fatal("probe succeeded")
+		} else if !strings.Contains(err.Error(), "damaged") {
+			t.Error("incorrect error:", err)
+		}
+	})
+	t.Run("cancelled", func(t *testing.T) {
+		directory := newCommittedRepository(t, filepath.Join(base, "cancelled"), "")
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		_, err := ProbeRoot(cancelled, directory)
+		if !errors.Is(err, context.Canceled) {
+			t.Error("incorrect error:", err)
+		}
+	})
+}
+
+// TestRunWithIndex verifies that a command run by RunWithIndex uses the
+// specified index and leaves the repository's own alone.
+func TestRunWithIndex(t *testing.T) {
+	requireGit(t)
+	isolate(t)
+	directory := newCommittedRepository(t, filepath.Join(realTemporaryDirectory(t), "repository"), "")
+	if err := os.WriteFile(filepath.Join(directory, "file"), []byte("contents"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, directory, "add", "file")
+	head := mustRun(t, directory, "rev-parse", "HEAD")
+	index := filepath.Join(directory, ".git", "other-index")
+	if _, err := RunWithIndex(context.Background(), directory, index, "read-tree", head); err != nil {
+		t.Fatal("unable to read tree into other index:", err)
+	} else if output, err := RunWithIndex(context.Background(), directory, index, "ls-files"); err != nil || output != "" {
+		t.Errorf("other index has entries: %q, %v", output, err)
+	} else if output := mustRun(t, directory, "ls-files"); output != "file" {
+		t.Errorf("repository's index changed: %q", output)
+	}
+}

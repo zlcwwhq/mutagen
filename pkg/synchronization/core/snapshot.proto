@@ -6,6 +6,7 @@ option go_package = "github.com/mutagen-io/mutagen/pkg/synchronization/core";
 
 import "synchronization/core/entry.proto";
 import "synchronization/core/problem.proto";
+import "synchronization/core/repository.proto";
 
 // Snapshot bundles a filesystem content snapshot with associated metadata.
 // Snapshot objects should be considered immutable and must not be modified.
@@ -56,6 +57,12 @@ message Snapshot {
     // content that one endpoint has changed and the other hasn't. Like
     // warnings, they aren't part of the snapshot's identity.
     map<string, SubmoduleStatus> submoduleStatuses = 10;
+    // Repository is the repository at the synchronization root in Git mode,
+    // or nil if the root has no .git entry (or the session isn't in Git
+    // mode). Reconciliation compares it with the other endpoint's and the
+    // ancestor's, separately from the content. Like warnings, it isn't part of
+    // the snapshot's identity.
+    Repository repository = 11;
 }
 
 // SubmoduleStatus describes how the working tree of a submodule differs from

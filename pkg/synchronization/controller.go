@@ -694,9 +694,11 @@ func (c *controller) reset(ctx context.Context, prompter string) error {
 		}
 	}
 
-	// Reset the session archive on disk. The replica record (if any) is kept,
-	// since what beta's rules have kept out of synchronization doesn't change
-	// when its history is forgotten.
+	// Reset the session archive on disk, which also forgets the commit and
+	// branch on which the repositories at the endpoints' roots last agreed in
+	// Git mode. The replica record (if any) is kept, since what beta's rules
+	// have kept out of synchronization doesn't change when its history is
+	// forgotten.
 	c.logger.Infof("Resetting ancestor")
 	archive := &core.Archive{}
 	if err := encoding.MarshalAndSaveProtobuf(c.archivePath, archive); err != nil {
@@ -1393,6 +1395,24 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			}
 		}
 
+		// In Git mode, reconcile the repositories at the endpoints' roots, which
+		// are compared separately from the content, with the commit and branch
+		// on which they last agreed (see core.ReconcileRepository). Their
+		// actions are subject to the same safety checks as the content's
+		// transitions below, and they're applied after them, so that a
+		// repository's index is computed against the files that the cycle
+		// has synchronized. If either repository is unavailable, then there's
+		// no reconciliation, and the ancestor and any conflict are kept.
+		var repository *core.RepositoryReconciliation
+		if gitMode {
+			repository = core.ReconcileRepository(
+				archive.Repository,
+				αSnapshot.Repository,
+				βSnapshot.Repository,
+				synchronizationMode,
+			)
+		}
+
 		// Store conflicts that arose during reconciliation.
 		c.stateLock.Lock()
 		c.state.Conflicts = conflicts
@@ -1496,6 +1516,21 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			}
 		}
 
+		// Stage the objects that alpha's repository needs, if any.
+		var αRepositoryStaging, βRepositoryStaging *core.RepositoryAction
+		if repository != nil {
+			αRepositoryStaging, βRepositoryStaging = repository.Staging()
+		}
+		var αRepositoryProblem *core.Problem
+		if αRepositoryStaging != nil {
+			c.logger.Debug("Staging repository objects on alpha")
+			if problem, err := stageRepository(ctx, alpha, beta, αRepositoryStaging); err != nil {
+				return fmt.Errorf("unable to stage repository objects on alpha: %w", err)
+			} else {
+				αRepositoryProblem = problem
+			}
+		}
+
 		// Stage files on beta.
 		c.stateLock.Lock()
 		c.state.Status = Status_StagingBeta
@@ -1531,6 +1566,17 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 				if err = alpha.Supply(filteredPaths, signatures, receiver); err != nil {
 					return fmt.Errorf("unable to stage files on beta: %w", err)
 				}
+			}
+		}
+
+		// Stage the objects that beta's repository needs, if any.
+		var βRepositoryProblem *core.Problem
+		if βRepositoryStaging != nil {
+			c.logger.Debug("Staging repository objects on beta")
+			if problem, err := stageRepository(ctx, beta, alpha, βRepositoryStaging); err != nil {
+				return fmt.Errorf("unable to stage repository objects on beta: %w", err)
+			} else {
+				βRepositoryProblem = problem
 			}
 		}
 
@@ -1579,13 +1625,53 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		}
 		transitionDone.Wait()
 
+		// Apply the repository actions, if any, now that the files that they
+		// describe have been synchronized, and determine the new repository
+		// ancestor and conflict from their results. An action isn't applied
+		// on an endpoint whose transitions failed, since the endpoint can't be
+		// relied upon, or if the objects that it needs couldn't be supplied,
+		// since it could only fail for lack of them. Its problems are reported
+		// as transition problems, like those of an action that fails, and the
+		// next cycle tries again. Errors are checked once the ancestor has
+		// been saved, and a repository ancestor is only determined without
+		// them, since the state of a repository is unknown after an error.
+		var repositoryAncestor *core.Repository
+		var repositoryConflict *core.RepositoryConflict
+		var αRepositoryErr, βRepositoryErr error
+		if repository != nil {
+			var αRepositoryResult, βRepositoryResult *core.RepositoryResult
+			if αRepositoryProblem != nil {
+				αProblems = append(αProblems, αRepositoryProblem)
+			} else if repository.AlphaAction != nil && αTransitionErr == nil {
+				c.logger.Debug("Applying repository action on alpha")
+				αRepositoryResult, αRepositoryErr = alpha.TransitionRepository(ctx, repository.AlphaAction)
+				if problem := αRepositoryResult.GetProblem(); problem != nil {
+					αProblems = append(αProblems, problem)
+				}
+			}
+			if βRepositoryProblem != nil {
+				βProblems = append(βProblems, βRepositoryProblem)
+			} else if repository.BetaAction != nil && βTransitionErr == nil {
+				c.logger.Debug("Applying repository action on beta")
+				βRepositoryResult, βRepositoryErr = beta.TransitionRepository(ctx, repository.BetaAction)
+				if problem := βRepositoryResult.GetProblem(); problem != nil {
+					βProblems = append(βProblems, problem)
+				}
+			}
+			repositoryAncestor, repositoryConflict = repository.Complete(αRepositoryResult, βRepositoryResult)
+		}
+
 		// Record transition problems, including those for exposed content
-		// that beta keeps.
+		// that beta keeps, and the repository conflict, if any. Without a
+		// repository reconciliation, any conflict is kept.
 		βProblems = append(βProblems, exposedProblems...)
 		c.stateLock.Lock()
 		c.state.Status = Status_Saving
 		c.state.AlphaState.TransitionProblems = αProblems
 		c.state.BetaState.TransitionProblems = βProblems
+		if repository != nil {
+			c.state.RepositoryConflict = repositoryConflict
+		}
 		c.stateLock.Unlock()
 
 		// Determine whether or not this cycle populated any submodules, which is
@@ -1600,6 +1686,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		// ancestor if any changes are present.
 		ancestorChanges = append(ancestorChanges, αChanges...)
 		ancestorChanges = append(ancestorChanges, βChanges...)
+		var saveArchive bool
 		if len(ancestorChanges) > 0 {
 			// Apply the changes to the ancestor.
 			if newAncestor, err := core.Apply(ancestor, ancestorChanges); err != nil {
@@ -1620,10 +1707,22 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			if err := ancestor.EnsureValid(true); err != nil {
 				return fmt.Errorf("new ancestor is invalid: %w", err)
 			}
-
-			// Save the ancestor.
-			c.logger.Debug("Saving ancestor")
 			archive.Content = ancestor
+			saveArchive = true
+		}
+
+		// Update the repository ancestor if it's changed, which can happen
+		// without any changes to the content, such as when both endpoints
+		// agree on a commit to begin with.
+		if repository != nil && αRepositoryErr == nil && βRepositoryErr == nil &&
+			!repositoryAncestor.Equal(archive.Repository) {
+			archive.Repository = repositoryAncestor
+			saveArchive = true
+		}
+
+		// Save the ancestor if it's changed.
+		if saveArchive {
+			c.logger.Debug("Saving ancestor")
 			if err := encoding.MarshalAndSaveProtobuf(c.archivePath, archive); err != nil {
 				return fmt.Errorf("unable to save ancestor: %w", err)
 			}
@@ -1634,6 +1733,10 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			return fmt.Errorf("unable to apply changes to alpha: %w", αTransitionErr)
 		} else if βTransitionErr != nil {
 			return fmt.Errorf("unable to apply changes to beta: %w", βTransitionErr)
+		} else if αRepositoryErr != nil {
+			return fmt.Errorf("unable to apply repository changes to alpha: %w", αRepositoryErr)
+		} else if βRepositoryErr != nil {
+			return fmt.Errorf("unable to apply repository changes to beta: %w", βRepositoryErr)
 		}
 
 		// If there were files missing from either endpoint's stager during the
@@ -1727,6 +1830,24 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			}
 		}
 	}
+}
+
+// stageRepository stages the objects that a repository action needs on the
+// endpoint whose repository it applies to (the follower), which the other
+// endpoint (the source) supplies if the follower doesn't have them. It returns
+// the problem that prevented the source from supplying them, if any.
+func stageRepository(ctx context.Context, follower, source Endpoint, action *core.RepositoryAction) (*core.Problem, error) {
+	haves, receiver, err := follower.StageRepository(ctx, action)
+	if err != nil {
+		return nil, fmt.Errorf("unable to begin staging: %w", err)
+	} else if receiver == nil {
+		return nil, nil
+	}
+	problem, err := source.SupplyRepository(ctx, action.Target.Commit, haves, receiver)
+	if err != nil {
+		return nil, fmt.Errorf("unable to supply objects: %w", err)
+	}
+	return problem, nil
 }
 
 // populatesSubmodules determines whether or not transition results include the
