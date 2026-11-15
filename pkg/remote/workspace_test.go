@@ -104,7 +104,7 @@ func TestStarSourceEntersSelectedEdge(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		for _, peer := range order {
-			if target, err := locateWorkspaceTest(&Selection{Node: peer}, root); err != nil || target.SourceSession != "center-"+peer || target.Node != peer {
+			if target, err := locateWorkspaceTest(&Selection{Node: peer}, root); err != nil || target.Session != "center-"+peer || target.Node != peer {
 				t.Fatalf("submission for node %s didn't enter through its edge (order %v): %+v %v", peer, order, target, err)
 			}
 		}
@@ -114,29 +114,22 @@ func TestStarSourceEntersSelectedEdge(t *testing.T) {
 			}
 		}
 
-		// A pinned target's selected edge never chooses its registration, even
-		// if it names another live registration of the same node.
-		mismatched := &Target{SourceSession: "center-b", SourceAlpha: true, Star: true, Resolved: true, SourceNode: "center", Node: "c", Session: "center-c", Alpha: true}
-		if target, err := locateWorkspaceTest(&Selection{Target: mismatched}, root); err != nil || target.SourceSession != "center-b" {
-			t.Fatalf("pinned target didn't keep its source registration: %+v %v", target, err)
-		}
-
 		// Once the selected node's registration isn't live, another one is
 		// located, through which the daemon refuses the submission (see
 		// TestStarUnavailableNodeIgnores).
 		channels["c"].Close()
-		if target, err := locateWorkspaceTest(&Selection{Node: "c"}, root); err != nil || target.SourceSession != "center-b" {
+		if target, err := locateWorkspaceTest(&Selection{Node: "c"}, root); err != nil || target.Session != "center-b" {
 			t.Fatalf("center not located for a node whose registration isn't live: %+v %v", target, err)
 		}
 
 		// A pinned target only uses its source registration, even while another
 		// registration of the same node is live.
-		pinned := &Target{SourceSession: "center-c", SourceAlpha: true, Star: true, Resolved: true, SourceNode: "center", Node: "c", Session: "center-c", Alpha: true}
+		pinned := &Target{Session: "center-c", Alpha: true, Star: true, Resolved: true, SourceNode: "center", Node: "c"}
 		if _, err := locateWorkspaceTest(&Selection{Target: pinned}, root); err == nil || !strings.Contains(err.Error(), "no longer connected") || ClassifyError(err) != ErrorKindConnection {
 			t.Fatal("pinned target selected another registration of its node:", err)
 		}
-		pinned = &Target{SourceSession: "center-b", SourceAlpha: true, Star: true, Resolved: true, SourceNode: "center", Node: "b", Session: "center-b", Alpha: true}
-		if target, err := locateWorkspaceTest(&Selection{Target: pinned}, root); err != nil || target.SourceSession != "center-b" {
+		pinned = &Target{Session: "center-b", Alpha: true, Star: true, Resolved: true, SourceNode: "center", Node: "b"}
+		if target, err := locateWorkspaceTest(&Selection{Target: pinned}, root); err != nil || target.Session != "center-b" {
 			t.Fatalf("pinned target didn't use its source registration: %+v %v", target, err)
 		}
 	}
@@ -189,7 +182,7 @@ func TestStarUnavailableNodeIgnores(t *testing.T) {
 				Reject(connection, ConnectionError(errors.New("node c is unavailable: its edge isn't connected for remote commands at the center")))
 				continue
 			}
-			RespondWithRoute(connection, &ResolvedRoute{Session: "center-b", Alpha: true, SourceNode: "center", Node: "b", Star: true, Revision: "b", Ignores: ignoring})
+			AcknowledgeRoute(connection)
 			connection.Close()
 		}
 	}()
@@ -201,7 +194,7 @@ func TestStarUnavailableNodeIgnores(t *testing.T) {
 		connection, target, err := selection.Submit(ctx, filepath.Join(root, directory), &Submission{Operation: OperationFlush})
 		if err == nil {
 			connection.Close()
-			if target.Session != "center-b" || target.SourceSession != "center-b" || target.Node != "b" {
+			if target.Session != "center-b" || !target.Resolved || target.Node != "b" {
 				t.Fatalf("incorrect edge selected for node %q: %+v", node, target)
 			}
 		}

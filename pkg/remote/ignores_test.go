@@ -401,9 +401,11 @@ func TestResolvedRouteIgnoresKnowRoot(t *testing.T) {
 	root := resolveSymbolicLinks(t.TempDir())
 	writeTestFiles(t, root, gitModeFiles)
 
-	// The daemon sends the ignores of the selected edge with the route, and
-	// they are as the registration's, so they need the root too.
-	channel, err := NewLocalChannel(nil, &Endpoint{Session: "center-b", Name: "star-b", Alpha: true, Star: "project", Node: "center", PeerNode: "b", Root: root, Submit: true})
+	// The ignores of a resolved target are its registration's, since the
+	// daemon only accepts routes across the registration's own edge, so they
+	// know the root too.
+	channel, err := NewLocalChannel(nil, &Endpoint{Session: "center-b", Name: "star-b", Alpha: true, Star: "project", Node: "center", PeerNode: "b", Root: root, Submit: true,
+		Ignores: &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, VCS: true, Git: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,8 +422,7 @@ func TestResolvedRouteIgnoresKnowRoot(t *testing.T) {
 				connection.Close()
 				continue
 			}
-			RespondWithRoute(connection, &ResolvedRoute{Session: "center-b", Alpha: true, SourceNode: "center", Node: "b", Star: true, Revision: "b",
-				Ignores: &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, VCS: true, Git: true}})
+			AcknowledgeRoute(connection)
 			connection.Close()
 		}
 	}()
@@ -434,7 +435,7 @@ func TestResolvedRouteIgnoresKnowRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection.Close()
-	if target.Ignores == nil || !target.Ignores.Git || target.Ignores.ExcludedInAnyForm("app.log", false) != "app.log" {
+	if !target.Resolved || target.Ignores == nil || !target.Ignores.Git || target.Ignores.ExcludedInAnyForm("app.log", false) != "app.log" {
 		t.Errorf("resolved ignores don't know the root: %+v", target.Ignores)
 	}
 }

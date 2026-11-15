@@ -98,7 +98,7 @@ func TestDialSelection(t *testing.T) {
 		defer cancel()
 		selection := &Selection{}
 		if session != "" {
-			selection.Target = &Target{SourceSession: session, SourceAlpha: session == "sync_outer"}
+			selection.Target = &Target{Session: session, Alpha: session == "sync_outer"}
 		}
 		connection, target, err := selection.Dial(ctx, directory, OperationExecute)
 		if err == nil {
@@ -335,20 +335,16 @@ func TestDialPinned(t *testing.T) {
 
 	// Pinning distinguishes the endpoints of a session.
 	registerTest(t, &Endpoint{Session: "sync_inner", Name: "inner", Root: filepath.Join(base, "beta"), Alpha: true}, "alpha", &accepted, &lock)
-	if pinnedAlpha, err := dialTest(&Selection{Target: &Target{SourceSession: "sync_inner", SourceAlpha: true}}, directory); err != nil ||
+	if pinnedAlpha, err := dialTest(&Selection{Target: &Target{Session: "sync_inner", Alpha: true}}, directory); err != nil ||
 		!pinnedAlpha.Alpha || pinnedAlpha.Contained {
 		t.Fatalf("pinned selection reached the wrong endpoint: %+v, %v", pinnedAlpha, err)
 	}
 
-	// Only the source registration pins a selection, never the edge that the
-	// daemon selected, so a target without a source is refused.
-	if pinned, err := dialTest(&Selection{Target: &Target{SourceSession: "sync_inner", Session: "sync_outer", Alpha: true}}, directory); err != nil ||
-		pinned.Session != "sync_inner" || pinned.Alpha || pinned.SourceSession != "sync_inner" {
-		t.Fatalf("pinned selection followed the selected edge: %+v, %v", pinned, err)
-	} else if _, err := dialTest(&Selection{Target: &Target{Session: "sync_inner"}}, directory); err == nil ||
+	// A target without a registration is refused.
+	if _, err := dialTest(&Selection{Target: &Target{}}, directory); err == nil ||
 		!strings.Contains(err.Error(), "doesn't identify a source registration") {
-		t.Fatal("target without a source registration pinned a selection:", err)
-	} else if _, err := dialTest(&Selection{Target: &Target{SourceSession: "sync_gone", SourceAlpha: true, Star: true, SourceNode: "a", Session: "sync_inner"}}, directory); err == nil ||
+		t.Fatal("target without a registration pinned a selection:", err)
+	} else if _, err := dialTest(&Selection{Target: &Target{Session: "sync_gone", Alpha: true, Star: true, SourceNode: "a"}}, directory); err == nil ||
 		!strings.Contains(err.Error(), "the alpha endpoint (node a) of session sync_gone is no longer connected") {
 		t.Fatal("disconnected source registration not described:", err)
 	}
@@ -377,7 +373,7 @@ func TestDialExcluded(t *testing.T) {
 	<-registration.done
 	for _, selection := range []*Selection{
 		{Corresponding: true},
-		{Target: &Target{SourceSession: "sync_outer", SourceAlpha: true}, Corresponding: true},
+		{Target: &Target{Session: "sync_outer", Alpha: true}, Corresponding: true},
 	} {
 		if _, err := dialTest(selection, directory); err == nil ||
 			!strings.Contains(err.Error(), "inner/x is inside inner, which session outer ignores") ||
@@ -532,13 +528,12 @@ func TestAgentChannel(t *testing.T) {
 		return filepath.Join(base, "agents", "remote"), nil
 	}
 	ignores := &Ignores{Syntax: ignore.Syntax_SyntaxMutagen, Patterns: []string{"ignored"}}
-	channel := testChannel(t, &Endpoint{Session: "sync_test", Root: root, Submit: true, Execute: true, Ignores: ignores, ExecutionHost: "opposite-host", ExecutionRoot: opposite}, install)
+	channel := testChannel(t, &Endpoint{Session: "sync_test", Root: root, Submit: true, Execute: true, Ignores: ignores}, install)
 	if !installed {
 		t.Fatal("remote executable not installed")
 	}
-	if registered, _, err := relate(filepath.Join(root, "sub")); err != nil || len(registered) != 1 ||
-		registered[0].ExecutionHost != "opposite-host" || registered[0].ExecutionRoot != opposite || registered[0].path != "sub" {
-		t.Fatalf("agent initialization lost execution metadata: %+v, %v", registered, err)
+	if registered, _, err := relate(filepath.Join(root, "sub")); err != nil || len(registered) != 1 || registered[0].path != "sub" {
+		t.Fatalf("agent initialization lost registration metadata: %+v, %v", registered, err)
 	}
 
 	// Commands opened by the daemon run in the endpoint's root.

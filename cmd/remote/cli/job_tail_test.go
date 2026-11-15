@@ -436,7 +436,7 @@ func TestWaitJobFollowReconnect(t *testing.T) {
 	drop := relayDroppableSession(t, "sync_follow", t.TempDir(), beta)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	connection, _, err := (&remote.Selection{Target: &remote.Target{SourceSession: "sync_follow", SourceAlpha: true}}).Dial(ctx, beta, remote.OperationExecute)
+	connection, _, err := (&remote.Selection{Target: &remote.Target{Session: "sync_follow", Alpha: true}}).Dial(ctx, beta, remote.OperationExecute)
 	if err != nil {
 		t.Fatal(err)
 	}

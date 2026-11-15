@@ -32,11 +32,9 @@ type Node struct {
 	Current   bool
 	Available bool
 	Reason    string `json:",omitempty"`
-	// Session and Alpha are daemon-only indexes of a destination's edge and
-	// the source's role on it. They are never serialized or used by clients
-	// to select a submission registration.
+	// Session is the daemon-only index of a destination's edge. It's never
+	// serialized or used by clients to select a submission registration.
 	Session string `json:"-"`
-	Alpha   bool   `json:"-"`
 }
 
 // NodeGraph describes the nodes that a source can reach, including
@@ -88,43 +86,27 @@ func ListNodes(ctx context.Context, connection io.ReadWriteCloser) (*NodeGraph, 
 	return response.Graph, nil
 }
 
-// ResolvedRoute acknowledges destination selection on an operation connection.
-// Session and Alpha describe the selected edge for checkout ownership and
-// conflict direction. It's always the edge whose registration the submission
-// entered through, since the daemon refuses submissions that would cross
-// another edge. Revision pins the selected edge for later submissions.
-type ResolvedRoute struct {
-	// Ignores belong to the selected edge.
-	Ignores    *Ignores `json:",omitempty"`
-	Session    string
-	Alpha      bool
-	SourceNode string
-	Node       string
-	Star       bool
-	Revision   string
+// AcknowledgeRoute acknowledges the destination selected for a submission
+// that requested it (see Submission.Resolve), before the operation's own
+// protocol. The destination is always the opposite endpoint of the edge whose
+// registration the submission entered through, since the daemon refuses
+// submissions that would cross another edge, so the acknowledgement describes
+// nothing that the submitter doesn't know already. Refusals are sent with
+// Reject instead.
+func AcknowledgeRoute(connection io.Writer) error {
+	return writeMessage(connection, &status{})
 }
 
-type resolvedRouteResponse struct {
-	Error     string
-	ErrorKind ErrorKind      `json:",omitempty"`
-	Route     *ResolvedRoute `json:",omitempty"`
-}
-
-// RespondWithRoute sends routing metadata before the operation's own protocol.
-func RespondWithRoute(connection io.Writer, route *ResolvedRoute) error {
-	return writeMessage(connection, &resolvedRouteResponse{Route: route})
-}
-
-func receiveResolvedRoute(ctx context.Context, connection io.ReadWriteCloser) (*ResolvedRoute, error) {
+// receiveRouteAcknowledgement waits for the acknowledgement of a submission's
+// destination (see AcknowledgeRoute), or for its refusal.
+func receiveRouteAcknowledgement(ctx context.Context, connection io.ReadWriteCloser) error {
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
 	defer stop()
-	var response resolvedRouteResponse
+	var response status
 	if err := readMessage(connection, &response); err != nil {
-		return nil, ConnectionError(fmt.Errorf("unable to receive selected node: %w", err))
+		return ConnectionError(fmt.Errorf("unable to receive selected node: %w", err))
 	} else if response.Error != "" {
-		return nil, receivedError(response.ErrorKind, errors.New(response.Error))
-	} else if response.Route == nil || response.Route.Node == "" {
-		return nil, ConnectionError(errors.New("missing selected node"))
+		return receivedError(response.ErrorKind, errors.New(response.Error))
 	}
-	return response.Route, nil
+	return nil
 }

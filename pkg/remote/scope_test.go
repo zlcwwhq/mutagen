@@ -147,7 +147,7 @@ func TestSynchronizingScopes(t *testing.T) {
 			t.Errorf("incorrect target: %+v", target)
 		}
 	}
-	if _, _, err := (&Selection{Target: &Target{SourceSession: "sync_results", SourceAlpha: true}}).Dial(ctx, filepath.Join(results, "data"), OperationExecute); err == nil ||
+	if _, _, err := (&Selection{Target: &Target{Session: "sync_results", Alpha: true}}).Dial(ctx, filepath.Join(results, "data"), OperationExecute); err == nil ||
 		!strings.Contains(err.Error(), "no longer connected") {
 		t.Error("session known only from its scope selected:", err)
 	}

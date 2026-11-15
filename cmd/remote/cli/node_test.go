@@ -14,7 +14,7 @@ import (
 func replyTestNodes(connection io.ReadWriteCloser, session, alpha, beta string) {
 	remote.RespondWithNodes(connection, &remote.NodeGraph{Source: "alpha", Nodes: []remote.Node{
 		{Name: "alpha", Root: alpha, Current: true, Available: true, Path: []string{"alpha"}},
-		{Name: "beta", Root: beta, Available: true, Mode: "two-way-safe", Path: []string{"alpha", "beta"}, Session: session, Alpha: true},
+		{Name: "beta", Root: beta, Available: true, Mode: "two-way-safe", Path: []string{"alpha", "beta"}, Session: session},
 	}}, nil)
 }
 
@@ -23,7 +23,7 @@ func replyTestNodes(connection io.ReadWriteCloser, session, alpha, beta string) 
 // daemon route handles.
 func TestNodeListing(t *testing.T) {
 	graph := &remote.NodeGraph{Source: "local", Star: true, Nodes: []remote.Node{
-		{Name: "gpu", Available: true, Host: "host", Root: "~/project", Mode: "one-way-safe", Path: []string{"local", "gpu"}, Session: "private-handle", Alpha: true},
+		{Name: "gpu", Available: true, Host: "host", Root: "~/project", Mode: "one-way-safe", Path: []string{"local", "gpu"}, Session: "private-handle"},
 		{Name: "local", Center: true, Host: "laptop", Root: "/work", Current: true, Available: true, Path: []string{"local"}},
 		{Name: "offline", Host: "offline", Root: "project", Mode: "two-way-safe", Reason: "node is paused or disconnected", Path: []string{"local", "offline"}},
 	}}
@@ -148,7 +148,7 @@ func replyTestRoute(connection io.ReadWriteCloser, header *remote.Submission, se
 		remote.Reject(connection, errors.New("unknown node"))
 		return false
 	}
-	if err := remote.RespondWithRoute(connection, &remote.ResolvedRoute{Session: session, Alpha: true, SourceNode: "alpha", Node: "beta", Revision: session}); err != nil {
+	if err := remote.AcknowledgeRoute(connection); err != nil {
 		connection.Close()
 		return false
 	}

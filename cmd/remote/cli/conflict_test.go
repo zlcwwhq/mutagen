@@ -134,7 +134,7 @@ func TestInterruptedCheckoutReleased(t *testing.T) {
 		}
 	}()
 	t.Cleanup(func() { channel.Close(); handlers.Wait() })
-	target := &remote.Target{SourceSession: "sync_claim", SourceAlpha: true, Session: "sync_claim", Alpha: true, Root: root}
+	target := &remote.Target{Session: "sync_claim", Alpha: true, Root: root}
 	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{{Path: "conflict", AlphaTakable: true, BetaTakable: true}}}
 	if _, err := checkout(testRouter(ctx, root, target, io.Discard), &options{}, listing, target, filepath.Join(root, "conflict")); err == nil {
 		t.Fatal("interrupted checkout succeeded")
@@ -269,7 +269,7 @@ func TestNoConflictsWithWarnings(t *testing.T) {
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	ctx := context.Background()
 	root := t.TempDir()
-	target := &remote.Target{SourceSession: "session", SourceAlpha: true, Session: "session", Alpha: true, Root: root, Contained: true}
+	target := &remote.Target{Session: "session", Alpha: true, Root: root, Contained: true}
 	warning := remote.Problem{Alpha: true, Path: "ignored", Error: "tracked by Git, but ignored", Warning: true}
 	problem := remote.Problem{Path: "unreadable", Error: "permission denied"}
 	conflict := remote.ConflictRoot{
@@ -948,7 +948,7 @@ func TestAutomaticCheckoutChecksTake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	target := &remote.Target{SourceSession: "session", SourceAlpha: true, Session: "session", Alpha: true, Root: root}
+	target := &remote.Target{Session: "session", Alpha: true, Root: root}
 	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{{Path: "conflict", AlphaTakable: true}}}
 	for _, test := range []struct {
 		options  conflictOptions
@@ -984,7 +984,7 @@ func TestRepositoryConflictListing(t *testing.T) {
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	ctx := context.Background()
 	root := t.TempDir()
-	target := &remote.Target{SourceSession: "session", SourceAlpha: false, Session: "session", Alpha: false, Root: root, Path: "sub", Contained: true}
+	target := &remote.Target{Session: "session", Alpha: false, Root: root, Path: "sub", Contained: true}
 	alpha := remote.Repository{Commit: strings.Repeat("1a", 20), Branch: "main"}
 	beta := remote.Repository{Commit: strings.Repeat("2b", 20), Branch: "main"}
 	listing := &remote.Listing{Repository: &remote.RepositoryConflict{Alpha: alpha, Beta: beta}}
@@ -1033,7 +1033,7 @@ func TestSubmoduleConflictListing(t *testing.T) {
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	ctx := context.Background()
 	root := t.TempDir()
-	target := &remote.Target{SourceSession: "session", SourceAlpha: true, Session: "session", Alpha: true, Root: root, Contained: true}
+	target := &remote.Target{Session: "session", Alpha: true, Root: root, Contained: true}
 	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{{
 		Path:         "sub",
 		Submodule:    true,

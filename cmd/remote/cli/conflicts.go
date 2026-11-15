@@ -1919,7 +1919,6 @@ func releaseAt(r *router, local string, w *workspace) (bool, error) {
 		// isn't resolved, so the release goes over that edge to its opposite
 		// endpoint directly, even at a star's center with several nodes.
 		router.selection = &remote.Selection{Target: &remote.Target{
-			SourceSession: w.Session, SourceAlpha: w.Alpha,
 			Session: w.Session, Alpha: w.Alpha,
 		}}
 	}

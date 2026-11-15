@@ -75,10 +75,6 @@ type record struct {
 	Name string
 	// Root is the normalized synchronization root on this system.
 	Root string
-	// ExecutionHost and ExecutionRoot describe the opposite endpoint for
-	// display (see Endpoint). Scopes and older registrations omit them.
-	ExecutionHost string `json:",omitempty"`
-	ExecutionRoot string `json:",omitempty"`
 	// Alpha indicates whether the registered endpoint is alpha.
 	Alpha bool
 	// Created is the registration time, used to prefer the newest registration
@@ -212,8 +208,6 @@ func register(endpoint *Endpoint, root string) (net.Listener, error) {
 		Session:        endpoint.Session,
 		Name:           endpoint.Name,
 		Root:           root,
-		ExecutionHost:  endpoint.ExecutionHost,
-		ExecutionRoot:  endpoint.ExecutionRoot,
 		Alpha:          endpoint.Alpha,
 		SessionCreated: endpoint.SessionCreated,
 		Ignores:        endpoint.Ignores,
@@ -350,33 +344,28 @@ func RegisterScope(session string, alpha bool, root string, ignores *Ignores) (i
 
 // Target describes the endpoint from which a command is submitted.
 type Target struct {
-	// SourceSession and SourceAlpha identify the local registration through
-	// which the command is submitted, and they pin later submissions (see
-	// Selection.Target), so targets built by hand must set them. The daemon
-	// only accepts an operation that crosses the edge through which it was
-	// submitted, so once resolved, they identify the selected edge (see
-	// Session), which, at a star's center, where every edge registers, is the
-	// selected node's own.
-	SourceSession string
-	SourceAlpha   bool
+	// Session and Alpha identify the local registration through which the
+	// command is submitted: its session, and whether the submitting endpoint
+	// is alpha, in which case the command runs on beta (and vice versa). They
+	// pin later submissions (see Selection.Target), so targets built by hand
+	// must set them. The daemon only accepts an operation that crosses the
+	// edge through which it was submitted, so they also identify the selected
+	// edge, such as for checkout ownership, which, at a star's center, where
+	// every edge registers, is the selected node's own.
+	Session string
+	Alpha   bool
 	// Star identifies a declared star workspace at the submitting registration.
 	Star bool
-	// Resolved marks a destination selected by the daemon. Revision pins it:
-	// it identifies the selected edge, so that changes to other edges don't
-	// affect later submissions.
+	// Resolved indicates that the daemon accepted the destination (see
+	// Selection.Resolve), which pins later submissions to it (see
+	// Submission.Pinned).
 	Resolved bool
-	Revision string
-	// SourceNode and Node identify the submitting and selected workspaces.
+	// SourceNode and Node identify the submitting workspace and the
+	// destination, which is the submitting registration's peer.
 	SourceNode string
 	Node       string
-	// Session identifies the selected edge, such as for checkout ownership.
-	// Once resolved, it's SourceSession (see SourceSession).
-	Session string
-	// Name is the name of the source session (see SourceSession), if any.
+	// Name is the name of the session, if any.
 	Name string
-	// Alpha indicates whether the submitting endpoint is alpha, in which case
-	// the command runs on beta (and vice versa).
-	Alpha bool
 	// Root is the submitting endpoint's synchronization root.
 	Root string
 	// Path is the slash-separated submission directory relative to Root. It is
@@ -434,7 +423,7 @@ type Selection struct {
 	// otherwise have been made.
 	Corresponding bool
 	// Target, if non-nil, restricts the selection to the local registration
-	// that its SourceSession and SourceAlpha identify, which was typically
+	// that its Session and Alpha identify, which was typically
 	// located by a previous submission, so that related submissions can't
 	// reach different sessions as sessions connect and disconnect in between.
 	// Dial then fails if that registration is no longer live, rather than
@@ -784,7 +773,7 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 	connection, c := endpoint.connection, endpoint.candidate
 
 	// Resolve destinations on the operation connection. Pinned targets retain
-	// the selected destination and the revision of its edge.
+	// the selected destination.
 	submitted := *header
 	header = &submitted
 	if s.Resolve || s.Target != nil && s.Target.Resolved {
@@ -795,9 +784,7 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 				header.Node = s.Target.Node
 			}
 		}
-		if header.Revision == "" && s.Target != nil && s.Target.Resolved {
-			header.Revision = s.Target.Revision
-		}
+		header.Pinned = s.Target != nil && s.Target.Resolved
 	}
 
 	// Refuse operations corresponding to a directory that the session doesn't
@@ -839,22 +826,16 @@ func (s *Selection) Submit(ctx context.Context, directory string, header *Submis
 		connection.Close()
 		return nil, nil, ConnectionError(fmt.Errorf("unable to handshake with session %s: %w", describe(c.Session, c.Name), err))
 	}
+	// Once the daemon accepts the route, the destination is the
+	// registration's peer, since the daemon only accepts operations that cross
+	// the edge through which they were submitted.
 	target := c.target()
 	if header.Resolve {
-		route, err := receiveResolvedRoute(ctx, connection)
-		if err != nil {
+		if err := receiveRouteAcknowledgement(ctx, connection); err != nil {
 			connection.Close()
 			return nil, nil, err
 		}
-		target.Session, target.Alpha = route.Session, route.Alpha
-		target.Node, target.SourceNode = route.Node, route.SourceNode
-		target.Star, target.Resolved, target.Revision = route.Star, true, route.Revision
-		if route.Ignores != nil {
-			// The daemon sends the selected edge's ignores without a root, since
-			// the root is this system's, so bind the registration's (see
-			// relateResolved).
-			target.Ignores = route.Ignores.WithRoot(c.root)
-		}
+		target.Resolved = true
 	}
 	if excluded != "" {
 		return nil, nil, refuse()
@@ -881,12 +862,12 @@ func (c *candidate) target() *Target {
 		}
 	}
 	return &Target{
-		SourceSession: c.Session, SourceAlpha: c.Alpha, Star: c.Star != "",
+		Session:    c.Session,
+		Alpha:      c.Alpha,
+		Star:       c.Star != "",
 		SourceNode: source,
 		Node:       peer,
-		Session:    c.Session,
 		Name:       c.Name,
-		Alpha:      c.Alpha,
 		Root:       c.Root,
 		Path:       c.path,
 		Contained:  c.contained,
@@ -1106,26 +1087,25 @@ func locateWorkspace(ctx context.Context, compatible, incompatible []*candidate,
 // directory, given the registrations related to it that are compatible with
 // this version of Mutagen and those that aren't.
 func (s *Selection) locate(ctx context.Context, compatible, incompatible []*candidate) (*liveEndpoint, error) {
-	// A pinned selection only considers the source registration that it
-	// identifies, which may have reconnected in the meantime, and fails rather
-	// than falling back to another endpoint, including another registration
-	// of the same star node, since the daemon only accepts operations through
-	// the edge that they cross. The daemon-selected edge (Session and Alpha)
-	// never chooses the registration, even if the source is unset.
+	// A pinned selection only considers the registration that it identifies,
+	// which may have reconnected in the meantime, and fails rather than
+	// falling back to another endpoint, including another registration of the
+	// same star node, since the daemon only accepts operations through the
+	// edge that they cross.
 	if s.Target != nil {
-		source := s.Target.SourceSession
+		source := s.Target.Session
 		if source == "" {
 			return nil, errors.New("pinned target doesn't identify a source registration")
 		}
 		pinned := func(c *candidate) bool {
-			return c.Session == source && c.Alpha == s.Target.SourceAlpha
+			return c.Session == source && c.Alpha == s.Target.Alpha
 		}
 		live, err := locate(ctx, filter(compatible, pinned))
 		if err != nil {
 			return nil, err
 		} else if len(live) == 0 {
 			endpoint := "beta endpoint"
-			if s.Target.SourceAlpha {
+			if s.Target.Alpha {
 				endpoint = "alpha endpoint"
 			}
 			if s.Target.Star && s.Target.SourceNode != "" {

@@ -309,10 +309,11 @@ type Submission struct {
 	// Node selects the destination for every operation. The daemon identifies
 	// the source from the submitting endpoint, never from client input.
 	Node string `json:",omitempty"`
-	// Revision pins the edge selected by an operation's first submission (see
-	// ResolvedRoute) for its later submissions, which fail if that edge was
-	// replaced or removed in the meantime. Other edges don't affect it.
-	Revision string `json:",omitempty"`
+	// Pinned indicates that an earlier submission of the operation resolved
+	// its destination (see Target.Resolved), so that it keeps using that edge,
+	// and fails if the edge was replaced or removed in the meantime. Other
+	// edges don't affect it.
+	Pinned bool `json:",omitempty"`
 	// Progress requests progress messages (see ReportProgress) while the
 	// daemon waits for the synchronization cycle of an OperationFlush or
 	// OperationConflicts submission. Submissions must accept a final response

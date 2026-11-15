@@ -1,7 +1,6 @@
 package synchronization
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sort"
@@ -11,7 +10,8 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/url"
 )
 
-// errNodeGraphChanged reports a stale destination selection consistently.
+// errNodeGraphChanged reports that the edge that an operation's earlier
+// submission selected was replaced or removed (see remote.Submission.Pinned).
 var errNodeGraphChanged = errors.New("node graph changed after target selection; query --nodes again")
 
 // commandStars indexes the daemon's sessions and their running command relays
@@ -72,15 +72,6 @@ func (s *commandStars) membersLocked(identifier string) []*Session {
 		}
 	}
 	return members
-}
-
-// edgeRevision pins the immutable identity of the edge that carries an
-// operation, identified by its session, so that the operation's later
-// submissions fail if that edge is replaced or removed, while changes to other
-// edges, such as adding, pausing, replacing, or removing other nodes, don't
-// affect them.
-func edgeRevision(session string) string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(session)))
 }
 
 // synchronizationModeName names a session's effective synchronization mode.
@@ -197,7 +188,7 @@ func pairNodesLocked(source *commandRelay, index int) *remote.NodeGraph {
 		if !node.Current {
 			node.Path = append(node.Path, node.Name)
 			node.Mode = synchronizationModeName(session)
-			node.Session, node.Alpha = session.Identifier, index == 0
+			node.Session = session.Identifier
 			if !executes(session, i) {
 				node.Reason = executionDisabledReason
 			} else if node.Available = connectedLocked(source, i); !node.Available {
@@ -250,7 +241,7 @@ func (s *commandStars) starNodesLocked(source *commandRelay, index int) *remote.
 	graph.Nodes = append(graph.Nodes, remote.Node{Name: center, Center: true, Host: host, Root: root, Path: []string{from}, Current: true, Available: true})
 	for name, edge := range edges {
 		host, root := commandExecutionLocation(edge.Beta)
-		node := remote.Node{Name: name, Host: host, Root: root, Path: []string{from, name}, Mode: synchronizationModeName(edge), Session: edge.Identifier, Alpha: true}
+		node := remote.Node{Name: name, Host: host, Root: root, Path: []string{from, name}, Mode: synchronizationModeName(edge), Session: edge.Identifier}
 		if problem != nil {
 			node.Reason = problem.Error()
 		} else {
@@ -274,29 +265,28 @@ func (s *commandStars) starHasNode(identifier, name string) bool {
 	return false
 }
 
-// resolveSubmission selects the destination of an operation submitted from
-// the specified endpoint of the relay's session, which is always the opposite
-// endpoint of the same edge, and describes the route. The source is identified
-// by the submitting endpoint, never by client input. Operations are never
-// redirected to another edge, so that they don't depend on any other edge. At
-// a star's center, where every edge registers the center's workspace, remote
-// submits through the selected node's own edge (see
-// remote.Selection). A submission that enters through another edge,
-// because the selected edge's registration isn't live, is refused as a
-// connection failure, just as operations on a pair fail while its local
-// registration isn't live. Other errors, such as an unknown node or a star
-// problem, are reported whichever edge the submission entered through. A
-// pinned revision only refers to the selected edge, so that changes to other
+// resolveSubmission checks the destination of an operation submitted from the
+// specified endpoint of the relay's session, which is always the opposite
+// endpoint of the same edge. The source is identified by the submitting
+// endpoint, never by client input. Operations are never redirected to another
+// edge, so that they don't depend on any other edge. At a star's center, where
+// every edge registers the center's workspace, remote submits through the
+// selected node's own edge (see remote.Selection). A submission that enters
+// through another edge, because the selected edge's registration isn't live,
+// is refused as a connection failure, just as operations on a pair fail while
+// its local registration isn't live. Other errors, such as an unknown node or
+// a star problem, are reported whichever edge the submission entered through.
+// A pinned submission only depends on its own edge, so that changes to other
 // edges don't fail later submissions of an operation.
-func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) (*remote.ResolvedRoute, error) {
+func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) error {
 	graph, err := r.stars.nodes(r, source)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	name := header.Node
 	if name == "" {
 		if len(graph.Nodes) != 2 {
-			return nil, errors.New("multiple destination nodes; use --nodes to inspect them and --node NAME to select one")
+			return errors.New("multiple destination nodes; use --nodes to inspect them and --node NAME to select one")
 		}
 		for _, node := range graph.Nodes {
 			if !node.Current {
@@ -311,20 +301,20 @@ func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) 
 			break
 		}
 	}
-	pinned := header.Revision != ""
-	if pinned && (selected == nil || selected.Current || edgeRevision(selected.Session) != header.Revision) {
-		return nil, errNodeGraphChanged
+	pinned := header.Pinned
+	if pinned && (selected == nil || selected.Current || selected.Session != r.controller.session.Identifier) {
+		return errNodeGraphChanged
 	}
 	star := r.controller.session.Star
 	if selected == nil {
 		if star != nil && r.stars.starHasNode(star.Identifier, name) {
-			return nil, fmt.Errorf("stars have no multi-hop: node %s is reachable only from the center node %s; run the command from %s", name, star.Center, star.Center)
+			return fmt.Errorf("stars have no multi-hop: node %s is reachable only from the center node %s; run the command from %s", name, star.Center, star.Center)
 		}
-		return nil, fmt.Errorf("unknown node %q; use --nodes to list configured nodes", name)
+		return fmt.Errorf("unknown node %q; use --nodes to list configured nodes", name)
 	} else if selected.Current {
-		return nil, errors.New("target is the current node; run the command locally")
+		return errors.New("target is the current node; run the command locally")
 	} else if star != nil && source == 0 && graph.Problem != "" && !pinned {
-		return nil, fmt.Errorf("operations from the center node %s are unavailable until the star is repaired, such as by applying the project again: %s", star.Center, graph.Problem)
+		return fmt.Errorf("operations from the center node %s are unavailable until the star is repaired, such as by applying the project again: %s", star.Center, graph.Problem)
 	}
 	// An operation that selected its edge before a star problem arose keeps
 	// using that edge, which the problem doesn't change, subject only to the
@@ -342,9 +332,9 @@ func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) 
 	// as its executor refuses commands, since retrying doesn't help, while
 	// other unavailable nodes are connection failures.
 	if !available && reason == executionDisabledReason {
-		return nil, fmt.Errorf("node %s is unavailable: %s", name, reason)
+		return fmt.Errorf("node %s is unavailable: %s", name, reason)
 	} else if !available {
-		return nil, remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, reason))
+		return remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, reason))
 	}
 
 	// The selected edge must be the one through which the submission entered.
@@ -352,24 +342,7 @@ func (r *commandRelay) resolveSubmission(source int, header *remote.Submission) 
 	// selected edge's registration there, even if the daemon still considers
 	// the edge connected, such as while it reconnects.
 	if selected.Session != r.controller.session.Identifier {
-		return nil, remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, centerUnavailableReason))
+		return remote.ConnectionError(fmt.Errorf("node %s is unavailable: %s", name, centerUnavailableReason))
 	}
-	configuration := r.controller.mergedBetaConfiguration
-	if selected.Alpha {
-		configuration = r.controller.mergedAlphaConfiguration
-	}
-	if configuration == nil {
-		configuration = r.controller.session.Configuration
-	}
-	revision := edgeRevision(selected.Session)
-	header.Node, header.Revision = name, revision
-	return &remote.ResolvedRoute{
-		Ignores:    EffectiveIgnores(configuration, r.controller.session.Version),
-		Session:    selected.Session,
-		Alpha:      selected.Alpha,
-		SourceNode: graph.Source,
-		Node:       name,
-		Star:       graph.Star,
-		Revision:   revision,
-	}, nil
+	return nil
 }

@@ -166,7 +166,6 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 	var maintainers sync.WaitGroup
 	urls := [2]*urlpkg.URL{c.session.Alpha, c.session.Beta}
 	for index, url := range urls {
-		executionHost, executionRoot := commandExecutionLocation(urls[1-index])
 		// Star endpoints are named by their nodes, and the endpoints of other
 		// sessions form an implicit pair of nodes named alpha and beta.
 		names := []string{"alpha", "beta"}
@@ -180,8 +179,6 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 			Session:        c.session.Identifier,
 			Name:           c.session.Name,
 			Root:           url.Path,
-			ExecutionHost:  executionHost,
-			ExecutionRoot:  executionRoot,
 			Alpha:          index == 0,
 			SessionCreated: c.session.CreationTime.AsTime(),
 			Submit:         (index == 0 && betaExecutes) || (index == 1 && alphaExecutes),
@@ -311,12 +308,11 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		return
 	}
 	if header.Resolve || header.Node != "" {
-		route, err := r.resolveSubmission(1-target, header)
-		if err != nil {
+		if err := r.resolveSubmission(1-target, header); err != nil {
 			remote.Reject(submission, err)
 			return
 		} else if header.Resolve {
-			if err := remote.RespondWithRoute(submission, route); err != nil {
+			if err := remote.AcknowledgeRoute(submission); err != nil {
 				submission.Close()
 				return
 			}

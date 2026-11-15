@@ -307,7 +307,7 @@ func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaEx
 	readyContext, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
-		connection, _, err := (&remote.Selection{Target: &remote.Target{SourceSession: sessionID, SourceAlpha: !alphaExecutes}}).Dial(readyContext, submitting, remote.OperationFlush)
+		connection, _, err := (&remote.Selection{Target: &remote.Target{Session: sessionID, Alpha: !alphaExecutes}}).Dial(readyContext, submitting, remote.OperationFlush)
 		if err == nil {
 			_, err = remote.Flush(readyContext, connection)
 		}
@@ -322,7 +322,7 @@ func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaEx
 	// The executor channel connects independently of synchronization. Wait
 	// until it can serve entries before exercising the command line.
 	for {
-		connection, _, err := (&remote.Selection{Target: &remote.Target{SourceSession: sessionID, SourceAlpha: !alphaExecutes}}).Dial(readyContext, submitting, remote.OperationExecute)
+		connection, _, err := (&remote.Selection{Target: &remote.Target{Session: sessionID, Alpha: !alphaExecutes}}).Dial(readyContext, submitting, remote.OperationExecute)
 		if err == nil {
 			_, err = remote.Fetch(readyContext, connection, "")
 		}

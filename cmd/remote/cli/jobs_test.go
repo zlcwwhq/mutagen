@@ -30,7 +30,7 @@ func TestKillNoFlush(t *testing.T) {
 	defer cancel()
 	dial := func() io.ReadWriteCloser {
 		t.Helper()
-		connection, _, err := (&remote.Selection{Target: &remote.Target{SourceSession: "sync_kill", SourceAlpha: true}}).Dial(ctx, root, remote.OperationExecute)
+		connection, _, err := (&remote.Selection{Target: &remote.Target{Session: "sync_kill", Alpha: true}}).Dial(ctx, root, remote.OperationExecute)
 		if err != nil {
 			t.Fatal(err)
 		}
