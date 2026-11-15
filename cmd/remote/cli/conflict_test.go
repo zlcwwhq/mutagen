@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
@@ -69,6 +70,76 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 				t.Fatal("directory workspace can't be discarded:", err)
 			}
 		})
+	}
+}
+
+func TestInterruptedCheckoutReleased(t *testing.T) {
+	// A checkout that fails because remote was interrupted or timed out after
+	// claiming the conflict still releases its claim, which would otherwise
+	// keep the opposite endpoint from checking the conflict out until conflicts
+	// are listed again.
+	data, err := os.MkdirTemp("", "mr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(data) })
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := remote.NewLocalChannel(nil, &remote.Endpoint{Session: "sync_claim", Root: root, Alpha: true, Submit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Relay claims and releases, and interrupt the download of the remote
+	// copy.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	released := make(chan string, 1)
+	var handlers sync.WaitGroup
+	handlers.Add(1)
+	go func() {
+		defer handlers.Done()
+		for {
+			connection, err := channel.Accept()
+			if err != nil {
+				return
+			}
+			handlers.Add(1)
+			go func() {
+				defer handlers.Done()
+				header, err := remote.ReceiveSubmission(context.Background(), connection)
+				if err != nil {
+					connection.Close()
+				} else if header.Operation != remote.OperationClaim && header.Operation != remote.OperationRelease {
+					cancel()
+					remote.Reject(connection, errors.New("interrupted"))
+				} else if path, token, err := remote.ReceiveCheckout(context.Background(), connection); err != nil {
+					remote.RespondToCheckout(connection, remote.CheckoutStatus{}, err)
+				} else if header.Operation == remote.OperationClaim {
+					remote.RespondToCheckout(connection, remote.CheckoutStatus{Sequence: 1}, nil)
+				} else {
+					released <- path
+					remote.RespondToCheckout(connection, remote.CheckoutStatus{Held: true, Token: token}, nil)
+				}
+			}()
+		}
+	}()
+	t.Cleanup(func() { channel.Close(); handlers.Wait() })
+	target := &remote.Target{SourceSession: "sync_claim", SourceAlpha: true, Session: "sync_claim", Alpha: true, Root: root}
+	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{{Path: "conflict", AlphaTakable: true, BetaTakable: true}}}
+	if _, err := checkout(ctx, root, &options{}, listing, target, filepath.Join(root, "conflict")); err == nil {
+		t.Fatal("interrupted checkout succeeded")
+	}
+	select {
+	case path := <-released:
+		if path != "conflict" {
+			t.Fatal("incorrect checkout released:", path)
+		}
+	default:
+		t.Fatal("claim of the interrupted checkout not released")
 	}
 }
 

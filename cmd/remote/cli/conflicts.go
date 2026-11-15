@@ -42,6 +42,9 @@ const (
 	// stagingRetention is the age after which a staging directory is assumed
 	// to have been left by an interrupted checkout.
 	stagingRetention = 24 * time.Hour
+	// cleanupTimeout bounds the release of the claim of a checkout that
+	// failed, which is attempted even if remote was interrupted or timed out.
+	cleanupTimeout = 5 * time.Second
 	// metadataName, localName, remoteName, baseName, and mergedName are the
 	// names of the files in a workspace.
 	metadataName, localName, remoteName, baseName, mergedName = "workspace.json", "local", "remote", "base", "merged"
@@ -1338,8 +1341,10 @@ func checkoutLocked(ctx context.Context, directory string, o *options, listing *
 
 	// Claim the checkout before downloading the copies, so that the opposite
 	// endpoint can't check the conflict out meanwhile, and release it if
-	// checkout fails. The claim has a new token, which the workspace keeps, so
-	// that late claims and releases of earlier checkouts can't take over or
+	// checkout fails, even if it failed because remote was interrupted or
+	// timed out, so that the claim is rarely left abandoned (see
+	// releaseAbandoned). The claim has a new token, which the workspace keeps,
+	// so that late claims and releases of earlier checkouts can't take over or
 	// remove its checkout. A checkout that the local endpoint already holds
 	// without a workspace, such as one left by an interrupted checkout, is
 	// released first (see claimSequence).
@@ -1351,6 +1356,8 @@ func checkoutLocked(ctx context.Context, directory string, o *options, listing *
 	created := false
 	defer func() {
 		if !created {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			defer cancel()
 			release(ctx, directory, target, path, token)
 		}
 	}()
