@@ -88,7 +88,8 @@ func (r *reconciler) reconcile(path string, ancestor, alpha, beta *Entry) {
 	// because the path is no longer being tracked, and this also means that if
 	// the rule goes away, the content on both sides will be reconciled as if
 	// the session had just been created, which can't propagate a deletion
-	// either.
+	// either. The other cases of endpoints with different rules are listed in
+	// git_mode.go of the synchronization package.
 	if r.gitMode {
 		alphaUntracked := alpha != nil && alpha.Kind == EntryKind_Untracked
 		betaUntracked := beta != nil && beta.Kind == EntryKind_Untracked

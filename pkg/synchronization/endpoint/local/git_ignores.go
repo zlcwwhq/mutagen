@@ -29,7 +29,9 @@ func gitReceivableFile(ignorer ignore.DirectoryIgnorer, path string) bool {
 // by the endpoint that receives them. The endpoints' rules can differ for as
 // long as a session runs, so what's left out is simply computed again as a
 // change of its own by each cycle, and it's refused on its own by each cycle,
-// without standing in the way of anything else.
+// without standing in the way of anything else. The other cases of endpoints
+// with different rules are listed in git_mode.go of the synchronization
+// package.
 //
 // Regular files that provide ignore rules are never left out for being
 // excluded, and neither are the directories that lead to them. Otherwise, a

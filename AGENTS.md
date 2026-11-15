@@ -65,7 +65,9 @@ follow the code and update this file.
   rules for Git mode (`git: enabled`, see `GitModeEnabled`) and is
   the only place that evaluates them. `pkg/remote/ignores.go` uses it
   so that `remote` sees the same ignores as scans, reading the rules
-  from its own system's copy of the tree. In Git mode, submodules are
+  from its own system's copy of the tree.
+  `pkg/synchronization/git_mode.go` lists how endpoints with
+  different rules are handled. In Git mode, submodules are
   synchronized file by file, with their `.git` represented by a
   GitLink leaf that identifies the commit:
   `pkg/synchronization/core/gitlink.go` defines what scans and
@@ -128,6 +130,10 @@ follow the code and update this file.
   `MUTAGEN_DATA_DIRECTORY` to a writable absolute path before
   running tests. Development builds default to `~/.mutagen-dev`;
   release builds use `~/.mutagen`.
+- Development builds share one version, so an SSH or Docker
+  endpoint keeps using the agent that an earlier build installed
+  in `~/.mutagen-dev/agents`. After rebuilding, remove that
+  directory on the endpoint and reconnect its sessions.
 - Run `go test -v -tags mutagensspl ./sspl/...` when touching
   SSPL code.
 

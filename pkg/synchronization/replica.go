@@ -29,7 +29,8 @@ const exposedContentProblem = "isn't removed or overwritten automatically, since
 // too. If the content that a rule ignored on beta was then tracked like any
 // other content, the cycle after the change would remove or overwrite it, even
 // though it was never synchronized, and even though a rule change can't delete
-// anything in other modes.
+// anything in other modes. The other cases of endpoints with different rules
+// are listed in git_mode.go.
 //
 // So a session in the one-way-replica mode with Git mode enabled keeps a record
 // of the paths of the untracked entries in beta's last snapshot. If the content

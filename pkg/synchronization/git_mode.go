@@ -4,6 +4,34 @@ import (
 	"fmt"
 )
 
+// Endpoints in Git mode read ignore rules from their own disks, so they can
+// disagree about what's ignored: briefly, while a .gitignore is being
+// synchronized, or for good, with rules in .git/info/exclude, which is never
+// synchronized. Five mechanisms deal with that. Each covers a case that the
+// others can't see, so none of them replaces another:
+//
+//   - A path exists on an endpoint whose rules ignore it: reconciliation
+//     propagates nothing to or from that side (see reconciler.reconcile in
+//     the core package). This is all that protects existing content under a
+//     rule that only one endpoint has.
+//   - A path is absent on an endpoint whose rules ignore it, where a scan
+//     can't mark it untracked: that endpoint doesn't stage or write it (see
+//     gitReceivableFile and gitTransitionPruner in the local endpoint
+//     package).
+//   - A .gitignore is on its way to an endpoint whose scan predates it: the
+//     cycle delivers only rules, and the next one computes everything else
+//     again (see ruleOnlyTransitions). Otherwise, the one-way-replica mode
+//     would delete what the rule is about to ignore, incoming content would
+//     be judged by rules that the endpoint doesn't have yet, and a flush
+//     would return before newly tracked content is reconciled. This never
+//     applies to exclude files, which aren't delivered.
+//   - A rule stops ignoring content on beta in the one-way-replica mode,
+//     which mirroring would then remove or overwrite: the session keeps it
+//     (see ReplicaRecord).
+//   - A root's .git entry is untracked and survives the deletion of
+//     everything else, which would keep the session from halting when a
+//     root is emptied (see rootEmptied).
+
 // IsDefault indicates whether or not the Git mode is GitMode_GitModeDefault.
 func (m GitMode) IsDefault() bool {
 	return m == GitMode_GitModeDefault

@@ -47,7 +47,8 @@ func oneEndpointEmptiedRoot(ancestor, alpha, beta *core.Entry, gitMode bool) boo
 // the deletion of everything else in a root, but only if the untracked content
 // has names that the ancestor doesn't: the ancestor only contains synchronized
 // content, so an untracked entry with a name in the ancestor was hidden by an
-// ignore rule rather than deleted, and it's still there.
+// ignore rule rather than deleted, and it's still there. The other cases of
+// endpoints with different rules are listed in git_mode.go.
 func rootEmptied(ancestor, root *core.Entry, gitMode bool) bool {
 	if len(root.Contents) == 0 {
 		return true
@@ -205,7 +206,8 @@ func ignoreRuleDeliveries(changes []*core.Change) []*core.Change {
 // Dropped transitions need no record, since the next cycle's reconciliation
 // recomputes them from scans that reflect the new rules, and ancestor changes
 // don't depend on them, since a transition's path is disjoint from those of all
-// other changes.
+// other changes. The other cases of endpoints with different rules are listed
+// in git_mode.go.
 func ruleOnlyTransitions(αTransitions, βTransitions []*core.Change) ([]*core.Change, []*core.Change, bool) {
 	αDeliveries := ignoreRuleDeliveries(αTransitions)
 	βDeliveries := ignoreRuleDeliveries(βTransitions)
