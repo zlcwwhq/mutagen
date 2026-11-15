@@ -940,6 +940,17 @@ func TestTransitionFollow(t *testing.T) {
 			expectedCalls:  []string{"Follow"},
 		},
 		{
+			description: "success with warning",
+			content:     map[string]string{"sub/.git/HEAD": "head", "sub/a": tF1Content},
+			path:        "sub/.git",
+			configure: func(p *testingGitProvider, _ context.CancelFunc) {
+				p.followWarnings = []string{"staged changes unstaged"}
+			},
+			expectedResult:   tGL1,
+			expectedProblems: []*Problem{{Path: "sub/.git", Error: "staged changes unstaged", Warning: true}},
+			expectedCalls:    []string{"Follow"},
+		},
+		{
 			description: "failure",
 			content:     map[string]string{"sub/.git/HEAD": "head", "sub/a": tF1Content},
 			path:        "sub/.git",

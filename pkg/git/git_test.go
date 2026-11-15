@@ -946,7 +946,7 @@ func mustRun(t *testing.T, directory string, args ...string) string {
 
 // verifyRootRepository verifies the result of ProbeRoot for a repository, with
 // the expected commit given in hexadecimal.
-func verifyRootRepository(t *testing.T, repository *RootRepository, commit, branch, url string) {
+func verifyRootRepository(t *testing.T, repository *Repository, commit, branch, url string) {
 	t.Helper()
 	if repository == nil {
 		t.Fatal("repository not found")

@@ -59,12 +59,15 @@ type GitProvider interface {
 	// Refresh refreshes the index of the repository in a directory, whose Git
 	// entry was just attached, which is only an optimization.
 	Refresh(ctx context.Context, directory string) error
-	// Follow moves the detached HEAD and the index of the repository in a
-	// directory from the commit of one GitLink entry to that of another,
-	// without touching the working tree. If the target commit isn't available
-	// locally, then it doesn't use the network to get it, but leaves that to
-	// happen in the background, and fails with an explanation.
-	Follow(ctx context.Context, directory string, old, target *Entry) error
+	// Follow moves HEAD and the index of the repository in a directory from
+	// the commit of one GitLink entry to that of another, detaching HEAD,
+	// without touching the working tree, and keeping the changes that are
+	// staged in the index where possible. It returns warnings about how the
+	// result differs from what was requested (such as staged changes that had
+	// to be unstaged). If the target commit isn't available locally, then it
+	// doesn't use the network to get it, but leaves that to happen in the
+	// background, and fails with an explanation.
+	Follow(ctx context.Context, directory string, old, target *Entry) ([]string, error)
 }
 
 // gitLink returns the GitLink entry of a directory, if it has one.

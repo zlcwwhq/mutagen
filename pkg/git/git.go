@@ -585,11 +585,21 @@ func CommitFromOutput(output string) ([]byte, error) {
 	return commit, nil
 }
 
-// Repository describes a repository that Probe has found to be a submodule.
+// Repository describes a repository that Probe has found to be a submodule, or
+// the repository at a synchronization root, as examined by ProbeRoot.
 type Repository struct {
-	// Commit is the commit that's checked out, in its raw form.
+	// Commit is the commit that HEAD identifies, in its raw form. Only
+	// ProbeRoot reports a repository without one, whose HEAD is unborn (i.e.
+	// which has no commits yet).
 	Commit []byte
-	// URL is the URL of the repository's origin, without credentials.
+	// Branch is the short name of the branch (beneath refs/heads/) that HEAD
+	// refers to, or empty if HEAD is detached. HEAD can refer to something
+	// other than a branch, but only Git's plumbing can do that, and Git treats
+	// such a HEAD as detached, as we do. Only ProbeRoot determines it.
+	Branch string
+	// URL is the URL of the repository's origin, without credentials. Probe
+	// only reports a repository that has one, while ProbeRoot leaves it empty
+	// if there's none, or if it can't be used elsewhere (see UsableURL).
 	URL string
 	// AutoCRLF is the value of the core.autocrlf setting that applies to the
 	// repository, or empty if it's unset or unusable (see UsableSetting).
@@ -598,8 +608,20 @@ type Repository struct {
 	EOL string
 }
 
-// probeSettings is the pattern for the settings that Probe reads, all of which
-// it reads with a single command.
+// useLineEndingSettings records the line ending settings among the settings
+// that readProbeSettings has read, leaving out those that can't be used
+// elsewhere, which means that the other endpoint uses its own.
+func (r *Repository) useLineEndingSettings(settings map[string]string) {
+	if value := settings["core.autocrlf"]; UsableSetting(value) {
+		r.AutoCRLF = value
+	}
+	if value := settings["core.eol"]; UsableSetting(value) {
+		r.EOL = value
+	}
+}
+
+// probeSettings is the pattern for the settings that Probe and ProbeRoot read,
+// all of which they read with a single command.
 const probeSettings = `^(remote\.origin\.url|core\.autocrlf|core\.eol)$`
 
 // Probe examines a directory that contains a .git entry to determine how a
@@ -621,7 +643,7 @@ func Probe(ctx context.Context, directory string) (*Repository, error) {
 	// something else.
 	output, err := Run(ctx, directory, "rev-parse", "--is-inside-work-tree", "--show-prefix")
 	if err != nil {
-		return nil, probeError(ctx, directory, err)
+		return nil, probeError(ctx, directory, err, false)
 	} else if output != "true" {
 		return nil, errors.New("contains a .git entry for a repository whose working tree isn't this directory; fix or remove the .git entry (not the directory), or add the directory to .gitignore to leave it out")
 	}
@@ -635,11 +657,11 @@ func Probe(ctx context.Context, directory string) (*Repository, error) {
 		if _, err := Run(ctx, directory, "rev-parse", "--verify", "--quiet", "HEAD"); ExitedWith(err, 1) {
 			return nil, nil
 		} else if err != nil {
-			return nil, probeError(ctx, directory, err)
+			return nil, probeError(ctx, directory, err, false)
 		}
 		return nil, errors.New("contains a .git entry for a damaged repository, whose HEAD refers to a commit that it doesn't have; repair it, or remove the .git entry (not the directory) to make the directory an ordinary one")
 	} else if err != nil {
-		return nil, probeError(ctx, directory, err)
+		return nil, probeError(ctx, directory, err, false)
 	}
 	commit, err := CommitFromOutput(output)
 	if err != nil {
@@ -649,7 +671,7 @@ func Probe(ctx context.Context, directory string) (*Repository, error) {
 	// Read the URL and the line ending settings.
 	settings, err := readProbeSettings(ctx, directory)
 	if err != nil {
-		return nil, probeError(ctx, directory, err)
+		return nil, probeError(ctx, directory, err, false)
 	}
 
 	// Without an origin there's nothing to fetch from, so it can't be a
@@ -663,15 +685,9 @@ func Probe(ctx context.Context, directory string) (*Repository, error) {
 		return nil, fmt.Errorf("origin can't be used by the other endpoint: %w; change it with git remote set-url, or add the directory to .gitignore to leave it out", err)
 	}
 
-	// Success. Settings that can't be used are left out, which means that a
-	// clone on the other endpoint uses its own settings.
+	// Success.
 	repository := &Repository{Commit: commit, URL: url}
-	if value := settings["core.autocrlf"]; UsableSetting(value) {
-		repository.AutoCRLF = value
-	}
-	if value := settings["core.eol"]; UsableSetting(value) {
-		repository.EOL = value
-	}
+	repository.useLineEndingSettings(settings)
 	return repository, nil
 }
 
@@ -704,27 +720,6 @@ func readProbeSettings(ctx context.Context, directory string) (map[string]string
 	return settings, nil
 }
 
-// RootRepository describes the repository at a synchronization root, as
-// examined by ProbeRoot.
-type RootRepository struct {
-	// Commit is the commit that HEAD identifies, in its raw form, or empty if
-	// HEAD is unborn (i.e. if the repository has no commits yet).
-	Commit []byte
-	// Branch is the short name of the branch (beneath refs/heads/) that HEAD
-	// refers to, or empty if HEAD is detached. HEAD can refer to something
-	// other than a branch, but only Git's plumbing can do that, and Git treats
-	// such a HEAD as detached, as we do.
-	Branch string
-	// URL is the URL of the repository's origin, without credentials, or empty
-	// if it doesn't have one, or if it can't be used elsewhere (see UsableURL).
-	URL string
-	// AutoCRLF is the value of the core.autocrlf setting that applies to the
-	// repository, or empty if it's unset or unusable (see UsableSetting).
-	AutoCRLF string
-	// EOL is the value of the core.eol setting, in the same way.
-	EOL string
-}
-
 // ProbeRoot examines the repository at a synchronization root, for a session
 // in Git mode, which keeps the commits and branches that the repositories at
 // both endpoints have checked out the same. If the directory doesn't have a
@@ -732,7 +727,7 @@ type RootRepository struct {
 // .git entry, but that its repository can't be examined or used, and its
 // message tells the user what to do about it. Unlike a nested repository (see
 // Probe), the repository doesn't need an origin, or even a commit.
-func ProbeRoot(ctx context.Context, directory string) (*RootRepository, error) {
+func ProbeRoot(ctx context.Context, directory string) (*Repository, error) {
 	// Check for a .git entry, which is the common case for an endpoint that
 	// only receives content, without involving Git. A root that's a file has
 	// no repository either.
@@ -751,7 +746,7 @@ func ProbeRoot(ctx context.Context, directory string) (*RootRepository, error) {
 	// this directory, as Probe does.
 	output, err := Run(ctx, directory, "rev-parse", "--is-inside-work-tree", "--show-prefix")
 	if err != nil {
-		return nil, probeRootError(ctx, directory, err)
+		return nil, probeError(ctx, directory, err, true)
 	} else if output != "true" {
 		return nil, errors.New("the .git entry at the root is for a repository whose working tree isn't the root; fix it, or move it aside to have the other endpoint's repository attached in its place")
 	}
@@ -763,36 +758,30 @@ func ProbeRoot(ctx context.Context, directory string) (*RootRepository, error) {
 	// since it's rare.
 	commit, branch, err := Head(ctx, directory)
 	if err != nil {
-		return nil, probeRootError(ctx, directory, err)
+		return nil, probeError(ctx, directory, err, true)
 	} else if commit == nil {
 		if branch == "" {
 			return nil, errors.New("the repository at the root is damaged: HEAD doesn't identify a commit that it has; repair it")
 		} else if _, err := Run(ctx, directory, "rev-parse", "--verify", "--quiet", "HEAD"); err == nil {
 			return nil, fmt.Errorf("the repository at the root is damaged: branch %s doesn't identify a commit that it has; repair it", branch)
 		} else if !ExitedWith(err, 1) {
-			return nil, probeRootError(ctx, directory, err)
+			return nil, probeError(ctx, directory, err, true)
 		}
 	}
 
-	// Read the URL and the line ending settings. Settings that can't be used
-	// elsewhere are left out, which means that the other endpoint uses its
-	// own.
+	// Read the URL and the line ending settings. A URL that can't be used
+	// elsewhere is left out, like a setting that can't (see Probe).
 	settings, err := readProbeSettings(ctx, directory)
 	if err != nil {
-		return nil, probeRootError(ctx, directory, err)
+		return nil, probeError(ctx, directory, err, true)
 	}
-	repository := &RootRepository{Commit: commit, Branch: branch}
+	repository := &Repository{Commit: commit, Branch: branch}
 	if url := settings["remote.origin.url"]; url != "" {
 		if usable, err := UsableURL(url); err == nil {
 			repository.URL = usable
 		}
 	}
-	if value := settings["core.autocrlf"]; UsableSetting(value) {
-		repository.AutoCRLF = value
-	}
-	if value := settings["core.eol"]; UsableSetting(value) {
-		repository.EOL = value
-	}
+	repository.useLineEndingSettings(settings)
 
 	// Success.
 	return repository, nil
@@ -802,7 +791,7 @@ func ProbeRoot(ctx context.Context, directory string) (*RootRepository, error) {
 // commit, in its raw form, and the short name of the branch (beneath
 // refs/heads/) that HEAD refers to. The commit is nil if HEAD doesn't resolve
 // to a commit, such as if it refers to a branch that doesn't exist yet, and the
-// branch is empty if HEAD is detached (see RootRepository). It runs two
+// branch is empty if HEAD is detached (see Repository.Branch). It runs two
 // commands, and any error is a *CommandError.
 func Head(ctx context.Context, directory string) ([]byte, string, error) {
 	// Determine the branch that HEAD refers to. Git answers with an exit code
@@ -833,33 +822,6 @@ func Head(ctx context.Context, directory string) ([]byte, string, error) {
 	return commit, branch, nil
 }
 
-// probeRootError converts the failure of a command run by ProbeRoot to an
-// error whose message tells the user what to do, as probeError does for Probe.
-func probeRootError(ctx context.Context, directory string, err error) error {
-	// Handle the case where we've been unable to get an answer.
-	if ctx.Err() != nil {
-		return fmt.Errorf("unable to examine the repository at the root: %w", ctx.Err())
-	}
-
-	// Handle the case where Git isn't available.
-	if errors.Is(err, exec.ErrNotFound) {
-		return errors.New("the root has a .git entry, but git isn't installed on this system, and it's required to keep HEAD at the other endpoint's commit; install it")
-	}
-
-	// Look for the failures that we know about.
-	message := err.Error()
-	if strings.Contains(message, "dubious ownership") {
-		return fmt.Errorf("Git refuses to use the repository at the root, because it's owned by someone else; if you trust it, run: git config --global --add safe.directory %s", directory)
-	} else if strings.Contains(message, "unknown option") {
-		return fmt.Errorf("the version of Git on this system is too old to keep HEAD at the other endpoint's commit, which requires Git 2.29 or later: %s", message)
-	}
-
-	// Otherwise, Git can't use the repository. Its commits and branches may
-	// exist nowhere else, so the advice is to move it aside rather than to
-	// remove it.
-	return fmt.Errorf("the .git entry at the root isn't a valid repository (%s); repair it, or move it aside to have the other endpoint's repository attached in its place", message)
-}
-
 // maximumSettingLength is the maximum length of a setting's value that
 // UsableSetting accepts.
 const maximumSettingLength = 64
@@ -873,16 +835,25 @@ func UsableSetting(value string) bool {
 		strings.IndexFunc(value, unicode.IsControl) == -1
 }
 
-// probeError converts the failure of a command run by a probe to an error
-// whose message tells the user what to do.
-func probeError(ctx context.Context, directory string, err error) error {
+// probeError converts the failure of a command run by Probe, or by ProbeRoot
+// if root is true, to an error whose message tells the user what to do.
+func probeError(ctx context.Context, directory string, err error, root bool) error {
+	// Describe the repository and what Git is required for.
+	repository, purpose := "this repository", "for submodules, which require"
+	if root {
+		repository, purpose = "the repository at the root", "to keep HEAD at the other endpoint's commit, which requires"
+	}
+
 	// Handle the case where we've been unable to get an answer.
 	if ctx.Err() != nil {
-		return fmt.Errorf("unable to examine repository: %w", ctx.Err())
+		return fmt.Errorf("unable to examine %s: %w", repository, ctx.Err())
 	}
 
 	// Handle the case where Git isn't available.
 	if errors.Is(err, exec.ErrNotFound) {
+		if root {
+			return errors.New("the root has a .git entry, but git isn't installed on this system, and it's required to keep HEAD at the other endpoint's commit; install it")
+		}
 		return errors.New("contains a .git entry, but git isn't installed on this system, and it's required for submodules; install it, or add the directory to .gitignore to leave it out")
 	}
 
@@ -893,22 +864,28 @@ func probeError(ctx context.Context, directory string, err error) error {
 	// decision.
 	message := err.Error()
 	if strings.Contains(message, "dubious ownership") {
-		return fmt.Errorf("Git refuses to use this repository, because it's owned by someone else; if you trust it, run: git config --global --add safe.directory %s", directory)
+		return fmt.Errorf("Git refuses to use %s, because it's owned by someone else; if you trust it, run: git config --global --add safe.directory %s", repository, directory)
 	} else if strings.Contains(message, "unknown option") {
-		return fmt.Errorf("the version of Git on this system is too old for submodules, which require Git 2.29 or later: %s", message)
+		return fmt.Errorf("the version of Git on this system is too old %s Git 2.29 or later: %s", purpose, message)
 	}
 
 	// Otherwise, Git can't use the repository, despite there being a .git
-	// entry. This is what a .git file looks like that was synchronized here
-	// from a submodule, by a session without Git mode, and that points to
-	// nothing on this system, but it may also be a real repository that Git
-	// can't read (such as one with invalid configuration, or one that uses an
-	// extension that this version of Git doesn't support). So the advice is
-	// never to remove the directory, which could lose commits and changes, or,
-	// if the directory is synchronized, propagate its removal to the other
-	// endpoint. Without its .git entry, the directory is an ordinary one, to
-	// which the session attaches the repository of a submodule that the other
-	// endpoint has there. Note that what this reports can't be the state of a
-	// repository enclosing this one: Command prevents that.
+	// entry. Its commits and branches may exist nowhere else, so the advice is
+	// to move the .git entry at the root aside rather than to remove it. In a
+	// directory other than the root, this is what a .git file looks like that
+	// was synchronized there from a submodule, by a session without Git mode,
+	// and that points to nothing on this system, but it may also be a real
+	// repository that Git can't read (such as one with invalid configuration,
+	// or one that uses an extension that this version of Git doesn't support).
+	// So the advice is never to remove the directory, which could lose commits
+	// and changes, or, if the directory is synchronized, propagate its removal
+	// to the other endpoint. Without its .git entry, the directory is an
+	// ordinary one, to which the session attaches the repository of a
+	// submodule that the other endpoint has there. Note that what this reports
+	// can't be the state of a repository enclosing this one: Command prevents
+	// that.
+	if root {
+		return fmt.Errorf("the .git entry at the root isn't a valid repository (%s); repair it, or move it aside to have the other endpoint's repository attached in its place", message)
+	}
 	return fmt.Errorf("contains a .git entry that isn't a valid repository (%s), such as one left by an older session; repair it, or remove the .git entry (not the directory), after which the directory is synchronized like any other, and a submodule that the other endpoint has there is attached to it", message)
 }

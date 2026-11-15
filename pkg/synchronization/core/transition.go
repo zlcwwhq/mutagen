@@ -1438,13 +1438,19 @@ func (t *transitioner) follow(path string, old, target *Entry) *Entry {
 
 	// Move HEAD and the index.
 	directory := filepath.Join(t.root, filepath.FromSlash(directoryPath))
-	if err := t.gitProvider.Follow(t.ctx, directory, old, target); err != nil {
+	warnings, err := t.gitProvider.Follow(t.ctx, directory, old, target)
+	if err != nil {
 		if t.ctx.Err() != nil {
 			t.recordProblem(path, errTransitionCancelled)
 		} else {
 			t.recordWarning(path, err)
 		}
 		return old
+	}
+
+	// Report how the result differs from what was requested.
+	for _, warning := range warnings {
+		t.recordWarning(path, errors.New(warning))
 	}
 
 	// Success.

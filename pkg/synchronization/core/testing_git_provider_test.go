@@ -95,6 +95,8 @@ type testingGitProvider struct {
 	cloneWarnings []string
 	// attachWarnings are the warnings that PrepareAttach returns.
 	attachWarnings []string
+	// followWarnings are the warnings that Follow returns.
+	followWarnings []string
 	// scanned is the entry that ScanClone returns, if non-nil. Otherwise,
 	// ScanClone scans the clone with ignored as the ignorer.
 	scanned *Entry
@@ -262,8 +264,13 @@ func (p *testingGitProvider) Refresh(_ context.Context, directory string) error 
 }
 
 // Follow implements GitProvider.Follow.
-func (p *testingGitProvider) Follow(_ context.Context, directory string, _, _ *Entry) error {
-	return p.run("Follow", directory, "")
+func (p *testingGitProvider) Follow(_ context.Context, directory string, _, _ *Entry) ([]string, error) {
+	if err := p.run("Follow", directory, ""); err != nil {
+		return nil, err
+	}
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	return p.followWarnings, nil
 }
 
 // testingWriteContent creates files and directories within a directory. The

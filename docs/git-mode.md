@@ -226,9 +226,11 @@ synchronized.
 ### Following commits
 
 When one endpoint checks out another commit, the other follows by moving its
-`HEAD` (detached) and its index to that commit, without touching any file. The
-files then arrive like any other changes. A branch that the following endpoint
-had checked out doesn't move.
+`HEAD` (detached) and its index to that commit, without touching any file, the
+way that the root repository follows. The files then arrive like any other
+changes. A branch that the following endpoint had checked out doesn't move.
+Staged changes stay staged where Git can keep them, and otherwise become
+unstaged, with a warning.
 
 If the following endpoint doesn't have the commit, it fetches it in the
 background, from its own `origin` or else from the other endpoint's, without
@@ -239,8 +241,9 @@ with a warning. Once it has the commit, a session that watches for changes
 follows right away, and one that doesn't at its next flush.
 
 `HEAD` also stays behind, with a warning, while a Git operation is in progress
-there, such as a merge, a rebase, or a commit whose message is being edited. It
-follows once the operation is finished or aborted.
+there, such as a merge, a rebase, or a commit whose message is being edited, or
+while another Git command holds its index. It follows once the operation is
+finished or aborted.
 
 ### Missing submodules
 

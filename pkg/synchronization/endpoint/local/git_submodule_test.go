@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -1191,8 +1190,8 @@ func waitForPollSignal(t *testing.T, e *endpoint) {
 
 // TestEndpointGitModeFollow tests that a transition between GitLink entries
 // moves the repository's HEAD and index to the target commit, without touching
-// the working tree or the branch that was checked out, and that it's only a
-// warning if it can't.
+// the working tree or the branch that was checked out, or the changes that are
+// staged where possible, and that it's only a warning if it can't.
 func TestEndpointGitModeFollow(t *testing.T) {
 	// The working tree is left alone, including modifications, files that the
 	// rules ignore, and the files of the target commit, which are synchronized
@@ -1350,8 +1349,9 @@ func TestEndpointGitModeFollow(t *testing.T) {
 
 	// Right after a checkout, when the files are racily clean, which is what a
 	// clone that the endpoint populates looks like, writing the index runs the
-	// filter even without a refresh, so the reset fails, and the index is
-	// replaced with the commit's tree instead.
+	// filter even without a refresh, so merging the change into the index
+	// fails, and the index is replaced with the commit's tree instead, which
+	// doesn't merit a warning, since nothing was staged.
 	t.Run("failing clean filter with racily clean files", func(t *testing.T) {
 		upstream := newGitUpstream(t, "upstream")
 		upstream.commitFiles("filtered", map[string]string{".gitattributes": "* filter=x\n", "data": "first"})
@@ -1388,7 +1388,7 @@ func TestEndpointGitModeFollow(t *testing.T) {
 		if result != old {
 			t.Error("incorrect result:", result)
 		}
-		verifySingleWarning(t, problems, "sub/.git", "changed since the scan", gitShortCommit(third))
+		verifySingleWarning(t, problems, "sub/.git", "changed here since the scan", gitShortCommit(third))
 		verifyDetachedAt(t, clone.directory, second)
 	})
 
@@ -1427,51 +1427,39 @@ func TestEndpointGitModeFollow(t *testing.T) {
 		verifyDetachedAt(t, clone.directory, second)
 	})
 
-	// Versions of Git before 2.36 don't know --no-refresh, which they reject
-	// as invalid usage, in which case the reset is performed without it.
-	t.Run("Git without --no-refresh", func(t *testing.T) {
-		if runtime.GOOS == "windows" {
-			t.Skip("wrapper requires a POSIX shell")
-		}
+	// Changes that are staged in the index stay staged, unless they conflict
+	// with the change between the commits, in which case they're unstaged,
+	// with a warning, as they are at the root. HEAD follows either way.
+	t.Run("staged changes", func(t *testing.T) {
 		upstream := newGitUpstream(t, "upstream")
 		clone := newSubmoduleClone(t, upstream)
-		second := upstream.commit("second", "second")
+		second := upstream.commit("other", "second")
+		third := upstream.commit("file", "third")
 		upstream.push()
 		mustGit(t, clone.directory, "fetch", "--quiet", "origin")
-
-		// Put a wrapper in front of Git that behaves like such a version.
-		real, err := exec.LookPath("git")
-		if err != nil {
-			t.Fatal(err)
-		}
-		wrapper := realTemporaryDirectory(t)
-		rejections := filepath.Join(wrapper, "rejections")
-		script := "#!/bin/sh\n" +
-			"for argument in \"$@\"; do\n" +
-			"  if [ \"$argument\" = --no-refresh ]; then\n" +
-			"    echo rejected >> '" + rejections + "'\n" +
-			"    echo \"error: unknown option \\`no-refresh'\" >&2\n" +
-			"    for line in 1 2 3 4 5 6 7 8 9 10 11 12; do echo \"usage line $line\" >&2; done\n" +
-			"    exit 129\n" +
-			"  fi\n" +
-			"done\n" +
-			"exec '" + real + "' \"$@\"\n"
-		writeTree(t, wrapper, map[string]string{"git": script})
-		if err := os.Chmod(filepath.Join(wrapper, "git"), 0700); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv("PATH", wrapper+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-		// Follow.
+		writeTree(t, clone.root, map[string]string{"sub/file": "staged"})
+		mustGit(t, clone.directory, "add", "--", "file")
 		e := newGitModeEndpoint(t, clone.root, synchronization.WatchMode_WatchModeNoWatch)
-		_, _, problems := follow(t, e, upstream.entry(second), nil)
+		_, result, problems := follow(t, e, upstream.entry(second), nil)
 		if len(problems) != 0 {
 			t.Fatal("unexpected problems:", problems)
+		} else if !result.Equal(upstream.entry(second), true) {
+			t.Error("incorrect result:", result)
 		}
 		verifyDetachedAt(t, clone.directory, second)
-		if contents, err := os.ReadFile(rejections); err != nil || string(contents) != "rejected\n" {
-			t.Errorf("wrapper didn't reject the option once: %q, %v", contents, err)
+		if staged := mustGit(t, clone.directory, "diff", "--cached", "--name-only"); staged != "file" {
+			t.Errorf("staged changes not kept: %q", staged)
 		}
+		_, result, problems = follow(t, e, upstream.entry(third), nil)
+		verifySingleWarning(t, problems, "sub/.git", "HEAD followed commit "+gitShortCommit(third), "unstaged")
+		if !result.Equal(upstream.entry(third), true) {
+			t.Error("incorrect result:", result)
+		}
+		verifyDetachedAt(t, clone.directory, third)
+		if staged := mustGit(t, clone.directory, "diff", "--cached", "--name-only"); staged != "" {
+			t.Errorf("conflicting staged changes kept: %q", staged)
+		}
+		verifyContents(t, clone.root, "sub/file", "staged")
 	})
 }
 

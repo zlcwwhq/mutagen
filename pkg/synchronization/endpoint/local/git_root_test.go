@@ -351,7 +351,7 @@ func TestEndpointGitModeRootAttach(t *testing.T) {
 		if autoCRLF, eol := mustGit(t, f.followerRoot, "config", "core.autocrlf"), mustGit(t, f.followerRoot, "config", "core.eol"); autoCRLF != "input" || eol != "lf" {
 			t.Errorf("incorrect line ending settings: %q %q", autoCRLF, eol)
 		}
-		if message := mustGit(t, f.followerRoot, "reflog", "-1", "--format=%gs", "refs/heads/main"); message != gitRootAttachMessage {
+		if message := mustGit(t, f.followerRoot, "reflog", "-1", "--format=%gs", "refs/heads/main"); message != gitAttachMessage {
 			t.Errorf("incorrect reflog message: %q", message)
 		}
 		if repository := scanEndpoint(t, f.follower, true).Repository; !repository.Equal(scanEndpoint(t, f.source, true).Repository) {
@@ -444,7 +444,7 @@ func TestEndpointGitModeRootFollow(t *testing.T) {
 		if status := mustGit(t, f.followerRoot, "status", "--porcelain"); status != "" {
 			t.Errorf("working tree isn't clean: %s", status)
 		}
-		if message := mustGit(t, f.followerRoot, "reflog", "-1", "--format=%gs", "refs/heads/main"); message != gitRootFollowMessage {
+		if message := mustGit(t, f.followerRoot, "reflog", "-1", "--format=%gs", "refs/heads/main"); message != gitFollowMessage {
 			t.Errorf("incorrect reflog message: %q", message)
 		}
 		if len(follow.haves) != 1 || fmt.Sprintf("%x", follow.haves[0]) != f.first {

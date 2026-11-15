@@ -1,15 +1,13 @@
 package local
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
@@ -27,12 +25,6 @@ const (
 	// that its Git directory can be renamed into place, and its name hides it
 	// from scans and watching.
 	gitRootTemporaryPrefix = filesystem.TemporaryNamePrefix + "repository-"
-	// gitRootFollowMessage is the reflog message for the changes that follow
-	// the other endpoint's repository.
-	gitRootFollowMessage = "mutagen: follow"
-	// gitRootAttachMessage is the reflog message for the changes that set up a
-	// repository for attachment.
-	gitRootAttachMessage = "mutagen: attach"
 	// gitRootFetchRefspec is the refspec that an attached repository's origin
 	// fetches with, which is the one that a clone configures.
 	gitRootFetchRefspec = "+refs/heads/*:refs/remotes/origin/*"
@@ -40,12 +32,6 @@ const (
 	// included in a core.Repository, which is well within what
 	// core.Repository.EnsureValid accepts.
 	gitRootMaximumTextLength = 2048
-	// gitIndexRenameAttempts is the number of times that renaming a new index
-	// into place is attempted on Windows, where it fails while another process
-	// has the index open, such as a Git command that only reads it.
-	gitIndexRenameAttempts = 20
-	// gitIndexRenameInterval is the interval between those attempts.
-	gitIndexRenameInterval = 50 * time.Millisecond
 )
 
 // gitRootText converts text, such as an error message, into a form that can be
@@ -284,23 +270,15 @@ func (e *endpoint) attachRootRepository(ctx context.Context, target *core.Reposi
 	}
 
 	// Point HEAD at the commit, on the branch if there's one, and make the
-	// index match the commit. Reading the tree only writes the index, and
-	// unlike a checkout, it doesn't involve the working tree, which is the
-	// root's, and whose files are synchronized separately. The repository is
-	// new, so the branch can't exist yet.
+	// index match the commit (see gitPrepareAttach). The repository is new, so
+	// the branch can't exist yet.
 	if target.Branch != "" {
 		if err := gitCheckBranchName(ctx, temporary, target.Branch); err != nil {
 			return failure(false, "the name of its branch isn't valid here: %v", err)
-		} else if _, err := git.Run(ctx, temporary, "update-ref", "-m", gitRootAttachMessage, "refs/heads/"+target.Branch, commit, ""); err != nil {
-			return failure(false, "its branch couldn't be created: %v", err)
-		} else if _, err := git.Run(ctx, temporary, "symbolic-ref", "-m", gitRootAttachMessage, "HEAD", "refs/heads/"+target.Branch); err != nil {
-			return failure(false, "HEAD couldn't be set: %v", err)
 		}
-	} else if _, err := git.Run(ctx, temporary, "update-ref", "--no-deref", "-m", gitRootAttachMessage, "HEAD", commit); err != nil {
-		return failure(false, "HEAD couldn't be set: %v", err)
 	}
-	if _, err := git.Run(ctx, temporary, "read-tree", "--no-recurse-submodules", commit); err != nil {
-		return failure(false, "its index couldn't be set: %v", err)
+	if err := gitPrepareAttach(ctx, temporary, commit, target.Branch); err != nil {
+		return failure(false, "%v", err)
 	}
 
 	// Move the Git directory into place, without replacing anything that has
@@ -312,37 +290,34 @@ func (e *endpoint) attachRootRepository(ctx context.Context, target *core.Reposi
 		return failure(false, "it couldn't be moved into place: %v", err)
 	}
 
-	// Refresh the index, which records the information about the files in the
-	// working tree that tells Git that they haven't changed. That only saves
-	// Git some work later, so a failure doesn't matter.
-	git.Run(ctx, e.root, "update-index", "-q", "--refresh")
+	// Refresh the index, which only saves Git some work later, so a failure
+	// doesn't matter.
+	gitRefreshIndex(ctx, e.root)
 
 	// Success.
 	return gitRootResult(core.RepositoryOutcome_Moved, "", false)
 }
 
-// gitRootRestore holds a Git command that undoes part of a follow.
-type gitRootRestore []string
-
 // followRootRepository moves HEAD in the repository at the root as an action
-// requests, for TransitionRepository. It doesn't touch the working tree, it
-// keeps the changes that are staged in the index where possible, it doesn't
-// write ORIG_HEAD, and it doesn't run hooks (see git.Command).
+// requests, for TransitionRepository (see followHead).
 func (e *endpoint) followRootRepository(ctx context.Context, action *core.RepositoryAction) *core.RepositoryResult {
 	// Extract the old state and the target.
 	old, target := action.Old, action.Target
 	oldCommit, targetCommit := hex.EncodeToString(old.Commit), hex.EncodeToString(target.Commit)
+	oldHead := gitHead{commit: oldCommit, branch: old.Branch}
+	targetHead := gitHead{commit: targetCommit, branch: target.Branch}
 
 	// Create functions to report failures, both for transient conditions,
-	// which are warnings, and for others.
+	// which are warnings, and for others, including those of followHead.
 	failure := func(warning bool, format string, arguments ...any) *core.RepositoryResult {
 		return gitRootResult(core.RepositoryOutcome_Failed, fmt.Sprintf(
 			"HEAD didn't follow the other endpoint to %s, because %s",
 			gitRootTarget(target), fmt.Sprintf(format, arguments...),
 		), warning)
 	}
-	changed := func() *core.RepositoryResult {
-		return failure(true, "HEAD changed here since the scan; the next synchronization cycle takes the change into account")
+	followFailure := func(err error) *core.RepositoryResult {
+		var reason *gitFollowError
+		return failure(errors.As(err, &reason) && reason.transient, "%v", err)
 	}
 
 	// Don't follow while an operation is in progress whose state is in the
@@ -355,25 +330,12 @@ func (e *endpoint) followRootRepository(ctx context.Context, action *core.Reposi
 		return failure(true, "%s here, which moving HEAD would disrupt; HEAD follows once that's over", operation)
 	}
 
-	// Verify that HEAD hasn't changed since the scan, since moving it would
-	// discard the change (e.g. a commit). If it's already at the target, then
-	// there's nothing to do.
-	isCurrent := func() (*core.RepositoryResult, bool) {
-		if _, err := os.Lstat(filepath.Join(e.root, ".git")); os.IsNotExist(err) {
-			return changed(), false
-		}
-		commit, branch, err := git.Head(ctx, e.root)
-		if err != nil {
-			return failure(false, "Git couldn't determine what HEAD identifies here: %v", err), false
-		} else if bytes.Equal(commit, target.Commit) && branch == target.Branch {
-			return gitRootResult(core.RepositoryOutcome_Moved, "", false), false
-		} else if !bytes.Equal(commit, old.Commit) || branch != old.Branch {
-			return changed(), false
-		}
-		return nil, true
-	}
-	if result, ok := isCurrent(); !ok {
-		return result
+	// Verify that HEAD hasn't changed since the scan. If it's already at the
+	// target, then there's nothing to do.
+	if done, err := checkHead(ctx, e.root, oldHead, targetHead); err != nil {
+		return followFailure(err)
+	} else if done {
+		return gitRootResult(core.RepositoryOutcome_Moved, "", false)
 	}
 
 	// Verify that the target commit is available.
@@ -403,9 +365,8 @@ func (e *endpoint) followRootRepository(ctx context.Context, action *core.Reposi
 	// used: it may only be created or fast-forwarded, so that no commits are
 	// lost, and it mustn't be checked out in another worktree, which would
 	// have its HEAD changed as well.
-	switching := target.Branch != "" && target.Branch != old.Branch
 	var branchTip string
-	if switching {
+	if target.Branch != "" && target.Branch != old.Branch {
 		if err := gitCheckBranchName(ctx, e.root, target.Branch); err != nil {
 			return failure(false, "the name of the branch isn't valid here: %v", err)
 		}
@@ -433,169 +394,14 @@ func (e *endpoint) followRootRepository(ctx context.Context, action *core.Reposi
 		}
 	}
 
-	// Take the index's lock, which keeps other Git commands from changing the
-	// index (and, by extension, from committing) while we work. The new index
-	// is written to the lock file and then renamed into place, which releases
-	// the lock, as Git itself does.
-	output, err := git.Run(ctx, e.root, "rev-parse", "--git-path", "index")
+	// Move HEAD and the index.
+	warning, err := followHead(ctx, e.logger, e.root, oldHead, targetHead, branchTip)
 	if err != nil {
-		return failure(false, "Git couldn't locate the index: %v", err)
+		return followFailure(err)
+	} else if warning != "" {
+		warning = fmt.Sprintf("HEAD followed the other endpoint to %s, but %s", gitRootTarget(target), warning)
 	}
-	index := filepath.FromSlash(output)
-	if !filepath.IsAbs(index) {
-		index = filepath.Join(e.root, index)
-	}
-	lock := index + ".lock"
-	lockFile, err := os.OpenFile(lock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
-	if err != nil {
-		if os.IsExist(err) {
-			return failure(true, "another Git command is using the index (index.lock exists); HEAD follows once it's done (if no Git command is running, remove %s)", lock)
-		}
-		return failure(false, "the index couldn't be locked: %v", err)
-	}
-	locked := true
-	defer func() {
-		if locked {
-			os.Remove(lock)
-		}
-	}()
-
-	// Now that nothing else can commit, verify again that HEAD hasn't changed.
-	if result, ok := isCurrent(); !ok {
-		lockFile.Close()
-		return result
-	}
-
-	// Copy the index into the lock file. If there's no index, then the lock
-	// file stays empty, which Git treats as an empty index when it's
-	// replacing it.
-	existingIndex, err := os.ReadFile(index)
-	if err != nil && !os.IsNotExist(err) {
-		lockFile.Close()
-		return failure(false, "the index couldn't be read: %v", err)
-	}
-	_, err = lockFile.Write(existingIndex)
-	if closeErr := lockFile.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return failure(false, "the index couldn't be copied: %v", err)
-	}
-
-	// Compute the new index by merging the change from the old commit to the
-	// target commit into the index, which keeps the changes that are staged
-	// and the information about unchanged files. Only the index is involved,
-	// not the working tree, whose files are synchronized separately and are
-	// thus already the target's. If that's not possible (because staged
-	// changes conflict with the change, or because there's no old commit),
-	// then the index is replaced with the target's tree, which unstages any
-	// changes. The latter doesn't merit a warning if there was no index.
-	var warning string
-	merged := false
-	if oldCommit != "" && existingIndex != nil {
-		_, err := git.RunWithIndex(ctx, e.root, lock, "read-tree", "--no-recurse-submodules", "-m", "-i", oldCommit, targetCommit)
-		merged = err == nil
-		if !merged {
-			warning = fmt.Sprintf("HEAD followed the other endpoint to %s, but the changes staged here had to be unstaged (%v); the files themselves are unchanged, so stage them again if needed",
-				gitRootTarget(target), err,
-			)
-		}
-	} else if existingIndex != nil {
-		warning = fmt.Sprintf("HEAD followed the other endpoint to %s, but any changes staged here had to be unstaged, since there were no commits here; the files themselves are unchanged, so stage them again if needed",
-			gitRootTarget(target),
-		)
-	}
-	if !merged {
-		if _, err := git.RunWithIndex(ctx, e.root, lock, "read-tree", "--no-recurse-submodules", targetCommit); err != nil {
-			return failure(false, "the index couldn't be computed: %v", err)
-		}
-	}
-
-	// Move the references, verifying their old values where Git allows it, and
-	// record how to undo each step, in case a later one fails.
-	var restores []gitRootRestore
-	move := func(arguments ...string) error {
-		_, err := git.Run(ctx, e.root, arguments...)
-		return err
-	}
-	switch {
-	case target.Branch == "":
-		// Detach HEAD at the target commit. An unborn HEAD can't be verified,
-		// because Git treats it as existing, though it was verified above while
-		// holding the lock.
-		arguments := []string{"update-ref", "--no-deref", "-m", gitRootFollowMessage, "HEAD", targetCommit}
-		if oldCommit != "" {
-			arguments = append(arguments, oldCommit)
-		}
-		if err := move(arguments...); err != nil {
-			return failure(false, "HEAD couldn't be moved: %v", err)
-		}
-		if old.Branch != "" {
-			restores = append(restores, gitRootRestore{"symbolic-ref", "HEAD", "refs/heads/" + old.Branch})
-		} else {
-			restores = append(restores, gitRootRestore{"update-ref", "--no-deref", "HEAD", oldCommit, targetCommit})
-		}
-	case !switching:
-		// Move the branch that HEAD refers to, creating it if it's unborn.
-		if err := move("update-ref", "-m", gitRootFollowMessage, "refs/heads/"+target.Branch, targetCommit, oldCommit); err != nil {
-			return failure(false, "branch %s couldn't be moved: %v", target.Branch, err)
-		}
-		if oldCommit != "" {
-			restores = append(restores, gitRootRestore{"update-ref", "refs/heads/" + target.Branch, oldCommit, targetCommit})
-		} else {
-			restores = append(restores, gitRootRestore{"update-ref", "-d", "refs/heads/" + target.Branch, targetCommit})
-		}
-	default:
-		// Create or fast-forward the target branch, and point HEAD at it. The
-		// old branch (if any) stays where it is.
-		if err := move("update-ref", "-m", gitRootFollowMessage, "refs/heads/"+target.Branch, targetCommit, branchTip); err != nil {
-			return failure(false, "branch %s couldn't be moved: %v", target.Branch, err)
-		}
-		if branchTip != "" {
-			restores = append(restores, gitRootRestore{"update-ref", "refs/heads/" + target.Branch, branchTip, targetCommit})
-		} else {
-			restores = append(restores, gitRootRestore{"update-ref", "-d", "refs/heads/" + target.Branch, targetCommit})
-		}
-		if err := move("symbolic-ref", "-m", gitRootFollowMessage, "HEAD", "refs/heads/"+target.Branch); err != nil {
-			e.restoreRootRepository(ctx, restores)
-			return failure(false, "HEAD couldn't be moved to branch %s: %v", target.Branch, err)
-		}
-		if old.Branch != "" {
-			restores = append(restores, gitRootRestore{"symbolic-ref", "HEAD", "refs/heads/" + old.Branch})
-		} else {
-			restores = append(restores, gitRootRestore{"update-ref", "--no-deref", "HEAD", oldCommit})
-		}
-	}
-
-	// Rename the new index into place, which releases the lock. If that fails,
-	// then undo the moves.
-	err = os.Rename(lock, index)
-	for attempt := 1; err != nil && runtime.GOOS == "windows" && attempt < gitIndexRenameAttempts; attempt++ {
-		time.Sleep(gitIndexRenameInterval)
-		err = os.Rename(lock, index)
-	}
-	if err != nil {
-		e.restoreRootRepository(ctx, restores)
-		return failure(false, "the index couldn't be replaced: %v", err)
-	}
-	locked = false
 
 	// Success.
 	return gitRootResult(core.RepositoryOutcome_Moved, warning, true)
-}
-
-// restoreRootRepository undoes the steps of a follow that failed, in reverse
-// order, as far as possible. The commands run even if the follow was
-// cancelled, since they undo what it did, and they only write a few small
-// files. Each uses the values that the follow set as its old values where Git
-// allows that, so that nothing that has changed since is undone.
-func (e *endpoint) restoreRootRepository(ctx context.Context, restores []gitRootRestore) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gitRestoreTimeout)
-	defer cancel()
-	for r := len(restores) - 1; r >= 0; r-- {
-		arguments := append([]string{restores[r][0], "-m", gitRootFollowMessage + " failed"}, restores[r][1:]...)
-		if _, err := git.Run(ctx, e.root, arguments...); err != nil {
-			e.logger.Warn("Unable to undo part of a failed follow of the repository at the root:", err)
-		}
-	}
 }
