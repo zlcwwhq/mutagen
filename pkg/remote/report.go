@@ -20,7 +20,7 @@ type Report struct {
 	// ExcludedProblems is the number of problems omitted from Problems.
 	ExcludedProblems uint64
 	// Resolution indicates whether remote can resolve the session's conflicts
-	// (see ListConflicts), which requires the two-way-safe mode.
+	// (see ListConflictsWithProgress), which requires the two-way-safe mode.
 	Resolution bool `json:",omitempty"`
 	// Repository is the conflict between the repositories at the endpoints'
 	// synchronization roots in Git mode, if any.

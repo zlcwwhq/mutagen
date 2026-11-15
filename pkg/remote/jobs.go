@@ -525,15 +525,6 @@ func operateJob(ctx context.Context, connection io.ReadWriteCloser, operation Jo
 	return response.Job, nil
 }
 
-// WaitJob waits for the job with the specified identifier, started at the
-// opposite endpoint's root, to end over an established route (see Dial), and
-// returns the job. It owns and closes the connection. Cancellation abandons
-// the wait without affecting the job.
-func WaitJob(ctx context.Context, connection io.ReadWriteCloser, id string) (*Job, error) {
-	job, _, err := WaitJobWithTail(ctx, connection, id, 0)
-	return job, err
-}
-
 // KillJob terminates the job with the specified identifier, started at the
 // opposite endpoint's root, over an established route (see Dial), and returns
 // the job. It owns and closes the connection. The job's process group receives

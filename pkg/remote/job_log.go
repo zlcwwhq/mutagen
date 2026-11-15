@@ -105,15 +105,6 @@ func (b *jobLogBuffer) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-// WaitJobWithTail waits as WaitJob does and also reads the final lines of the
-// job's log. Zero lines disables log reading and returns a nil log. Errors
-// reading the log are reported in JobLog.Error without affecting the job's
-// status. The entire tail is buffered until the request succeeds, so callers
-// can retry interrupted requests without duplicating partial output.
-func WaitJobWithTail(ctx context.Context, connection io.ReadWriteCloser, id string, lines int64) (*Job, *JobLog, error) {
-	return WaitJobWithOptions(ctx, connection, id, &WaitOptions{Tail: lines})
-}
-
 // waitMargin is the longest time by which a wait with a deadline asks the
 // executing endpoint to return before the deadline, so that the job and its
 // log's tail, which the endpoint reads once it stops waiting, can arrive in
@@ -143,10 +134,13 @@ type WaitOptions struct {
 	Warn func(string)
 }
 
-// WaitJobWithOptions waits as WaitJob does, and also reads the final lines of
-// the job's log, which it returns along with the job if the job is still
-// running once a deadline approaches, or streams the log while waiting, as the
-// options specify. Errors reading the log are reported in JobLog.Error, or
+// WaitJobWithOptions waits for the job with the specified identifier, started
+// at the opposite endpoint's root, to end over an established route (see Dial),
+// and returns the job. It owns and closes the connection. Cancellation abandons
+// the wait without affecting the job. It also reads the final lines of the
+// job's log, which it returns along with the job if the job is still running
+// once a deadline approaches, or streams the log while waiting, as the options
+// specify. Errors reading the log are reported in JobLog.Error, or
 // through WaitOptions.Warn while following, without affecting the job's status.
 // A tail is buffered until the request succeeds, so callers can retry
 // interrupted requests without duplicating partial output, while followed

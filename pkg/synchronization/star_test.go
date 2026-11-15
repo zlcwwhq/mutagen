@@ -715,7 +715,7 @@ func TestStarCrossEdgeSubmissionRefused(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("flush did not start")
 	}
-	if _, err := remote.Flush(ctx, connection); err != nil {
+	if _, err := remote.FlushWithProgress(ctx, connection, nil); err != nil {
 		t.Fatal("flush failed:", err)
 	}
 

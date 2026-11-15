@@ -172,17 +172,12 @@ func exchange(ctx context.Context, connection io.ReadWriteCloser, request *Reque
 	return &response, nil
 }
 
-// Flush waits for the synchronization cycle requested by a flush submission (see
-// Dial) to complete and returns a report of content that the session couldn't
-// synchronize. It owns and closes the connection. Cancellation abandons the
-// wait, but not the synchronization cycle.
-func Flush(ctx context.Context, connection io.ReadWriteCloser) (*Report, error) {
-	return FlushWithProgress(ctx, connection, nil)
-}
-
-// FlushWithProgress is Flush for a submission that may have requested progress
-// messages (see Submission.Progress), which are passed to progress, if
-// non-nil, as they arrive.
+// FlushWithProgress waits for the synchronization cycle requested by a flush
+// submission (see Dial) to complete and returns a report of content that the
+// session couldn't synchronize. It owns and closes the connection.
+// Cancellation abandons the wait, but not the synchronization cycle. Progress
+// messages, if the submission requested them (see Submission.Progress), are
+// passed to progress, if non-nil, as they arrive.
 func FlushWithProgress(ctx context.Context, connection io.ReadWriteCloser, progress func(*Progress)) (*Report, error) {
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { connection.Close() })

@@ -44,7 +44,7 @@ func TestKillNoFlush(t *testing.T) {
 	})
 	if err != nil || code != 0 {
 		t.Fatalf("unable to start job: %d, %v", code, err)
-	} else if job, err = remote.WaitJob(ctx, dial(), job.ID); err != nil || job.State != remote.JobExited {
+	} else if job, _, err = remote.WaitJobWithOptions(ctx, dial(), job.ID, &remote.WaitOptions{}); err != nil || job.State != remote.JobExited {
 		t.Fatalf("unable to wait for job: %+v, %v", job, err)
 	}
 

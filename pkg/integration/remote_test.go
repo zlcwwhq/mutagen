@@ -55,7 +55,7 @@ func flushRemote(directory string) (*remote.Report, error) {
 		connection, _, err := (&remote.Selection{Resolve: true}).Dial(ctx, directory, remote.OperationFlush)
 		var report *remote.Report
 		if err == nil {
-			report, err = remote.Flush(ctx, connection)
+			report, err = remote.FlushWithProgress(ctx, connection, nil)
 		}
 		cancel()
 		if err == nil || time.Now().After(deadline) {
@@ -309,7 +309,7 @@ func createRemoteSession(t *testing.T, name, alphaRoot, betaRoot string, alphaEx
 	for {
 		connection, _, err := (&remote.Selection{Target: &remote.Target{Session: sessionID, Alpha: !alphaExecutes}}).Dial(readyContext, submitting, remote.OperationFlush)
 		if err == nil {
-			_, err = remote.Flush(readyContext, connection)
+			_, err = remote.FlushWithProgress(readyContext, connection, nil)
 		}
 		if err == nil {
 			break

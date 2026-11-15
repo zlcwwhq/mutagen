@@ -20,7 +20,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/filesystem"
 )
 
-// ConflictRoot describes a conflict listed by ListConflicts.
+// ConflictRoot describes a conflict listed by ListConflictsWithProgress.
 type ConflictRoot struct {
 	// Path is the slash-separated conflict root relative to the
 	// synchronization root, which is empty for the root itself.
@@ -183,16 +183,11 @@ func RespondWithConflicts(connection io.ReadWriteCloser, listing *Listing, err e
 	return writer.Flush()
 }
 
-// ListConflicts waits for the synchronization cycle requested by a conflicts
-// submission (see Dial) to complete and returns the session's conflicts,
-// problems, and checkouts. It owns and closes the connection.
-func ListConflicts(ctx context.Context, connection io.ReadWriteCloser) (*Listing, error) {
-	return ListConflictsWithProgress(ctx, connection, nil)
-}
-
-// ListConflictsWithProgress is ListConflicts for a submission that may have
-// requested progress messages (see Submission.Progress), which are passed to
-// progress, if non-nil, as they arrive.
+// ListConflictsWithProgress waits for the synchronization cycle requested by a
+// conflicts submission (see Dial) to complete and returns the session's
+// conflicts, problems, and checkouts. It owns and closes the connection.
+// Progress messages, if the submission requested them (see
+// Submission.Progress), are passed to progress, if non-nil, as they arrive.
 func ListConflictsWithProgress(ctx context.Context, connection io.ReadWriteCloser, progress func(*Progress)) (*Listing, error) {
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { connection.Close() })

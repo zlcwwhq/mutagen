@@ -750,9 +750,10 @@ func relateResolved(name, directory string) ([]*candidate, []*candidate, error) 
 
 // Dial submits the specified operation through the registered endpoint whose
 // root most specifically contains the specified directory, subject to the
-// selection. The returned connection is suitable for Execute, Flush, or the
-// other functions that complete the operation, and the returned target
-// describes the endpoint, which can pin subsequent selections.
+// selection. The returned connection is suitable for Execute,
+// FlushWithProgress, or the other functions that complete the operation, and
+// the returned target describes the endpoint, which can pin subsequent
+// selections.
 func (s *Selection) Dial(ctx context.Context, directory string, operation Operation) (net.Conn, *Target, error) {
 	return s.Submit(ctx, directory, &Submission{Operation: operation})
 }

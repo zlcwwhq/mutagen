@@ -280,7 +280,8 @@ const (
 	// daemon reports with a status message.
 	OperationFlush
 	// OperationConflicts requests a synchronization cycle followed by a
-	// complete listing of the session's conflicts (see ListConflicts).
+	// complete listing of the session's conflicts (see
+	// ListConflictsWithProgress).
 	OperationConflicts
 	// OperationClaim requests that the daemon record a checkout of a conflict
 	// by the submitting endpoint (see ClaimCheckout).
