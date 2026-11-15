@@ -354,6 +354,7 @@ func TestConflictOptions(t *testing.T) {
 		{"--conflict-apply", "--conflict-discard", "file"}, {"--json", "echo"},
 		{"--conflict-checkout"}, {"--conflict-apply", "file", "--take", "local"},
 		{"--conflict-checkout", "--base", "base", "file", "other"}, {"--conflict-apply", "--base", "base", "file"},
+		{"--conflict-apply", "-C", "sub", "file"},
 	} {
 		if _, err := parse(args); err == nil {
 			t.Fatalf("accepted %v", args)

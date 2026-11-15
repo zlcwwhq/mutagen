@@ -274,6 +274,12 @@ func TestParseModes(t *testing.T) {
 		{"--progress", "--diff", "a"},
 		{"--progress", "--conflicts"},
 		{"--conflict-apply", "--progress", "a"},
+		// Operations keep accepting the options that they always have, even
+		// where those have no effect.
+		{"--conflict-discard", "--progress", "a"},
+		{"--diff", "-C", "sub", "a"},
+		{"--diff", "-e", "X=1"},
+		{"--diff", "--env-file", "vars", "--no-prologue"},
 	} {
 		if _, err := parse(arguments); err != nil {
 			t.Errorf("valid arguments %v rejected: %v", arguments, err)
@@ -366,10 +372,37 @@ func TestParseModes(t *testing.T) {
 		{"--sessions", "--progress"},
 		{"--ignores", "--progress"},
 		{"--pull", "--progress", "a"},
+		{"--diff", "--log", "diff.log"},
+		{"--diff", "--json"},
 		{"--progress=maybe", "--flush"},
 	} {
 		if _, err := parse(arguments); err == nil {
 			t.Errorf("invalid arguments %v accepted", arguments)
+		}
+	}
+
+	// Errors name the options that can't be combined, or the operations that
+	// an option requires.
+	for _, test := range []struct {
+		arguments []string
+		expected  string
+	}{
+		{[]string{"--jobs", "--no-flush"}, "--no-flush can't be combined with --jobs"},
+		{[]string{"--conflict-apply", "-C", "sub", "a"}, "--cwd can't be combined with --conflict-apply"},
+		{[]string{"--conflicts", "--conflict-discard", "a"}, "--conflict-discard can't be combined with --conflicts"},
+		{[]string{"--tail", "1", "true"}, "--tail requires --wait"},
+		{[]string{"--json", "true"}, "--json requires --nodes or --conflicts or --conflict-checkout or --conflict-apply or --conflict-discard"},
+		{[]string{"--jobs", "x"}, "--jobs doesn't accept arguments"},
+	} {
+		if _, err := parse(test.arguments); err == nil || err.Error() != test.expected {
+			t.Errorf("arguments %v not refused with %q: %v", test.arguments, test.expected, err)
+		}
+	}
+
+	// Options set to false select no operation.
+	for _, arguments := range [][]string{{"--diff=false", "true"}, {"--conflicts=false", "--jobs"}} {
+		if options, err := parse(arguments); err != nil || options.command() != (arguments[1] == "true") {
+			t.Errorf("arguments %v parsed incorrectly: %v", arguments, err)
 		}
 	}
 }

@@ -110,32 +110,10 @@ func (o *conflictOptions) register(flags *pflag.FlagSet) {
 	flags.BoolVar(&o.json, "json", false, "Print conflict results as JSON")
 }
 
-// validateConflicts checks the combination of conflict options.
+// validateConflicts checks the values of conflict options, which validate
+// checks the combination of.
 func (o *options) validateConflicts() error {
-	modes := 0
-	for _, enabled := range []bool{o.conflicts, o.checkout, o.apply, o.discard} {
-		if enabled {
-			modes++
-		}
-	}
-	paths := o.checkout || o.apply || o.discard
-	if modes > 1 {
-		return errors.New("--conflicts, --conflict-checkout, --conflict-apply, and --conflict-discard are mutually exclusive")
-	} else if modes == 1 && (o.flush || o.noFlush || o.diff || o.directory != "" ||
-		len(o.environment) != 0 || len(o.environmentFiles) != 0 || o.noPrologue ||
-		o.script != "" || o.detach || o.log != "") {
-		return errors.New("conflict operations can't be combined with commands or command options")
-	} else if o.conflicts && len(o.arguments) != 0 {
-		return errors.New("--conflicts doesn't accept arguments")
-	} else if paths && len(o.arguments) == 0 {
-		return errors.New("no conflicting paths specified")
-	} else if paths && slices.ContainsFunc(o.arguments, func(argument string) bool { return strings.HasPrefix(argument, "-") }) {
-		return errors.New("options must precede paths (prefix paths starting with - with ./)")
-	} else if o.json && modes == 0 && !o.nodes {
-		return errors.New("--json requires --nodes or a conflict operation")
-	} else if !o.apply && (o.take != "" || o.delete || o.executable != "") {
-		return errors.New("--take, --delete, and --executable require --conflict-apply")
-	} else if o.base != "" && (!o.checkout || len(o.arguments) != 1) {
+	if o.base != "" && len(o.arguments) != 1 {
 		return errors.New("--base requires --conflict-checkout of a single path")
 	} else if o.take != "" && o.take != sideLocal && o.take != sideRemote {
 		return errors.New("--take must be local or remote")

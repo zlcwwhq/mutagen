@@ -303,66 +303,125 @@ func scriptBoundary(flags *pflag.FlagSet, arguments []string) int {
 	return -1
 }
 
-// modes are the options that select an operation other than running a
-// command, with the other options that each of them accepts, excluding the
-// conflict operations, which validateConflicts checks.
-var modes = []struct {
-	// name is the option's name.
+// operation is an operation that an option selects instead of running a
+// command.
+type operation struct {
+	// name is the name of the option that selects it.
 	name string
 	// accepted are the names of the other options that it accepts.
 	accepted []string
-}{
-	{"nodes", []string{"json", "timeout"}},
-	{"jobs", []string{"node"}},
-	{"wait", []string{"node", "timeout", "no-flush", "tail", "follow", "progress"}},
-	{"kill", []string{"node", "timeout", "no-flush", "progress"}},
-	{"ignores", []string{"node"}},
-	{"pull", []string{"node", "timeout"}},
+	// arguments are the arguments that it takes: noArguments, optionalPaths,
+	// or requiredPaths.
+	arguments int
 }
 
-// validate checks the combination of options other than conflict options.
-func (o *options) validate(flags *pflag.FlagSet) error {
-	if flags.Changed("node") {
-		if o.node == "" {
-			return errors.New("--node requires a node name")
+// The arguments that operations take. Paths can't look like options, which
+// must precede them, except for --diff, which compares whatever paths it's
+// given.
+const (
+	noArguments = iota
+	optionalPaths
+	requiredPaths
+)
+
+// operations are the operations other than running a command. Running a
+// command accepts commandOptions, and the other options require an operation
+// that accepts them. Some operations accept options that have no effect for
+// them, such as --no-flush and --progress for --kill, and command options for
+// --diff, as they always have.
+var operations = []operation{
+	{"nodes", []string{"json", "timeout"}, noArguments},
+	{"jobs", []string{"node"}, noArguments},
+	{"wait", []string{"node", "timeout", "no-flush", "tail", "follow", "progress"}, noArguments},
+	{"kill", []string{"node", "timeout", "no-flush", "progress"}, noArguments},
+	{"ignores", []string{"node"}, optionalPaths},
+	{"pull", []string{"node", "timeout"}, requiredPaths},
+	{"diff", []string{"node", "timeout", "progress", "cwd", "env", "env-file", "no-prologue"}, optionalPaths},
+	{"conflicts", []string{"node", "timeout", "progress", "json"}, noArguments},
+	{"conflict-checkout", []string{"node", "timeout", "progress", "json", "base"}, requiredPaths},
+	{"conflict-apply", []string{"node", "timeout", "progress", "json", "take", "delete", "executable"}, requiredPaths},
+	{"conflict-discard", []string{"node", "timeout", "progress", "json"}, requiredPaths},
+}
+
+// commandOptions are the options that running a command (or script) accepts.
+var commandOptions = []string{
+	"node", "cwd", "env", "env-file", "script", "timeout", "no-prologue",
+	"no-flush", "flush", "progress", "detach", "log",
+}
+
+// selects indicates whether a set option that names an operation selects it,
+// which a boolean option set to false, such as --diff=false, doesn't.
+func selects(flag *pflag.Flag) bool {
+	return flag.Changed && (flag.Value.Type() != "bool" || flag.Value.String() == "true")
+}
+
+// operation returns the operation that the options select, or nil if they
+// request running a command.
+func (o *options) operation() *operation {
+	for i := range operations {
+		if selects(o.flags.Lookup(operations[i].name)) {
+			return &operations[i]
 		}
 	}
-	if flags.Changed("tail") && !flags.Changed("wait") {
-		return errors.New("--tail requires --wait")
-	} else if flags.Changed("follow") && !flags.Changed("wait") {
-		return errors.New("--follow requires --wait")
+	return nil
+}
+
+// command indicates whether the options request running a command (or script).
+func (o *options) command() bool {
+	return o.operation() == nil && (o.script != "" || len(o.arguments) > 0)
+}
+
+// validate checks the combination of options, other than the values of
+// conflict options, which validateConflicts checks.
+func (o *options) validate(flags *pflag.FlagSet) error {
+	if flags.Changed("node") && o.node == "" {
+		return errors.New("--node requires a node name")
 	} else if o.tail < 0 {
 		return errors.New("tail count must not be negative")
 	} else if o.timeout < 0 {
 		return errors.New("timeout must not be negative")
 	}
-	for _, mode := range modes {
-		if !flags.Changed(mode.name) {
-			continue
-		}
-		var err error
-		flags.Visit(func(flag *pflag.Flag) {
-			if err == nil && flag.Name != mode.name && !slices.Contains(mode.accepted, flag.Name) {
-				err = fmt.Errorf("--%s can't be combined with --%s", flag.Name, mode.name)
-			}
-		})
-		if err != nil {
-			return err
-		}
+
+	// Check that the operation, or running a command, accepts the other
+	// options, skipping those that select no operation.
+	selected := o.operation()
+	accepted := commandOptions
+	if selected != nil {
+		accepted = selected.accepted
 	}
-	paths := o.pull || o.ignores
-	if (o.nodes || o.jobs || flags.Changed("wait") || flags.Changed("kill")) && len(o.arguments) > 0 {
-		return errors.New("--nodes, --jobs, --wait, and --kill don't accept arguments")
-	} else if (flags.Changed("wait") && o.wait == "") || (flags.Changed("kill") && o.kill == "") {
-		return errors.New("--wait and --kill require a job identifier")
-	} else if o.pull && len(o.arguments) == 0 {
+	var err error
+	flags.Visit(func(flag *pflag.Flag) {
+		if err != nil || slices.Contains(accepted, flag.Name) || selected != nil && flag.Name == selected.name ||
+			!selects(flag) && slices.ContainsFunc(operations, func(other operation) bool { return other.name == flag.Name }) {
+			return
+		} else if selected != nil {
+			err = fmt.Errorf("--%s can't be combined with --%s", flag.Name, selected.name)
+			return
+		}
+		var accepting []string
+		for _, other := range operations {
+			if slices.Contains(other.accepted, flag.Name) {
+				accepting = append(accepting, "--"+other.name)
+			}
+		}
+		err = fmt.Errorf("--%s requires %s", flag.Name, strings.Join(accepting, " or "))
+	})
+	if err != nil {
+		return err
+	}
+
+	// Check the arguments and the remaining combinations.
+	paths := selected != nil && selected.arguments != noArguments && selected.name != "diff"
+	if selected != nil && selected.arguments == noArguments && len(o.arguments) > 0 {
+		return fmt.Errorf("--%s doesn't accept arguments", selected.name)
+	} else if selected != nil && selected.arguments == requiredPaths && len(o.arguments) == 0 {
 		return errors.New("no paths specified")
 	} else if paths && slices.ContainsFunc(o.arguments, func(argument string) bool { return strings.HasPrefix(argument, "-") }) {
 		return errors.New("options must precede paths (prefix paths starting with - with ./)")
+	} else if (flags.Changed("wait") && o.wait == "") || (flags.Changed("kill") && o.kill == "") {
+		return errors.New("--wait and --kill require a job identifier")
 	} else if o.flush && o.noFlush {
 		return errors.New("--flush and --no-flush are mutually exclusive")
-	} else if o.diff && (o.flush || o.noFlush || o.script != "" || o.detach) {
-		return errors.New("--diff can't be combined with --flush, --no-flush, --script, or --detach")
 	} else if flags.Changed("script") && o.script == "" {
 		return errors.New("--script requires a file (or - for standard input)")
 	} else if flags.Changed("log") && !o.detach {
@@ -371,21 +430,10 @@ func (o *options) validate(flags *pflag.FlagSet) error {
 		return fmt.Errorf("--timeout can't be combined with --detach, which returns once the job starts; to limit the job's duration, run it with timeout, such as %s --detach timeout 1h make bench", followUpCommand(o.node))
 	} else if o.detach && o.script == "" && len(o.arguments) == 0 {
 		return errors.New("--detach requires a command or --script")
-	} else if !o.flush && !o.diff && !o.active() && !o.mode() && o.script == "" && len(o.arguments) == 0 {
+	} else if selected == nil && !o.flush && o.script == "" && len(o.arguments) == 0 {
 		return errors.New("no command specified")
 	}
 	return nil
-}
-
-// mode indicates whether an option that selects an operation other than
-// running a command, comparing copies, or resolving conflicts is specified.
-func (o *options) mode() bool {
-	return o.nodes || o.jobs || o.wait != "" || o.kill != "" || o.ignores || o.pull
-}
-
-// command indicates whether the options request running a command (or script).
-func (o *options) command() bool {
-	return !o.diff && !o.active() && !o.mode() && (o.script != "" || len(o.arguments) > 0)
 }
 
 // Run executes the command line (excluding the executable name) and returns the
@@ -497,10 +545,12 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	var code int
 	output := &checkedWriter{Writer: stdout}
 	switch {
-	case options.conflicts:
-		activity, err = "listing conflicts", printConflicts(router, options, output)
 	case options.active():
-		activity, err = "resolving conflicts", runConflicts(router, options, output)
+		activity = "resolving conflicts"
+		if options.conflicts {
+			activity = "listing conflicts"
+		}
+		err = runConflicts(router, options, output)
 	case options.jobs:
 		activity, err = "listing jobs", listJobs(router, output)
 	case options.wait != "":
