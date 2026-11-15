@@ -38,10 +38,8 @@ func executing(target *remote.Target) string {
 	if target.Node != "" {
 		return terminal.NeutralizeControlCharacters(target.Node)
 	}
-	if target.Alpha {
-		return "beta"
-	}
-	return "alpha"
+	_, opposite := orient(target.Alpha, "alpha", "beta")
+	return opposite
 }
 
 // shellQuote quotes an argument for display in a POSIX shell command line, if

@@ -239,10 +239,7 @@ func (w *workspace) changedSince(conflict *remote.ConflictRoot) string {
 	} else if !conflict.Files {
 		return "copies"
 	}
-	local, opposite := conflict.AlphaDigest, conflict.BetaDigest
-	if !w.Alpha {
-		local, opposite = opposite, local
-	}
+	local, opposite := orient(w.Alpha, conflict.AlphaDigest, conflict.BetaDigest)
 	switch localChanged, remoteChanged := local != w.ListedLocal, opposite != w.ListedRemote; {
 	case localChanged && remoteChanged:
 		return "local and remote copies"
@@ -598,7 +595,7 @@ func releaseOver(router *router, connection io.ReadWriteCloser, path, token stri
 func releaseAbandoned(router *router, target *remote.Target, checkouts []remote.Checkout, workspaces map[string]*workspace) []remote.Checkout {
 	var remaining []remote.Checkout
 	for _, checkout := range checkouts {
-		if checkout.Alpha != target.Alpha || workspaces[checkout.Path] != nil || !releaseIfAbandoned(router, target, checkout) {
+		if sideOf(checkout.Alpha, target.Alpha) != sideLocal || workspaces[checkout.Path] != nil || !releaseIfAbandoned(router, target, checkout) {
 			remaining = append(remaining, checkout)
 		}
 	}
@@ -933,10 +930,7 @@ type pendingResolution struct {
 // localSides converts which endpoints' copies of a conflict can be taken to
 // local and remote copies.
 func localSides(conflict *remote.ConflictRoot, target *remote.Target) []string {
-	local, opposite := conflict.AlphaTakable, conflict.BetaTakable
-	if !target.Alpha {
-		local, opposite = opposite, local
-	}
+	local, opposite := orient(target.Alpha, conflict.AlphaTakable, conflict.BetaTakable)
 	var sides []string
 	if local {
 		sides = append(sides, sideLocal)
@@ -992,10 +986,7 @@ func printConflicts(router *router, o *options, output io.Writer) error {
 	if err := renderConflicts(router, o, &rendered, listing, target); err != nil {
 		return err
 	}
-	alpha, beta := target.SourceNode, target.Node
-	if !target.Alpha {
-		alpha, beta = beta, alpha
-	}
+	alpha, beta := orient(target.Alpha, target.SourceNode, target.Node)
 	return json.NewEncoder(output).Encode(struct {
 		Edges []conflictEdge `json:"edges"`
 	}{[]conflictEdge{{alpha, beta, target.SourceNode, target.Node, json.RawMessage(rendered.Bytes())}}})
@@ -1018,16 +1009,16 @@ func renderConflicts(router *router, o *options, output io.Writer, listing *remo
 	l := newLocator(target)
 	workspaces := sessionWorkspaces(target)
 	checkouts := releaseAbandoned(router, target, listing.Checkouts, workspaces)
-	holders := make(map[string]bool)
+	holders := make(map[string]string)
 	for _, checkout := range checkouts {
-		holders[checkout.Path] = checkout.Alpha
+		holders[checkout.Path] = sideOf(checkout.Alpha, target.Alpha)
 	}
 	// A checkout held by the opposite endpoint prevails over a local workspace,
 	// which apply then refuses.
 	checkedOut := func(path string) string {
-		if alpha, held := holders[path]; held && alpha != target.Alpha {
-			return sideRemote
-		} else if held || workspaces[path] != nil {
+		if holder := holders[path]; holder != "" {
+			return holder
+		} else if workspaces[path] != nil {
 			return sideLocal
 		}
 		return ""
@@ -1069,8 +1060,8 @@ func renderConflicts(router *router, o *options, output io.Writer, listing *remo
 		pending = append(pending, path)
 	}
 	slices.Sort(pending)
-	for path, alpha := range holders {
-		if alpha != target.Alpha {
+	for path, holder := range holders {
+		if holder == sideRemote {
 			elsewhere = append(elsewhere, path)
 		}
 	}
@@ -1091,10 +1082,7 @@ func renderConflicts(router *router, o *options, output io.Writer, listing *remo
 			Repository    *listedRepositoryConflict `json:",omitempty"`
 		}{Conflicts: conflicts, Pending: make([]pendingResolution, len(pending)), RemotePending: make([]string, len(elsewhere)), Problems: make([]remote.Problem, len(listing.Problems)), Checkouts: make([]checkoutOwner, len(checkouts))}
 		if conflict := listing.Repository; conflict != nil {
-			local, opposite := conflict.Alpha, conflict.Beta
-			if !target.Alpha {
-				local, opposite = opposite, local
-			}
+			local, opposite := orient(target.Alpha, conflict.Alpha, conflict.Beta)
 			listed.Repository = &listedRepositoryConflict{
 				Local: local, Remote: opposite, Ancestor: conflict.Ancestor,
 				Resolution: reports.describeRepositoryConflict(conflict)[1],
@@ -1106,7 +1094,7 @@ func renderConflicts(router *router, o *options, output io.Writer, listing *remo
 		}
 		for i, checkout := range checkouts {
 			node := target.Node
-			if checkout.Alpha == target.Alpha {
+			if sideOf(checkout.Alpha, target.Alpha) == sideLocal {
 				node = target.SourceNode
 			}
 			listed.Checkouts[i] = checkoutOwner{l.local(checkout.Path), node}
@@ -1419,10 +1407,8 @@ func checkoutFiles(ctx context.Context, conflict *remote.ConflictRoot, local, ex
 			return source(file)
 		})
 	}
-	listed := [2]string{conflict.AlphaDigest, conflict.BetaDigest}
-	if !w.Alpha {
-		listed[0], listed[1] = listed[1], listed[0]
-	}
+	var listed [2]string
+	listed[0], listed[1] = orient(w.Alpha, conflict.AlphaDigest, conflict.BetaDigest)
 	var err error
 	if w.Local, err = download(localName, copyLocal, hashers[0]); err != nil {
 		return fmt.Errorf("unable to copy the local copy: %w", err)
@@ -1890,12 +1876,8 @@ func (a *application) unsettled(listing *remote.Listing) error {
 	}
 	for _, problem := range listing.Problems {
 		if !problem.Warning && overlaps(problem.Path, a.w.Path) {
-			side := sideRemote
-			if problem.Alpha == a.target.Alpha {
-				side = sideLocal
-			}
 			return fmt.Errorf("updated the copies, but synchronization reports a problem with %s on the %s endpoint (%s), so the resolution isn't verified; fix it, then retry, or discard the workspace",
-				a.locator.display(problem.Path), side, terminal.NeutralizeControlCharacters(problem.Error))
+				a.locator.display(problem.Path), sideOf(problem.Alpha, a.target.Alpha), terminal.NeutralizeControlCharacters(problem.Error))
 		}
 	}
 	return nil

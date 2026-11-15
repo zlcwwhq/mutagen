@@ -396,10 +396,8 @@ func (d *progressDisplay) label(status string) string {
 	label, ok := statusLabels[status]
 	if !ok {
 		return terminal.NeutralizeControlCharacters(status)
-	} else if alpha, ok := statusEndpoints[status]; ok && alpha == d.alpha {
-		label += " (local)"
-	} else if ok {
-		label += " (remote)"
+	} else if alpha, ok := statusEndpoints[status]; ok {
+		label += " (" + sideOf(alpha, d.alpha) + ")"
 	}
 	return label
 }

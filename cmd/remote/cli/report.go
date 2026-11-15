@@ -83,6 +83,28 @@ func escapes(relative string) bool {
 	return relative == ".." || strings.HasPrefix(relative, "../")
 }
 
+// orient converts a pair of values between the order of alpha and beta and
+// that of the local and remote endpoints, from the perspective of the
+// submitting endpoint, which is alpha if alpha is true: it orders the values
+// of alpha and beta as those of the local and remote endpoints, and vice
+// versa. It and sideOf are the only places that convert between the two.
+func orient[T any](alpha bool, first, second T) (T, T) {
+	if alpha {
+		return first, second
+	}
+	return second, first
+}
+
+// sideOf names the endpoint that alpha identifies, which is alpha if it's true
+// and beta otherwise, from the perspective of the submitting endpoint, which
+// is alpha if submitter is true: local or remote (see orient).
+func sideOf(alpha, submitter bool) string {
+	if alpha == submitter {
+		return sideLocal
+	}
+	return sideRemote
+}
+
 // reporter prints synchronization reports as warnings from the submitting
 // endpoint's perspective, omitting lines that it has already printed.
 type reporter struct {
@@ -128,12 +150,8 @@ func (r *reporter) print(report *remote.Report) {
 	}
 	var problems, byDesign []string
 	for _, problem := range report.Problems {
-		side := "remote"
-		if problem.Alpha == r.alpha {
-			side = "local"
-		}
 		line := fmt.Sprintf("%s (%s): %s",
-			r.locator.display(problem.Path), side, terminal.NeutralizeControlCharacters(problem.Error))
+			r.locator.display(problem.Path), sideOf(problem.Alpha, r.alpha), terminal.NeutralizeControlCharacters(problem.Error))
 		if problem.Warning {
 			byDesign = append(byDesign, line)
 		} else {
@@ -168,10 +186,7 @@ func (r *reporter) section(warning string, lines []string) {
 
 // sides returns a conflict's local and remote changes.
 func (r *reporter) sides(conflict remote.Conflict) ([]remote.Change, []remote.Change) {
-	if r.alpha {
-		return conflict.Alpha, conflict.Beta
-	}
-	return conflict.Beta, conflict.Alpha
+	return orient(r.alpha, conflict.Alpha, conflict.Beta)
 }
 
 // describeConflict describes a conflict on one line, such as "out: deleted
@@ -210,10 +225,7 @@ const repositoryConflictHeading = "the Git repositories conflict, so their commi
 // side that gave up its commit. Only beta can give up its commit in one-way
 // sessions, since alpha never takes beta's.
 func (r *reporter) describeRepositoryConflict(conflict *remote.RepositoryConflict) []string {
-	local, opposite := conflict.Alpha, conflict.Beta
-	if !r.alpha {
-		local, opposite = opposite, local
-	}
+	local, opposite := orient(r.alpha, conflict.Alpha, conflict.Beta)
 	agreed := "they never agreed"
 	if conflict.Ancestor != nil {
 		agreed = "they last agreed on " + describeRepository(*conflict.Ancestor)

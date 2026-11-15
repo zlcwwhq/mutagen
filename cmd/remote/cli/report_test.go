@@ -9,6 +9,20 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/remote"
 )
 
+func TestPerspective(t *testing.T) {
+	// Values of alpha and beta are ordered as local and remote ones and back,
+	// and each endpoint is named from the submitting endpoint's perspective.
+	for submitter, expected := range map[bool][2]string{true: {"alpha", "beta"}, false: {"beta", "alpha"}} {
+		if local, opposite := orient(submitter, "alpha", "beta"); local != expected[0] || opposite != expected[1] {
+			t.Errorf("incorrect order for submitter alpha=%t: %s, %s", submitter, local, opposite)
+		} else if alpha, beta := orient(submitter, local, opposite); alpha != "alpha" || beta != "beta" {
+			t.Errorf("order not restored for submitter alpha=%t: %s, %s", submitter, alpha, beta)
+		} else if sideOf(submitter, submitter) != sideLocal || sideOf(!submitter, submitter) != sideRemote {
+			t.Errorf("incorrect sides for submitter alpha=%t", submitter)
+		}
+	}
+}
+
 func TestLocator(t *testing.T) {
 	root := t.TempDir()
 	inside := &locator{root: root, base: "sub", contained: true}
