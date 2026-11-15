@@ -484,9 +484,7 @@ func findConflict(listing *remote.Listing, path string) *remote.ConflictRoot {
 // has no workspace. It's abandoned, such as one left by an interrupted
 // checkout or recorded by a claim that arrived late, and claims leave it as it
 // is, so it's released by its token before claiming the checkout again, which
-// fails if the opposite endpoint claims it meanwhile. A checkout recorded
-// without a token, by a build that didn't issue tokens, takes the claim's
-// token instead, since it may belong to the workspace.
+// fails if the opposite endpoint claims it meanwhile.
 //
 // It returns the claim's sequence number, which orders the replacements an apply
 // makes after claiming its checkout (see remote.Replacement.Sequence) after
@@ -544,9 +542,7 @@ func release(router *router, path, token string) (bool, error) {
 // thus abandoned too, since the local endpoint has no workspace for the
 // conflict root, so it's released by that token, and one recorded after the
 // release is released by listing conflicts, discarding, or checking the
-// conflict out again (see claimSequence). That includes a checkout without a token,
-// recorded by a build that didn't issue tokens, which a release without one
-// removes.
+// conflict out again (see claimSequence).
 func releaseOver(router *router, connection io.ReadWriteCloser, path, token string) (bool, error) {
 	held, current, err := remote.ReleaseCheckout(router.ctx, connection, path, token)
 	if err != nil || !held || current == token {
