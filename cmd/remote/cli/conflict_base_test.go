@@ -189,12 +189,13 @@ func TestCheckoutBindsCopiesToListing(t *testing.T) {
 func TestRetireAndPrune(t *testing.T) {
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	local := filepath.Join(t.TempDir(), "file")
-	base, directory, err := workspaceDirectory(local)
+	directory, err := workspaceDirectory(local)
 	if err != nil {
 		t.Fatal(err)
 	} else if err := os.Mkdir(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
+	base := filepath.Dir(directory)
 	file := &remote.Entry{Kind: remote.EntryFile, Size: 1, Digest: strings.Repeat("0", 64)}
 	w := &workspace{Session: "session", Path: "file", Local: file, Remote: file, directory: directory}
 	if err := w.save(); err != nil {
@@ -210,7 +211,7 @@ func TestRetireAndPrune(t *testing.T) {
 	backup, err := w.retire()
 	if err != nil {
 		t.Fatal(err)
-	} else if _, err := loadWorkspace(local); !os.IsNotExist(err) {
+	} else if _, err := loadWorkspace(directory); !os.IsNotExist(err) {
 		t.Fatal("retired workspace still loaded:", err)
 	} else if paths := sessionWorkspaces(&remote.Target{Session: "session"}); len(paths) != 0 {
 		t.Fatal("retired workspace listed")

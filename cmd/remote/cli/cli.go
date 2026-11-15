@@ -533,7 +533,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Discovery is explicit; all other operations resolve their destination
 	// on the same daemon connection that performs the operation.
 	if options.nodes {
-		graph, _, err := queryNodes(ctx, directory, false, true)
+		graph, err := queryNodes(ctx, directory)
 		if err == nil {
 			err = printNodes(graph, options.json, stdout)
 		}

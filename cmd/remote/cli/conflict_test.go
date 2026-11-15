@@ -34,7 +34,7 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 		t.Run(fmt.Sprintf("localDirectory=%t", localDirectory), func(t *testing.T) {
 			root := t.TempDir()
 			local := filepath.Join(root, "conflict")
-			_, directory, err := workspaceDirectory(local)
+			directory, err := workspaceDirectory(local)
 			if err != nil {
 				t.Fatal(err)
 			} else if err := os.Mkdir(directory, 0700); err != nil {
@@ -57,7 +57,7 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 			}
 			for _, side := range []string{sideLocal, sideRemote} {
 				o := &options{conflictOptions: conflictOptions{take: side}}
-				_, unlock, err := apply(testRouter(ctx, root, nil, io.Discard), o, local, func() (*remote.Listing, *remote.Target, error) {
+				_, unlock, err := apply(testRouter(ctx, root, nil, io.Discard), o, local, local, directory, func() (*remote.Listing, *remote.Target, error) {
 					t.Fatal("conflicts listed for a directory workspace")
 					return nil, nil, nil
 				})
@@ -72,7 +72,7 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 			// can't be released, which is reported.
 			if _, err := discard(testRouter(ctx, filepath.Dir(local), nil, io.Discard), local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
 				t.Fatal("unreleased checkout not reported:", err)
-			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+			} else if _, err := loadWorkspace(directory); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("directory workspace can't be discarded:", err)
 			}
 		})
@@ -161,7 +161,7 @@ func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 		t.Run(fmt.Sprintf("missing=%t", missing), func(t *testing.T) {
 			root := t.TempDir()
 			local := filepath.Join(root, "conflict")
-			_, directory, err := workspaceDirectory(local)
+			directory, err := workspaceDirectory(local)
 			if err != nil {
 				t.Fatal(err)
 			} else if err := os.Mkdir(directory, 0700); err != nil {
@@ -182,7 +182,7 @@ func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 			if _, err := checkout(testRouter(ctx, root, nil, io.Discard), &options{}, &remote.Listing{}, target, local); !reported(err) {
 				t.Fatal("unreadable workspace not reported by checkout:", err)
 			}
-			_, unlock, err := apply(testRouter(ctx, root, nil, io.Discard), &options{}, local, func() (*remote.Listing, *remote.Target, error) {
+			_, unlock, err := apply(testRouter(ctx, root, nil, io.Discard), &options{}, local, local, directory, func() (*remote.Listing, *remote.Target, error) {
 				t.Fatal("conflicts listed for an unreadable workspace")
 				return nil, nil, nil
 			})
@@ -198,7 +198,7 @@ func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 				t.Fatal("unreleased checkout not reported:", err)
 			} else if !strings.Contains(err.Error(), check) {
 				t.Fatal("copies not to be checked against the workspace:", err)
-			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+			} else if _, err := loadWorkspace(directory); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("unreadable workspace not set aside:", err)
 			}
 			backups, err := filesystem.Mutagen(false, workspacesDirectoryName, backupsDirectoryName)
@@ -224,7 +224,7 @@ func TestDiscardAppliedWorkspace(t *testing.T) {
 	for _, applied := range []bool{false, true} {
 		t.Run(fmt.Sprintf("applied=%t", applied), func(t *testing.T) {
 			local := filepath.Join(t.TempDir(), "file")
-			_, directory, err := workspaceDirectory(local)
+			directory, err := workspaceDirectory(local)
 			if err != nil {
 				t.Fatal(err)
 			} else if err := os.Mkdir(directory, 0700); err != nil {
@@ -243,7 +243,7 @@ func TestDiscardAppliedWorkspace(t *testing.T) {
 				t.Fatal("unreleased checkout not reported:", err)
 			} else if strings.Contains(err.Error(), "since results were applied through it") != applied {
 				t.Fatal("applied results misreported:", err)
-			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+			} else if _, err := loadWorkspace(directory); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("workspace not set aside:", err)
 			}
 		})
@@ -735,7 +735,7 @@ func TestEmptyMergedResolution(t *testing.T) {
 func TestWorkspaceMetadata(t *testing.T) {
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	local := filepath.Join(t.TempDir(), "file")
-	_, directory, err := workspaceDirectory(local)
+	directory, err := workspaceDirectory(local)
 	if err != nil {
 		t.Fatal(err)
 	} else if err := os.Mkdir(directory, 0700); err != nil {
@@ -745,7 +745,7 @@ func TestWorkspaceMetadata(t *testing.T) {
 	w := &workspace{Path: "file", Local: file, Remote: file, Applied: []*remote.Entry{file}, directory: directory}
 	if err := w.save(); err != nil {
 		t.Fatal(err)
-	} else if loaded, err := loadWorkspace(local); err != nil || len(loaded.Applied) != 1 || !remote.SameFile(loaded.Applied[0], file) {
+	} else if loaded, err := loadWorkspace(directory); err != nil || len(loaded.Applied) != 1 || !remote.SameFile(loaded.Applied[0], file) {
 		t.Fatalf("applied results not saved: %v", err)
 	} else if entries, _ := os.ReadDir(directory); len(entries) != 1 {
 		t.Fatal("saving left files behind:", entries)
@@ -754,19 +754,19 @@ func TestWorkspaceMetadata(t *testing.T) {
 	w.Applied = append(w.Applied, &remote.Entry{Kind: remote.EntryMissing}, &remote.Entry{Kind: remote.EntrySymbolicLink, Target: "target"})
 	if err := w.save(); err != nil {
 		t.Fatal(err)
-	} else if loaded, err := loadWorkspace(local); err != nil || len(loaded.Applied) != 3 || !loaded.applied() {
+	} else if loaded, err := loadWorkspace(directory); err != nil || len(loaded.Applied) != 3 || !loaded.applied() {
 		t.Fatalf("applied results not saved: %v", err)
 	}
 	w.Applied = append(w.Applied, &remote.Entry{Kind: remote.EntryDirectory})
 	if err := w.save(); err != nil {
 		t.Fatal(err)
-	} else if _, err := loadWorkspace(local); err == nil {
+	} else if _, err := loadWorkspace(directory); err == nil {
 		t.Fatal("invalid applied result accepted")
 	}
 	w = &workspace{Path: "file", Local: file, Remote: file, directory: directory}
 	if err := w.save(); err != nil {
 		t.Fatal(err)
-	} else if loaded, err := loadWorkspace(local); err != nil || loaded.applied() {
+	} else if loaded, err := loadWorkspace(directory); err != nil || loaded.applied() {
 		t.Fatalf("unapplied workspace considered applied: %v", err)
 	}
 }
@@ -812,8 +812,8 @@ func TestTakeResolution(t *testing.T) {
 func TestWorkspaceLock(t *testing.T) {
 	// POSIX record locks don't exclude other locks held by the same process,
 	// so a helper process holds the lock until its input closes.
-	if local := os.Getenv("MUTAGEN_TEST_WORKSPACE_LOCK"); local != "" {
-		unlock, err := lockWorkspace(local)
+	if directory := os.Getenv("MUTAGEN_TEST_WORKSPACE_LOCK"); directory != "" {
+		unlock, err := lockWorkspace(directory)
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
@@ -824,9 +824,12 @@ func TestWorkspaceLock(t *testing.T) {
 		os.Exit(0)
 	}
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
-	local := filepath.Join(t.TempDir(), "file")
+	directory, err := workspaceDirectory(filepath.Join(t.TempDir(), "file"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	helper := exec.Command(os.Args[0], "-test.run=^TestWorkspaceLock$")
-	helper.Env = append(os.Environ(), "MUTAGEN_TEST_WORKSPACE_LOCK="+local)
+	helper.Env = append(os.Environ(), "MUTAGEN_TEST_WORKSPACE_LOCK="+directory)
 	input, err := helper.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -841,7 +844,7 @@ func TestWorkspaceLock(t *testing.T) {
 	if line, err := bufio.NewReader(output).ReadString('\n'); err != nil || line != "locked\n" {
 		t.Fatalf("helper unable to lock: %q: %v", line, err)
 	}
-	if unlock, err := lockWorkspace(local); err == nil {
+	if unlock, err := lockWorkspace(directory); err == nil {
 		unlock()
 		t.Fatal("concurrent operation allowed")
 	} else if !strings.Contains(err.Error(), "in progress") {
@@ -851,7 +854,7 @@ func TestWorkspaceLock(t *testing.T) {
 	if err := helper.Wait(); err != nil {
 		t.Fatal("helper failed:", err)
 	}
-	unlock, err := lockWorkspace(local)
+	unlock, err := lockWorkspace(directory)
 	if err != nil {
 		t.Fatal("unable to lock after release:", err)
 	}
@@ -904,10 +907,14 @@ func TestAutomaticCheckoutKeepsWorkspaceLock(t *testing.T) {
 	// check exclusion (see TestWorkspaceLock).
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	local := filepath.Join(t.TempDir(), "file")
+	directory, err := workspaceDirectory(local)
+	if err != nil {
+		t.Fatal(err)
+	}
 	check := func(held bool) {
 		t.Helper()
 		helper := exec.Command(os.Args[0], "-test.run=^TestWorkspaceLock$")
-		helper.Env = append(os.Environ(), "MUTAGEN_TEST_WORKSPACE_LOCK="+local)
+		helper.Env = append(os.Environ(), "MUTAGEN_TEST_WORKSPACE_LOCK="+directory)
 		output, err := helper.CombinedOutput()
 		if held && (err == nil || !strings.Contains(string(output), "in progress")) {
 			t.Fatalf("workspace lock not retained: %s, %v", output, err)
@@ -916,7 +923,7 @@ func TestAutomaticCheckoutKeepsWorkspaceLock(t *testing.T) {
 		}
 	}
 	expected := errors.New("listing failed")
-	_, unlock, err := apply(testRouter(context.Background(), filepath.Dir(local), nil, io.Discard), &options{conflictOptions: conflictOptions{take: sideLocal}}, local,
+	_, unlock, err := apply(testRouter(context.Background(), filepath.Dir(local), nil, io.Discard), &options{conflictOptions: conflictOptions{take: sideLocal}}, local, local, directory,
 		func() (*remote.Listing, *remote.Target, error) {
 			check(true)
 			return nil, nil, expected
@@ -937,6 +944,10 @@ func TestAutomaticCheckoutChecksTake(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	local := filepath.Join(root, "conflict")
+	directory, err := workspaceDirectory(local)
+	if err != nil {
+		t.Fatal(err)
+	}
 	target := &remote.Target{SourceSession: "session", SourceAlpha: true, Session: "session", Alpha: true, Root: root}
 	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{{Path: "conflict", AlphaTakable: true}}}
 	for _, test := range []struct {
@@ -947,7 +958,7 @@ func TestAutomaticCheckoutChecksTake(t *testing.T) {
 		{conflictOptions{apply: true, take: sideLocal, executable: "true"}, "can only be resolved with --take"},
 		{conflictOptions{apply: true, take: sideLocal}, ""},
 	} {
-		_, unlock, err := apply(testRouter(ctx, root, nil, io.Discard), &options{conflictOptions: test.options}, local,
+		_, unlock, err := apply(testRouter(ctx, root, nil, io.Discard), &options{conflictOptions: test.options}, local, local, directory,
 			func() (*remote.Listing, *remote.Target, error) {
 				return listing, target, nil
 			})
@@ -959,7 +970,7 @@ func TestAutomaticCheckoutChecksTake(t *testing.T) {
 		} else if test.expected == "" && (err == nil || strings.Contains(err.Error(), "can't be taken") || strings.Contains(err.Error(), "can only be resolved")) {
 			t.Errorf("%+v refused, rather than claimed: %v", test.options, err)
 		}
-		if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+		if _, err := loadWorkspace(directory); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%+v left a workspace: %v", test.options, err)
 		}
 	}

@@ -229,34 +229,31 @@ func (w *workspace) changedSince(conflict *remote.ConflictRoot) string {
 	return ""
 }
 
-// workspaceDirectory computes the workspaces directory and the directory of
-// the workspace for a local path. The path's parent is resolved, so that
-// differently spelled paths share a workspace.
-func workspaceDirectory(local string) (string, string, error) {
+// workspaceDirectory computes the directory of the workspace for a local path,
+// in the workspaces directory, which it creates if needed. The path's parent
+// is resolved, so that differently spelled paths share a workspace, and since
+// that can change, operations compute it once for each path.
+func workspaceDirectory(local string) (string, error) {
 	base, err := filesystem.Mutagen(true, workspacesDirectoryName)
 	if err != nil {
-		return "", "", fmt.Errorf("unable to create workspaces directory: %w", err)
+		return "", fmt.Errorf("unable to create workspaces directory: %w", err)
 	}
 	parent := filepath.Dir(local)
 	if resolved, err := filepath.EvalSymlinks(parent); err == nil {
 		parent = resolved
 	}
 	digest := sha256.Sum256([]byte(filepath.Join(parent, filepath.Base(local))))
-	return base, filepath.Join(base, fmt.Sprintf("%x", digest[:16])), nil
+	return filepath.Join(base, fmt.Sprintf("%x", digest[:16])), nil
 }
 
-// lockWorkspace locks the workspace for a local path, whether or not it exists,
+// lockWorkspace locks the workspace in a directory, whether or not it exists,
 // and returns a function that unlocks it. Operations on a workspace must not
 // interleave: applies of different results would otherwise replace each
 // other's results, since each accepts either checked-out copy, and the last to
 // finish would remove the workspace. The lock file is kept beside the
 // workspace, since one inside it wouldn't outlive the workspace's removal. It
 // fails rather than wait for another operation to finish.
-func lockWorkspace(local string) (func(), error) {
-	_, directory, err := workspaceDirectory(local)
-	if err != nil {
-		return nil, err
-	}
+func lockWorkspace(directory string) (func(), error) {
 	locker, err := locking.NewLocker(directory+".lock", 0600)
 	if err != nil {
 		return nil, fmt.Errorf("unable to lock workspace: %w", err)
@@ -334,16 +331,12 @@ func (e *unreadableWorkspace) Error() string {
 	return fmt.Sprintf("unable to read the workspace in %s (%v); discard it, which changes neither copy, and if anything was applied through it, check the copies against its files, which discard keeps", e.directory, e.err)
 }
 
-// loadWorkspace loads the workspace for a local path, failing with an error
+// loadWorkspace loads the workspace in a directory, failing with an error
 // wrapping os.ErrNotExist if there's none, or with an unreadableWorkspace if
 // it can't be read. A workspace directory without metadata is unreadable
 // rather than missing, since checkouts create workspaces complete, and a new
 // checkout couldn't replace it.
-func loadWorkspace(local string) (*workspace, error) {
-	_, directory, err := workspaceDirectory(local)
-	if err != nil {
-		return nil, err
-	}
+func loadWorkspace(directory string) (*workspace, error) {
 	w, err := readWorkspace(directory)
 	if errors.Is(err, os.ErrNotExist) {
 		if _, statErr := os.Lstat(directory); statErr != nil {
@@ -580,13 +573,16 @@ func releaseAbandoned(router *router, target *remote.Target, checkouts []remote.
 // it has no workspace and no operation on its path is in progress, and returns
 // whether the local endpoint no longer holds it.
 func releaseIfAbandoned(router *router, target *remote.Target, checkout remote.Checkout) bool {
-	local := filepath.Join(target.Root, filepath.FromSlash(checkout.Path))
-	unlock, err := lockWorkspace(local)
+	directory, err := workspaceDirectory(filepath.Join(target.Root, filepath.FromSlash(checkout.Path)))
+	if err != nil {
+		return false
+	}
+	unlock, err := lockWorkspace(directory)
 	if err != nil {
 		return false
 	}
 	defer unlock()
-	if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
+	if _, err := loadWorkspace(directory); !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
 	_, err = release(router, checkout.Path, checkout.Token)
@@ -1229,12 +1225,16 @@ func checkout(router *router, o *options, listing *remote.Listing, target *remot
 	if err != nil {
 		return nil, fmt.Errorf("unable to locate it: %w", err)
 	}
-	unlock, err := lockWorkspace(local)
+	directory, err := workspaceDirectory(local)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := lockWorkspace(directory)
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
-	w, _, err := checkoutLocked(router, o, listing, target, local)
+	w, _, err := checkoutLocked(router, o, listing, target, local, directory)
 	if err != nil {
 		return nil, err
 	}
@@ -1245,13 +1245,13 @@ func checkout(router *router, o *options, listing *remote.Listing, target *remot
 // workspace lock. It returns the claim's sequence number so that an automatic
 // checkout can apply its result under that same claim, without another round
 // trip. A non-nil workspace on failure has been published and is kept for retry.
-func checkoutLocked(router *router, o *options, listing *remote.Listing, target *remote.Target, local string) (*workspace, uint64, error) {
+func checkoutLocked(router *router, o *options, listing *remote.Listing, target *remote.Target, local, directory string) (*workspace, uint64, error) {
 	path, err := newLocator(target).resolve(local)
 	if err != nil {
 		return nil, 0, err
 	}
 	conflict := findConflict(listing, path)
-	if w, err := loadWorkspace(local); err == nil {
+	if w, err := loadWorkspace(directory); err == nil {
 		return nil, 0, checkedOut(w, conflict, target, path)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, 0, err
@@ -1298,10 +1298,8 @@ func checkoutLocked(router *router, o *options, listing *remote.Listing, target 
 			release(&cleanup, path, token)
 		}
 	}()
-	base, final, err := workspaceDirectory(local)
-	if err != nil {
-		return nil, 0, err
-	} else if err := outside(base, target.Root); err != nil {
+	base := filepath.Dir(directory)
+	if err := outside(base, target.Root); err != nil {
 		return nil, 0, err
 	}
 
@@ -1331,11 +1329,11 @@ func checkoutLocked(router *router, o *options, listing *remote.Listing, target 
 		return nil, 0, err
 	} else if err := w.save(); err != nil {
 		return nil, 0, fmt.Errorf("unable to save workspace: %w", err)
-	} else if err := os.Rename(staging, final); err != nil {
+	} else if err := os.Rename(staging, directory); err != nil {
 		return nil, 0, fmt.Errorf("unable to save workspace: %w", err)
 	}
 	created = true
-	w.directory = final
+	w.directory = directory
 	// The workspace's files and directory were flushed (see workspace.save),
 	// so flush the workspaces directory that it was moved into, and that
 	// directory's parent, in case the workspaces directory was just created,
@@ -1618,19 +1616,19 @@ func applyAll(router *router, o *options, p *printer) error {
 		// closing another descriptor would release the first lock. Aliases of
 		// an earlier argument must therefore be rejected before locking them.
 		local, err := filepath.Abs(argument)
-		var key string
+		var directory string
 		if err == nil {
-			_, key, err = workspaceDirectory(local)
+			directory, err = workspaceDirectory(local)
 		}
 		if err != nil {
 			p.print(argument, nil, err)
 			continue
-		} else if seen[key] {
+		} else if seen[directory] {
 			p.print(argument, nil, errors.New("this path was already specified"))
 			continue
 		}
-		seen[key] = true
-		a, unlock, err := apply(router, o, argument, listed)
+		seen[directory] = true
+		a, unlock, err := apply(router, o, argument, local, directory, listed)
 		if unlock != nil {
 			unlocks = append(unlocks, unlock)
 		}
@@ -1675,16 +1673,12 @@ func applyAll(router *router, o *options, p *printer) error {
 // that the other endpoint checked out, possibly with a result that's one of
 // the checked-out copies, which this workspace would otherwise accept and
 // replace.
-func apply(router *router, o *options, argument string, listed func() (*remote.Listing, *remote.Target, error)) (_ *application, _ func(), resultErr error) {
-	local, err := filepath.Abs(argument)
-	if err != nil {
-		return nil, nil, fmt.Errorf("unable to locate it: %w", err)
-	}
-	unlock, err := lockWorkspace(local)
+func apply(router *router, o *options, argument, local, directory string, listed func() (*remote.Listing, *remote.Target, error)) (_ *application, _ func(), resultErr error) {
+	unlock, err := lockWorkspace(directory)
 	if err != nil {
 		return nil, nil, err
 	}
-	w, err := loadWorkspace(local)
+	w, err := loadWorkspace(directory)
 	var sequence uint64
 	if errors.Is(err, os.ErrNotExist) && (o.take == sideLocal || o.take == sideRemote) {
 		// Hold this lock from checking for a workspace through claim,
@@ -1694,7 +1688,7 @@ func apply(router *router, o *options, argument string, listed func() (*remote.L
 		if listErr != nil {
 			return nil, unlock, fmt.Errorf("unable to synchronize before applying: %w", listErr)
 		}
-		w, sequence, err = checkoutLocked(router, o, listing, target, local)
+		w, sequence, err = checkoutLocked(router, o, listing, target, local, directory)
 		if w != nil {
 			defer func() {
 				if resultErr != nil {
@@ -1982,12 +1976,16 @@ func discard(router *router, argument string) (*outcome, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to locate it: %w", err)
 	}
-	unlock, err := lockWorkspace(local)
+	directory, err := workspaceDirectory(local)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := lockWorkspace(directory)
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
-	w, err := loadWorkspace(local)
+	w, err := loadWorkspace(directory)
 	var unreadable *unreadableWorkspace
 	if errors.Is(err, os.ErrNotExist) {
 		if held, err := releaseAt(router, local, nil); err != nil {

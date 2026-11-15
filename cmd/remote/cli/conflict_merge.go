@@ -75,12 +75,9 @@ func (m conflictMarkers) writeRegion(output *strings.Builder, local, base, remot
 type mergeMethod int
 
 const (
-	// mergeUnknown indicates that the merged file wasn't prepared by this
-	// process.
-	mergeUnknown mergeMethod = iota
 	// mergeCopied indicates copies with the same contents (differing only in
 	// executability), which the merged file copies.
-	mergeCopied
+	mergeCopied mergeMethod = iota
 	// mergeBinary indicates binary copies, which receive no merged file.
 	mergeBinary
 	// mergeMarked indicates that every region where the copies differ is
@@ -239,9 +236,6 @@ func writeWholeRegion(path string, inputs []string, markers conflictMarkers) err
 // line by line can misrepresent changes even where it marks nothing.
 func mergeNote(w *workspace, regions int) string {
 	method := w.merge.method
-	if method == mergeUnknown && w.BaseSource != "" {
-		method = mergeAncestor
-	}
 	switch {
 	case method == mergeWhole && w.BaseSource != "":
 		return fmt.Sprintf("The copies couldn't be merged line by line, since %s, so the merged file is a single region with the complete local, base, and remote versions: compare each side with Base to see what each changed, and combine both sides' changes (keeping either version whole would drop the other side's changes).", w.merge.reason)

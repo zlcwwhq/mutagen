@@ -11,18 +11,17 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/remote"
 )
 
-// queryNodes locates a source workspace and asks its daemon for the nodes
-// that it can reach. Discovery never flushes or opens an executor, including
-// for offline targets. The returned source pins later requests to the same
-// workspace.
-func queryNodes(ctx context.Context, directory string, corresponding, outside bool) (*remote.NodeGraph, *remote.Target, error) {
-	selection := &remote.Selection{Workspace: true, WorkspaceOutside: outside, Corresponding: corresponding}
-	connection, source, err := selection.Submit(ctx, directory, &remote.Submission{Operation: remote.OperationNodes})
+// queryNodes locates a source workspace, which may be the only one on this
+// system if the directory is outside all of them, and asks its daemon for the
+// nodes that it can reach. Discovery never flushes or opens an executor,
+// including for offline targets.
+func queryNodes(ctx context.Context, directory string) (*remote.NodeGraph, error) {
+	selection := &remote.Selection{Workspace: true, WorkspaceOutside: true}
+	connection, _, err := selection.Submit(ctx, directory, &remote.Submission{Operation: remote.OperationNodes})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	graph, err := remote.ListNodes(ctx, connection)
-	return graph, source, err
+	return remote.ListNodes(ctx, connection)
 }
 
 // listedNode omits daemon route handles from the public node listing.
