@@ -637,33 +637,29 @@ func Probe(ctx context.Context, directory string) (*Repository, error) {
 	defer cancel()
 
 	// Determine whether this is a usable repository whose working tree is at
-	// this directory. Anything else (such as a bare repository in the .git
-	// entry, or a repository that's configured to have its working tree
-	// elsewhere) can't be used by Mutagen, and operating on one would change
-	// something else.
-	output, err := Run(ctx, directory, "rev-parse", "--is-inside-work-tree", "--show-prefix")
-	if err != nil {
-		return nil, probeError(ctx, directory, err, false)
-	} else if output != "true" {
-		return nil, errors.New("contains a .git entry for a repository whose working tree isn't this directory; fix or remove the .git entry (not the directory), or add the directory to .gitignore to leave it out")
-	}
-
-	// Determine the commit that's checked out. Failure with an exit code of one
-	// (which is how --verify --quiet reports a failure) means that HEAD doesn't
-	// resolve to a commit. That's expected if there aren't any commits yet, but
-	// otherwise it refers to one that the repository doesn't have.
-	output, err = Run(ctx, directory, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+	// this directory, and the commit that's checked out. A repository whose
+	// working tree is elsewhere (such as a bare repository in the .git entry, or
+	// a repository that's configured to have its working tree elsewhere) can't
+	// be used by Mutagen, and operating on one would change something else.
+	// Scans probe every submodule, so both are determined by one command in the
+	// usual case. Failure with an exit code of one (which is how --verify
+	// --quiet reports a failure) means that HEAD doesn't resolve to a commit,
+	// whose output Run doesn't return, so the questions are then asked
+	// separately.
+	output, err := Run(ctx, directory, "rev-parse", "--is-inside-work-tree", "--show-prefix", "--verify", "--quiet", "HEAD^{commit}")
 	if ExitedWith(err, 1) {
-		if _, err := Run(ctx, directory, "rev-parse", "--verify", "--quiet", "HEAD"); ExitedWith(err, 1) {
-			return nil, nil
-		} else if err != nil {
-			return nil, probeError(ctx, directory, err, false)
-		}
-		return nil, errors.New("contains a .git entry for a damaged repository, whose HEAD refers to a commit that it doesn't have; repair it, or remove the .git entry (not the directory) to make the directory an ordinary one")
+		return nil, probeUnresolvedHead(ctx, directory)
 	} else if err != nil {
 		return nil, probeError(ctx, directory, err, false)
 	}
-	commit, err := CommitFromOutput(output)
+	lines := strings.Split(output, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSuffix(lines[i], "\r")
+	}
+	if len(lines) != 3 || lines[0] != "true" || lines[1] != "" {
+		return nil, errWorkingTreeElsewhere
+	}
+	commit, err := CommitFromOutput(lines[2])
 	if err != nil {
 		return nil, err
 	}
@@ -689,6 +685,29 @@ func Probe(ctx context.Context, directory string) (*Repository, error) {
 	repository := &Repository{Commit: commit, URL: url}
 	repository.useLineEndingSettings(settings)
 	return repository, nil
+}
+
+// errWorkingTreeElsewhere is the error that Probe returns for a .git entry
+// whose repository has its working tree elsewhere.
+var errWorkingTreeElsewhere = errors.New("contains a .git entry for a repository whose working tree isn't this directory; fix or remove the .git entry (not the directory), or add the directory to .gitignore to leave it out")
+
+// probeUnresolvedHead completes Probe for a directory whose HEAD doesn't
+// resolve to a commit. That's expected for a repository whose working tree is
+// at the directory if there aren't any commits yet, in which case the result is
+// nil, but otherwise HEAD refers to a commit that the repository doesn't have.
+// The working tree is checked first, as it is when HEAD resolves.
+func probeUnresolvedHead(ctx context.Context, directory string) error {
+	if output, err := Run(ctx, directory, "rev-parse", "--is-inside-work-tree", "--show-prefix"); err != nil {
+		return probeError(ctx, directory, err, false)
+	} else if output != "true" {
+		return errWorkingTreeElsewhere
+	}
+	if _, err := Run(ctx, directory, "rev-parse", "--verify", "--quiet", "HEAD"); ExitedWith(err, 1) {
+		return nil
+	} else if err != nil {
+		return probeError(ctx, directory, err, false)
+	}
+	return errors.New("contains a .git entry for a damaged repository, whose HEAD refers to a commit that it doesn't have; repair it, or remove the .git entry (not the directory) to make the directory an ordinary one")
 }
 
 // readProbeSettings reads the settings that probeSettings matches from the

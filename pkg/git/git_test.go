@@ -888,6 +888,46 @@ func TestProbe(t *testing.T) {
 			t.Error("error doesn't say what to do:", err)
 		}
 	})
+	// A repository whose working tree isn't the directory is refused, whether
+	// or not its HEAD resolves to a commit, which Probe examines in different
+	// ways.
+	t.Run("working tree elsewhere", func(t *testing.T) {
+		configured := newCommittedRepository(t, filepath.Join(base, "configured"), "https://example.org/repository.git")
+		elsewhere := filepath.Join(base, "elsewhere")
+		if err := os.MkdirAll(elsewhere, 0700); err != nil {
+			t.Fatal(err)
+		} else if _, err := runCommand(configured, "config", "core.worktree", elsewhere); err != nil {
+			t.Fatal(err)
+		}
+		uncommitted := filepath.Join(base, "configured-uncommitted")
+		initializeRepository(t, uncommitted)
+		if _, err := runCommand(uncommitted, "config", "core.worktree", elsewhere); err != nil {
+			t.Fatal(err)
+		}
+		for _, directory := range []string{configured, uncommitted} {
+			if _, err := Probe(ctx, directory); err == nil {
+				t.Errorf("probe of %s succeeded", directory)
+			} else if !strings.Contains(err.Error(), "working tree isn't this directory") {
+				t.Errorf("incorrect error for %s: %v", directory, err)
+			}
+		}
+	})
+	t.Run("damaged HEAD", func(t *testing.T) {
+		directory := newCommittedRepository(t, filepath.Join(base, "damaged"), "https://example.org/repository.git")
+		reference, err := runCommand(directory, "symbolic-ref", "HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		missing := []byte(strings.Repeat("0123456789", 4) + "\n")
+		if err := os.WriteFile(filepath.Join(directory, ".git", filepath.FromSlash(reference)), missing, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Probe(ctx, directory); err == nil {
+			t.Fatal("probe succeeded")
+		} else if !strings.Contains(err.Error(), "damaged repository") {
+			t.Error("incorrect error:", err)
+		}
+	})
 	t.Run("invalid repository", func(t *testing.T) {
 		directory := filepath.Join(base, "invalid")
 		if err := os.MkdirAll(filepath.Join(directory, ".git"), 0700); err != nil {
