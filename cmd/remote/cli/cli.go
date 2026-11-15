@@ -453,68 +453,45 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 
-	// Terminate the command on timeout or termination signals.
+	// Terminate the command on timeout or termination signals, which cancel
+	// the context with a signalError as its cause (see router.signaled).
 	ctx := context.Background()
 	if options.timeout > 0 {
 		var cancelTimeout context.CancelFunc
 		ctx, cancelTimeout = context.WithTimeout(ctx, options.timeout)
 		defer cancelTimeout()
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var signalLock sync.Mutex
-	var received os.Signal
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
 	go func() {
 		select {
 		case s := <-signals:
-			signalLock.Lock()
-			received = s
-			signalLock.Unlock()
-			cancel()
+			cancel(signalError{s})
 		case <-ctx.Done():
 		}
 	}()
-	interrupted := func(activity string) (int, bool) {
-		if ctx.Err() == nil {
-			return 0, false
-		}
-		signalLock.Lock()
-		defer signalLock.Unlock()
-		if number, ok := received.(syscall.Signal); ok {
-			return 128 + int(number), true
-		} else if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			fmt.Fprintf(stderr, "remote: timed out after %v while %s\n", options.timeout, activity)
-			return timeoutExitCode, true
-		}
-		return failureExitCode, true
-	}
 
 	// Determine the working directory, which locates the session.
 	directory, err := os.Getwd()
 	if err != nil {
 		return fail(fmt.Errorf("unable to determine working directory: %w", err))
 	}
+	router := &router{
+		ctx: ctx, directory: directory, selection: options.selection(request != nil && options.directory == ""),
+		node: options.node, stderr: stderr, progress: options.progress, timeout: options.timeout,
+	}
+
 	// Discovery is explicit; all other operations resolve their destination
 	// on the same daemon connection that performs the operation.
 	if options.nodes {
 		graph, _, err := queryNodes(ctx, directory, false, true)
-		if status, ok := interrupted("querying nodes"); ok {
-			return status
+		if err == nil {
+			err = printNodes(graph, options.json, stdout)
 		}
-		if err != nil {
-			return fail(err)
-		}
-		if err := printNodes(graph, options.json, stdout); err != nil {
-			return fail(err)
-		}
-		return 0
-	}
-	router := &router{
-		ctx: ctx, directory: directory, selection: options.selection(request != nil && options.directory == ""),
-		node: options.node, stderr: stderr, progress: options.progress,
+		return router.exit("querying nodes", 0, err)
 	}
 	if (options.ignores || options.discard) && options.node != "" {
 		target, err := router.resolve()
@@ -536,19 +513,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case options.jobs:
 		activity, err = "listing jobs", listJobs(router, output)
 	case options.wait != "":
-		activity = "waiting for the job"
-		code, err = waitJob(router, options, stdout)
-		interruptedCode, ok := interrupted(activity)
-		if !ok && errors.Is(err, errJobRunning) {
-			// The executing endpoint returned the running job shortly before
-			// the timeout (see remote.WaitOptions.Deadline).
-			fmt.Fprintf(stderr, "remote: timed out after %v while %s\n", options.timeout, activity)
-			interruptedCode, ok = timeoutExitCode, true
-		}
-		if ok {
-			fmt.Fprintf(stderr, "remote: job %[2]s is still running; %[1]s --wait %[2]s resumes waiting, and %[1]s --kill %[2]s terminates it\n", router.followUp(), options.wait)
-			return interruptedCode
-		}
+		return waitJob(router, options, stdout)
 	case options.kill != "":
 		activity, err = "terminating the job", killJob(router, options.kill)
 	case options.ignores:
@@ -557,19 +522,23 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case options.pull:
 		activity, err = "pulling", pull(router, options.arguments)
 	default:
-		return runCommand(router, options, request, stdin, stdout, stderr, interrupted)
+		return runCommand(router, options, request, stdin, stdout, stderr)
 	}
 	if output.err != nil {
 		err = errors.Join(err, fmt.Errorf("unable to print output: %w", output.err))
 	}
-	if interruptedCode, ok := interrupted(activity); ok {
-		return interruptedCode
-	} else if errors.Is(err, errReported) {
-		return errorExitCode(err)
-	} else if err != nil {
-		return fail(err)
-	}
-	return code
+	return router.exit(activity, code, err)
+}
+
+// signalError is the cause with which a termination signal cancels the context
+// of remote's operations.
+type signalError struct {
+	os.Signal
+}
+
+// Error implements error.Error.
+func (e signalError) Error() string {
+	return "received " + e.Signal.String()
 }
 
 // router submits related operations through one session's endpoint, which the
@@ -591,6 +560,8 @@ type router struct {
 	progress *bool
 	// reports prints synchronization reports, once created by synchronize.
 	reports *reporter
+	// timeout is the --timeout setting, which diagnostics name when it expires.
+	timeout time.Duration
 }
 
 // dial submits an operation through the session's endpoint. The first
@@ -671,6 +642,83 @@ func (r *router) warn(format string, arguments ...any) {
 	fmt.Fprintf(r.stderr, "remote: warning: "+format+"\n", arguments...)
 }
 
+// Operations determine remote's exit status with exit or, once a command or
+// job has finished, with finished, which implement the precedence that the
+// termination help topic documents. A termination signal takes precedence over
+// everything else. The status of a command or job that has finished takes
+// precedence over failures that follow it, including the expiry of the timeout
+// while synchronizing afterwards, which are only warnings. Otherwise, the
+// expiry of the timeout takes precedence over failures, and failures over the
+// operation's own status, such as that of --diff. The failures of a batch are
+// joined, which gives connection failures precedence over operation failures
+// (see errorExitCode).
+
+// signaled returns the exit status for a termination signal, 128+N for signal
+// N, if remote received one.
+func (r *router) signaled() (int, bool) {
+	var received signalError
+	if !errors.As(context.Cause(r.ctx), &received) {
+		return 0, false
+	} else if number, ok := received.Signal.(syscall.Signal); ok {
+		return 128 + int(number), true
+	}
+	return failureExitCode, true
+}
+
+// interrupted returns the exit status for a termination signal (see signaled)
+// or for the expiry of the timeout, which it reports, if either ended the
+// specified activity.
+func (r *router) interrupted(activity string) (int, bool) {
+	if status, ok := r.signaled(); ok {
+		return status, true
+	} else if r.ctx.Err() == nil {
+		return 0, false
+	} else if errors.Is(r.ctx.Err(), context.DeadlineExceeded) {
+		return r.timedOut(activity), true
+	}
+	return failureExitCode, true
+}
+
+// timedOut reports that the timeout expired while performing the specified
+// activity and returns the exit status for that.
+func (r *router) timedOut(activity string) int {
+	fmt.Fprintf(r.stderr, "remote: timed out after %v while %s\n", r.timeout, activity)
+	return timeoutExitCode
+}
+
+// exit returns remote's exit status once the specified activity has ended,
+// given the status that it determined and the error that it failed with, if
+// any. Errors are printed, except for errReported, whose causes were printed
+// as they occurred.
+func (r *router) exit(activity string, code int, err error) int {
+	if status, ok := r.interrupted(activity); ok {
+		return status
+	} else if err != nil {
+		if !errors.Is(err, errReported) {
+			fmt.Fprintln(r.stderr, "remote:", err)
+		}
+		return errorExitCode(err)
+	}
+	return code
+}
+
+// finished returns remote's exit status once a command or job, as named by
+// what, has finished with the specified status, given the error with which
+// synchronizing afterwards failed, if it did. The status takes precedence over
+// that failure, including the expiry of the timeout, which is reported as a
+// warning, but not over termination signals.
+func (r *router) finished(what string, code int, err error) int {
+	if status, ok := r.signaled(); ok {
+		return status
+	} else if err != nil {
+		if errors.Is(r.ctx.Err(), context.DeadlineExceeded) {
+			err = fmt.Errorf("timed out after %v", r.timeout)
+		}
+		r.warn("unable to synchronize after the %s, whose changes may not be present locally yet: %v", what, err)
+	}
+	return code
+}
+
 // followUp returns the start of the remote command lines that remote suggests
 // for later operations on the destination (see followUpCommand).
 func (r *router) followUp() string {
@@ -679,12 +727,7 @@ func (r *router) followUp() string {
 
 // runCommand synchronizes the session, if requested, and then runs a command,
 // starts it as a detached job, or compares copies, returning the exit code.
-func runCommand(router *router, options *options, request *remote.Request, stdin io.Reader, stdout, stderr io.Writer, interrupted func(string) (int, bool)) int {
-	fail := func(err error) int {
-		fmt.Fprintln(stderr, "remote:", err)
-		return errorExitCode(err)
-	}
-
+func runCommand(router *router, options *options, request *remote.Request, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Synchronize local changes before the command. Failure to locate the
 	// session is fatal, since it would also prevent running the command, but
 	// failure to synchronize isn't, since the command may still be useful.
@@ -693,10 +736,8 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 	var err error
 	if !options.noFlush {
 		target, report, err = router.synchronize()
-		if interruptedCode, ok := interrupted("synchronizing"); ok {
-			return interruptedCode
-		} else if err != nil && (target == nil || request == nil) {
-			return fail(err)
+		if (err != nil && (target == nil || request == nil)) || router.ctx.Err() != nil {
+			return router.exit("synchronizing", 0, err)
 		} else if err != nil {
 			router.warn("unable to synchronize before the command, which may see outdated files: %v", err)
 		}
@@ -705,31 +746,26 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 	// Compare copies if requested.
 	if options.diff {
 		differ, err := compare(router.ctx, router.directory, target, report, options.arguments, stdout, stderr)
-		if interruptedCode, ok := interrupted("comparing"); ok {
-			return interruptedCode
-		} else if err != nil {
-			return fail(err)
-		} else if differ {
-			return 1
+		code := 0
+		if differ {
+			code = 1
 		}
-		return 0
+		return router.exit("comparing", code, err)
 	} else if request == nil {
 		return 0
 	}
 
 	// Locate the route and run the command, or start it as a detached job.
 	connection, target, err := router.dial(remote.OperationExecute)
-	if interruptedCode, ok := interrupted("running the command"); ok {
-		return interruptedCode
-	} else if err != nil {
-		return fail(err)
+	if err != nil || router.ctx.Err() != nil {
+		return router.exit("running the command", 0, err)
 	}
 	request.Path = target.Path
 	request.Prologue = target.Contained && !options.noPrologue
 	if request.Job != nil {
 		code, err := startJob(router.ctx, connection, target, request, router.followUp(), stdout, stderr)
-		if interruptedCode, ok := interrupted("starting the job"); ok {
-			return interruptedCode
+		if status, ok := router.interrupted("starting the job"); ok {
+			return status
 		} else if err != nil {
 			printCommandError(stderr, err, request.Directory)
 			if code != 0 {
@@ -740,16 +776,17 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 		return 0
 	}
 	code, err := remote.Execute(router.ctx, connection, request, stdin, stdout, stderr)
-	if interruptedCode, ok := interrupted("running the command"); ok {
-		return interruptedCode
+	if status, ok := router.interrupted("running the command"); ok {
+		return status
 	} else if errors.Is(err, remote.ErrConnectionLost) {
 		// The executing endpoint terminates the command when the connection is
 		// lost, which happens whenever the session stops synchronizing, so
 		// synchronizing afterwards isn't attempted.
-		if options.noFlush {
-			return fail(remote.ConnectionError(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated")))
+		lost := "the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated"
+		if !options.noFlush {
+			lost += " and the session wasn't synchronized afterwards"
 		}
-		return fail(remote.ConnectionError(errors.New("the connection to the executing endpoint was lost (the session may have stopped synchronizing), so the command was terminated and the session wasn't synchronized afterwards")))
+		return router.exit("running the command", 0, remote.ConnectionError(errors.New(lost)))
 	} else if err != nil {
 		// Startup failures such as missing commands report conventional exit
 		// codes (126 or 127) alongside the error.
@@ -760,18 +797,10 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 		return errorExitCode(err)
 	}
 
-	// Synchronize the command's changes back. Once the command has finished,
-	// its exit status takes precedence over failure to do so (including
-	// timeouts), but not over signals.
+	// Synchronize the command's changes back, which can fail without changing
+	// the command's status (see router.finished).
 	if !options.noFlush {
-		if _, _, err := router.synchronize(); err != nil {
-			if errors.Is(router.ctx.Err(), context.DeadlineExceeded) {
-				err = fmt.Errorf("timed out after %v", options.timeout)
-			} else if interruptedCode, ok := interrupted("synchronizing"); ok {
-				return interruptedCode
-			}
-			router.warn("unable to synchronize after the command, whose changes may not be present locally yet: %v", err)
-		}
+		_, _, err = router.synchronize()
 	}
-	return code
+	return router.finished("command", code, err)
 }

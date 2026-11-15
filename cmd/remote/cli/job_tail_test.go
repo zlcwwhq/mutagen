@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -127,6 +128,98 @@ func TestWaitJobTailTimeout(t *testing.T) {
 	var output, errors bytes.Buffer
 	if code := Run([]string{"--node", "beta", "--wait", job.ID, "--tail", "1", "--no-flush"}, strings.NewReader(""), &output, &errors); code != 0 || output.String() != "finished\n" {
 		t.Fatalf("wait couldn't be resumed: %d, %q, %q", code, output.String(), errors.String())
+	}
+}
+
+// TestWaitJobFinishedFlushInterrupted verifies that a job that has ended keeps
+// its status if the timeout expires while synchronizing afterwards, which is
+// only a warning, that a signal still takes precedence, and that neither
+// reports the job as still running.
+func TestWaitJobFinishedFlushInterrupted(t *testing.T) {
+	// Keep the data directory short enough for Unix domain sockets on macOS.
+	data, err := os.MkdirTemp("", "mr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(data) })
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
+	alpha, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitting, err := remote.NewLocalChannel(nil, &remote.Endpoint{Session: "sync_flush", Root: alpha, Alpha: true, Submit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executing, err := remote.NewLocalChannel(nil, &remote.Endpoint{Session: "sync_flush", Root: t.TempDir(), Execute: true})
+	if err != nil {
+		submitting.Close()
+		t.Fatal(err)
+	}
+
+	// Relay the session, whose synchronization never completes. Receiving a
+	// flush proves that Run installed its signal handler, so the signal is
+	// sent then, if requested.
+	var interrupt atomic.Bool
+	var routes sync.WaitGroup
+	routes.Add(1)
+	go func() {
+		defer routes.Done()
+		for {
+			submission, err := submitting.Accept()
+			if err != nil {
+				return
+			}
+			routes.Add(1)
+			go func() {
+				defer routes.Done()
+				if header, err := remote.ReceiveSubmission(context.Background(), submission); err != nil {
+					remote.Reject(submission, err)
+				} else if !replyTestRoute(submission, header, "sync_flush") {
+					return
+				} else if header.Operation == remote.OperationFlush {
+					if interrupt.Load() {
+						process, _ := os.FindProcess(os.Getpid())
+						process.Signal(os.Interrupt)
+					}
+					io.Copy(io.Discard, submission)
+					submission.Close()
+				} else if execution, err := executing.Open(context.Background()); err != nil {
+					remote.Reject(submission, err)
+				} else {
+					remote.Splice(submission, execution)
+				}
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		submitting.Close()
+		executing.Close()
+		routes.Wait()
+	})
+	t.Chdir(alpha)
+	var output, diagnostic bytes.Buffer
+	if code := Run([]string{"--detach", "--no-flush", "sh", "-c", "exit 7"}, strings.NewReader(""), &output, &diagnostic); code != 0 {
+		t.Fatalf("unable to start job: %d, %q", code, diagnostic.String())
+	}
+	id := strings.TrimSpace(output.String())
+	for _, test := range []struct {
+		arguments []string
+		signal    bool
+		code      int
+		warning   string
+	}{
+		{[]string{"--timeout", "1"}, false, 7, "remote: warning: unable to synchronize after the job, whose changes may not be present locally yet: timed out after 1s\n"},
+		{nil, true, 130, ""},
+	} {
+		interrupt.Store(test.signal)
+		output.Reset()
+		diagnostic.Reset()
+		code := Run(append([]string{"--wait", id}, test.arguments...), strings.NewReader(""), &output, &diagnostic)
+		if code != test.code || !strings.Contains(diagnostic.String(), test.warning+"remote: job "+id+" exited with status 7 after ") ||
+			strings.Contains(diagnostic.String(), "still running") {
+			t.Fatalf("incorrect wait with %v and signal %t: %d, %q", test.arguments, test.signal, code, diagnostic.String())
+		}
 	}
 }
 

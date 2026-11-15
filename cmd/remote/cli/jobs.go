@@ -268,18 +268,15 @@ func printJobs(output io.Writer, locator *locator, endpoint, followUp string, jo
 	return nil
 }
 
-// errJobRunning indicates that a job was still running when the timeout of
-// remote --wait expired, as reported by the executing endpoint shortly before
-// it (see remote.WaitOptions.Deadline).
-var errJobRunning = errors.New("the job is still running")
-
 // waitJob waits for a detached job to end, retrying for a while if the
 // connection to the executing endpoint is lost, synchronizes the session if
-// requested, reports how the job ended, and returns the job's exit status. A
-// requested log tail is printed once the job ends, or, if the timeout expires
-// while it's running, before returning errJobRunning, while a followed log is
+// requested, reports how the job ended, and returns remote's exit status,
+// which is the job's once it has ended (see router.finished). A requested log
+// tail is printed once the job ends, or, if the timeout expires while it's
+// running, before reporting that it's still running, while a followed log is
 // printed as it's written.
-func waitJob(router *router, options *options, output io.Writer) (int, error) {
+func waitJob(router *router, options *options, output io.Writer) int {
+	const activity = "waiting for the job"
 	id := options.wait
 	wait := &remote.WaitOptions{Warn: func(message string) { router.warn("%s", message) }}
 	if deadline, ok := router.ctx.Deadline(); ok {
@@ -306,42 +303,55 @@ func waitJob(router *router, options *options, output io.Writer) (int, error) {
 		}
 		ended = true
 	}
-	defer endLine()
 
 	// Wait for the job, retrying with the same follower, which resumes where
 	// the previous attempt stopped.
 	var job *remote.Job
 	var tail *remote.JobLog
-	var deadline time.Time
-	for {
-		started := time.Now()
-		connection, _, err := router.dial(remote.OperationExecute)
-		if err == nil {
-			if job, tail, err = remote.WaitJobWithOptions(router.ctx, connection, id, wait); err == nil {
-				break
+	err := func() error {
+		var deadline time.Time
+		for {
+			started := time.Now()
+			connection, _, err := router.dial(remote.OperationExecute)
+			if err == nil {
+				if job, tail, err = remote.WaitJobWithOptions(router.ctx, connection, id, wait); err == nil {
+					return nil
+				}
+			}
+
+			// Retry failures to reach the executing endpoint once it has been
+			// reached, but not errors about the job or failures to locate the
+			// session. An attempt that waited for longer than the retry period
+			// before failing, such as one that followed a log for hours,
+			// starts a new retry period.
+			if router.ctx.Err() != nil || remote.ClassifyError(err) != remote.ErrorKindConnection || router.selection.Target == nil {
+				return err
+			} else if deadline.IsZero() || time.Since(started) > waitRetryPeriod {
+				deadline = time.Now().Add(waitRetryPeriod)
+				router.warn("unable to wait for job %s, which keeps running, so remote retries for up to %v: %v", id, waitRetryPeriod, err)
+			} else if time.Now().After(deadline) {
+				return fmt.Errorf("unable to wait for job %s, which may still be running: %w", id, err)
+			}
+			select {
+			case <-time.After(waitRetryInterval):
+			case <-router.ctx.Done():
+				return router.ctx.Err()
 			}
 		}
-
-		// Retry failures to reach the executing endpoint once it has been
-		// reached, but not errors about the job or failures to locate the
-		// session. An attempt that waited for longer than the retry period
-		// before failing, such as one that followed a log for hours, starts
-		// a new retry period.
-		if router.ctx.Err() != nil || remote.ClassifyError(err) != remote.ErrorKindConnection || router.selection.Target == nil {
-			return 0, err
-		} else if deadline.IsZero() || time.Since(started) > waitRetryPeriod {
-			deadline = time.Now().Add(waitRetryPeriod)
-			router.warn("unable to wait for job %s, which keeps running, so remote retries for up to %v: %v", id, waitRetryPeriod, err)
-		} else if time.Now().After(deadline) {
-			return 0, fmt.Errorf("unable to wait for job %s, which may still be running: %w", id, err)
-		}
-		select {
-		case <-time.After(waitRetryInterval):
-		case <-router.ctx.Done():
-			return 0, router.ctx.Err()
-		}
-	}
+	}()
 	endLine()
+
+	// An interrupted wait leaves the job running, which is reported along with
+	// how to resume waiting.
+	running := func(status int) int {
+		fmt.Fprintf(router.stderr, "remote: job %[2]s is still running; %[1]s --wait %[2]s resumes waiting, and %[1]s --kill %[2]s terminates it\n", router.followUp(), id)
+		return status
+	}
+	if err != nil && router.ctx.Err() != nil {
+		return running(router.exit(activity, 0, err))
+	} else if err != nil {
+		return router.exit(activity, 0, err)
+	}
 
 	// Print only the successful attempt's tail, so reconnecting can't repeat
 	// partial output. A log failure doesn't replace the job's exit status.
@@ -362,24 +372,24 @@ func waitJob(router *router, options *options, output io.Writer) (int, error) {
 	// to expire. It isn't synchronized, as with timeouts that expire while
 	// waiting.
 	if job.State == remote.JobRunning {
-		return 0, errJobRunning
+		return running(router.timedOut(activity))
 	}
 
-	// Synchronize the job's changes. The job's status takes precedence over
-	// failure to do so.
-	if !options.noFlush {
-		if _, _, err := router.synchronize(); err != nil {
-			if router.ctx.Err() != nil {
-				return 0, err
-			}
-			router.warn("unable to synchronize after the job, whose changes may not be present locally yet: %v", err)
-		}
+	// Synchronize the job's changes, which can fail without changing the job's
+	// status (see router.finished). A job that ended without recording its
+	// status has failed.
+	code := job.ExitCode
+	if job.State != remote.JobExited && job.State != remote.JobKilled {
+		code = failureExitCode
 	}
+	if !options.noFlush {
+		_, _, err = router.synchronize()
+	}
+	status := router.finished("job", code, err)
 
 	// Report how the job ended, and any processes that it left running.
 	target := router.selection.Target
 	log := describeLog(newLocator(target), job)
-	code := job.ExitCode
 	switch job.State {
 	case remote.JobExited:
 		fmt.Fprintf(router.stderr, "remote: job %s exited with status %d after %s; output in %s\n", id, job.ExitCode, formatElapsed(job.Elapsed), log)
@@ -387,10 +397,9 @@ func waitJob(router *router, options *options, output io.Writer) (int, error) {
 		fmt.Fprintf(router.stderr, "remote: job %s was terminated by remote --kill (status %d); output in %s\n", id, job.ExitCode, log)
 	default:
 		fmt.Fprintf(router.stderr, "remote: job %s ended without recording its exit status, such as because it was killed with SIGKILL or %s restarted; output in %s\n", id, executing(target), log)
-		code = failureExitCode
 	}
 	fmt.Fprint(router.stderr, describeLeftoverReport(router.followUp(), id, job, false))
-	return code, nil
+	return status
 }
 
 // killJob terminates a detached job and reports its state.
