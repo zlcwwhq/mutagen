@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -63,13 +62,11 @@ type JobRequest struct {
 	// Follow, if non-nil, requests that JobWait stream the job's log as output
 	// while waiting, as frames (see logFrame), instead of sending its tail.
 	// Once the job ends, the log's contents up to then are sent before the
-	// result. Executors that predate following, which don't report
-	// featureFollow, ignore it.
+	// result.
 	Follow *JobFollow `json:",omitempty"`
 	// Timeout, if positive, is the time after which JobWait returns the job
 	// even if it's still running, along with the tail requested by Tail, so
-	// that the result can arrive before the client stops waiting. Executors
-	// that predate it, which don't report featureWaitTimeout, ignore it.
+	// that the result can arrive before the client stops waiting.
 	Timeout time.Duration `json:",omitempty"`
 }
 
@@ -318,25 +315,11 @@ type Submission struct {
 	Revision string `json:",omitempty"`
 	// Progress requests progress messages (see ReportProgress) while the
 	// daemon waits for the synchronization cycle of an OperationFlush or
-	// OperationConflicts submission. Daemons that predate it ignore it and
-	// send only their final response, which submissions must accept.
+	// OperationConflicts submission. Submissions must accept a final response
+	// that no progress message precedes, which is sent if there's no progress
+	// to report.
 	Progress bool `json:",omitempty"`
 }
-
-// Features of the protocol that executing endpoints report supporting (see
-// status.Features), so that submitters can adapt their requests to executors
-// of other versions, which ignore request fields that they don't know.
-const (
-	// featureFollow indicates that the executor streams job logs while waiting
-	// for jobs (see JobRequest.Follow).
-	featureFollow = "follow"
-	// featureWaitTimeout indicates that the executor returns running jobs once
-	// a wait's timeout expires (see JobRequest.Timeout).
-	featureWaitTimeout = "wait-timeout"
-)
-
-// executorFeatures are the features that this executor reports supporting.
-var executorFeatures = []string{featureFollow, featureWaitTimeout}
 
 // status reports whether a command route reached an executing endpoint. It is
 // written by the executing endpoint on success or by any intermediate hop that
@@ -346,16 +329,6 @@ type status struct {
 	Error string
 	// ErrorKind classifies Error independently of its diagnostic text.
 	ErrorKind ErrorKind `json:",omitempty"`
-	// Features are the optional protocol features that the executing endpoint
-	// supports. Executors that predate feature reporting report none, and hops
-	// that report routing errors don't report any.
-	Features []string `json:",omitempty"`
-}
-
-// supports indicates whether the executing endpoint reported supporting a
-// feature.
-func (s *status) supports(feature string) bool {
-	return slices.Contains(s.Features, feature)
 }
 
 // flushResponse reports the outcome of a flush, or its progress. Hops that are
@@ -410,8 +383,7 @@ type result struct {
 	// request.
 	Job *Job `json:",omitempty"`
 	// JobLog describes the requested tail of a waited-for job's log. Its
-	// contents are sent as output. A nil value means no tail was requested,
-	// or the executing endpoint predates log tails.
+	// contents are sent as output. A nil value means no tail was requested.
 	JobLog *JobLog `json:",omitempty"`
 	// HiddenJobs is the number of jobs omitted from a job listing because they
 	// were started at other roots.

@@ -427,13 +427,7 @@ func describeKill(followUp, id string, job *remote.Job) (string, error) {
 	case remote.JobKilled:
 		report = fmt.Sprintf("remote: terminated job %s (status %d)\n", id, job.ExitCode)
 	case remote.JobExited:
-		if job.Group == 0 {
-			// The executing endpoint predates the reporting of processes that
-			// jobs left running, so whether there are any is unknown.
-			report = fmt.Sprintf("remote: job %s had already exited with status %d; processes that it left running aren't terminated\n", id, job.ExitCode)
-		} else {
-			report = fmt.Sprintf("remote: job %s had already exited with status %d\n", id, job.ExitCode)
-		}
+		report = fmt.Sprintf("remote: job %s had already exited with status %d\n", id, job.ExitCode)
 	case remote.JobLost:
 		report = fmt.Sprintf("remote: job %s had already ended without recording its exit status\n", id)
 	default:

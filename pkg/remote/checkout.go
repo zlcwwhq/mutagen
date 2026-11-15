@@ -21,8 +21,7 @@ type Checkout struct {
 	// Alpha indicates whether the conflict was checked out through alpha.
 	Alpha bool `json:",omitempty"`
 	// Token identifies the claim that recorded the checkout (see
-	// ClaimCheckout). Checkouts recorded by builds that didn't issue tokens
-	// have none until they're claimed again.
+	// ClaimCheckout).
 	Token string `json:",omitempty"`
 }
 
@@ -42,8 +41,7 @@ type CheckoutStatus struct {
 	// Held indicates whether the submitting endpoint held a checkout of the
 	// conflict root before the submission.
 	Held bool `json:",omitempty"`
-	// Token is the token of that checkout, which is empty if it was recorded
-	// by a build that didn't issue tokens.
+	// Token is the token of that checkout.
 	Token string `json:",omitempty"`
 	// Sequence is the sequence number of a claim that succeeded (see
 	// ClaimCheckout), and zero otherwise.
@@ -98,8 +96,7 @@ func exchangeCheckout(ctx context.Context, connection io.ReadWriteCloser, path, 
 // identified by a token, which is required. A checkout that the submitting
 // endpoint already holds is left as it is, so the claim only succeeds if the
 // endpoint holds no checkout of the conflict root, or holds one with the
-// claim's token, or one that a build that didn't issue tokens recorded, which
-// takes the claim's token. It owns and closes the connection.
+// claim's token. It owns and closes the connection.
 //
 // A claim that succeeds returns a sequence number, which is later than those of
 // the earlier successful claims of the session's checkouts, through either
@@ -130,9 +127,8 @@ func ClaimCheckout(ctx context.Context, connection io.ReadWriteCloser, path, tok
 // endpoint held a checkout beforehand and, if so, its token. A checkout held by
 // the opposite endpoint is left as it is. Since claims require a token, a
 // release without one only reports the token, so that a checkout whose token
-// is unknown is released by a second release naming it, unless a build that
-// didn't issue tokens recorded the checkout, in which case the release removes
-// it. It owns and closes the connection.
+// is unknown is released by a second release naming it. It owns and closes the
+// connection.
 func ReleaseCheckout(ctx context.Context, connection io.ReadWriteCloser, path, token string) (bool, string, error) {
 	status, err := exchangeCheckout(ctx, connection, path, token)
 	if err != nil {

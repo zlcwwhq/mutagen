@@ -125,7 +125,7 @@ const waitMargin = time.Second
 type WaitOptions struct {
 	// Tail is the number of final log lines to read once the job ends, or once
 	// Deadline passes while it's running. Zero disables log reading. It's
-	// ignored if Follow is non-nil, except as described there.
+	// ignored if Follow is non-nil.
 	Tail int64
 	// Deadline, if non-zero, is the time at which a wait that reads a tail
 	// returns the job even if it's still running, along with the tail. It
@@ -133,14 +133,9 @@ type WaitOptions struct {
 	// return somewhat earlier (see waitMargin), so that its result arrives
 	// before the context ends the wait. Other waits, including those that
 	// follow logs, whose contents have arrived already, end with the context
-	// instead, so that they don't stop waiting early, as do waits whose
-	// executing endpoints predate deadlines.
+	// instead, so that they don't stop waiting early.
 	Deadline time.Time
 	// Follow, if non-nil, streams the job's log to its output while waiting.
-	// If the executing endpoint doesn't support following logs, which is
-	// reported through Warn, then the wait reads the final Follow.Lines lines,
-	// if positive, once the job ends instead, unless an earlier wait with the
-	// follower received some of the log.
 	Follow *LogFollower
 	// Warn, if non-nil, receives warnings about the job's log, none of which
 	// affect the wait, such as logs that can't be followed. It's never called
@@ -163,33 +158,16 @@ func WaitJobWithOptions(ctx context.Context, connection io.ReadWriteCloser, id s
 		warn = func(string) {}
 	}
 
-	// Adapt the request to the features that the executing endpoint reports.
-	// Executors that predate a feature would ignore the request fields that
-	// enable it, and a tail requested in its place would be sent as raw output
-	// rather than in frames.
-	route, err := connect(ctx, connection)
-	if err != nil {
-		return nil, nil, err
-	}
+	// Build the request. Followers whose logs can't be followed any more wait
+	// without following them.
 	request := &JobRequest{Operation: JobWait, ID: id, Tail: options.Tail}
 	if follow := options.Follow; follow != nil {
 		request.Tail = 0
-		if follow.state == following && !route.supports(featureFollow) {
-			follow.state = followUnsupported
-			if follow.Lines > 0 && !follow.started {
-				warn(fmt.Sprintf("unable to follow the log of job %s: the executing endpoint doesn't support following logs, so only its final %d lines are shown once the job ends", id, follow.Lines))
-			} else {
-				warn(fmt.Sprintf("unable to follow the log of job %s: the executing endpoint doesn't support following logs", id))
-			}
-		}
 		if follow.state == following {
 			request.Follow = follow.request()
-		} else if follow.state == followUnsupported && follow.Lines > 0 && !follow.started {
-			request.Tail = follow.Lines
 		}
 	}
-	timeouts := !options.Deadline.IsZero() && request.Tail > 0 && route.supports(featureWaitTimeout)
-	if timeouts {
+	if !options.Deadline.IsZero() && request.Tail > 0 {
 		remaining := time.Until(options.Deadline)
 		request.Timeout = max(remaining-min(waitMargin, remaining/2), time.Millisecond)
 	}
@@ -213,15 +191,12 @@ func WaitJobWithOptions(ctx context.Context, connection io.ReadWriteCloser, id s
 	} else {
 		output = &buffer
 	}
-	response, err := exchange(ctx, connection, &Request{Job: request}, strings.NewReader(""), output, io.Discard)
+	response, err := execute(ctx, connection, &Request{Job: request}, strings.NewReader(""), output, io.Discard)
 	if stream != nil {
 		stream.Close()
 		<-received
 	}
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) && !options.Deadline.IsZero() && !timeouts && request.Tail > 0 {
-			warn(fmt.Sprintf("unable to show the log of job %s: the executing endpoint doesn't support log tails of running jobs", id))
-		}
 		return nil, nil, err
 	} else if response.Error != "" {
 		return nil, nil, receivedError(response.ErrorKind, &JobError{response.Error})
@@ -234,7 +209,7 @@ func WaitJobWithOptions(ctx context.Context, connection io.ReadWriteCloser, id s
 	}
 	log := response.JobLog
 	if log == nil {
-		log = &JobLog{Error: "the executing endpoint doesn't support log tails", ErrorKind: ErrorKindOperation}
+		return nil, nil, ConnectionError(errors.New("no job log received"))
 	} else if buffer.overflow {
 		log = &JobLog{Error: "the executing endpoint returned a log tail larger than 1 MiB", ErrorKind: ErrorKindConnection}
 	} else if log.Error == "" {

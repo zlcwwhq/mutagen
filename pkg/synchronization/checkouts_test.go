@@ -1,7 +1,6 @@
 package synchronization
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -247,52 +246,6 @@ func TestCheckoutSequences(t *testing.T) {
 		t.Fatal(err)
 	} else if _, err := c.claimCheckout(true, "file", "g"); err == nil || !strings.Contains(err.Error(), "is corrupt") {
 		t.Fatal("corrupt record of the latest sequence number not reported:", err)
-	}
-}
-
-func TestCheckoutLegacyRecords(t *testing.T) {
-	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
-
-	// Builds that didn't issue tokens recorded checkouts without them, as an
-	// array, which is still read, including for conflicts that are no longer
-	// listed, such as those of partially applied resolutions.
-	c := newCheckoutController()
-	path := writeCheckouts(t, c, `[{"Path":"workspace","Alpha":true},{"Path":"abandoned"}]`)
-	expected := []remote.Checkout{{Path: "abandoned"}, {Path: "workspace", Alpha: true}}
-	if checkouts, err := c.checkouts(); err != nil || !reflect.DeepEqual(checkouts, expected) {
-		t.Fatalf("checkouts recorded without tokens not read: %+v, %v", checkouts, err)
-	}
-
-	// Releases report that such a checkout is held, even with a token, which
-	// leaves it as it is, and the first claim through its endpoint succeeds,
-	// recording the claim's token, so that late requests can't take it over
-	// or remove it afterward.
-	legacy := remote.CheckoutStatus{Held: true}
-	if status, err := c.releaseCheckout(true, "workspace", "token"); err != nil || status != legacy {
-		t.Fatal("checkout without a token not reported to a release:", status, err)
-	} else if _, err := c.claimCheckout(false, "workspace", "opposite"); !errors.Is(err, errCheckedOutOpposite) {
-		t.Fatal("checkout without a token claimed through the opposite endpoint:", err)
-	} else if status, err := c.claimCheckout(true, "workspace", "token"); err != nil || !status.Held || status.Token != "" || status.Sequence == 0 {
-		t.Fatal("checkout without a token not claimed:", status, err)
-	} else if status, err := c.claimCheckout(true, "workspace", "late"); err != nil || status != (remote.CheckoutStatus{Held: true, Token: "token"}) {
-		t.Fatal("token of a claimed checkout not kept:", status, err)
-	} else if status, err := c.releaseCheckout(true, "workspace", ""); err != nil || status != (remote.CheckoutStatus{Held: true, Token: "token"}) {
-		t.Fatal("claimed checkout not kept by a release without a token:", status, err)
-	}
-	var record checkoutsRecord
-	if data, err := os.ReadFile(path); err != nil {
-		t.Fatal(err)
-	} else if err := json.Unmarshal(data, &record); err != nil {
-		t.Fatal("checkouts not saved in the current format:", err)
-	} else if !reflect.DeepEqual(record.Checkouts, []remote.Checkout{{Path: "abandoned"}, {Path: "workspace", Alpha: true, Token: "token"}}) || record.Sequence == 0 {
-		t.Fatalf("checkouts not saved: %+v", record)
-	}
-
-	// A release without a token removes a checkout recorded without one.
-	if status, err := c.releaseCheckout(false, "abandoned", ""); err != nil || status != legacy {
-		t.Fatal("checkout without a token not released:", status, err)
-	} else if status, err := c.releaseCheckout(false, "abandoned", ""); err != nil || status.Held {
-		t.Fatal("released checkout reported as held:", status, err)
 	}
 }
 

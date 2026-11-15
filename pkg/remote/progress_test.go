@@ -58,9 +58,8 @@ func TestFlushWithProgressPeers(t *testing.T) {
 	}{
 		// Daemons that report progress send it before the outcome.
 		{"progress", []any{&progressMessage{scanning}, &progressMessage{staging}, &flushResponse{Report: report}}, []*Progress{scanning, staging}, ""},
-		// Daemons that predate progress messages, or ignore the request,
-		// send only the outcome.
-		{"earlier-daemon", []any{&flushResponse{Report: report}}, nil, ""},
+		// Daemons with no progress to report send only the outcome.
+		{"no-progress", []any{&flushResponse{Report: report}}, nil, ""},
 		// Failures end the wait, whether reported by the daemon or by a hop
 		// that couldn't reach it, which sends a status.
 		{"failure", []any{&progressMessage{scanning}, &flushResponse{Error: "synchronization stopped"}}, []*Progress{scanning}, "synchronization stopped"},

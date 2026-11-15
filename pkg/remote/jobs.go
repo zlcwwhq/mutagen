@@ -125,8 +125,7 @@ type Job struct {
 	// measured on the executing system.
 	Elapsed time.Duration `json:",omitempty"`
 	// Group is the identifier of the job's process group, which its
-	// supervisor led. It's zero if the executing endpoint predates its
-	// reporting.
+	// supervisor led.
 	Group int `json:",omitempty"`
 	// Leftovers are processes that remain in the job's process group after
 	// the job has ended, which its command left running, ordered by process

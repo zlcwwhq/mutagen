@@ -57,7 +57,7 @@ func TestProtocolErrorCategories(t *testing.T) {
 				switch operation {
 				case "route":
 					go Reject(server, cause)
-					_, err = connect(ctx, client)
+					err = connect(ctx, client)
 				case "flush":
 					go RespondToFlush(server, nil, cause)
 					_, err = Flush(ctx, client)
@@ -132,7 +132,7 @@ func TestMetadataInputAndTransportFailures(t *testing.T) {
 		server.Write([]byte{0, 0, 0, 1, '!'})
 		server.Close()
 	}()
-	if _, err := connect(ctx, client); err == nil || ClassifyError(err) != ErrorKindConnection {
+	if err := connect(ctx, client); err == nil || ClassifyError(err) != ErrorKindConnection {
 		t.Fatalf("invalid metadata not classified as protocol failure: %v", err)
 	}
 }

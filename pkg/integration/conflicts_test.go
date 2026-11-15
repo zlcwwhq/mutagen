@@ -487,46 +487,6 @@ func TestRemoteConflictLateRequests(t *testing.T) {
 	beta.checkout("file")
 }
 
-func TestRemoteConflictLegacyCheckouts(t *testing.T) {
-	// Builds that didn't issue tokens recorded checkouts without them. Applying
-	// a workspace that such a build checked out claims its checkout, which
-	// records the workspace's token, so that resolving the conflict releases
-	// the checkout. Discarding releases such a checkout too, with or without a
-	// workspace, and reports it. The opposite endpoint can then check the
-	// conflicts out.
-	alpha, beta, _ := createBothSidedConflicts(t, "applied", "discarded", "abandoned")
-	for _, path := range []string{"applied", "discarded", "abandoned"} {
-		w := alpha.checkout(path)
-		if path == "abandoned" {
-			if err := os.RemoveAll(filepath.Dir(w.Local)); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	directory, err := filesystem.Mutagen(false, filesystem.MutagenSynchronizationCheckoutsDirectoryName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	checkouts, err := filepath.Glob(filepath.Join(directory, "sync_*"))
-	if err != nil || len(checkouts) != 1 {
-		t.Fatalf("unexpected checkouts: %v, %v", checkouts, err)
-	}
-	writeFile(t, checkouts[0], `[{"Path":"abandoned","Alpha":true},{"Path":"applied","Alpha":true},{"Path":"discarded","Alpha":true}]`)
-	if applied := alpha.outcomes("--conflict-apply", "--take", "local", "applied")[0]; !applied.Resolved {
-		t.Fatalf("conflict not resolved: %+v", applied)
-	} else if listing := beta.list(); len(listing.RemotePending) != 0 {
-		t.Fatalf("checkout of a resolved conflict not released: %+v", listing)
-	}
-	if discarded := alpha.outcomes("--conflict-discard", "discarded")[0]; !discarded.Discarded || discarded.Backup == "" {
-		t.Fatalf("workspace not discarded: %+v", discarded)
-	} else if discarded := alpha.outcomes("--conflict-discard", "abandoned")[0]; !discarded.Discarded || discarded.Backup != "" {
-		t.Fatalf("checkout without a workspace not released: %+v", discarded)
-	}
-	alpha.fail("isn't checked out", "--conflict-discard", "abandoned")
-	beta.checkout("discarded")
-	beta.checkout("abandoned")
-}
-
 func TestRemoteConflictCorruptCheckouts(t *testing.T) {
 	// Checkouts that can't be read, such as an empty file left by an operating
 	// system crash, aren't taken for no checkouts, which would let both

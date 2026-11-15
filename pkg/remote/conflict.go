@@ -139,7 +139,7 @@ type conflictsMessage struct {
 	// Done indicates the end of a complete listing.
 	Done bool `json:",omitempty"`
 	// Repository is the listing's repository conflict, if any, which is sent
-	// with Done, so that clients that predate it ignore it.
+	// with Done.
 	Repository *RepositoryConflict `json:",omitempty"`
 	// Progress is set, and nothing else, by progress messages.
 	Progress *Progress `json:",omitempty"`
@@ -192,8 +192,7 @@ func ListConflicts(ctx context.Context, connection io.ReadWriteCloser) (*Listing
 
 // ListConflictsWithProgress is ListConflicts for a submission that may have
 // requested progress messages (see Submission.Progress), which are passed to
-// progress, if non-nil, as they arrive. Daemons and hops that predate progress
-// messages send none.
+// progress, if non-nil, as they arrive.
 func ListConflictsWithProgress(ctx context.Context, connection io.ReadWriteCloser, progress func(*Progress)) (*Listing, error) {
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { connection.Close() })

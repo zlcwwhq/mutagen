@@ -199,9 +199,6 @@ const (
 	// followStopped indicates that the log can't be followed, such as because
 	// it's missing or isn't a regular file, which was reported.
 	followStopped
-	// followUnsupported indicates that the executing endpoint doesn't support
-	// following logs, which was reported.
-	followUnsupported
 )
 
 // LogFollower receives a job's log while WaitJobWithOptions waits for the job

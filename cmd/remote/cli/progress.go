@@ -97,8 +97,8 @@ type progressPhase struct {
 // progressDisplay shows the progress of a synchronization that remote waits
 // for (see remote.FlushWithProgress), starting once ProgressDelay has elapsed,
 // and finishes with a summary of where the synchronization spent its time.
-// Daemons that predate progress messages send none, so only the elapsed time
-// is shown for them. A nil display shows nothing.
+// If no progress messages arrive, only the elapsed time is shown. A nil
+// display shows nothing.
 type progressDisplay struct {
 	// output is the progress output.
 	output *progressOutput

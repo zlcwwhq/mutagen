@@ -1,7 +1,6 @@
 package synchronization
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,8 +32,7 @@ func compareCheckout(checkout remote.Checkout, path string) int {
 }
 
 // checkoutsRecord is the serialized form of a session's checkouts (see
-// remote.Checkout). Builds that didn't number claims serialized the checkouts
-// alone, as an array, which loadCheckouts still reads.
+// remote.Checkout).
 type checkoutsRecord struct {
 	// Sequence is the sequence number of the session's latest successful claim
 	// (see claimCheckout). It's kept once the session's checkouts are released,
@@ -115,12 +113,7 @@ func (c *controller) loadCheckouts() (*checkoutsRecord, error) {
 		return nil, fmt.Errorf("unable to read conflict checkouts: %w", err)
 	}
 	record := &checkoutsRecord{}
-	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && trimmed[0] == '[' {
-		err = json.Unmarshal(data, &record.Checkouts)
-	} else {
-		err = json.Unmarshal(data, record)
-	}
-	if err != nil {
+	if err := json.Unmarshal(data, record); err != nil {
 		return nil, fmt.Errorf("the session's conflict checkouts in %s, on the Mutagen daemon's system, are corrupt (%v); remove that file to resolve conflicts again, after which workspaces can only be applied if their conflicts are still listed, and must otherwise be discarded", path, err)
 	}
 	slices.SortFunc(record.Checkouts, func(a, b remote.Checkout) int {
@@ -177,11 +170,7 @@ func (c *controller) checkouts() ([]remote.Checkout, error) {
 // by that token (see releaseCheckout): neither a late claim nor a late release
 // can take over or remove the checkout of a later claim. A checkout held under
 // another token must be released first, once its endpoint knows that it's
-// abandoned. Checkouts recorded by builds that didn't issue tokens are the
-// exception: they take the token of the first claim through their endpoint, so
-// that workspaces checked out by those builds keep their checkouts, even if
-// their conflicts are no longer listed, and late requests can't take them over
-// or remove them afterward.
+// abandoned.
 //
 // A claim that succeeds is numbered with a sequence number, which orders the
 // replacements that resolutions make after claiming their checkouts (see
@@ -201,10 +190,9 @@ func (c *controller) claimCheckout(alpha bool, path, token string) (remote.Check
 	index, found := slices.BinarySearchFunc(record.Checkouts, path, compareCheckout)
 	if found && record.Checkouts[index].Alpha == alpha {
 		status = remote.CheckoutStatus{Held: true, Token: record.Checkouts[index].Token}
-		if status.Token != "" && status.Token != token {
+		if status.Token != token {
 			return status, nil
 		}
-		record.Checkouts[index].Token = token
 	} else if found {
 		return remote.CheckoutStatus{}, errCheckedOutOpposite
 	} else {
@@ -232,8 +220,7 @@ func (c *controller) claimCheckout(alpha bool, path, token string) (remote.Check
 // is, as is one recorded by another claim, so that a release that arrives
 // after its submitter stopped waiting for it doesn't remove the checkout of a
 // later claim. Claims require a token, so a release without one only reports
-// the token, unless a build that didn't issue tokens recorded the checkout,
-// which the release then removes.
+// the token.
 func (c *controller) releaseCheckout(alpha bool, path, token string) (remote.CheckoutStatus, error) {
 	c.checkoutsLock.Lock()
 	defer c.checkoutsLock.Unlock()
@@ -246,7 +233,7 @@ func (c *controller) releaseCheckout(alpha bool, path, token string) (remote.Che
 		return remote.CheckoutStatus{}, nil
 	}
 	status := remote.CheckoutStatus{Held: true, Token: record.Checkouts[index].Token}
-	if status.Token != token {
+	if token == "" || status.Token != token {
 		return status, nil
 	}
 	record.Checkouts = slices.Delete(record.Checkouts, index, index+1)

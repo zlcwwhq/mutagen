@@ -45,31 +45,29 @@ func Execute(ctx context.Context, connection io.ReadWriteCloser, request *Reques
 
 // execute implements Execute, returning the result sent by the executor.
 func execute(ctx context.Context, connection io.ReadWriteCloser, request *Request, stdin io.Reader, stdout, stderr io.Writer) (*result, error) {
-	if _, err := connect(ctx, connection); err != nil {
+	if err := connect(ctx, connection); err != nil {
 		return nil, err
 	}
 	return exchange(ctx, connection, request, stdin, stdout, stderr)
 }
 
-// connect waits for a route to reach an executing endpoint and returns the
-// route's status, which reports the executor's features, so that the request
-// can be adapted to them before exchange sends it. Any hop that cannot
-// establish the route reports why instead of simply disconnecting. The
+// connect waits for a route to reach an executing endpoint. Any hop that
+// cannot establish the route reports why instead of simply disconnecting. The
 // connection is closed if this fails.
-func connect(ctx context.Context, connection io.ReadWriteCloser) (*status, error) {
+func connect(ctx context.Context, connection io.ReadWriteCloser) error {
 	stopRoute := context.AfterFunc(ctx, func() { connection.Close() })
 	var route status
 	err := readMessage(connection, &route)
 	if !stopRoute() {
-		return nil, ctx.Err()
+		return ctx.Err()
 	} else if err != nil {
 		connection.Close()
-		return nil, ConnectionError(fmt.Errorf("unable to receive route status: %w", err))
+		return ConnectionError(fmt.Errorf("unable to receive route status: %w", err))
 	} else if route.Error != "" {
 		connection.Close()
-		return nil, receivedError(route.ErrorKind, errors.New(route.Error))
+		return receivedError(route.ErrorKind, errors.New(route.Error))
 	}
-	return &route, nil
+	return nil
 }
 
 // exchange sends a request over a route that has reached an executing endpoint
@@ -184,8 +182,7 @@ func Flush(ctx context.Context, connection io.ReadWriteCloser) (*Report, error) 
 
 // FlushWithProgress is Flush for a submission that may have requested progress
 // messages (see Submission.Progress), which are passed to progress, if
-// non-nil, as they arrive. Daemons and hops that predate progress messages
-// send none.
+// non-nil, as they arrive.
 func FlushWithProgress(ctx context.Context, connection io.ReadWriteCloser, progress func(*Progress)) (*Report, error) {
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { connection.Close() })

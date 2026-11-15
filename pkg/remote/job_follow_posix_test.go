@@ -438,7 +438,7 @@ func TestWaitJobDeadline(t *testing.T) {
 	}
 }
 
-func TestWaitJobOldClient(t *testing.T) {
+func TestWaitJobWithoutTimeout(t *testing.T) {
 	useTestJobs(t)
 	root := t.TempDir()
 	release := filepath.Join(t.TempDir(), "release")
@@ -447,9 +447,8 @@ func TestWaitJobOldClient(t *testing.T) {
 	job := startTestJob(t, root, "", "sh", "-c", `printf 'one\ntwo\n'; `+releasedJob, "sh", release)
 	waitForLines(t, job.Log, 2)
 
-	// Clients that predate following and deadlines don't send them, so a wait
-	// for a running job doesn't return before the job ends, even with a tail,
-	// and the tail is sent as raw output once it does.
+	// A wait without a timeout or following doesn't return before the job
+	// ends, even with a tail, which is sent as raw output once it does.
 	request := &Request{Job: &JobRequest{Operation: JobWait, ID: job.ID, Tail: 1}}
 	waiting, stop := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer stop()
@@ -463,6 +462,6 @@ func TestWaitJobOldClient(t *testing.T) {
 	var output bytes.Buffer
 	response, err := execute(ctx, jobRoute(ctx, root), request, strings.NewReader(""), &output, io.Discard)
 	if err != nil || response.Job == nil || response.Job.ExitCode != 5 || response.JobLog == nil || output.String() != "two\n" {
-		t.Fatalf("incorrect result for an old client: %+v, %v, %q", response, err, output.String())
+		t.Fatalf("incorrect result without a timeout: %+v, %v, %q", response, err, output.String())
 	}
 }

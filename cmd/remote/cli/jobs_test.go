@@ -193,17 +193,12 @@ func TestLeftoverReports(t *testing.T) {
 		t.Errorf("incorrect kill report for a group: %q, %v", report, err)
 	}
 
-	// Nothing is reported for jobs without leftovers, but executing endpoints
-	// that predate their reporting, which don't report groups, can't tell.
+	// Nothing is reported for jobs without leftovers.
 	job.GroupMayRemain = false
 	if report := describeLeftoverReport("remote", job.ID, job, false); report != "" {
 		t.Errorf("incorrect report without leftovers: %q", report)
 	} else if report, err := describeKill("remote", job.ID, job); err != nil || report != "remote: job b2c4d6e8 had already exited with status 0\n" {
 		t.Errorf("incorrect kill report without leftovers: %q, %v", report, err)
-	}
-	job.Group = 0
-	if report, err := describeKill("remote", job.ID, job); err != nil || report != "remote: job b2c4d6e8 had already exited with status 0; processes that it left running aren't terminated\n" {
-		t.Errorf("incorrect kill report from an older endpoint: %q, %v", report, err)
 	}
 	job.State = remote.JobRunning
 	if _, err := describeKill("remote", job.ID, job); err == nil {

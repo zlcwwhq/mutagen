@@ -124,8 +124,7 @@ func TestListingIncludesCheckouts(t *testing.T) {
 		t.Fatalf("listing received incorrectly: %+v, %v", received, err)
 	}
 
-	// The repository conflict is sent with the end of the listing, which
-	// clients that predate it accept.
+	// The repository conflict is sent with the end of the listing.
 	client, server = net.Pipe()
 	go RespondWithConflicts(server, &Listing{Repository: sent.Repository}, nil)
 	var message struct{ Done bool }
