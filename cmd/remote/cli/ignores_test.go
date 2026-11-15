@@ -39,9 +39,12 @@ func TestPrintIgnores(t *testing.T) {
 		t.Fatalf("listing didn't suggest commands: %q", output.String())
 	}
 
-	// The suggested commands keep the node that selected the destination.
+	// The suggested commands keep the node that selected the destination,
+	// which the daemon resolved.
 	output.Reset()
-	router := pinnedRouter(target, &errorOutput)
+	resolved := *target
+	resolved.Resolved = true
+	router := pinnedRouter(&resolved, &errorOutput)
 	router.node = "gpu"
 	if _, err := printIgnores(router, nil, &output); err != nil {
 		t.Fatal("listing failed:", err)

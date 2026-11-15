@@ -473,19 +473,16 @@ func sessionWorkspaces(target *remote.Target) map[string]*workspace {
 }
 
 // listConflicts synchronizes the session, showing the synchronization's
-// progress on errorOutput if enabled (see newProgressOutput), and lists all of
-// its conflicts.
-func listConflicts(ctx context.Context, directory string, o *options, errorOutput io.Writer) (*remote.Listing, *remote.Target, error) {
-	output := newProgressOutput(errorOutput, o.progress)
-	header := &remote.Submission{Operation: remote.OperationConflicts, Progress: output.writer != nil}
-	selection := o.selection(false)
-	connection, target, err := selection.Submit(ctx, directory, header)
+// progress if enabled (see newProgressOutput), and lists all of its conflicts.
+func listConflicts(router *router) (*remote.Listing, *remote.Target, error) {
+	output := newProgressOutput(router.stderr, router.progress)
+	connection, target, err := router.submit(&remote.Submission{Operation: remote.OperationConflicts, Progress: output.writer != nil})
 	if err != nil {
 		return nil, nil, err
 	}
 	display := newProgressDisplay(output, target)
-	listing, err := remote.ListConflictsWithProgress(ctx, connection, display.begin())
-	display.finish(ctx, err)
+	listing, err := remote.ListConflictsWithProgress(router.ctx, connection, display.begin())
+	display.finish(router.ctx, err)
 	return listing, target, err
 }
 
@@ -499,32 +496,12 @@ func findConflict(listing *remote.Listing, path string) *remote.ConflictRoot {
 	return nil
 }
 
-// dialSession submits an operation through the endpoint that the specified
-// target identifies, which must be the one located for the submission.
-func dialSession(ctx context.Context, directory string, operation remote.Operation, expected *remote.Target) (io.ReadWriteCloser, error) {
-	connection, target, err := (&remote.Selection{Target: expected}).Dial(ctx, directory, operation)
-	if err != nil {
-		return nil, err
-	} else if target.Session != expected.Session || target.Alpha != expected.Alpha {
-		connection.Close()
-		return nil, errors.New("the session was located differently while resolving the conflict")
-	}
-	return connection, nil
-}
-
-// dialOpposite opens a route to the opposite endpoint, which must be the one
-// that the specified target identifies.
-func dialOpposite(ctx context.Context, directory string, expected *remote.Target) (io.ReadWriteCloser, error) {
-	return dialSession(ctx, directory, remote.OperationExecute, expected)
-}
-
 // claimSequence records with the daemon that a conflict root is checked out
-// through the endpoint that the specified target identifies, under a token
-// identifying the claim, failing if the opposite endpoint holds its checkout (see
-// remote.ClaimCheckout). Each conflict is checked out through a single
-// endpoint, which alone can apply or discard its resolution, since workspaces
-// are kept on the system that checked them out, where the opposite endpoint
-// can't see them.
+// through the router's endpoint, under a token identifying the claim, failing
+// if the opposite endpoint holds its checkout (see remote.ClaimCheckout). Each
+// conflict is checked out through a single endpoint, which alone can apply or
+// discard its resolution, since workspaces are kept on the system that checked
+// them out, where the opposite endpoint can't see them.
 //
 // Claims are only made while the local endpoint's workspace for the conflict
 // root is locked, by the checkout creating the workspace or through the
@@ -540,21 +517,21 @@ func dialOpposite(ctx context.Context, directory string, expected *remote.Target
 // makes after claiming its checkout (see remote.Replacement.Sequence) after
 // those of all earlier applies of the conflict, including those whose clients
 // stopped waiting for them while the replacements kept running.
-func claimSequence(ctx context.Context, directory string, target *remote.Target, path, token string) (uint64, error) {
+func claimSequence(router *router, path, token string) (uint64, error) {
 	claimOnce := func() (uint64, string, error) {
-		connection, err := dialSession(ctx, directory, remote.OperationClaim, target)
+		connection, _, err := router.dial(remote.OperationClaim)
 		if err != nil {
 			return 0, "", err
 		}
-		return remote.ClaimCheckout(ctx, connection, path, token)
+		return remote.ClaimCheckout(router.ctx, connection, path, token)
 	}
 	sequence, held, err := claimOnce()
 	if err != nil || sequence != 0 {
 		return sequence, err
 	}
-	connection, err := dialSession(ctx, directory, remote.OperationRelease, target)
+	connection, _, err := router.dial(remote.OperationRelease)
 	if err == nil {
-		_, _, err = remote.ReleaseCheckout(ctx, connection, path, held)
+		_, _, err = remote.ReleaseCheckout(router.ctx, connection, path, held)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("unable to release an abandoned checkout: %w", err)
@@ -566,22 +543,21 @@ func claimSequence(ctx context.Context, directory string, target *remote.Target,
 	return sequence, nil
 }
 
-// release removes the checkout of a conflict root held by the endpoint that
-// the specified target identifies, if any, and returns whether it held one
-// (see releaseOver).
-func release(ctx context.Context, directory string, target *remote.Target, path, token string) (bool, error) {
-	connection, err := dialSession(ctx, directory, remote.OperationRelease, target)
+// release removes the checkout of a conflict root held by the router's
+// endpoint, if any, and returns whether it held one (see releaseOver).
+func release(router *router, path, token string) (bool, error) {
+	connection, _, err := router.dial(remote.OperationRelease)
 	if err != nil {
 		return false, err
 	}
-	return releaseOver(ctx, connection, directory, target, path, token)
+	return releaseOver(router, connection, path, token)
 }
 
-// releaseOver removes the checkout of a conflict root held by the endpoint
-// that the specified target identifies, if any, over a release submission
-// through it, and returns whether it held one. Checkouts are only released
-// once the local endpoint has no workspace for the conflict root, which is
-// locked meanwhile, so any checkout that the endpoint holds is abandoned.
+// releaseOver removes the checkout of a conflict root held by the router's
+// endpoint, if any, over a release submission through it, and returns whether
+// it held one. Checkouts are only released once the local endpoint has no
+// workspace for the conflict root, which is locked meanwhile, so any checkout
+// that the endpoint holds is abandoned.
 //
 // Releases still name the token of the claim that they end (see
 // remote.ReleaseCheckout), starting with the specified one, which is empty if
@@ -596,15 +572,15 @@ func release(ctx context.Context, directory string, target *remote.Target, path,
 // conflict out again (see claimSequence). That includes a checkout without a token,
 // recorded by a build that didn't issue tokens, which a release without one
 // removes.
-func releaseOver(ctx context.Context, connection io.ReadWriteCloser, directory string, target *remote.Target, path, token string) (bool, error) {
-	held, current, err := remote.ReleaseCheckout(ctx, connection, path, token)
+func releaseOver(router *router, connection io.ReadWriteCloser, path, token string) (bool, error) {
+	held, current, err := remote.ReleaseCheckout(router.ctx, connection, path, token)
 	if err != nil || !held || current == token {
 		return held, err
 	}
-	connection, err = dialSession(ctx, directory, remote.OperationRelease, target)
+	connection, _, err = router.dial(remote.OperationRelease)
 	if err != nil {
 		return true, err
-	} else if stillHeld, remaining, err := remote.ReleaseCheckout(ctx, connection, path, current); err != nil {
+	} else if stillHeld, remaining, err := remote.ReleaseCheckout(router.ctx, connection, path, current); err != nil {
 		return true, err
 	} else if stillHeld && remaining != current {
 		return true, errors.New("the checkout was claimed again while it was being released")
@@ -619,10 +595,10 @@ func releaseOver(ctx context.Context, connection io.ReadWriteCloser, directory s
 // such as a checkout that hasn't created its workspace yet, are kept, as are
 // those whose workspaces can't be read, which discarding releases, and those
 // that can't be released, since the listing is advisory.
-func releaseAbandoned(ctx context.Context, directory string, target *remote.Target, checkouts []remote.Checkout, workspaces map[string]*workspace) []remote.Checkout {
+func releaseAbandoned(router *router, target *remote.Target, checkouts []remote.Checkout, workspaces map[string]*workspace) []remote.Checkout {
 	var remaining []remote.Checkout
 	for _, checkout := range checkouts {
-		if checkout.Alpha != target.Alpha || workspaces[checkout.Path] != nil || !releaseIfAbandoned(ctx, directory, target, checkout) {
+		if checkout.Alpha != target.Alpha || workspaces[checkout.Path] != nil || !releaseIfAbandoned(router, target, checkout) {
 			remaining = append(remaining, checkout)
 		}
 	}
@@ -632,7 +608,7 @@ func releaseAbandoned(ctx context.Context, directory string, target *remote.Targ
 // releaseIfAbandoned releases a listed checkout held by the local endpoint if
 // it has no workspace and no operation on its path is in progress, and returns
 // whether the local endpoint no longer holds it.
-func releaseIfAbandoned(ctx context.Context, directory string, target *remote.Target, checkout remote.Checkout) bool {
+func releaseIfAbandoned(router *router, target *remote.Target, checkout remote.Checkout) bool {
 	local := filepath.Join(target.Root, filepath.FromSlash(checkout.Path))
 	unlock, err := lockWorkspace(local)
 	if err != nil {
@@ -642,7 +618,7 @@ func releaseIfAbandoned(ctx context.Context, directory string, target *remote.Ta
 	if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
-	_, err = release(ctx, directory, target, checkout.Path, checkout.Token)
+	_, err = release(router, checkout.Path, checkout.Token)
 	return err == nil
 }
 
@@ -860,25 +836,22 @@ func appliedNote(backup string) string {
 // runConflicts performs a conflict operation. Failures for individual paths
 // are printed as they occur and reported with errReported, while other errors
 // are returned.
-func runConflicts(ctx context.Context, directory string, o *options, output, errorOutput io.Writer) error {
+func runConflicts(router *router, o *options, output io.Writer) error {
 	pruneWorkspaces()
 	if o.conflicts {
-		return printConflicts(ctx, directory, o, output, errorOutput)
+		return printConflicts(router, o, output)
 	}
-	p := &printer{output: output, errors: errorOutput, json: o.json, headings: len(o.arguments) > 1}
+	p := &printer{output: output, errors: router.stderr, json: o.json, headings: len(o.arguments) > 1}
 	var err error
 	if o.checkout {
-		err = checkoutAll(ctx, directory, o, p)
+		err = checkoutAll(router, o, p)
 	} else if o.apply {
-		err = applyAll(ctx, directory, o, p)
+		err = applyAll(router, o, p)
 	} else {
-		for _, argument := range o.arguments {
-			result, err := discard(ctx, o, argument)
-			p.print(argument, result, err)
-		}
+		err = discardAll(router, o, p)
 	}
 	if err != nil {
-		fmt.Fprintln(errorOutput, "remote:", err)
+		fmt.Fprintln(router.stderr, "remote:", err)
 		p.failures = append(p.failures, err)
 	}
 	if len(p.failures) > 0 {
@@ -1008,15 +981,15 @@ func limitChanges(conflict remote.Conflict, maximum int) remote.Conflict {
 // checkouts (see releaseAbandoned). Paths are local paths, which are relative
 // to the working directory if it's inside the root, as other operations
 // expect.
-func printConflicts(ctx context.Context, directory string, o *options, output, errorOutput io.Writer) error {
-	listing, target, err := listConflicts(ctx, directory, o, errorOutput)
+func printConflicts(router *router, o *options, output io.Writer) error {
+	listing, target, err := listConflicts(router)
 	if err != nil {
 		return err
 	} else if !o.json {
-		return renderConflicts(ctx, directory, o, output, errorOutput, listing, target)
+		return renderConflicts(router, o, output, listing, target)
 	}
 	var rendered bytes.Buffer
-	if err := renderConflicts(ctx, directory, o, &rendered, errorOutput, listing, target); err != nil {
+	if err := renderConflicts(router, o, &rendered, listing, target); err != nil {
 		return err
 	}
 	alpha, beta := target.SourceNode, target.Node
@@ -1041,10 +1014,10 @@ type conflictEdge struct {
 }
 
 // renderConflicts prints a conflict listing (see printConflicts).
-func renderConflicts(ctx context.Context, directory string, o *options, output, errorOutput io.Writer, listing *remote.Listing, target *remote.Target) error {
+func renderConflicts(router *router, o *options, output io.Writer, listing *remote.Listing, target *remote.Target) error {
 	l := newLocator(target)
 	workspaces := sessionWorkspaces(target)
-	checkouts := releaseAbandoned(ctx, directory, target, listing.Checkouts, workspaces)
+	checkouts := releaseAbandoned(router, target, listing.Checkouts, workspaces)
 	holders := make(map[string]bool)
 	for _, checkout := range checkouts {
 		holders[checkout.Path] = checkout.Alpha
@@ -1060,7 +1033,7 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 		return ""
 	}
 	conflicts := make([]listedConflict, len(listing.Conflicts))
-	reports := newReporter(errorOutput, target, followUpCommand(o.node))
+	reports := newReporter(router.stderr, target, router.followUp())
 	for c := range listing.Conflicts {
 		conflict := &listing.Conflicts[c]
 		localChanges, remoteChanges := reports.sides(conflict.Changes())
@@ -1238,13 +1211,13 @@ func renderConflicts(ctx context.Context, directory string, o *options, output, 
 }
 
 // checkoutAll checks out the specified conflicts after listing them.
-func checkoutAll(ctx context.Context, directory string, o *options, p *printer) error {
-	listing, target, err := listConflicts(ctx, directory, o, p.errors)
+func checkoutAll(router *router, o *options, p *printer) error {
+	listing, target, err := listConflicts(router)
 	if err != nil {
 		return err
 	}
 	for _, argument := range o.arguments {
-		result, err := checkout(ctx, directory, o, listing, target, argument)
+		result, err := checkout(router, o, listing, target, argument)
 		p.print(argument, result, err)
 	}
 	return nil
@@ -1289,7 +1262,7 @@ func checkedOut(w *workspace, conflict *remote.ConflictRoot, target *remote.Targ
 // checkout downloads both copies of a conflict into a new workspace. A
 // conflict that's already checked out, through either endpoint, can't be
 // checked out again until its workspace is applied or discarded.
-func checkout(ctx context.Context, directory string, o *options, listing *remote.Listing, target *remote.Target, argument string) (*outcome, error) {
+func checkout(router *router, o *options, listing *remote.Listing, target *remote.Target, argument string) (*outcome, error) {
 	local, err := filepath.Abs(argument)
 	if err != nil {
 		return nil, fmt.Errorf("unable to locate it: %w", err)
@@ -1299,7 +1272,7 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 		return nil, err
 	}
 	defer unlock()
-	w, _, err := checkoutLocked(ctx, directory, o, listing, target, local)
+	w, _, err := checkoutLocked(router, o, listing, target, local)
 	if err != nil {
 		return nil, err
 	}
@@ -1310,7 +1283,7 @@ func checkout(ctx context.Context, directory string, o *options, listing *remote
 // workspace lock. It returns the claim's sequence number so that an automatic
 // checkout can apply its result under that same claim, without another round
 // trip. A non-nil workspace on failure has been published and is kept for retry.
-func checkoutLocked(ctx context.Context, directory string, o *options, listing *remote.Listing, target *remote.Target, local string) (*workspace, uint64, error) {
+func checkoutLocked(router *router, o *options, listing *remote.Listing, target *remote.Target, local string) (*workspace, uint64, error) {
 	path, err := newLocator(target).resolve(local)
 	if err != nil {
 		return nil, 0, err
@@ -1349,16 +1322,18 @@ func checkoutLocked(ctx context.Context, directory string, o *options, listing *
 	// without a workspace, such as one left by an interrupted checkout, is
 	// released first (see claimSequence).
 	token := rand.Text()[:8]
-	sequence, err := claimSequence(ctx, directory, target, path, token)
+	sequence, err := claimSequence(router, path, token)
 	if err != nil {
 		return nil, 0, err
 	}
 	created := false
 	defer func() {
 		if !created {
-			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			cleanup := *router
+			var cancel context.CancelFunc
+			cleanup.ctx, cancel = context.WithTimeout(context.WithoutCancel(router.ctx), cleanupTimeout)
 			defer cancel()
-			release(ctx, directory, target, path, token)
+			release(&cleanup, path, token)
 		}
 	}()
 	base, final, err := workspaceDirectory(local)
@@ -1377,18 +1352,18 @@ func checkoutLocked(ctx context.Context, directory string, o *options, listing *
 	defer os.RemoveAll(staging)
 	w := &workspace{Session: target.Session, Alpha: target.Alpha, Path: path, Token: token, directory: staging}
 	if conflict.Files {
-		err = checkoutFiles(ctx, conflict, local, o.base, w, func(output io.Writer) (*remote.Entry, error) {
-			return remote.CopyFile(ctx, target.Root, path, output)
+		err = checkoutFiles(router.ctx, conflict, local, o.base, w, func(output io.Writer) (*remote.Entry, error) {
+			return remote.CopyFile(router.ctx, target.Root, path, output)
 		}, func(output io.Writer) (*remote.Entry, error) {
-			connection, err := dialOpposite(ctx, directory, target)
+			connection, _, err := router.dial(remote.OperationExecute)
 			if err != nil {
 				return nil, err
 			}
-			return remote.Copy(ctx, connection, path, output)
+			return remote.Copy(router.ctx, connection, path, output)
 		})
 	} else {
 		w.Take = localSides(conflict, target)
-		err = checkoutEntries(ctx, directory, o, target, w)
+		err = checkoutEntries(router, target, w)
 	}
 	if err != nil {
 		return nil, 0, err
@@ -1472,20 +1447,20 @@ func checkoutFiles(ctx context.Context, conflict *remote.ConflictRoot, local, ex
 
 // checkoutEntries downloads both copies of a conflict other than between two
 // files into a workspace.
-func checkoutEntries(ctx context.Context, directory string, o *options, target *remote.Target, w *workspace) error {
+func checkoutEntries(router *router, target *remote.Target, w *workspace) error {
 	var err error
-	w.Local, err = extractCopy(ctx, w.file(localName), func(output io.Writer) (*remote.Entry, error) {
-		return remote.ArchiveEntry(ctx, target.Root, w.Path, output)
+	w.Local, err = extractCopy(router.ctx, w.file(localName), func(output io.Writer) (*remote.Entry, error) {
+		return remote.ArchiveEntry(router.ctx, target.Root, w.Path, output)
 	})
 	if err != nil {
 		return fmt.Errorf("unable to copy the local copy: %w", err)
 	}
-	w.Remote, err = extractCopy(ctx, w.file(remoteName), func(output io.Writer) (*remote.Entry, error) {
-		connection, err := dialOpposite(ctx, directory, target)
+	w.Remote, err = extractCopy(router.ctx, w.file(remoteName), func(output io.Writer) (*remote.Entry, error) {
+		connection, _, err := router.dial(remote.OperationExecute)
 		if err != nil {
 			return nil, err
 		}
-		return remote.Archive(ctx, connection, w.Path, output)
+		return remote.Archive(router.ctx, connection, w.Path, output)
 	})
 	if err != nil {
 		return fmt.Errorf("unable to download the remote copy: %w", err)
@@ -1654,8 +1629,9 @@ type application struct {
 // applyAll applies the resolutions of the specified conflicts, then
 // synchronizes once and verifies them, synchronizing once more beforehand if
 // any workspace has nothing applied (see apply). Workspaces remain locked
-// until verified.
-func applyAll(ctx context.Context, directory string, o *options, p *printer) error {
+// until verified. The router pins the session that the first submission
+// locates, and each workspace checks that it was checked out through it.
+func applyAll(router *router, o *options, p *printer) error {
 	var unlocks []func()
 	defer func() {
 		for _, unlock := range unlocks {
@@ -1666,24 +1642,12 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 	// conflicts are no longer listed (see workspace.applied), which requires a
 	// listing before writing them. It's made at most once, when first needed,
 	// and isn't needed to finish resolutions applied before.
-	// Pin the session once selected, including before automatically checking
-	// out multiple paths. Each workspace also checks the submitting endpoint.
-	options := *o
-	o = &options
 	var preliminary *remote.Listing
-	var preliminaryTarget, selected *remote.Target
+	var preliminaryTarget *remote.Target
 	var preliminaryErr error
 	listed := func() (*remote.Listing, *remote.Target, error) {
 		if preliminary == nil && preliminaryErr == nil {
-			preliminary, preliminaryTarget, preliminaryErr = listConflicts(ctx, directory, o, p.errors)
-			if preliminaryErr == nil {
-				if selected != nil && (selected.Session != preliminaryTarget.Session || selected.Alpha != preliminaryTarget.Alpha) {
-					preliminaryErr = errors.New("the session was located differently while resolving the conflict")
-					return nil, nil, preliminaryErr
-				}
-				selected = preliminaryTarget
-				o.target = preliminaryTarget
-			}
+			preliminary, preliminaryTarget, preliminaryErr = listConflicts(router)
 		}
 		return preliminary, preliminaryTarget, preliminaryErr
 	}
@@ -1706,13 +1670,9 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 			continue
 		}
 		seen[key] = true
-		a, unlock, err := apply(ctx, directory, o, argument, selected, listed)
+		a, unlock, err := apply(router, o, argument, listed)
 		if unlock != nil {
 			unlocks = append(unlocks, unlock)
-		}
-		if a != nil {
-			selected = a.target
-			o.target = selected
 		}
 		if err != nil {
 			p.print(argument, nil, err)
@@ -1723,17 +1683,13 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 	if len(applications) == 0 {
 		return nil
 	}
-	listing, target, listErr := listConflicts(ctx, directory, o, p.errors)
+	listing, _, listErr := listConflicts(router)
 	for _, a := range applications {
-		err := listErr
-		if err == nil && (target.Session != a.target.Session || target.Alpha != a.target.Alpha) {
-			err = errors.New("the session was located differently while resolving the conflict")
-		}
-		if err != nil {
-			p.print(a.argument, nil, fmt.Errorf("updated the copies, but unable to verify synchronization (retry to verify): %w", err))
+		if listErr != nil {
+			p.print(a.argument, nil, fmt.Errorf("updated the copies, but unable to verify synchronization (retry to verify): %w", listErr))
 			continue
 		}
-		result, err := a.verify(ctx, directory, o, listing)
+		result, err := a.verify(router, o, listing)
 		p.print(a.argument, result, err)
 	}
 	return nil
@@ -1759,7 +1715,7 @@ func applyAll(ctx context.Context, directory string, o *options, p *printer) err
 // that the other endpoint checked out, possibly with a result that's one of
 // the checked-out copies, which this workspace would otherwise accept and
 // replace.
-func apply(ctx context.Context, directory string, o *options, argument string, expected *remote.Target, listed func() (*remote.Listing, *remote.Target, error)) (_ *application, _ func(), resultErr error) {
+func apply(router *router, o *options, argument string, listed func() (*remote.Listing, *remote.Target, error)) (_ *application, _ func(), resultErr error) {
 	local, err := filepath.Abs(argument)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to locate it: %w", err)
@@ -1778,7 +1734,7 @@ func apply(ctx context.Context, directory string, o *options, argument string, e
 		if listErr != nil {
 			return nil, unlock, fmt.Errorf("unable to synchronize before applying: %w", listErr)
 		}
-		w, sequence, err = checkoutLocked(ctx, directory, o, listing, target, local)
+		w, sequence, err = checkoutLocked(router, o, listing, target, local)
 		if w != nil {
 			defer func() {
 				if resultErr != nil {
@@ -1794,30 +1750,25 @@ func apply(ctx context.Context, directory string, o *options, argument string, e
 	} else if w.hasDirectory() {
 		return nil, unlock, errDirectoryConflict
 	}
-	result, source, err := resolution(ctx, w, o)
+	result, source, err := resolution(router.ctx, w, o)
 	if err != nil {
 		return nil, unlock, err
 	}
-	connection, target, err := o.selection(false).Dial(ctx, directory, remote.OperationExecute)
+
+	// Open the connection through which the remote copy is replaced, which
+	// locates the session, unless an earlier submission did.
+	connection, target, err := router.dial(remote.OperationExecute)
 	if err != nil {
 		return nil, unlock, err
 	}
-	a := &application{argument: argument, w: w, result: result, target: target, locator: newLocator(target), followUp: followUpCommand(o.node)}
-	if expected != nil && (target.Session != expected.Session || target.Alpha != expected.Alpha) {
-		connection.Close()
-		return nil, unlock, errors.New("the session was located differently while resolving the conflict")
-	} else if path, err := a.locator.resolve(local); err != nil || !w.matches(target, path) {
-		connection.Close()
+	defer connection.Close()
+	a := &application{argument: argument, w: w, result: result, target: target, locator: newLocator(target), followUp: router.followUp()}
+	if path, err := a.locator.resolve(local); err != nil || !w.matches(target, path) {
 		return nil, unlock, errors.New("the workspace was checked out through a different session or endpoint")
 	} else if !w.applied() {
-		if listing, listedTarget, err := listed(); err != nil {
-			connection.Close()
+		if listing, _, err := listed(); err != nil {
 			return nil, unlock, fmt.Errorf("unable to synchronize before applying: %w", err)
-		} else if listedTarget.Session != target.Session || listedTarget.Alpha != target.Alpha {
-			connection.Close()
-			return nil, unlock, errors.New("the session was located differently while resolving the conflict")
 		} else if findConflict(listing, w.Path) == nil {
-			connection.Close()
 			return nil, unlock, errResolvedOtherwise
 		}
 	}
@@ -1829,13 +1780,11 @@ func apply(ctx context.Context, directory string, o *options, argument string, e
 	// Automatic checkout already claimed this token and obtained the sequence
 	// while holding the same lock. Existing workspaces always claim anew.
 	if sequence == 0 {
-		sequence, err = claimSequence(ctx, directory, target, w.Path, w.Token)
+		if sequence, err = claimSequence(router, w.Path, w.Token); err != nil {
+			return nil, unlock, err
+		}
 	}
-	if err != nil {
-		connection.Close()
-		return nil, unlock, err
-	}
-	return a, unlock, a.write(ctx, connection, source, sequence)
+	return a, unlock, a.write(router.ctx, connection, source, sequence)
 }
 
 // supersededHint adds advice to an error caused by a later apply of the
@@ -1849,8 +1798,9 @@ func supersededHint(err error, followUp string) error {
 }
 
 // write writes the result to both copies using a connection to the opposite
-// endpoint, reading a file result's contents from a workspace file, with the
-// sequence number of the apply's claim of the checkout.
+// endpoint, which the caller closes, reading a file result's contents from a
+// workspace file, with the sequence number of the apply's claim of the
+// checkout.
 //
 // An apply whose client stops waiting, such as on timeout, may leave its
 // replacement of the remote copy running, and a retry, or another resolution
@@ -1873,7 +1823,6 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 	// Check the local copy first, so that one changed since checkout doesn't
 	// leave only the remote copy updated.
 	if err := remote.CheckFile(ctx, a.target.Root, replacement); err != nil {
-		connection.Close()
 		return fmt.Errorf("unable to update the local copy: %w", staleHint(err))
 	}
 	// Record the result before writing it, since either write may succeed even
@@ -1888,7 +1837,6 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 	}) {
 		w.Applied = append(w.Applied, a.result)
 		if err := w.save(); err != nil {
-			connection.Close()
 			return fmt.Errorf("unable to save workspace: %w", err)
 		}
 		recorded = true
@@ -1901,7 +1849,6 @@ func (a *application) write(ctx context.Context, connection io.ReadWriteCloser, 
 	}
 	input, err := open()
 	if err != nil {
-		connection.Close()
 		forget()
 		return err
 	}
@@ -1958,7 +1905,7 @@ func (a *application) unsettled(listing *remote.Listing) error {
 // made after the resolution was applied, and sets its workspace aside. No
 // conflict or problem may involve the conflict root (see unsettled), and both
 // copies must have the result.
-func (a *application) verify(ctx context.Context, directory string, o *options, listing *remote.Listing) (*outcome, error) {
+func (a *application) verify(router *router, o *options, listing *remote.Listing) (*outcome, error) {
 	w := a.w
 	unverified := func(err error) error {
 		return fmt.Errorf("updated the copies, but unable to verify synchronization (retry to verify): %w", err)
@@ -1966,15 +1913,15 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 	if err := a.unsettled(listing); err != nil {
 		return nil, err
 	}
-	localEntry, err := remote.ReadEntry(ctx, filepath.Join(a.target.Root, filepath.FromSlash(w.Path)))
+	localEntry, err := remote.ReadEntry(router.ctx, filepath.Join(a.target.Root, filepath.FromSlash(w.Path)))
 	if err != nil {
 		return nil, unverified(err)
 	}
-	connection, err := dialOpposite(ctx, directory, a.target)
+	connection, _, err := router.dial(remote.OperationExecute)
 	if err != nil {
 		return nil, unverified(err)
 	}
-	remoteEntry, err := remote.Fetch(ctx, connection, w.Path)
+	remoteEntry, err := remote.Fetch(router.ctx, connection, w.Path)
 	if err != nil {
 		return nil, unverified(err)
 	}
@@ -1993,8 +1940,8 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 	lines := []string{resolved, retentionNote(backup)}
 	// The checkout is released once the workspace is set aside. One left
 	// behind is released by the next listing (see releaseAbandoned).
-	if _, err := release(ctx, directory, a.target, w.Path, w.Token); err != nil {
-		lines = append(lines, fmt.Sprintf("Unable to release the checkout (%v); %s --conflicts releases it.", err, followUpCommand(o.node)))
+	if _, err := release(router, w.Path, w.Token); err != nil {
+		lines = append(lines, fmt.Sprintf("Unable to release the checkout (%v); %s --conflicts releases it.", err, router.followUp()))
 	}
 	return &outcome{Path: a.argument, Resolved: true, Backup: backup, lines: lines}, nil
 }
@@ -2010,21 +1957,23 @@ func (a *application) verify(ctx context.Context, directory string, o *options, 
 // session alone. If a workspace is specified, which must have been set aside,
 // the checkout must be the one that it was checked out through, and it's
 // released starting with the workspace's token. Otherwise, the token is
-// unknown (see releaseOver).
-func releaseAt(ctx context.Context, local string, selected *remote.Target, w *workspace) (bool, error) {
-	selection := &remote.Selection{Workspace: true, Resolve: true, Target: selected}
-	if selected == nil && w != nil {
+// unknown (see releaseOver). Each path is located separately, with a router of
+// its own, unless --node pinned the router to the destination.
+func releaseAt(r *router, local string, w *workspace) (bool, error) {
+	router := *r
+	router.directory = filepath.Dir(local)
+	if r.selection.Target == nil && w != nil {
 		// A saved workspace identifies the local endpoint of the edge that owns
 		// its checkout, which is the registration to pin, since operations
 		// only cross the edge through which they're submitted. The target
 		// isn't resolved, so the release goes over that edge to its opposite
 		// endpoint directly, even at a star's center with several nodes.
-		selection = &remote.Selection{Target: &remote.Target{
+		router.selection = &remote.Selection{Target: &remote.Target{
 			SourceSession: w.Session, SourceAlpha: w.Alpha,
 			Session: w.Session, Alpha: w.Alpha,
 		}}
 	}
-	connection, target, err := selection.Dial(ctx, filepath.Dir(local), remote.OperationRelease)
+	connection, target, err := router.dial(remote.OperationRelease)
 	if err != nil {
 		return false, err
 	}
@@ -2040,7 +1989,24 @@ func releaseAt(ctx context.Context, local string, selected *remote.Target, w *wo
 	if w != nil {
 		token = w.Token
 	}
-	return releaseOver(ctx, connection, filepath.Dir(local), target, path, token)
+	return releaseOver(&router, connection, path, token)
+}
+
+// discardAll discards the workspaces of the specified conflicts. An explicit
+// node pins the router to its destination, to which each workspace must then
+// belong (see discard), while otherwise each path's endpoint is located
+// separately (see releaseAt).
+func discardAll(router *router, o *options, p *printer) error {
+	if router.node != "" {
+		if _, err := router.resolve(); err != nil {
+			return err
+		}
+	}
+	for _, argument := range o.arguments {
+		result, err := discard(router, argument)
+		p.print(argument, result, err)
+	}
+	return nil
 }
 
 // discard sets a workspace aside without changing either copy and releases its
@@ -2055,7 +2021,7 @@ func releaseAt(ctx context.Context, local string, selected *remote.Target, w *wo
 // copies are kept. Whether anything was applied through an unreadable
 // workspace is unknown, so the copies are to be checked against its files if
 // anything was.
-func discard(ctx context.Context, o *options, argument string) (*outcome, error) {
+func discard(router *router, argument string) (*outcome, error) {
 	local, err := filepath.Abs(argument)
 	if err != nil {
 		return nil, fmt.Errorf("unable to locate it: %w", err)
@@ -2068,7 +2034,7 @@ func discard(ctx context.Context, o *options, argument string) (*outcome, error)
 	w, err := loadWorkspace(local)
 	var unreadable *unreadableWorkspace
 	if errors.Is(err, os.ErrNotExist) {
-		if held, err := releaseAt(ctx, local, o.target, nil); err != nil {
+		if held, err := releaseAt(router, local, nil); err != nil {
 			return nil, err
 		} else if !held {
 			return nil, errors.New("isn't checked out")
@@ -2084,7 +2050,7 @@ func discard(ctx context.Context, o *options, argument string) (*outcome, error)
 		backup, err := (&workspace{directory: unreadable.directory}).retire()
 		if err != nil {
 			return nil, fmt.Errorf("unable to set the workspace aside: %w", err)
-		} else if _, err := releaseAt(ctx, local, o.target, nil); err != nil {
+		} else if _, err := releaseAt(router, local, nil); err != nil {
 			return nil, fmt.Errorf("set the unreadable workspace aside without changing either copy (it's kept in %s; if anything was applied through it, check the copies against its files), but unable to release its checkout, so the opposite endpoint can't check the conflict out yet: %w; discard again to release it", backup, err)
 		}
 		return &outcome{Path: argument, Discarded: true, Backup: backup, lines: []string{
@@ -2094,7 +2060,7 @@ func discard(ctx context.Context, o *options, argument string) (*outcome, error)
 	} else if err != nil {
 		return nil, err
 	}
-	if o.target != nil && (w.Session != o.target.Session || w.Alpha != o.target.Alpha) {
+	if target := router.selection.Target; target != nil && (w.Session != target.Session || w.Alpha != target.Alpha) {
 		return nil, errors.New("the checkout belongs to a different node pair")
 	}
 	backup, err := w.retire()
@@ -2104,7 +2070,7 @@ func discard(ctx context.Context, o *options, argument string) (*outcome, error)
 	// The saved endpoint pins the checkout even outside a single-file
 	// workspace. A retry would find no workspace, so a release failure
 	// mentions anything applied through it as well.
-	if _, err := releaseAt(ctx, local, o.target, w); err != nil {
+	if _, err := releaseAt(router, local, w); err != nil {
 		kept := "it's kept in " + backup
 		if w.applied() {
 			kept += ", and since results were applied through it, a copy may still have one, or one original copy may exist only in its local or remote file"

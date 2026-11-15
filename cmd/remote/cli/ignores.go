@@ -109,9 +109,14 @@ func resolveLanding(root, relative string) (string, string) {
 
 // printIgnores prints the session's ignores or, if paths are specified,
 // whether the session synchronizes them, and returns 1 if it ignores any of
-// them, and 0 otherwise.
+// them, and 0 otherwise. The ignores are local rules unless --node selects the
+// destination, which the daemon then resolves (see router.locate).
 func printIgnores(router *router, paths []string, output io.Writer) (int, error) {
-	target, err := router.locate()
+	locate := router.locate
+	if router.node != "" {
+		locate = router.resolve
+	}
+	target, err := locate()
 	if err != nil {
 		return 0, err
 	}

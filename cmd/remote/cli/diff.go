@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -293,16 +292,16 @@ func compareEntries(path string, local, opposite *remote.Entry) string {
 // compare prints how the remote copies of the specified path arguments (or, if
 // there are none, of the paths involved in the report's conflicts) differ from
 // the local copies, and reports whether any differ. The target and report are
-// those of a flush, and remote copies are read through the target's endpoint.
-// Path arguments must exist on at least one endpoint.
-func compare(ctx context.Context, directory string, target *remote.Target, report *remote.Report, arguments []string, output, errorOutput io.Writer) (bool, error) {
+// those of a flush through the router, which reads the remote copies through
+// the same endpoint. Path arguments must exist on at least one endpoint.
+func compare(router *router, target *remote.Target, report *remote.Report, arguments []string, output io.Writer) (bool, error) {
 	locator := newLocator(target)
 	var paths []string
 	if len(arguments) == 0 {
 		if paths = conflictPaths(report); len(paths) == 0 && report.ExcludedConflicts > 0 {
 			return false, fmt.Errorf("%d conflicts were omitted from the report; specify paths with --diff to compare them", report.ExcludedConflicts)
 		} else if len(paths) == 0 {
-			fmt.Fprintln(errorOutput, "remote: there are no conflicts to compare")
+			fmt.Fprintln(router.stderr, "remote: there are no conflicts to compare")
 		}
 	}
 	for _, argument := range arguments {
@@ -314,15 +313,15 @@ func compare(ctx context.Context, directory string, target *remote.Target, repor
 	}
 	var differ bool
 	for _, path := range paths {
-		local, err := remote.ReadEntry(ctx, filepath.Join(target.Root, filepath.FromSlash(path)))
+		local, err := remote.ReadEntry(router.ctx, filepath.Join(target.Root, filepath.FromSlash(path)))
 		if err != nil {
 			return differ, fmt.Errorf("unable to read %s: %w", locator.display(path), err)
 		}
-		connection, _, err := (&remote.Selection{Target: target}).Dial(ctx, directory, remote.OperationExecute)
+		connection, _, err := router.dial(remote.OperationExecute)
 		if err != nil {
 			return differ, err
 		}
-		opposite, err := remote.Fetch(ctx, connection, path)
+		opposite, err := remote.Fetch(router.ctx, connection, path)
 		if err != nil {
 			return differ, fmt.Errorf("unable to read remote %s: %w", locator.display(path), err)
 		} else if len(arguments) > 0 && local.Kind == remote.EntryMissing && opposite.Kind == remote.EntryMissing {

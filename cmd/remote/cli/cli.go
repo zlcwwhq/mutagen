@@ -99,8 +99,6 @@ type options struct {
 	node string
 	// nodes requests a read-only listing of the nodes that can be reached.
 	nodes bool
-	// target is the resolved route, kept internal to node selection.
-	target *remote.Target
 	conflictOptions
 	// Deprecated selectors are parsed solely to report migration errors.
 	deprecatedSession  string
@@ -493,13 +491,6 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return router.exit("querying nodes", 0, err)
 	}
-	if (options.ignores || options.discard) && options.node != "" {
-		target, err := router.resolve()
-		if err != nil {
-			return fail(err)
-		}
-		options.target = target
-	}
 
 	// Perform operations other than running commands.
 	var activity string
@@ -507,9 +498,9 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	output := &checkedWriter{Writer: stdout}
 	switch {
 	case options.conflicts:
-		activity, err = "listing conflicts", printConflicts(ctx, directory, options, output, stderr)
+		activity, err = "listing conflicts", printConflicts(router, options, output)
 	case options.active():
-		activity, err = "resolving conflicts", runConflicts(ctx, directory, options, output, stderr)
+		activity, err = "resolving conflicts", runConflicts(router, options, output)
 	case options.jobs:
 		activity, err = "listing jobs", listJobs(router, output)
 	case options.wait != "":
@@ -745,7 +736,7 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 
 	// Compare copies if requested.
 	if options.diff {
-		differ, err := compare(router.ctx, router.directory, target, report, options.arguments, stdout, stderr)
+		differ, err := compare(router, target, report, options.arguments, stdout)
 		code := 0
 		if differ {
 			code = 1

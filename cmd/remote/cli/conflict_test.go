@@ -19,6 +19,12 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/remote"
 )
 
+// testRouter creates a router that submits operations from a directory, pinned
+// to a target if it's non-nil, and prints diagnostics to stderr.
+func testRouter(ctx context.Context, directory string, target *remote.Target, stderr io.Writer) *router {
+	return &router{ctx: ctx, directory: directory, selection: &remote.Selection{Target: target}, stderr: stderr}
+}
+
 func TestDirectoryWorkspaceRejected(t *testing.T) {
 	// Existing workspaces must not bypass the rejection of directory
 	// conflicts, even when their conflict is no longer listed.
@@ -46,12 +52,12 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 				t.Fatal(err)
 			}
 			target := &remote.Target{Session: "session", Root: root}
-			if _, err := checkout(ctx, root, &options{}, &remote.Listing{}, target, local); !errors.Is(err, errDirectoryConflict) {
+			if _, err := checkout(testRouter(ctx, root, nil, io.Discard), &options{}, &remote.Listing{}, target, local); !errors.Is(err, errDirectoryConflict) {
 				t.Fatal("directory workspace reused:", err)
 			}
 			for _, side := range []string{sideLocal, sideRemote} {
 				o := &options{conflictOptions: conflictOptions{take: side}}
-				_, unlock, err := apply(ctx, root, o, local, nil, func() (*remote.Listing, *remote.Target, error) {
+				_, unlock, err := apply(testRouter(ctx, root, nil, io.Discard), o, local, func() (*remote.Listing, *remote.Target, error) {
 					t.Fatal("conflicts listed for a directory workspace")
 					return nil, nil, nil
 				})
@@ -64,7 +70,7 @@ func TestDirectoryWorkspaceRejected(t *testing.T) {
 			}
 			// Without a daemon, the workspace is set aside, but its checkout
 			// can't be released, which is reported.
-			if _, err := discard(ctx, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
+			if _, err := discard(testRouter(ctx, filepath.Dir(local), nil, io.Discard), local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
 				t.Fatal("unreleased checkout not reported:", err)
 			} else if _, err := loadWorkspace(local); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("directory workspace can't be discarded:", err)
@@ -130,7 +136,7 @@ func TestInterruptedCheckoutReleased(t *testing.T) {
 	t.Cleanup(func() { channel.Close(); handlers.Wait() })
 	target := &remote.Target{SourceSession: "sync_claim", SourceAlpha: true, Session: "sync_claim", Alpha: true, Root: root}
 	listing := &remote.Listing{Conflicts: []remote.ConflictRoot{{Path: "conflict", AlphaTakable: true, BetaTakable: true}}}
-	if _, err := checkout(ctx, root, &options{}, listing, target, filepath.Join(root, "conflict")); err == nil {
+	if _, err := checkout(testRouter(ctx, root, target, io.Discard), &options{}, listing, target, filepath.Join(root, "conflict")); err == nil {
 		t.Fatal("interrupted checkout succeeded")
 	}
 	select {
@@ -173,10 +179,10 @@ func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 					strings.Contains(err.Error(), check)
 			}
 			target := &remote.Target{Session: "session", Root: root}
-			if _, err := checkout(ctx, root, &options{}, &remote.Listing{}, target, local); !reported(err) {
+			if _, err := checkout(testRouter(ctx, root, nil, io.Discard), &options{}, &remote.Listing{}, target, local); !reported(err) {
 				t.Fatal("unreadable workspace not reported by checkout:", err)
 			}
-			_, unlock, err := apply(ctx, root, &options{}, local, nil, func() (*remote.Listing, *remote.Target, error) {
+			_, unlock, err := apply(testRouter(ctx, root, nil, io.Discard), &options{}, local, func() (*remote.Listing, *remote.Target, error) {
 				t.Fatal("conflicts listed for an unreadable workspace")
 				return nil, nil, nil
 			})
@@ -188,7 +194,7 @@ func TestUnreadableWorkspaceDiscarded(t *testing.T) {
 			}
 			// Without a daemon, the workspace is set aside, but its checkout
 			// can't be released, which is reported.
-			if _, err := discard(ctx, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
+			if _, err := discard(testRouter(ctx, filepath.Dir(local), nil, io.Discard), local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
 				t.Fatal("unreleased checkout not reported:", err)
 			} else if !strings.Contains(err.Error(), check) {
 				t.Fatal("copies not to be checked against the workspace:", err)
@@ -233,7 +239,7 @@ func TestDiscardAppliedWorkspace(t *testing.T) {
 			}
 			// Without a daemon, the workspace is set aside, but its checkout
 			// can't be released, which is reported.
-			if _, err := discard(ctx, &options{}, local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
+			if _, err := discard(testRouter(ctx, filepath.Dir(local), nil, io.Discard), local); err == nil || !strings.Contains(err.Error(), "unable to release its checkout") {
 				t.Fatal("unreleased checkout not reported:", err)
 			} else if strings.Contains(err.Error(), "since results were applied through it") != applied {
 				t.Fatal("applied results misreported:", err)
@@ -297,7 +303,7 @@ func TestNoConflictsWithWarnings(t *testing.T) {
 		{"warning, problem, and conflict", &remote.Listing{Conflicts: []remote.ConflictRoot{conflict}, Problems: []remote.Problem{warning, problem}}, false, true, []remote.Problem{problem}},
 	} {
 		var output, errorOutput strings.Builder
-		if err := renderConflicts(ctx, root, &options{}, &output, &errorOutput, test.listing, target); err != nil {
+		if err := renderConflicts(testRouter(ctx, root, nil, &errorOutput), &options{}, &output, test.listing, target); err != nil {
 			t.Fatalf("%s: unable to list conflicts: %v", test.description, err)
 		}
 		if test.reported {
@@ -909,7 +915,7 @@ func TestAutomaticCheckoutKeepsWorkspaceLock(t *testing.T) {
 		}
 	}
 	expected := errors.New("listing failed")
-	_, unlock, err := apply(context.Background(), filepath.Dir(local), &options{conflictOptions: conflictOptions{take: sideLocal}}, local, nil,
+	_, unlock, err := apply(testRouter(context.Background(), filepath.Dir(local), nil, io.Discard), &options{conflictOptions: conflictOptions{take: sideLocal}}, local,
 		func() (*remote.Listing, *remote.Target, error) {
 			check(true)
 			return nil, nil, expected
@@ -940,7 +946,7 @@ func TestAutomaticCheckoutChecksTake(t *testing.T) {
 		{conflictOptions{apply: true, take: sideLocal, executable: "true"}, "can only be resolved with --take"},
 		{conflictOptions{apply: true, take: sideLocal}, ""},
 	} {
-		_, unlock, err := apply(ctx, root, &options{conflictOptions: test.options}, local, nil,
+		_, unlock, err := apply(testRouter(ctx, root, nil, io.Discard), &options{conflictOptions: test.options}, local,
 			func() (*remote.Listing, *remote.Target, error) {
 				return listing, target, nil
 			})
@@ -971,7 +977,7 @@ func TestRepositoryConflictListing(t *testing.T) {
 	beta := remote.Repository{Commit: strings.Repeat("2b", 20), Branch: "main"}
 	listing := &remote.Listing{Repository: &remote.RepositoryConflict{Alpha: alpha, Beta: beta}}
 	var output, errorOutput strings.Builder
-	if err := renderConflicts(ctx, root, &options{}, &output, &errorOutput, listing, target); err != nil {
+	if err := renderConflicts(testRouter(ctx, root, nil, &errorOutput), &options{}, &output, listing, target); err != nil {
 		t.Fatal("unable to list conflicts:", err)
 	}
 	expected := filepath.Join("..", ".git") + ": the commits and branches conflict, which remote can't resolve: " +
@@ -986,7 +992,7 @@ func TestRepositoryConflictListing(t *testing.T) {
 
 	// The JSON listing describes it as well.
 	output.Reset()
-	if err := renderConflicts(ctx, root, &options{conflictOptions: conflictOptions{json: true}}, &output, &errorOutput, listing, target); err != nil {
+	if err := renderConflicts(testRouter(ctx, root, nil, &errorOutput), &options{conflictOptions: conflictOptions{json: true}}, &output, listing, target); err != nil {
 		t.Fatal("unable to list conflicts as JSON:", err)
 	}
 	var listed struct {
@@ -1001,7 +1007,7 @@ func TestRepositoryConflictListing(t *testing.T) {
 
 	// Without a repository conflict, the key is omitted.
 	output.Reset()
-	if err := renderConflicts(ctx, root, &options{conflictOptions: conflictOptions{json: true}}, &output, &errorOutput, &remote.Listing{}, target); err != nil {
+	if err := renderConflicts(testRouter(ctx, root, nil, &errorOutput), &options{conflictOptions: conflictOptions{json: true}}, &output, &remote.Listing{}, target); err != nil {
 		t.Fatal("unable to list conflicts as JSON:", err)
 	} else if strings.Contains(output.String(), "Repository") {
 		t.Error("repository conflict key present without a conflict:", output.String())
@@ -1023,7 +1029,7 @@ func TestSubmoduleConflictListing(t *testing.T) {
 		BetaChanges:  []remote.Change{{Path: "sub/.git", Old: "submodule commit 010000000000", New: "submodule commit 030000000000"}},
 	}}}
 	var output, errorOutput strings.Builder
-	if err := renderConflicts(ctx, root, &options{}, &output, &errorOutput, listing, target); err != nil {
+	if err := renderConflicts(testRouter(ctx, root, nil, &errorOutput), &options{}, &output, listing, target); err != nil {
 		t.Fatal("unable to list conflicts:", err)
 	}
 	for _, expected := range []string{
@@ -1037,7 +1043,7 @@ func TestSubmoduleConflictListing(t *testing.T) {
 	if strings.Contains(output.String(), "involves a directory") {
 		t.Errorf("submodule conflict described as a directory conflict: %q", output.String())
 	}
-	if _, err := checkout(ctx, root, &options{}, listing, target, filepath.Join(root, "sub")); err == nil ||
+	if _, err := checkout(testRouter(ctx, root, nil, io.Discard), &options{}, listing, target, filepath.Join(root, "sub")); err == nil ||
 		!strings.Contains(err.Error(), "check out the same commit") {
 		t.Fatal("submodule conflict checkout not refused with an explanation:", err)
 	}
