@@ -247,6 +247,45 @@ func TestIgnoresGitMode(t *testing.T) {
 	}
 }
 
+// TestIgnoresGitModeStoredForms tests that Git mode evaluates every form of a
+// path with the rules found along the path as given, so that, on filesystems
+// that store names as given, the forms that name no directories don't miss
+// rules that exclude a path, rules that unignore it, or nested repositories
+// whose rules replace those above them, whichever form names are stored in.
+func TestIgnoresGitModeStoredForms(t *testing.T) {
+	for _, directory := range []string{"café", "café"} {
+		root := resolveSymbolicLinks(t.TempDir())
+		writeTestFiles(t, root, map[string]string{
+			".gitignore":                          "build/\n*.log\n",
+			directory + "/.gitignore":             "!build/\nout/\n",
+			directory + "/sub/.git/HEAD":          "ref: refs/heads/main\n",
+			directory + "/sub/.git/objects/.keep": "",
+			directory + "/sub/.git/refs/.keep":    "",
+		})
+		ignores := gitModeIgnores(root)
+		for _, test := range []struct {
+			path      string
+			directory bool
+			excluded  string
+		}{
+			{directory + "/out", true, directory + "/out"},
+			{directory + "/out/x", false, directory + "/out"},
+			{directory + "/build", true, ""},
+			{directory + "/build/x", false, ""},
+			{directory + "/a.log", false, directory + "/a.log"},
+			{directory + "/sub/x.log", false, ""},
+			{directory + "/sub/build", true, ""},
+		} {
+			if excluded := ignores.ExcludedInAnyForm(test.path, test.directory); excluded != test.excluded {
+				t.Errorf("incorrect exclusion in any form of %+q (directory: %t): %+q", test.path, test.directory, excluded)
+			}
+			if excluded := ignores.ExcludedInEveryForm(test.path, test.directory); excluded != test.excluded {
+				t.Errorf("incorrect exclusion in every form of %+q (directory: %t): %+q", test.path, test.directory, excluded)
+			}
+		}
+	}
+}
+
 func TestIgnoresGitModeRuleChanges(t *testing.T) {
 	// Rules are read from disk whenever paths are evaluated, so changes to them
 	// apply without recreating the ignores.

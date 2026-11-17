@@ -71,7 +71,10 @@ func (i *Ignores) WithRoot(root string) *Ignores {
 //
 // In Git mode, the rules of .gitignore files and .git/info/exclude apply as
 // scans apply them (see gitignore.NewIgnorer), and are read from disk each
-// time, so changes to them take effect immediately.
+// time, so changes to them take effect immediately. They're read along the
+// path as given, whatever the form evaluated (see below), since that's the path
+// that names the entry wherever the forms name distinct entries, while forms
+// name the same entries elsewhere.
 //
 // Scans needn't see a path in the form given: they recompose names on
 // filesystems that decompose them, and filesystems that look up names
@@ -162,11 +165,14 @@ func (i gitEntryIgnorer) Ignore(path string, directory bool) (ignore.IgnoreStatu
 }
 
 // ignorer creates the ignorer that scans use for the ignores, as far as the
-// ignores determine it, or returns nil if they can't be compiled or their
-// syntax is unresolved. In Git mode, the ignorer reads rule files as it
-// evaluates paths and retains what it reads, so it's created for each use,
-// rather than kept, since it wouldn't observe later changes to rule files.
-func (i *Ignores) ignorer() ignore.Ignorer {
+// ignores determine it, for evaluating the forms of a path (see excluded), or
+// returns nil if they can't be compiled or their syntax is unresolved. In Git
+// mode, the ignorer reads rule files as it evaluates paths and retains what it
+// reads, so it's created for each use, rather than kept, since it wouldn't
+// observe later changes to rule files. It reads them from the directories that
+// the path names as given, whatever the form that it evaluates: on filesystems
+// that store names as given, the other forms name other directories, if any.
+func (i *Ignores) ignorer(path string) ignore.Ignorer {
 	var ignorer ignore.Ignorer
 	var err error
 	switch i.Syntax {
@@ -187,7 +193,15 @@ func (i *Ignores) ignorer() ignore.Ignorer {
 	// synchronizes the .git files of worktrees and submodules. Without a root,
 	// there are no rule files to read, and only those entries are known.
 	if i.Git && i.root != "" {
-		ignorer = gitignore.NewIgnorer(i.root, ignorer)
+		components := strings.Split(path, "/")
+		ignorer = gitignore.NewIgnorerWithStoredNames(i.root, ignorer, func(directory string) string {
+			if directory == "" {
+				return ""
+			} else if depth := strings.Count(directory, "/") + 1; depth <= len(components) {
+				return strings.Join(components[:depth], "/")
+			}
+			return directory
+		})
 	} else if i.Git {
 		ignorer = gitEntryIgnorer{ignorer}
 	}
@@ -200,7 +214,7 @@ func (i *Ignores) excluded(path string, directory, every bool) string {
 	if i == nil || path == "" {
 		return ""
 	}
-	ignorer := i.ignorer()
+	ignorer := i.ignorer(path)
 	if ignorer == nil {
 		return ""
 	}

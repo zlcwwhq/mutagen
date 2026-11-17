@@ -223,6 +223,10 @@ type ignorer struct {
 	// gitRoot is the synchronization root with any symbolic links in it
 	// resolved, from which repositories are located (see readExcludeFile).
 	gitRoot string
+	// stored maps the root-relative path of a directory, as it's evaluated, to
+	// the root-relative path under which it's stored, or is nil if they're the
+	// same (see NewIgnorerWithStoredNames).
+	stored func(string) string
 	// session is the session-specific ignorer, if any.
 	session ignore.Ignorer
 	// directories maps root-relative directory paths to the chain of rule sets
@@ -278,14 +282,40 @@ type ignorer struct {
 // depend on whether or not the root is specified by a symbolic link (see
 // readExcludeFile).
 func NewIgnorer(root string, session ignore.Ignorer) ignore.DirectoryIgnorer {
+	return NewIgnorerWithStoredNames(root, session, nil)
+}
+
+// NewIgnorerWithStoredNames is like NewIgnorer, but for evaluating paths that
+// may name directories otherwise than the filesystem stores them, such as in
+// another Unicode normalization form, on a filesystem that doesn't find names
+// in forms other than the stored one. What applies to the entries of each
+// directory, namely whether or not a scan would traverse it, whether or not
+// it's the top level of a nested repository, and its rules, is read from the
+// directory whose root-relative path stored returns for that of the directory,
+// which is either the empty string (for the root) or a path with the same
+// number of components. The rules still match the names as they're evaluated.
+// If stored is nil, then directories are read under the names that they're
+// evaluated by, as they are for NewIgnorer.
+func NewIgnorerWithStoredNames(root string, session ignore.Ignorer, stored func(directory string) string) ignore.DirectoryIgnorer {
 	return &ignorer{
 		root:          root,
 		gitRoot:       physicalPath(root),
+		stored:        stored,
 		session:       session,
 		directories:   make(map[string]*ruleSet),
 		untraversable: make(map[string]bool),
 		repositories:  make(map[string]repositoryState),
 	}
+}
+
+// storedPath returns the root-relative path under which a directory, specified
+// by the root-relative path that it's evaluated by, is stored (see
+// NewIgnorerWithStoredNames).
+func (i *ignorer) storedPath(directory string) string {
+	if i.stored == nil {
+		return directory
+	}
+	return i.stored(directory)
 }
 
 // EnsureDirectory implements ignore.DirectoryIgnorer.EnsureDirectory.
@@ -450,7 +480,7 @@ func (i *ignorer) load(directory string) *ruleSet {
 		// Read the directory's own rules, which take precedence over the base.
 		rules = base
 		if base == nil || base.err == nil {
-			path := filepath.Join(i.root, filepath.FromSlash(directory), ruleFileName)
+			path := filepath.Join(i.root, filepath.FromSlash(i.storedPath(directory)), ruleFileName)
 			if contents, err := readRegularFile(path, maximumRuleFileSize); err != nil {
 				rules = &ruleSet{err: fmt.Errorf("unable to read ignore rules: %w", err)}
 			} else if parsed, err := parseRules(contents); err != nil {
@@ -486,7 +516,7 @@ func (i *ignorer) traversable(directory, parent string) (bool, error) {
 		i.untraversable[directory] = true
 		return false, nil
 	}
-	info, err := os.Lstat(filepath.Join(i.root, filepath.FromSlash(directory)))
+	info, err := os.Lstat(filepath.Join(i.root, filepath.FromSlash(i.storedPath(directory))))
 	if err == nil && info.IsDir() {
 		return true, nil
 	} else if err == nil || os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
@@ -519,7 +549,7 @@ func isEntryName(component string) bool {
 // ".git" entry, whether or not Git accepts it (see Repositories).
 func (i *ignorer) repositoryRules(directory string) (bool, *ruleSet) {
 	// Read the exclude file and record the result.
-	location, contents, err := readExcludeFile(i.gitRoot, directory)
+	location, contents, err := readExcludeFile(i.gitRoot, i.storedPath(directory))
 	if directory == "" || location.present {
 		i.repositories[directory] = newRepositoryState(location, contents, err)
 	}

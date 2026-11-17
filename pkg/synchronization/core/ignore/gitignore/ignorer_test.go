@@ -1445,6 +1445,39 @@ func TestNestedRepositoryMemoization(t *testing.T) {
 	expectIgnored(t, ignorer, "other/a", false, true)
 }
 
+// TestIgnoreStoredNames tests that an ignorer for names that differ from the
+// stored ones reads whether directories are traversable, whether they're
+// nested repositories, and their rules from the stored directories, while
+// matching the rules against the names it evaluates.
+func TestIgnoreStoredNames(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, withGitDirectories(map[string]string{
+		".gitignore":                    "b\n",
+		"stored/.gitignore":             "*.tmp\n/alias-only\n",
+		"stored/repo/.git/info/exclude": "a\n",
+	}, "stored/repo/.git"))
+	stored := func(directory string) string {
+		if rest, ok := strings.CutPrefix(directory, "alias"); ok {
+			return "stored" + rest
+		}
+		return directory
+	}
+	ignorer := NewIgnorerWithStoredNames(root, nil, stored)
+	expectIgnored(t, ignorer, "alias/x.tmp", false, true)
+	expectIgnored(t, ignorer, "alias/alias-only", false, true)
+	expectIgnored(t, ignorer, "alias/b", false, true)
+	expectIgnored(t, ignorer, "alias/repo/a", false, true)
+	expectIgnored(t, ignorer, "alias/repo/b", false, false)
+	expectIgnored(t, ignorer, "alias/repo/x.tmp", false, false)
+
+	// Without the mapping, the directory doesn't exist, so only the root's
+	// rules apply.
+	ignorer = NewIgnorer(root, nil)
+	expectIgnored(t, ignorer, "alias/x.tmp", false, false)
+	expectIgnored(t, ignorer, "alias/b", false, true)
+	expectIgnored(t, ignorer, "alias/repo/b", false, true)
+}
+
 // TestIgnoreSessionTraversalEndToEnd tests that traversal directives from the
 // session ignorer are retained alongside rule file results.
 func TestIgnoreSessionTraversalEndToEnd(t *testing.T) {
