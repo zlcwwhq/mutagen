@@ -25,8 +25,8 @@ var errTreeRemoved = errors.New("workspace trees (tree:) were removed; declare a
 	"list the same nodes without parent, name the former root as the star's center " +
 	"(center: <node>), and apply the project again, which recreates the sessions as star-<node>")
 
-// StarNode is a named workspace. Execution settings belong to nodes. Mode and
-// Remote configure a non-center node's own edge with the center.
+// StarNode is a named workspace. Execution settings belong to nodes. Mode
+// configures a non-center node's own edge with the center.
 type StarNode struct {
 	// Endpoint is the URL of this node's directory workspace.
 	Endpoint string `yaml:"endpoint"`
@@ -34,9 +34,10 @@ type StarNode struct {
 	// which is the edge's alpha. It can't be set on the center.
 	Mode core.SynchronizationMode `yaml:"mode"`
 	// Remote, if set, takes precedence over StarConfiguration.Remote for the
-	// node's edge with the center: it grants or denies command submission and
-	// execution in both directions between the node and the center. It can't
-	// be set on the center, whose commands cross every edge.
+	// node: it specifies whether the node executes commands submitted from
+	// across its edges. The center executes commands submitted from every
+	// other node, and every other node executes commands submitted from the
+	// center.
 	Remote *bool `yaml:"remote"`
 	// RemotePrologue is the node's default execution prologue.
 	RemotePrologue string `yaml:"remotePrologue"`
@@ -44,14 +45,15 @@ type StarNode struct {
 
 // StarConfiguration declares one star managed by the project's daemon: a
 // center node and other nodes, each joined to the center by its own pair
-// session. Remote explicitly authorizes commands between the center and the
-// other nodes, unless a node's own remote setting says otherwise. Sync is
-// shared by every edge; endpoint-specific pair defaults, and the remote
-// command mode and prologue of the synchronization defaults, don't apply to
-// star nodes.
+// session. Remote explicitly authorizes every node to execute commands
+// submitted from across its edges, unless the node's own remote setting says
+// otherwise. Sync is shared by every edge; endpoint-specific pair defaults,
+// and the remote command mode and prologue of the synchronization defaults,
+// don't apply to star nodes.
 type StarConfiguration struct {
-	// Remote grants command submission and execution between the center and
-	// every other node that doesn't set its own remote setting.
+	// Remote specifies whether the nodes that don't set their own remote
+	// setting, including the center, execute commands submitted from across
+	// their edges.
 	Remote bool `yaml:"remote"`
 	// Sync contains the synchronization settings shared by every edge.
 	Sync models.Configuration `yaml:"sync"`
@@ -79,7 +81,8 @@ func starSpecifications(star *StarConfiguration, defaults *synchronization.Confi
 	// and their prologue must not reach the shared configuration, which
 	// underlies every node's merged endpoint configuration and would run it on
 	// each node without its own. Only star.remote and each node's remote and
-	// remotePrologue apply to star commands.
+	// remotePrologue apply to star commands, and each edge's remote command
+	// mode is set below.
 	configuration := star.Sync.ToInternal()
 	if !configuration.RemoteCommandMode.IsDefault() || configuration.RemotePrologue != "" {
 		return nil, errors.New("use star.remote and each node's remote and remotePrologue for star commands")
@@ -89,9 +92,6 @@ func starSpecifications(star *StarConfiguration, defaults *synchronization.Confi
 	configuration = synchronization.MergeConfigurations(defaults, configuration)
 	configuration.RemoteCommandMode = synchronization.RemoteCommandMode_RemoteCommandModeDisabled
 	configuration.RemotePrologue = ""
-	if star.Remote {
-		configuration.RemoteCommandMode = synchronization.RemoteCommandMode_RemoteCommandModeBoth
-	}
 	if configuration.SynchronizationMode.IsDefault() {
 		configuration.SynchronizationMode = core.SynchronizationMode_SynchronizationModeTwoWaySafe
 	}
@@ -120,8 +120,6 @@ func starSpecifications(star *StarConfiguration, defaults *synchronization.Confi
 			return nil, fmt.Errorf("node %s has no endpoint", name)
 		} else if name == star.Center && !node.Mode.IsDefault() {
 			return nil, fmt.Errorf("mode can't be set on the center node %s: each other node's mode configures its own edge", name)
-		} else if name == star.Center && node.Remote != nil {
-			return nil, fmt.Errorf("remote can't be set on the center node %s: use star.remote for every node, or each other node's remote for its own edge", name)
 		} else if !node.Mode.IsDefault() && !node.Mode.Supported() {
 			return nil, fmt.Errorf("unsupported synchronization mode for node %s", name)
 		}
@@ -147,10 +145,13 @@ func starSpecifications(star *StarConfiguration, defaults *synchronization.Confi
 		}
 	}
 
-	// Expand the star into one edge per non-center node. A node's mode and
-	// remote setting override the shared ones for its own edge.
+	// Expand the star into one edge per non-center node. A node's mode
+	// overrides the shared one for its own edge. Each edge's remote command
+	// mode combines whether the center, which is alpha, and the node, which is
+	// beta, execute commands.
 	sort.Strings(names)
 	center := star.Nodes[star.Center]
+	centerExecutes := star.executes(center)
 	var result []*svc.CreationSpecification
 	for _, name := range names {
 		node := star.Nodes[name]
@@ -158,12 +159,7 @@ func starSpecifications(star *StarConfiguration, defaults *synchronization.Confi
 		if !node.Mode.IsDefault() {
 			edgeConfiguration.SynchronizationMode = node.Mode
 		}
-		if node.Remote != nil {
-			edgeConfiguration.RemoteCommandMode = synchronization.RemoteCommandMode_RemoteCommandModeDisabled
-			if *node.Remote {
-				edgeConfiguration.RemoteCommandMode = synchronization.RemoteCommandMode_RemoteCommandModeBoth
-			}
-		}
+		edgeConfiguration.RemoteCommandMode = remoteCommandMode(centerExecutes, star.executes(node))
 		result = append(result, &svc.CreationSpecification{
 			Name:  starSessionPrefix + name,
 			Alpha: proto.Clone(endpoints[star.Center]).(*url.URL), Beta: endpoints[name],
@@ -192,6 +188,30 @@ func starSpecifications(star *StarConfiguration, defaults *synchronization.Confi
 		return nil, err
 	}
 	return result, nil
+}
+
+// executes reports whether a node executes commands submitted from across its
+// edges: its own remote setting takes precedence over the star's.
+func (star *StarConfiguration) executes(node StarNode) bool {
+	if node.Remote != nil {
+		return *node.Remote
+	}
+	return star.Remote
+}
+
+// remoteCommandMode returns the remote command mode of an edge whose alpha and
+// beta execute commands as specified.
+func remoteCommandMode(alpha, beta bool) synchronization.RemoteCommandMode {
+	switch {
+	case alpha && beta:
+		return synchronization.RemoteCommandMode_RemoteCommandModeBoth
+	case alpha:
+		return synchronization.RemoteCommandMode_RemoteCommandModeAlpha
+	case beta:
+		return synchronization.RemoteCommandMode_RemoteCommandModeBeta
+	default:
+		return synchronization.RemoteCommandMode_RemoteCommandModeDisabled
+	}
 }
 
 // specificationSession describes a planned session without assigning its

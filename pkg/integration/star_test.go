@@ -369,15 +369,12 @@ func TestStarNodeDiscovery(t *testing.T) {
 	}
 }
 
-// TestStarNodeRemoteSetting verifies that a node whose remote setting in the
-// project disables commands, although star.remote enables them for the other
-// nodes, still synchronizes with the center, but is unavailable for commands
-// from the center, which other nodes aren't affected by, and can't submit
-// commands to the center either.
-func TestStarNodeRemoteSetting(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("commands require a POSIX shell")
-	}
+// startStarProject creates the edges of a star declared by a project file
+// whose nodes are directories with the specified names under a new temporary
+// directory, and waits until each of the specified sources lists its expected
+// nodes as available.
+func startStarProject(t *testing.T, nodes []string, configuration string, ready map[string][]string) *starFixture {
+	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -396,30 +393,21 @@ func TestStarNodeRemoteSetting(t *testing.T) {
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
 	t.Chdir(base)
 	f := &starFixture{base: base, roots: make(map[string]string), sessions: make(map[string]string)}
-	for _, node := range []string{"local", "server", "private"} {
+	for _, node := range nodes {
 		f.roots[node] = filepath.Join(base, node)
 		if err := os.Mkdir(f.roots[node], 0700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	configPath := filepath.Join(base, "mutagen.yml")
-	if err := os.WriteFile(configPath, []byte(`star:
-  remote: true
-  sync:
-    watch: {mode: no-watch}
-  center: local
-  nodes:
-    local: {endpoint: ./local}
-    server: {endpoint: ./server}
-    private: {endpoint: ./private, remote: false}
-`), 0600); err != nil {
+	if err := os.WriteFile(configPath, []byte(configuration), 0600); err != nil {
 		t.Fatal(err)
 	}
-	configuration, err := project.LoadConfiguration(configPath)
+	loaded, err := project.LoadConfiguration(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	specifications, err := project.NewSessionSpecifications(configuration, nil, "star-test", false)
+	specifications, err := project.NewSessionSpecifications(loaded, nil, "star-test", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,45 +428,123 @@ func TestStarNodeRemoteSetting(t *testing.T) {
 		f.sessions[s.Name] = id
 	}
 	deadline := time.Now().Add(15 * time.Second)
-	for !f.available(f.roots["local"], "local", "server") || !f.available(f.roots["server"], "server", "local") {
-		if time.Now().After(deadline) {
-			t.Fatal("star command channels did not connect")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	// The center lists the node, which is unavailable, and other nodes are
-	// unaffected.
-	listing, output := listStar(t, f.roots["local"])
-	if len(listing.Nodes) != 3 {
-		t.Fatalf("incomplete listing from the center: %s", output)
-	}
-	for _, node := range listing.Nodes {
-		if node.Name == "private" && (node.Available || !strings.Contains(node.Reason, "command execution is disabled")) {
-			t.Fatalf("node with disabled commands misreported: %+v", node)
-		} else if node.Name != "private" && !node.Available {
-			t.Fatalf("other node affected: %+v", node)
+	for source, expected := range ready {
+		for !f.available(f.roots[source], source, expected...) {
+			if time.Now().After(deadline) {
+				t.Fatal("star command channels did not connect")
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	if code, _, diagnostic := runRemote(t, f.roots["local"], "--node", "private", "true"); code != 125 || !strings.Contains(diagnostic, "node private is unavailable: command execution is disabled") {
-		t.Fatalf("command on a node with disabled commands not refused: %d %s", code, diagnostic)
-	} else if code, _, diagnostic := runRemote(t, f.roots["local"], "--node", "server", "true"); code != 0 {
-		t.Fatalf("command on another node failed: %d %s", code, diagnostic)
+	return f
+}
+
+// TestStarNodeRemoteSetting verifies that each node's remote setting in the
+// project, including the center's, decides whether the node executes commands,
+// independently of the other end of its edges: a node that doesn't execute
+// commands still synchronizes with the center and is unavailable for commands
+// from the center, which other nodes aren't affected by, but can still submit
+// commands to an executing center, while no node can submit commands to a
+// center that doesn't execute them.
+func TestStarNodeRemoteSetting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("commands require a POSIX shell")
 	}
 
-	// The node doesn't register for submissions.
-	if code, _, diagnostic := runRemote(t, f.roots["private"], "true"); code != 255 || !strings.Contains(diagnostic, "no connected node contains the current directory") {
-		t.Fatalf("node with disabled commands submitted a command: %d %s", code, diagnostic)
+	// listsDisabled verifies that the center lists the private node as
+	// unavailable because it doesn't execute commands, and the server as
+	// available, and that commands on them fail and succeed accordingly.
+	listsDisabled := func(t *testing.T, f *starFixture) {
+		t.Helper()
+		listing, output := listStar(t, f.roots["local"])
+		if len(listing.Nodes) != 3 {
+			t.Fatalf("incomplete listing from the center: %s", output)
+		}
+		for _, node := range listing.Nodes {
+			if node.Name == "private" && (node.Available || !strings.Contains(node.Reason, "command execution is disabled")) {
+				t.Fatalf("node with disabled commands misreported: %+v", node)
+			} else if node.Name != "private" && !node.Available {
+				t.Fatalf("other node affected: %+v", node)
+			}
+		}
+		if code, _, diagnostic := runRemote(t, f.roots["local"], "--node", "private", "true"); code != 125 || !strings.Contains(diagnostic, "node private is unavailable: command execution is disabled") {
+			t.Fatalf("command on a node with disabled commands not refused: %d %s", code, diagnostic)
+		} else if code, _, diagnostic := runRemote(t, f.roots["local"], "--node", "server", "true"); code != 0 {
+			t.Fatalf("command on another node failed: %d %s", code, diagnostic)
+		}
 	}
 
-	// The node's edge still synchronizes.
-	if err := os.WriteFile(filepath.Join(f.roots["local"], "input"), []byte("synchronized"), 0600); err != nil {
-		t.Fatal(err)
-	} else if err := f.manager.Flush(context.Background(), &selection.Selection{Specifications: []string{f.sessions["star-private"]}}, "", false); err != nil {
-		t.Fatal(err)
-	} else if contents, err := os.ReadFile(filepath.Join(f.roots["private"], "input")); err != nil || string(contents) != "synchronized" {
-		t.Fatalf("edge of a node with disabled commands didn't synchronize: %q %v", contents, err)
-	}
+	// A node that doesn't execute commands can still run them on an executing
+	// center, and its edge still synchronizes.
+	t.Run("node", func(t *testing.T) {
+		f := startStarProject(t, []string{"local", "server", "private"}, `star:
+  remote: true
+  sync:
+    watch: {mode: no-watch}
+  center: local
+  nodes:
+    local: {endpoint: ./local}
+    server: {endpoint: ./server}
+    private: {endpoint: ./private, remote: false}
+`, map[string][]string{"local": {"server"}, "server": {"local"}, "private": {"local"}})
+		listsDisabled(t, f)
+		if code, output, diagnostic := runRemote(t, f.roots["private"], "sh", "-c", `printf %s "$MUTAGEN_REMOTE_NODE"`); code != 0 || output != "local" {
+			t.Fatalf("node with disabled commands couldn't run a command on the center: %d %q %s", code, output, diagnostic)
+		}
+		if err := os.WriteFile(filepath.Join(f.roots["local"], "input"), []byte("synchronized"), 0600); err != nil {
+			t.Fatal(err)
+		} else if err := f.manager.Flush(context.Background(), &selection.Selection{Specifications: []string{f.sessions["star-private"]}}, "", false); err != nil {
+			t.Fatal(err)
+		} else if contents, err := os.ReadFile(filepath.Join(f.roots["private"], "input")); err != nil || string(contents) != "synchronized" {
+			t.Fatalf("edge of a node with disabled commands didn't synchronize: %q %v", contents, err)
+		}
+	})
+
+	// A center that doesn't execute commands can still run them on the nodes
+	// that do, but no node can submit commands to it.
+	t.Run("center", func(t *testing.T) {
+		f := startStarProject(t, []string{"local", "server", "private"}, `star:
+  remote: true
+  sync:
+    watch: {mode: no-watch}
+  center: local
+  nodes:
+    local: {endpoint: ./local, remote: false}
+    server: {endpoint: ./server}
+    private: {endpoint: ./private, remote: false}
+`, map[string][]string{"local": {"server"}})
+		listsDisabled(t, f)
+		for _, node := range []string{"server", "private"} {
+			if code, _, diagnostic := runRemote(t, f.roots[node], "true"); code != 255 || !strings.Contains(diagnostic, "no connected node contains the current directory") {
+				t.Fatalf("node %s submitted a command to a center with disabled commands: %d %s", node, code, diagnostic)
+			}
+		}
+	})
+
+	// When only the center executes commands, every other node can run them
+	// on the center, but the center can't submit any.
+	t.Run("center-only", func(t *testing.T) {
+		f := startStarProject(t, []string{"local", "server", "private"}, `star:
+  sync:
+    watch: {mode: no-watch}
+  center: local
+  nodes:
+    local: {endpoint: ./local, remote: true}
+    server: {endpoint: ./server}
+    private: {endpoint: ./private}
+`, map[string][]string{"server": {"local"}, "private": {"local"}})
+		for _, node := range []string{"server", "private"} {
+			if code, output, diagnostic := runRemote(t, f.roots[node], "sh", "-c", `printf %s "$MUTAGEN_REMOTE_NODE"`); code != 0 || output != "local" {
+				t.Fatalf("node %s couldn't run a command on the center: %d %q %s", node, code, output, diagnostic)
+			}
+		}
+		// The center's directory is outside every registered workspace, so
+		// that only an explicit --node or --nodes could use another workspace
+		// on its system, such as these nodes'.
+		if code, _, diagnostic := runRemote(t, f.roots["local"], "true"); code != 255 || !strings.Contains(diagnostic, "no connected node contains the current directory") {
+			t.Fatalf("center submitted to nodes that don't execute commands: %d %s", code, diagnostic)
+		}
+	})
 }
 
 func TestStarConflicts(t *testing.T) {

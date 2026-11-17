@@ -421,7 +421,9 @@ func TestStarNodesExecution(t *testing.T) {
 		return err != nil && remote.ClassifyError(err) == remote.ErrorKindOperation && strings.Contains(err.Error(), errExecutionDisabled.Error())
 	}
 
-	// A star edge on which only the center executes commands.
+	// A star edge on which only the center executes commands, as for a node
+	// whose remote setting in the project disables them while the center's
+	// enables them.
 	gpu, server := starTestEdge("gpu"), starTestEdge("server")
 	gpu.Configuration.RemoteCommandMode = RemoteCommandMode_RemoteCommandModeAlpha
 	stars, relays := starTestRegistry([]*Session{gpu, server}, "gpu", "server")
@@ -444,7 +446,8 @@ func TestStarNodesExecution(t *testing.T) {
 		t.Fatalf("executing center misreported: %+v", node)
 	}
 
-	// A star edge on which only the node executes commands.
+	// A star edge on which only the node executes commands, as for a center
+	// whose remote setting disables them while the node's enables them.
 	gpu.Configuration.RemoteCommandMode = RemoteCommandMode_RemoteCommandModeBeta
 	if graph, err := stars.nodes(relays["gpu"], 1); err != nil {
 		t.Fatal(err)
@@ -455,8 +458,9 @@ func TestStarNodesExecution(t *testing.T) {
 	}
 
 	// A star edge on which neither endpoint executes commands, as for a node
-	// whose remote setting in the project disables them, runs no relay, so
-	// that operations on its node can only enter through another edge.
+	// and a center whose remote settings in the project disable them, runs no
+	// relay, so that operations on its node can only enter through another
+	// edge.
 	gpu = starTestEdge("gpu")
 	gpu.Configuration.RemoteCommandMode = RemoteCommandMode_RemoteCommandModeDisabled
 	stars, relays = starTestRegistry([]*Session{gpu, server}, "server")

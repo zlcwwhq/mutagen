@@ -109,10 +109,12 @@ several identities.
 
 ## Remote commands
 
-`star.remote: true` permits commands between the center and every other node.
-It defaults to false, regardless of `sync.defaults.remote`. A node's own
-`remote` setting takes precedence for its edge, so that commands can be limited
-to some nodes:
+Each node's `remote` setting, including the center's, decides whether the node
+executes commands submitted from across its edges: the center executes
+commands from every other node, and every other node executes commands from
+the center. `star.remote: true` enables execution on every node that doesn't
+set its own `remote`. It defaults to false, regardless of
+`sync.defaults.remote`.
 
 ```yaml
 star:
@@ -121,6 +123,7 @@ star:
   nodes:
     local:
       endpoint: "."
+      remote: false
     gpu:
       endpoint: "gpu:~/project"
     shared:
@@ -128,15 +131,27 @@ star:
       remote: false
 ```
 
-- `remote: false` on a node disables commands in both directions on its edge:
-  the center can't run commands on the node, and the node can't run commands
-  on the center. The edge still synchronizes. `remote --nodes` lists the node
-  as unavailable, operations on it from the center fail with status 125, and
-  `remote` on the node finds no connected node (status 255).
-- `remote: true` on a node enables commands on its edge while `star.remote` is
-  false, so that only the nodes that set it can be used.
-- `remote` can't be set on the center. Changing a node's `remote` replaces only
-  its own edge (see [Applying project configuration](project-apply.md)).
+Here, the center can run commands on `gpu`, but not on `shared`, and neither
+node can run commands on the center.
+
+- A node that doesn't execute commands still synchronizes. `remote --nodes`
+  lists it as unavailable, and operations on it from the center fail with
+  status 125.
+- A node only connects for commands if a node that it reaches executes them.
+  If the center doesn't, `remote` on every other node finds no connected node
+  (status 255), as it does on the center if no other node executes commands.
+- Each edge's remote command mode combines the settings of its ends.
+  `mutagen sync list -l` shows which of them execute commands: the center is
+  alpha, and the other node is beta.
+- Changing the center's `remote` replaces every edge, and changing another
+  node's replaces only its own edge (see
+  [Applying project configuration](project-apply.md)).
+- In 0.4.0, a node's `remote` applied to its edge in both directions, and the
+  center couldn't set it. Applying such a project again replaces the edges
+  whose meaning changes: a node with `remote: false` can now run commands on
+  the center unless the center sets `remote: false`, and a node with
+  `remote: true` under `star.remote: false` can only run commands on the
+  center if the center sets `remote: true`.
 
 Select a node by name:
 
@@ -186,11 +201,12 @@ node, itself and the center. It marks the current node and the center, and
 shows each node's host and root, the mode of the edge to it, and its
 availability. `--nodes --json` gives machine-readable output.
 
-A node is available if it executes commands, as the remote setting of its edge
-permits, and that edge is connected for commands at both ends. Operations on a
-node that doesn't execute commands fail with status 125. Listing nodes neither
-synchronizes files nor executes commands, and being available doesn't mean
-being free of conflicts. Terminating an edge only removes its node.
+A node is available if it executes commands, as its remote setting permits,
+and the edge to it is connected for commands at both ends. Operations from the
+center on a node that doesn't execute commands fail with status 125. Listing
+nodes neither synchronizes files nor executes commands, and being available
+doesn't mean being free of conflicts. Terminating an edge only removes its
+node.
 
 
 ## Star problems

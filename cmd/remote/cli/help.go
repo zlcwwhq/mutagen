@@ -114,10 +114,12 @@ Any node can be the center, but only the center reaches every node, so put it
 where you usually work, such as where agents run. The daemon relays every
 edge, so every endpoint must be reachable from the daemon, which relays a
 center on another system as it relays a pair whose endpoints are both
-remote. star.remote explicitly enables commands between the center and every
-node, and a node's own remote setting (true or false) takes precedence for
-its edge, in both directions; prologues come only from each node's
-remotePrologue, never from synchronization defaults.
+remote. Each node's remote setting, including the center's, decides whether
+it executes commands from the nodes joined to it: every other node for the
+center, and the center for any other node. A node that executes none can
+still submit commands to nodes that do. star.remote explicitly enables
+execution on the nodes that don't set their own; prologues come only from each
+node's remotePrologue, never from synchronization defaults.
 `},
 	{"sync", "synchronization, ignored paths, --pull, and --diff", `Each operation synchronizes the pair session that it crosses, such as the edge
 between a star's center and one of its nodes:
