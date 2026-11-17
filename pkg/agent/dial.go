@@ -131,10 +131,11 @@ func connect(logger *logging.Logger, transport Transport, mode, prompter string,
 		// which is all we care about.
 		stream.Close()
 
-		// Shut the error valve before reading the error output. The process
-		// has terminated, but the Goroutine that forwards its error output may
-		// still be writing, and shutting the valve waits for that and stops
-		// any further writes.
+		// Shut the error valve before reading the error output. Close has
+		// waited for the forwarding of the process' error output to finish
+		// (see transport.NewStream), but shutting the valve guarantees that
+		// nothing writes to the buffer while we read it, whatever the
+		// transport does.
 		errorValve.Shut()
 
 		// Extract any error output, ensure that it's UTF-8, strip out any

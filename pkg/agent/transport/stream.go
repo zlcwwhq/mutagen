@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -9,6 +10,12 @@ import (
 	"syscall"
 	"time"
 )
+
+// standardErrorForwardingDelay is how long Wait waits for a process' standard
+// error stream to close after the process exits, so that error output it wrote
+// before exiting is forwarded, before Wait closes the stream itself because a
+// subprocess still has it open.
+const standardErrorForwardingDelay = time.Second
 
 // Stream implements io.ReadWriteCloser using the standard input and output
 // streams of an agent process, with closure implemented via termination
@@ -48,23 +55,17 @@ func NewStream(process *exec.Cmd, standardErrorReceiver io.Writer) (*Stream, err
 		return nil, fmt.Errorf("unable to redirect process output: %w", err)
 	}
 
-	// If a standard error receiver has been specified, then create a pipe from
-	// the process' standard error stream and forward it to the receiver. We do
-	// this manually (instead of just assigning the receiver to process.Stderr)
-	// to avoid golang/go#23019. We perform the same closure on the standard
-	// error stream as os/exec's standard forwarding Goroutines, a fix designed
-	// to avoid golang/go#10400.
+	// If a standard error receiver has been specified, then let os/exec forward
+	// the process' standard error stream to it. Wait then waits for that
+	// forwarding to finish, so that error output written before the process
+	// exits isn't lost when Wait closes the stream, which would happen if we
+	// copied from os/exec.Cmd.StderrPipe ourselves. Wait would also wait for
+	// subprocesses that keep the stream open after the process exits
+	// (golang/go#23019), so we bound that wait with a delay, after which Wait
+	// closes the stream and stops forwarding.
 	if standardErrorReceiver != nil {
-		standardError, err := process.StderrPipe()
-		if err != nil {
-			standardInput.Close()
-			standardOutput.Close()
-			return nil, fmt.Errorf("unable to redirect process error output: %w", err)
-		}
-		go func() {
-			io.Copy(standardErrorReceiver, standardError)
-			standardError.Close()
-		}()
+		process.Stderr = standardErrorReceiver
+		process.WaitDelay = standardErrorForwardingDelay
 	}
 
 	// Create the result.
@@ -136,8 +137,13 @@ func (s *Stream) SetTerminationDelay(terminationDelay time.Duration) {
 //
 // This method guarantees that, by the time it returns, the underlying transport
 // process has terminated and its associated standard input, output, and error
-// stream handles in the current process have been closed. The error returned by
-// this function will be that returned by os/exec.Cmd.Wait. Note, however, that
+// stream handles in the current process have been closed, and that any standard
+// error output that the process wrote has been forwarded, unless a subprocess
+// kept the stream open after the process exited (see NewStream). The error
+// returned by this function will be that returned by os/exec.Cmd.Wait, except
+// that it's nil rather than os/exec.ErrWaitDelay if the process exited
+// successfully but a subprocess kept its standard error stream open, since
+// that's no failure of the process. Note, however, that
 // this method cannot guarantee that any or all child processes spawned by the
 // transport process have terminated by the time this method returns. This is
 // mostly due to operating system API limitations. Specifically, POSIX provides
@@ -158,12 +164,16 @@ func (s *Stream) SetTerminationDelay(terminationDelay time.Duration) {
 func (s *Stream) Close() error {
 	// Start a background Goroutine that will wait for the process to exit and
 	// return the wait result. We'll rely on this call to Wait to close the
-	// standard output and error streams. We don't have to worry about
-	// golang/go#23019 in this case because we're only using pipes and thus Wait
-	// doesn't have any internal copying Goroutines to wait on.
+	// standard output and error streams. Wait also waits for the forwarding of
+	// standard error output, if any, which the forwarding delay bounds (see
+	// NewStream), so golang/go#23019 can't block it indefinitely.
 	waitResults := make(chan error, 1)
 	go func() {
-		waitResults <- s.process.Wait()
+		err := s.process.Wait()
+		if errors.Is(err, exec.ErrWaitDelay) {
+			err = nil
+		}
+		waitResults <- err
 	}()
 
 	// Start by waiting for the process to terminate on its own.
