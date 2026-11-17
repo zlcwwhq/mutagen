@@ -32,6 +32,12 @@ const (
 	Version_Invalid Version = 0
 	// Version1 represents session version 1.
 	Version_Version1 Version = 1
+	// Version2 represents session version 2, which is the version of sessions
+	// in Git mode. Its defaults are those of session version 1, but daemons
+	// that don't support Git mode don't support it either, so they don't load
+	// such sessions, which they would otherwise synchronize as ordinary ones,
+	// including their repositories' Git directories.
+	Version_Version2 Version = 2
 )
 
 // Enum value maps for Version.
@@ -39,10 +45,12 @@ var (
 	Version_name = map[int32]string{
 		0: "Invalid",
 		1: "Version1",
+		2: "Version2",
 	}
 	Version_value = map[string]int32{
 		"Invalid":  0,
 		"Version1": 1,
+		"Version2": 2,
 	}
 )
 
@@ -77,10 +85,11 @@ var File_synchronization_version_proto protoreflect.FileDescriptor
 
 const file_synchronization_version_proto_rawDesc = "" +
 	"\n" +
-	"\x1dsynchronization/version.proto\x12\x0fsynchronization*$\n" +
+	"\x1dsynchronization/version.proto\x12\x0fsynchronization*2\n" +
 	"\aVersion\x12\v\n" +
 	"\aInvalid\x10\x00\x12\f\n" +
-	"\bVersion1\x10\x01B3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
+	"\bVersion1\x10\x01\x12\f\n" +
+	"\bVersion2\x10\x02B3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
 
 var (
 	file_synchronization_version_proto_rawDescOnce sync.Once

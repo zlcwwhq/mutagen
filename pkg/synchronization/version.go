@@ -14,10 +14,27 @@ import (
 // DefaultVersion is the default session version.
 const DefaultVersion Version = Version_Version1
 
+// gitModeVersion is the session version of sessions in Git mode, which has the
+// defaults of DefaultVersion (see Version_Version2).
+const gitModeVersion Version = Version_Version2
+
+// versionFor returns the session version for a session with the specified
+// session configuration: gitModeVersion if the configuration enables Git mode,
+// so that daemons that don't support Git mode don't load the session, and
+// DefaultVersion otherwise, so that they still load other sessions. The
+// versions have the same defaults, so the choice doesn't change what the
+// configuration means.
+func versionFor(configuration *Configuration) Version {
+	if configuration != nil && GitModeEnabled(configuration, DefaultVersion) {
+		return gitModeVersion
+	}
+	return DefaultVersion
+}
+
 // Supported indicates whether or not the session version is supported.
 func (v Version) Supported() bool {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return true
 	default:
 		return false
@@ -28,7 +45,7 @@ func (v Version) Supported() bool {
 // session version.
 func (v Version) DefaultSynchronizationMode() core.SynchronizationMode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return core.SynchronizationMode_SynchronizationModeTwoWaySafe
 	default:
 		panic("unknown or unsupported session version")
@@ -39,7 +56,7 @@ func (v Version) DefaultSynchronizationMode() core.SynchronizationMode {
 // version.
 func (v Version) DefaultHashingAlgorithm() hashing.Algorithm {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return hashing.Algorithm_AlgorithmSHA1
 	default:
 		panic("unknown or unsupported session version")
@@ -50,7 +67,7 @@ func (v Version) DefaultHashingAlgorithm() hashing.Algorithm {
 // session version.
 func (v Version) DefaultMaximumEntryCount() uint64 {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return math.MaxUint64
 	default:
 		panic("unknown or unsupported session version")
@@ -61,7 +78,7 @@ func (v Version) DefaultMaximumEntryCount() uint64 {
 // for the session version.
 func (v Version) DefaultMaximumStagingFileSize() uint64 {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return math.MaxUint64
 	default:
 		panic("unknown or unsupported session version")
@@ -71,7 +88,7 @@ func (v Version) DefaultMaximumStagingFileSize() uint64 {
 // DefaultProbeMode returns the default probe mode for the session version.
 func (v Version) DefaultProbeMode() behavior.ProbeMode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return behavior.ProbeMode_ProbeModeProbe
 	default:
 		panic("unknown or unsupported session version")
@@ -81,7 +98,7 @@ func (v Version) DefaultProbeMode() behavior.ProbeMode {
 // DefaultScanMode returns the default scan mode for the session version.
 func (v Version) DefaultScanMode() ScanMode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return ScanMode_ScanModeAccelerated
 	default:
 		panic("unknown or unsupported session version")
@@ -91,7 +108,7 @@ func (v Version) DefaultScanMode() ScanMode {
 // DefaultStageMode returns the default staging mode for the session version.
 func (v Version) DefaultStageMode() StageMode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return StageMode_StageModeMutagen
 	default:
 		panic("unknown or unsupported session version")
@@ -102,7 +119,7 @@ func (v Version) DefaultStageMode() StageMode {
 // session version.
 func (v Version) DefaultSymbolicLinkMode() core.SymbolicLinkMode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return core.SymbolicLinkMode_SymbolicLinkModePortable
 	default:
 		panic("unknown or unsupported session version")
@@ -112,7 +129,7 @@ func (v Version) DefaultSymbolicLinkMode() core.SymbolicLinkMode {
 // DefaultWatchMode returns the default watch mode for the session version.
 func (v Version) DefaultWatchMode() WatchMode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return WatchMode_WatchModePortable
 	default:
 		panic("unknown or unsupported session version")
@@ -123,7 +140,7 @@ func (v Version) DefaultWatchMode() WatchMode {
 // the session version.
 func (v Version) DefaultWatchPollingInterval() uint32 {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return 10
 	default:
 		panic("unknown or unsupported session version")
@@ -134,7 +151,7 @@ func (v Version) DefaultWatchPollingInterval() uint32 {
 // version.
 func (v Version) DefaultIgnoreSyntax() ignore.Syntax {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return ignore.Syntax_SyntaxMutagen
 	default:
 		panic("unknown or unsupported session version")
@@ -145,7 +162,7 @@ func (v Version) DefaultIgnoreSyntax() ignore.Syntax {
 // version.
 func (v Version) DefaultIgnoreVCSMode() ignore.IgnoreVCSMode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return ignore.IgnoreVCSMode_IgnoreVCSModePropagate
 	default:
 		panic("unknown or unsupported session version")
@@ -155,7 +172,7 @@ func (v Version) DefaultIgnoreVCSMode() ignore.IgnoreVCSMode {
 // DefaultGitMode returns the default Git mode for the session version.
 func (v Version) DefaultGitMode() GitMode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return GitMode_GitModeDisabled
 	default:
 		panic("unknown or unsupported session version")
@@ -181,7 +198,7 @@ func (v Version) DefaultPermissionsMode() core.PermissionsMode {
 	// how to enforce that the daemon's default session version is what's being
 	// used for validation in the command line interface or external tools.
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return core.PermissionsMode_PermissionsModePortable
 	default:
 		panic("unknown or unsupported session version")
@@ -192,7 +209,7 @@ func (v Version) DefaultPermissionsMode() core.PermissionsMode {
 // version.
 func (v Version) DefaultFileMode() filesystem.Mode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return filesystem.ModePermissionUserRead |
 			filesystem.ModePermissionUserWrite
 	default:
@@ -204,7 +221,7 @@ func (v Version) DefaultFileMode() filesystem.Mode {
 // session version.
 func (v Version) DefaultDirectoryMode() filesystem.Mode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return filesystem.ModePermissionUserRead |
 			filesystem.ModePermissionUserWrite |
 			filesystem.ModePermissionUserExecute
@@ -217,7 +234,7 @@ func (v Version) DefaultDirectoryMode() filesystem.Mode {
 // session version.
 func (v Version) DefaultOwnerSpecification() string {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return ""
 	default:
 		panic("unknown or unsupported session version")
@@ -228,7 +245,7 @@ func (v Version) DefaultOwnerSpecification() string {
 // the session version.
 func (v Version) DefaultGroupSpecification() string {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return ""
 	default:
 		panic("unknown or unsupported session version")
@@ -239,7 +256,7 @@ func (v Version) DefaultGroupSpecification() string {
 // session version.
 func (v Version) DefaultCompressionAlgorithm() compression.Algorithm {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return compression.Algorithm_AlgorithmDeflate
 	default:
 		panic("unknown or unsupported session version")
@@ -250,7 +267,7 @@ func (v Version) DefaultCompressionAlgorithm() compression.Algorithm {
 // session version.
 func (v Version) DefaultRemoteCommandMode() RemoteCommandMode {
 	switch v {
-	case Version_Version1:
+	case Version_Version1, Version_Version2:
 		return RemoteCommandMode_RemoteCommandModeDisabled
 	default:
 		panic("unknown or unsupported session version")

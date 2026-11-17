@@ -129,7 +129,7 @@ func newSession(
 	prompting.Message(prompter, "Creating session...")
 
 	// Set the session version.
-	version := DefaultVersion
+	version := versionFor(configuration)
 
 	// Compute the creation time and check that it's valid for Protocol Buffers.
 	creationTime := timestamppb.Now()
@@ -302,6 +302,19 @@ func loadSession(logger *logging.Logger, tracker *state.Tracker, stars *commandS
 	}
 	if err := session.EnsureValid(); err != nil {
 		return nil, fmt.Errorf("invalid session found on disk: %w", err)
+	}
+
+	// Sessions in Git mode that were created before Git mode had its own
+	// session version have the default version, which daemons that don't
+	// support Git mode load (see Version_Version2). Give them the Git mode
+	// version and record it, so that those daemons no longer load them. If it
+	// can't be recorded, then the session still runs, and it's recorded when
+	// the session is next paused, resumed, or loaded.
+	if session.Version == DefaultVersion && versionFor(session.Configuration) == gitModeVersion {
+		session.Version = gitModeVersion
+		if err := encoding.MarshalAndSaveProtobuf(sessionPath, session); err != nil {
+			logger.Warn("Unable to record the session version of Git mode:", err)
+		}
 	}
 
 	// Create the controller.

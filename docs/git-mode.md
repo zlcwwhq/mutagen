@@ -54,6 +54,13 @@ mutagen sync create --git --remote=true . server:~/project
 - Changing it in a project recreates the session at the next
   `mutagen project apply`, like other configuration changes.
 - `mutagen sync list -l` shows the mode.
+- Sessions in Git mode have a session version of their own, so that the daemons
+  of releases without Git mode, which would synchronize `.git` directories and
+  ignore `.gitignore` files, don't load them. Releases up to 0.3.1 don't know
+  that version, including 0.3.0 and 0.3.1, which have Git mode: once a later
+  daemon has created or loaded a session in Git mode, they don't load it, and
+  it's back when you upgrade again. Don't create the session again in the
+  meantime: both would synchronize the same directories after the upgrade.
 
 To migrate a session that used `ignore.vcs: true`, replace that with
 `git: enabled`, remove the `ignore.paths` patterns that repeat `.gitignore`

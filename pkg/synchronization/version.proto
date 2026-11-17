@@ -13,4 +13,10 @@ enum Version {
     Invalid = 0;
     // Version1 represents session version 1.
     Version1 = 1;
+    // Version2 represents session version 2, which is the version of sessions
+    // in Git mode. Its defaults are those of session version 1, but daemons
+    // that don't support Git mode don't support it either, so they don't load
+    // such sessions, which they would otherwise synchronize as ordinary ones,
+    // including their repositories' Git directories.
+    Version2 = 2;
 }
