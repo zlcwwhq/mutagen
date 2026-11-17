@@ -1,9 +1,9 @@
 module github.com/mutagen-io/mutagen
 
-go 1.25.0
+go 1.26.0
 
 require (
-	github.com/Microsoft/go-winio v0.6.2
+	github.com/Microsoft/go-winio v0.6.4
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/dustin/go-humanize v1.0.1
 	github.com/eknkc/basex v1.0.1
@@ -21,7 +21,7 @@ require (
 	github.com/zeebo/xxh3 v1.1.0
 	go.yaml.in/yaml/v4 v4.0.0-rc.4
 	golang.org/x/net v0.53.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/sys v0.49.0
 	golang.org/x/term v0.42.0
 	golang.org/x/text v0.36.0
 	google.golang.org/grpc v1.80.0

@@ -65,7 +65,7 @@ const (
 
 	// minimumMacOSVersion is the minimum version of macOS that
 	// we'll support. This is pinned to the oldest version of
-	// macOS that Mutagen's minimum Go version supports. Go 1.25
+	// macOS that Mutagen's minimum Go version supports. Go 1.26
 	// requires macOS 12 Monterey or later.
 	minimumMacOSVersion = "12"
 

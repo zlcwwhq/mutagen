@@ -14,12 +14,14 @@ import (
 
 // TestPipeListenerCloseWithClients tests that closing a named pipe listener
 // returns while clients connect and disconnect, which can fail the listener's
-// pending connection with ERROR_NO_DATA as it's closed (see pipeListener).
+// pending connection with ERROR_NO_DATA as it's closed. With go-winio before
+// v0.6.3, the listener then waited for another client instead of closing, and
+// Close blocked forever.
 func TestPipeListenerCloseWithClients(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		// Create a listener that accepts and closes connections.
 		name := fmt.Sprintf(`\\.\pipe\mutagen-ipc-test-%s`, uuid.NewString())
-		listener, err := ListenPipe(name, &winio.PipeConfig{})
+		listener, err := winio.ListenPipe(name, &winio.PipeConfig{})
 		if err != nil {
 			t.Fatal("unable to create listener:", err)
 		}
