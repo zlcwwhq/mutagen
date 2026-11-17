@@ -369,6 +369,118 @@ func TestStarNodeDiscovery(t *testing.T) {
 	}
 }
 
+// TestStarNodeRemoteSetting verifies that a node whose remote setting in the
+// project disables commands, although star.remote enables them for the other
+// nodes, still synchronizes with the center, but is unavailable for commands
+// from the center, which other nodes aren't affected by, and can't submit
+// commands to the center either.
+func TestStarNodeRemoteSetting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("commands require a POSIX shell")
+	}
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the data directory out of t.TempDir, whose long path would push
+	// the command registry's socket paths past Unix socket path limits.
+	data, err := os.MkdirTemp("", "ms-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(data); err != nil {
+			t.Error("unable to remove data directory:", err)
+		}
+	})
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
+	t.Chdir(base)
+	f := &starFixture{base: base, roots: make(map[string]string), sessions: make(map[string]string)}
+	for _, node := range []string{"local", "server", "private"} {
+		f.roots[node] = filepath.Join(base, node)
+		if err := os.Mkdir(f.roots[node], 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configPath := filepath.Join(base, "mutagen.yml")
+	if err := os.WriteFile(configPath, []byte(`star:
+  remote: true
+  sync:
+    watch: {mode: no-watch}
+  center: local
+  nodes:
+    local: {endpoint: ./local}
+    server: {endpoint: ./server}
+    private: {endpoint: ./private, remote: false}
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := project.LoadConfiguration(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specifications, err := project.NewSessionSpecifications(configuration, nil, "star-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.manager, err = synchronization.NewManager(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		f.manager.Terminate(context.Background(), &selection.Selection{All: true}, "")
+		f.manager.Shutdown()
+	})
+	for _, s := range specifications.Synchronization {
+		s.Beta.Protocol = netpipe.Protocol_Netpipe
+		id, err := f.manager.Create(context.Background(), s.Alpha, s.Beta, s.Configuration, s.ConfigurationAlpha, s.ConfigurationBeta, s.Name, s.Labels, s.Star, false, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.sessions[s.Name] = id
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for !f.available(f.roots["local"], "local", "server") || !f.available(f.roots["server"], "server", "local") {
+		if time.Now().After(deadline) {
+			t.Fatal("star command channels did not connect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The center lists the node, which is unavailable, and other nodes are
+	// unaffected.
+	listing, output := listStar(t, f.roots["local"])
+	if len(listing.Nodes) != 3 {
+		t.Fatalf("incomplete listing from the center: %s", output)
+	}
+	for _, node := range listing.Nodes {
+		if node.Name == "private" && (node.Available || !strings.Contains(node.Reason, "command execution is disabled")) {
+			t.Fatalf("node with disabled commands misreported: %+v", node)
+		} else if node.Name != "private" && !node.Available {
+			t.Fatalf("other node affected: %+v", node)
+		}
+	}
+	if code, _, diagnostic := runRemote(t, f.roots["local"], "--node", "private", "true"); code != 125 || !strings.Contains(diagnostic, "node private is unavailable: command execution is disabled") {
+		t.Fatalf("command on a node with disabled commands not refused: %d %s", code, diagnostic)
+	} else if code, _, diagnostic := runRemote(t, f.roots["local"], "--node", "server", "true"); code != 0 {
+		t.Fatalf("command on another node failed: %d %s", code, diagnostic)
+	}
+
+	// The node doesn't register for submissions.
+	if code, _, diagnostic := runRemote(t, f.roots["private"], "true"); code != 255 || !strings.Contains(diagnostic, "no connected node contains the current directory") {
+		t.Fatalf("node with disabled commands submitted a command: %d %s", code, diagnostic)
+	}
+
+	// The node's edge still synchronizes.
+	if err := os.WriteFile(filepath.Join(f.roots["local"], "input"), []byte("synchronized"), 0600); err != nil {
+		t.Fatal(err)
+	} else if err := f.manager.Flush(context.Background(), &selection.Selection{Specifications: []string{f.sessions["star-private"]}}, "", false); err != nil {
+		t.Fatal(err)
+	} else if contents, err := os.ReadFile(filepath.Join(f.roots["private"], "input")); err != nil || string(contents) != "synchronized" {
+		t.Fatalf("edge of a node with disabled commands didn't synchronize: %q %v", contents, err)
+	}
+}
+
 func TestStarConflicts(t *testing.T) {
 	f := newStarFixture(t)
 	if code, _, diagnostic := runRemote(t, f.roots["local"], "--node", "server", "true"); code != 0 {

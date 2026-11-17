@@ -454,6 +454,24 @@ func TestStarNodesExecution(t *testing.T) {
 		t.Fatal("operation on a non-executing center not refused:", err)
 	}
 
+	// A star edge on which neither endpoint executes commands, as for a node
+	// whose remote setting in the project disables them, runs no relay, so
+	// that operations on its node can only enter through another edge.
+	gpu = starTestEdge("gpu")
+	gpu.Configuration.RemoteCommandMode = RemoteCommandMode_RemoteCommandModeDisabled
+	stars, relays = starTestRegistry([]*Session{gpu, server}, "server")
+	if graph, err := stars.nodes(relays["server"], 0); err != nil {
+		t.Fatal(err)
+	} else if node := starTestNode(t, graph, "gpu"); !disabled(node) {
+		t.Fatalf("node with disabled commands misreported from the center: %+v", node)
+	} else if node := starTestNode(t, graph, "server"); !node.Available {
+		t.Fatalf("other node affected: %+v", node)
+	} else if err := relays["server"].resolveSubmission(0, &remote.Submission{Node: "gpu", Resolve: true}); !refused(err) {
+		t.Fatal("operation on a node with disabled commands not refused:", err)
+	} else if err := relays["server"].resolveSubmission(0, &remote.Submission{Node: "server", Resolve: true}); err != nil {
+		t.Fatal("operation on another node refused:", err)
+	}
+
 	// A pair on which only alpha executes commands.
 	pair := starTestEdge("pair")
 	pair.Star, pair.Labels = nil, nil

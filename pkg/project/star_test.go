@@ -134,6 +134,87 @@ star:
 	}
 }
 
+// TestStarRemotePrecedence verifies that a node's remote setting takes
+// precedence over star.remote for its own edge, in either direction, without
+// affecting other edges, which star.remote configures, and that pair commands
+// enabled in the defaults don't reach the nodes that don't set it.
+func TestStarRemotePrecedence(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const (
+		disabled = synchronization.RemoteCommandMode_RemoteCommandModeDisabled
+		both     = synchronization.RemoteCommandMode_RemoteCommandModeBoth
+	)
+	for _, test := range []struct {
+		name, star string
+		expected   map[string]synchronization.RemoteCommandMode
+	}{
+		{"opt-out", "remote: true", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": both, "star-shared": disabled, "star-server": both,
+		}},
+		{"opt-in", "remote: false", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": both, "star-shared": disabled, "star-server": disabled,
+		}},
+		{"opt-in-default", "", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": both, "star-shared": disabled, "star-server": disabled,
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			specifications := testSpecifications(t, fmt.Sprintf(`
+sync:
+  defaults: {remote: true}
+star:
+  %s
+  center: local
+  nodes:
+    local: {endpoint: ./local}
+    server: {endpoint: ./server}
+    gpu: {endpoint: ./gpu, remote: true}
+    shared: {endpoint: ./shared, remote: false}
+`, test.star))
+			modes := make(map[string]synchronization.RemoteCommandMode)
+			for _, s := range specifications.Synchronization {
+				modes[s.Name] = s.Configuration.RemoteCommandMode
+			}
+			if !reflect.DeepEqual(modes, test.expected) {
+				t.Fatalf("incorrect remote command modes: %v, expected %v", modes, test.expected)
+			}
+		})
+	}
+
+	// Changing one node's remote setting replaces only its own edge.
+	configuration := testConfiguration(t, `
+star:
+  remote: true
+  center: local
+  nodes:
+    local: {endpoint: ./local}
+    server: {endpoint: ./server}
+    gpu: {endpoint: ./gpu}
+`)
+	initial, err := NewSessionSpecifications(configuration, nil, "project", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, states := testSessionStates(initial)
+	node := configuration.Star.Nodes["gpu"]
+	node.Remote = new(bool)
+	configuration.Star.Nodes["gpu"] = node
+	desired, err := NewSessionSpecifications(configuration, nil, "project", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewPlan(desired, nil, states)
+	if err != nil {
+		t.Fatal(err)
+	} else if plan.unchanged != 1 || len(plan.synchronization) != 1 {
+		t.Fatalf("incorrect plan for a node's remote setting: %+v", plan)
+	} else if change := plan.synchronization[0]; change.current.GetName() != "star-gpu" ||
+		change.specification.GetName() != "star-gpu" ||
+		change.specification.Configuration.RemoteCommandMode != disabled {
+		t.Fatalf("node's remote setting didn't replace its own edge: %+v", change)
+	}
+}
+
 // TestStarValidation verifies that invalid stars are rejected before any
 // session is created.
 func TestStarValidation(t *testing.T) {
@@ -146,6 +227,7 @@ func TestStarValidation(t *testing.T) {
 		{"center-unknown", "star: {center: c, nodes: {a: {endpoint: ./a}, b: {endpoint: ./b}}}", `star.center "c" doesn't name a node`},
 		{"single", "star: {center: a, nodes: {a: {endpoint: ./a}}}", "at least one node besides its center"},
 		{"center-mode", "star: {center: a, nodes: {a: {endpoint: ./a, mode: one-way-safe}, b: {endpoint: ./b}}}", "mode can't be set on the center node a"},
+		{"center-remote", "star: {center: a, nodes: {a: {endpoint: ./a, remote: false}, b: {endpoint: ./b}}}", "remote can't be set on the center node a"},
 		{"endpoint", "star: {center: a, nodes: {a: {endpoint: ./a}, b: {}}}", "node b has no endpoint"},
 		{"name", "star: {center: a, nodes: {a: {endpoint: ./a}, -b: {endpoint: ./b}}}", "invalid star node name"},
 		{"reserved", "star: {center: a, nodes: {a: {endpoint: ./a}, defaults: {endpoint: ./b}}}", "reserved"},
@@ -166,12 +248,15 @@ func TestStarValidation(t *testing.T) {
 			}
 		})
 	}
-	// Invalid modes are rejected when the file is loaded.
-	path := filepath.Join(t.TempDir(), DefaultConfigurationFileName)
-	if err := os.WriteFile(path, []byte("star: {center: a, nodes: {a: {endpoint: ./a}, b: {endpoint: ./b, mode: sideways}}}"), 0600); err != nil {
-		t.Fatal(err)
-	} else if _, err := LoadConfiguration(path); err == nil {
-		t.Fatal("invalid mode accepted")
+	// Invalid modes and remote settings, including the directions that pairs
+	// accept, are rejected when the file is loaded.
+	for _, node := range []string{"mode: sideways", "remote: beta"} {
+		path := filepath.Join(t.TempDir(), DefaultConfigurationFileName)
+		if err := os.WriteFile(path, []byte("star: {center: a, nodes: {a: {endpoint: ./a}, b: {endpoint: ./b, "+node+"}}}"), 0600); err != nil {
+			t.Fatal(err)
+		} else if _, err := LoadConfiguration(path); err == nil {
+			t.Fatal("invalid node setting accepted:", node)
+		}
 	}
 	// Enabling pair commands in defaults must not grant star-wide execution.
 	specifications := testSpecifications(t, "sync: {defaults: {remote: true}}\nstar: {center: a, nodes: {a: {endpoint: ./a}, b: {endpoint: ./b}}}")

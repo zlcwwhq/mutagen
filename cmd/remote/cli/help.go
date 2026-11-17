@@ -59,7 +59,8 @@ root and the synchronization mode of the edge to it. This is read-only: it
 neither synchronizes files nor executes commands. Available means that the
 node executes commands and the edge to it is connected at both ends, not that
 it's conflict-free. Operations on a node whose session's remote setting
-disables execution there fail with 125.
+disables execution there, such as a star node with remote: false, fail with
+125.
 
   - A project's star names its nodes. Its center is joined to every other
     node by its own synchronization pair, so the center reaches every node,
@@ -114,8 +115,9 @@ where you usually work, such as where agents run. The daemon relays every
 edge, so every endpoint must be reachable from the daemon, which relays a
 center on another system as it relays a pair whose endpoints are both
 remote. star.remote explicitly enables commands between the center and every
-node; prologues come only from each node's remotePrologue, never from
-synchronization defaults.
+node, and a node's own remote setting (true or false) takes precedence for
+its edge, in both directions; prologues come only from each node's
+remotePrologue, never from synchronization defaults.
 `},
 	{"sync", "synchronization, ignored paths, --pull, and --diff", `Each operation synchronizes the pair session that it crosses, such as the edge
 between a star's center and one of its nodes:

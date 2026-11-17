@@ -110,8 +110,35 @@ several identities.
 ## Remote commands
 
 `star.remote: true` permits commands between the center and every other node.
-It defaults to false, regardless of `sync.defaults.remote`. Select a node by
-name:
+It defaults to false, regardless of `sync.defaults.remote`. A node's own
+`remote` setting takes precedence for its edge, so that commands can be limited
+to some nodes:
+
+```yaml
+star:
+  remote: true
+  center: local
+  nodes:
+    local:
+      endpoint: "."
+    gpu:
+      endpoint: "gpu:~/project"
+    shared:
+      endpoint: "shared:~/project"
+      remote: false
+```
+
+- `remote: false` on a node disables commands in both directions on its edge:
+  the center can't run commands on the node, and the node can't run commands
+  on the center. The edge still synchronizes. `remote --nodes` lists the node
+  as unavailable, operations on it from the center fail with status 125, and
+  `remote` on the node finds no connected node (status 255).
+- `remote: true` on a node enables commands on its edge while `star.remote` is
+  false, so that only the nodes that set it can be used.
+- `remote` can't be set on the center. Changing a node's `remote` replaces only
+  its own edge (see [Applying project configuration](project-apply.md)).
+
+Select a node by name:
 
 ```sh
 remote --nodes

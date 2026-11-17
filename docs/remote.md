@@ -56,7 +56,8 @@ sync:
 mutagen sync create --remote=true ~/project server:~/project
 ```
 
-Stars use `star.remote` instead; see [Star workspaces](stars.md).
+Stars use `star.remote` and each node's `remote` instead; see
+[Star workspaces](stars.md#remote-commands).
 
 Any process running as your user on a system that submits commands can run
 commands on the executing endpoint. Only enable execution on an endpoint if you
