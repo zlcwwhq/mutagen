@@ -1283,6 +1283,11 @@ func removeDirectoryInUse(t *testing.T, path string) {
 	}
 }
 
+// gitSubmoduleCommands indicates whether or not the scenarios for submodules
+// can run remote commands on this system. Commands require a POSIX shell, which
+// Windows lacks.
+const gitSubmoduleCommands = runtime.GOOS != "windows"
+
 // gitSubmoduleTransports are the transports with which the scenarios for
 // submodules are run by TestGitModeSubmodules.
 var gitSubmoduleTransports = []struct {
@@ -1291,25 +1296,25 @@ var gitSubmoduleTransports = []struct {
 }{
 	{"local", gitSubmoduleTransport{}},
 	{"remote endpoint", gitSubmoduleTransport{
-		commands: true,
+		commands: gitSubmoduleCommands,
 		configure: func(options *gitModeOptions) {
 			options.remoteBeta = true
-			options.commands = synchronization.RemoteCommandMode_RemoteCommandModeBeta
+			if gitSubmoduleCommands {
+				options.commands = synchronization.RemoteCommandMode_RemoteCommandModeBeta
+			}
 		},
 	}},
 }
 
 // TestGitModeSubmodules runs the scenarios for submodules between local
-// endpoints and through the remote endpoint implementation, the latter of which
-// also supports remote commands.
+// endpoints and through the remote endpoint implementation. The latter also
+// supports remote commands, except on Windows, where its scenarios run without
+// the steps that use them.
 func TestGitModeSubmodules(t *testing.T) {
 	isolateGitMode(t)
 	for _, transport := range gitSubmoduleTransports {
 		for _, scenario := range gitSubmoduleScenarios {
 			t.Run(transport.name+"/"+scenario.name, func(t *testing.T) {
-				if transport.transport.commands && runtime.GOOS == "windows" {
-					t.Skip("commands require a POSIX shell")
-				}
 				scenario.run(t, transport.transport)
 			})
 		}
