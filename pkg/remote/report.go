@@ -25,12 +25,18 @@ type Report struct {
 	// Repository is the conflict between the repositories at the endpoints'
 	// synchronization roots in Git mode, if any.
 	Repository *RepositoryConflict `json:",omitempty"`
+	// Destination, for an operation whose destination is reached through a
+	// star's center (see Target.Via), reports the destination's edge, whose
+	// alpha is the center and whose beta is the destination, while the rest
+	// of the report describes the submitting node's edge.
+	Destination *Report `json:",omitempty"`
 }
 
 // Empty indicates whether the report contains no conflicts or problems.
 func (r *Report) Empty() bool {
 	return r == nil || (len(r.Conflicts) == 0 && r.ExcludedConflicts == 0 &&
-		len(r.Problems) == 0 && r.ExcludedProblems == 0 && r.Repository == nil)
+		len(r.Problems) == 0 && r.ExcludedProblems == 0 && r.Repository == nil &&
+		r.Destination.Empty())
 }
 
 // RepositoryConflict describes a disagreement between the commits and branches

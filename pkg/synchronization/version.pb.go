@@ -38,6 +38,13 @@ const (
 	// such sessions, which they would otherwise synchronize as ordinary ones,
 	// including their repositories' Git directories.
 	Version_Version2 Version = 2
+	// Version3 represents session version 3, which is the version of sessions
+	// whose remote submission mode keeps an endpoint from submitting commands
+	// that it would submit by default, whether in Git mode or not. Its
+	// defaults are those of session version 1, but daemons that don't support
+	// remote submission modes don't support it either, so they don't load
+	// such sessions, which would otherwise let that endpoint submit commands.
+	Version_Version3 Version = 3
 )
 
 // Enum value maps for Version.
@@ -46,11 +53,13 @@ var (
 		0: "Invalid",
 		1: "Version1",
 		2: "Version2",
+		3: "Version3",
 	}
 	Version_value = map[string]int32{
 		"Invalid":  0,
 		"Version1": 1,
 		"Version2": 2,
+		"Version3": 3,
 	}
 )
 
@@ -85,11 +94,12 @@ var File_synchronization_version_proto protoreflect.FileDescriptor
 
 const file_synchronization_version_proto_rawDesc = "" +
 	"\n" +
-	"\x1dsynchronization/version.proto\x12\x0fsynchronization*2\n" +
+	"\x1dsynchronization/version.proto\x12\x0fsynchronization*@\n" +
 	"\aVersion\x12\v\n" +
 	"\aInvalid\x10\x00\x12\f\n" +
 	"\bVersion1\x10\x01\x12\f\n" +
-	"\bVersion2\x10\x02B3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
+	"\bVersion2\x10\x02\x12\f\n" +
+	"\bVersion3\x10\x03B3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
 
 var (
 	file_synchronization_version_proto_rawDescOnce sync.Once

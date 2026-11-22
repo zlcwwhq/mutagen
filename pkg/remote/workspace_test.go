@@ -182,7 +182,7 @@ func TestStarUnavailableNodeIgnores(t *testing.T) {
 				Reject(connection, ConnectionError(errors.New("node c is unavailable: its edge isn't connected for remote commands at the center")))
 				continue
 			}
-			AcknowledgeRoute(connection)
+			AcknowledgeRoute(connection, Route{})
 			connection.Close()
 		}
 	}()

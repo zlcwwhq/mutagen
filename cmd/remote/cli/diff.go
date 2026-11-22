@@ -298,8 +298,12 @@ func compare(router *router, target *remote.Target, report *remote.Report, argum
 	locator := newLocator(target)
 	var paths []string
 	if len(arguments) == 0 {
-		if paths = conflictPaths(report); len(paths) == 0 && report.ExcludedConflicts > 0 {
-			return false, fmt.Errorf("%d conflicts were omitted from the report; specify paths with --diff to compare them", report.ExcludedConflicts)
+		excluded := report.ExcludedConflicts
+		if report.Destination != nil {
+			excluded += report.Destination.ExcludedConflicts
+		}
+		if paths = conflictPaths(report); len(paths) == 0 && excluded > 0 {
+			return false, fmt.Errorf("%d conflicts were omitted from the report; specify paths with --diff to compare them", excluded)
 		} else if len(paths) == 0 {
 			fmt.Fprintln(router.stderr, "remote: there are no conflicts to compare")
 		}

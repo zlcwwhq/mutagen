@@ -3,6 +3,7 @@ package synchronization
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -314,6 +315,11 @@ func starTestRegistry(sessions []*Session, connected ...string) (*commandStars, 
 	return stars, relays
 }
 
+// errorOf returns the error of a destination's resolution.
+func errorOf(_ *destination, err error) error {
+	return err
+}
+
 // starTestNode finds a node in a graph.
 func starTestNode(t *testing.T, graph *remote.NodeGraph, name string) remote.Node {
 	t.Helper()
@@ -327,8 +333,9 @@ func starTestNode(t *testing.T, graph *remote.NodeGraph, name string) remote.Nod
 }
 
 // TestStarNodes verifies node discovery: the center lists every node over its
-// own edge, including offline ones, while another node lists only itself and
-// the center.
+// own edge, including offline ones, while another node lists itself, the
+// center over its own edge, and the other nodes through the center over their
+// own edges.
 func TestStarNodes(t *testing.T) {
 	gpu, server, offline := starTestEdge("gpu"), starTestEdge("server"), starTestEdge("offline")
 	gpu.Configuration.SynchronizationMode = core.SynchronizationMode_SynchronizationModeOneWaySafe
@@ -362,12 +369,19 @@ func TestStarNodes(t *testing.T) {
 		}
 	}
 
-	// From another node, which reaches only the center.
+	// From another node, which reaches the other nodes through the center.
 	graph, err := stars.nodes(relays["gpu"], 1)
 	if err != nil {
 		t.Fatal(err)
-	} else if graph.Source != "gpu" || !graph.Star || len(graph.Nodes) != 2 {
+	} else if graph.Source != "gpu" || !graph.Star || len(graph.Nodes) != 4 {
 		t.Fatalf("node's graph misreported: %+v", graph)
+	}
+	if node := starTestNode(t, graph, "server"); node.Center || node.Current || !node.Available || node.Host != "server" ||
+		node.Mode != "two-way-safe" || node.Session != "server" || strings.Join(node.Path, ",") != "gpu,center,server" {
+		t.Fatalf("node through the center misreported: %+v", node)
+	}
+	if node := starTestNode(t, graph, "offline"); node.Available || !strings.Contains(node.Reason, "paused or disconnected") {
+		t.Fatalf("offline node through the center misreported: %+v", node)
 	}
 	center := starTestNode(t, graph, "center")
 	if !center.Center || center.Current || !center.Available || center.Mode != "one-way-safe" || center.Session != "gpu" ||
@@ -380,7 +394,8 @@ func TestStarNodes(t *testing.T) {
 
 	// A disconnected center channel makes the center unavailable from a node,
 	// and the node unavailable from the center, since submissions for it can
-	// only enter through its own edge's registration at the center.
+	// only enter through its own edge's registration at the center, but not
+	// from other nodes, whose operations through the center don't use it.
 	close(relays["server"].channels[0].(*starTestChannel).done)
 	if graph, err := stars.nodes(relays["server"], 1); err != nil {
 		t.Fatal(err)
@@ -393,6 +408,17 @@ func TestStarNodes(t *testing.T) {
 		t.Fatalf("node whose edge is disconnected at the center misreported: %+v", node)
 	} else if node := starTestNode(t, graph, "gpu"); !node.Available {
 		t.Fatalf("other node affected by a disconnected edge: %+v", node)
+	}
+	if graph, err := stars.nodes(relays["gpu"], 1); err != nil {
+		t.Fatal(err)
+	} else if node := starTestNode(t, graph, "server"); !node.Available {
+		t.Fatalf("node whose edge is disconnected at the center unavailable through the center: %+v", node)
+	}
+	close(relays["server"].channels[1].(*starTestChannel).done)
+	if graph, err := stars.nodes(relays["gpu"], 1); err != nil {
+		t.Fatal(err)
+	} else if node := starTestNode(t, graph, "server"); node.Available || node.Reason != errNodeUnavailable.Error() {
+		t.Fatalf("disconnected node available through the center: %+v", node)
 	}
 
 	// An implicit pair has nodes named alpha and beta.
@@ -436,7 +462,7 @@ func TestStarNodesExecution(t *testing.T) {
 		t.Fatalf("other node affected: %+v", node)
 	}
 	for _, through := range []string{"gpu", "server"} {
-		if err := relays[through].resolveSubmission(0, &remote.Submission{Node: "gpu", Resolve: true}); !refused(err) {
+		if _, err := relays[through].resolveSubmission(0, &remote.Submission{Node: "gpu", Resolve: true}); !refused(err) {
 			t.Fatalf("operation on a non-executing node through %s not refused: %v", through, err)
 		}
 	}
@@ -453,7 +479,7 @@ func TestStarNodesExecution(t *testing.T) {
 		t.Fatal(err)
 	} else if node := starTestNode(t, graph, "center"); !disabled(node) {
 		t.Fatalf("non-executing center misreported from a node: %+v", node)
-	} else if err := relays["gpu"].resolveSubmission(1, &remote.Submission{Resolve: true}); !refused(err) {
+	} else if _, err := relays["gpu"].resolveSubmission(1, &remote.Submission{Resolve: true}); !refused(err) {
 		t.Fatal("operation on a non-executing center not refused:", err)
 	}
 
@@ -470,9 +496,9 @@ func TestStarNodesExecution(t *testing.T) {
 		t.Fatalf("node with disabled commands misreported from the center: %+v", node)
 	} else if node := starTestNode(t, graph, "server"); !node.Available {
 		t.Fatalf("other node affected: %+v", node)
-	} else if err := relays["server"].resolveSubmission(0, &remote.Submission{Node: "gpu", Resolve: true}); !refused(err) {
+	} else if _, err := relays["server"].resolveSubmission(0, &remote.Submission{Node: "gpu", Resolve: true}); !refused(err) {
 		t.Fatal("operation on a node with disabled commands not refused:", err)
-	} else if err := relays["server"].resolveSubmission(0, &remote.Submission{Node: "server", Resolve: true}); err != nil {
+	} else if _, err := relays["server"].resolveSubmission(0, &remote.Submission{Node: "server", Resolve: true}); err != nil {
 		t.Fatal("operation on another node refused:", err)
 	}
 
@@ -485,7 +511,7 @@ func TestStarNodesExecution(t *testing.T) {
 		t.Fatal(err)
 	} else if node := starTestNode(t, graph, "beta"); !disabled(node) {
 		t.Fatalf("non-executing pair peer misreported: %+v", node)
-	} else if err := relays["pair"].resolveSubmission(0, &remote.Submission{Resolve: true}); !refused(err) {
+	} else if _, err := relays["pair"].resolveSubmission(0, &remote.Submission{Resolve: true}); !refused(err) {
 		t.Fatal("operation on a non-executing pair peer not refused:", err)
 	}
 	if graph, err := stars.nodes(relays["pair"], 1); err != nil {
@@ -496,14 +522,15 @@ func TestStarNodesExecution(t *testing.T) {
 }
 
 // TestStarResolution verifies destination selection: the center reaches every
-// node over the node's own edge, and only through it, other nodes reach only
-// the center, and node names are only omitted when there is a single other
-// node.
+// node over the node's own edge, and only through it, other nodes reach the
+// center, which is their default destination, and the other nodes through
+// the center, and node names are only omitted at the center when there is a
+// single other node.
 func TestStarResolution(t *testing.T) {
 	gpu, server := starTestEdge("gpu"), starTestEdge("server")
 	_, relays := starTestRegistry([]*Session{gpu, server}, "gpu", "server")
 	resolve := func(through string, source int, node string) error {
-		return relays[through].resolveSubmission(source, &remote.Submission{Operation: remote.OperationFlush, Node: node, Resolve: true})
+		return errorOf(relays[through].resolveSubmission(source, &remote.Submission{Operation: remote.OperationFlush, Node: node, Resolve: true}))
 	}
 
 	// From the center, a submission through the selected node's own edge
@@ -531,23 +558,29 @@ func TestStarResolution(t *testing.T) {
 		t.Fatal("unknown node accepted:", err)
 	}
 
-	// From a node, the center is the only destination, so it can be omitted.
+	// From a node, the center is the default destination, which it reaches
+	// over its own edge.
 	for _, node := range []string{"", "center"} {
-		if err := resolve("gpu", 1, node); err != nil {
+		if destination, err := relays["gpu"].resolveSubmission(1, &remote.Submission{Node: node, Resolve: true}); err != nil {
 			t.Fatal(err)
+		} else if destination.relay != relays["gpu"] || destination.index != 0 || destination.node != "center" || destination.via != "" ||
+			destination.route() != (remote.Route{Node: "center", Edge: "gpu"}) {
+			t.Fatalf("center misresolved from a node: %+v", destination)
 		}
 	}
 
-	// Stars have no multi-hop routes.
-	if err := resolve("gpu", 1, "server"); err == nil || remote.ClassifyError(err) != remote.ErrorKindOperation ||
-		!strings.Contains(err.Error(), "no multi-hop") || !strings.Contains(err.Error(), "run the command from center") {
-		t.Fatal("multi-hop route accepted:", err)
+	// Another node is reached through the center, over its own edge.
+	if destination, err := relays["gpu"].resolveSubmission(1, &remote.Submission{Node: "server", Resolve: true}); err != nil {
+		t.Fatal("node through the center refused:", err)
+	} else if destination.relay != relays["server"] || destination.index != 1 || destination.node != "server" || destination.via != "center" ||
+		destination.route() != (remote.Route{Node: "server", Via: "center", Edge: "server"}) {
+		t.Fatalf("node through the center misresolved: %+v", destination)
 	}
 
 	// A single other node can be omitted at the center, too.
 	lone := starTestEdge("lone")
 	_, single := starTestRegistry([]*Session{lone}, "lone")
-	if err := single["lone"].resolveSubmission(0, &remote.Submission{Resolve: true}); err != nil {
+	if _, err := single["lone"].resolveSubmission(0, &remote.Submission{Resolve: true}); err != nil {
 		t.Fatal("single destination not selected:", err)
 	}
 }
@@ -560,7 +593,7 @@ func TestStarPinnedEdge(t *testing.T) {
 	gpu, server := starTestEdge("gpu"), starTestEdge("server")
 	stars, relays := starTestRegistry([]*Session{gpu, server}, "gpu", "server")
 	pinned := func(through string) error {
-		return relays[through].resolveSubmission(0, &remote.Submission{Operation: remote.OperationFlush, Node: "server", Resolve: true, Pinned: true})
+		return errorOf(relays[through].resolveSubmission(0, &remote.Submission{Operation: remote.OperationFlush, Node: "server", Resolve: true, Pinned: true, Edge: "server"}))
 	}
 	if err := pinned("server"); err != nil {
 		t.Fatal("pinned submission refused:", err)
@@ -607,8 +640,16 @@ func TestStarPinnedEdge(t *testing.T) {
 	pair := starTestEdge("pair")
 	pair.Star, pair.Labels = nil, nil
 	_, relays = starTestRegistry([]*Session{pair}, "pair")
-	if err := relays["pair"].resolveSubmission(1, &remote.Submission{Operation: remote.OperationFlush, Resolve: true, Pinned: true}); err != nil {
+	if _, err := relays["pair"].resolveSubmission(1, &remote.Submission{Operation: remote.OperationFlush, Resolve: true, Pinned: true, Edge: "pair"}); err != nil {
 		t.Fatal("pinned pair submission refused:", err)
+	}
+
+	// A pinned submission that doesn't identify its destination's edge, as
+	// from clients that predate destinations through a star's center, which
+	// pin the registration's peer, is refused rather than sent to that peer.
+	_, relays = starTestRegistry([]*Session{gpu, server}, "gpu", "server")
+	if _, err := relays["gpu"].resolveSubmission(1, &remote.Submission{Operation: remote.OperationFlush, Node: "center", Resolve: true, Pinned: true}); !errors.Is(err, errPinnedWithoutEdge) {
+		t.Fatal("pinned submission without a destination edge accepted:", err)
 	}
 }
 
@@ -619,13 +660,13 @@ func TestStarPinnedEdge(t *testing.T) {
 func TestStarResolutionProblems(t *testing.T) {
 	gpu, server := starTestEdge("gpu"), starTestEdge("server")
 	stars, relays := starTestRegistry([]*Session{gpu, server}, "gpu")
-	if err := relays["gpu"].resolveSubmission(0, &remote.Submission{Node: "server", Resolve: true}); err == nil ||
+	if _, err := relays["gpu"].resolveSubmission(0, &remote.Submission{Node: "server", Resolve: true}); err == nil ||
 		remote.ClassifyError(err) != remote.ErrorKindConnection || !strings.Contains(err.Error(), "node server is unavailable") {
 		t.Fatal("unavailable node not reported as a connection failure:", err)
 	}
 
-	pinned := &remote.Submission{Node: "gpu", Resolve: true, Pinned: true}
-	if err := relays["gpu"].resolveSubmission(0, pinned); err != nil {
+	pinned := &remote.Submission{Node: "gpu", Resolve: true, Pinned: true, Edge: "gpu"}
+	if _, err := relays["gpu"].resolveSubmission(0, pinned); err != nil {
 		t.Fatal(err)
 	}
 	server.Alpha = &url.URL{Protocol: url.Protocol_SSH, Host: "center", Path: "~/elsewhere"}
@@ -637,29 +678,29 @@ func TestStarResolutionProblems(t *testing.T) {
 	} else if node := starTestNode(t, graph, "gpu"); node.Available || node.Reason != graph.Problem {
 		t.Fatalf("node available despite star problem: %+v", node)
 	}
-	if err := relays["gpu"].resolveSubmission(0, &remote.Submission{Node: "gpu", Resolve: true}); err == nil ||
+	if _, err := relays["gpu"].resolveSubmission(0, &remote.Submission{Node: "gpu", Resolve: true}); err == nil ||
 		remote.ClassifyError(err) != remote.ErrorKindOperation || !strings.Contains(err.Error(), "until the star is repaired") {
 		t.Fatal("star problem didn't refuse an operation from the center:", err)
 	}
 
 	// An operation that selected its edge before the problem keeps using it,
 	// subject to its connection at both ends.
-	if err := relays["gpu"].resolveSubmission(0, pinned); err != nil {
+	if _, err := relays["gpu"].resolveSubmission(0, pinned); err != nil {
 		t.Fatal("star problem refused a pinned operation:", err)
 	}
 	close(relays["gpu"].channels[1].(*starTestChannel).done)
-	if err := relays["gpu"].resolveSubmission(0, pinned); err == nil || remote.ClassifyError(err) != remote.ErrorKindConnection {
+	if _, err := relays["gpu"].resolveSubmission(0, pinned); err == nil || remote.ClassifyError(err) != remote.ErrorKindConnection {
 		t.Fatal("disconnected pinned edge accepted:", err)
 	}
 	if graph, err := stars.nodes(relays["gpu"], 1); err != nil || graph.Problem == "" {
 		t.Fatalf("star problem not reported from a node: %+v %v", graph, err)
 	}
 	relays["gpu"].channels[1] = &starTestChannel{make(chan struct{})}
-	if err := relays["gpu"].resolveSubmission(1, &remote.Submission{Resolve: true}); err != nil {
+	if _, err := relays["gpu"].resolveSubmission(1, &remote.Submission{Resolve: true}); err != nil {
 		t.Fatal("star problem refused a node's own edge:", err)
 	}
 	close(relays["gpu"].channels[0].(*starTestChannel).done)
-	if err := relays["gpu"].resolveSubmission(0, pinned); err == nil || remote.ClassifyError(err) != remote.ErrorKindConnection ||
+	if _, err := relays["gpu"].resolveSubmission(0, pinned); err == nil || remote.ClassifyError(err) != remote.ErrorKindConnection ||
 		!strings.Contains(err.Error(), "isn't connected for remote commands at the center") {
 		t.Fatal("pinned edge disconnected at the center accepted:", err)
 	}
@@ -752,5 +793,264 @@ func TestStarCrossEdgeSubmissionRefused(t *testing.T) {
 	case <-drained:
 	case <-ctx.Done():
 		t.Fatal("relay retained completed routes")
+	}
+}
+
+// TestStarAcrossEdges verifies operations from a star's node on another node,
+// which it reaches through the center: flushes synchronize the submitting
+// node's edge and then the destination's, or the reverse when returning,
+// report both edges, and end once the destination's relay stops; later
+// submissions are pinned to the destination's edge; and conflict operations,
+// which belong to each edge, are refused.
+func TestStarAcrossEdges(t *testing.T) {
+	data, err := os.MkdirTemp("", "ms-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(data)
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", data)
+	stars, relays := starTestRegistry([]*Session{starTestEdge("gpu"), starTestEdge("server")}, "gpu", "server")
+	for name, relay := range relays {
+		relay.flushRequests = make(chan chan error)
+		relay.report = func() *remote.Report {
+			return &remote.Report{Problems: []remote.Problem{{Path: name}}}
+		}
+	}
+	destinationCtx, stopDestination := context.WithCancel(context.Background())
+	defer stopDestination()
+	relays["server"].ctx = destinationCtx
+	source := relays["gpu"]
+	channel, err := remote.NewLocalChannel(nil, &remote.Endpoint{Session: "gpu", Star: "project", Node: "gpu", PeerNode: "center", Root: t.TempDir(), Submit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer channel.Close()
+	source.channels[1] = channel
+	source.routes.Add(1)
+	go func() {
+		defer source.routes.Done()
+		source.accept(context.Background(), 1, channel)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	submit := func(selection *remote.Selection, header *remote.Submission) (net.Conn, *remote.Target, error) {
+		return selection.Submit(ctx, t.TempDir(), header)
+	}
+
+	// flushes answers the flush requests of the specified edges in order.
+	flushes := func(order ...string) <-chan error {
+		result := make(chan error, 1)
+		go func() {
+			for _, name := range order {
+				select {
+				case request := <-relays[name].flushRequests:
+					request <- nil
+				case <-relays[other(name)].flushRequests:
+					result <- fmt.Errorf("edges flushed out of order, expected %v", order)
+					return
+				case <-ctx.Done():
+					result <- fmt.Errorf("flush of %s did not start", name)
+					return
+				}
+			}
+			result <- nil
+		}()
+		return result
+	}
+
+	// A flush before a command synchronizes the submitting node's edge first.
+	selection := &remote.Selection{Target: &remote.Target{Session: "gpu"}, Resolve: true, Node: "server"}
+	order := flushes("gpu", "server")
+	connection, target, err := submit(selection, &remote.Submission{Operation: remote.OperationFlush})
+	if err != nil {
+		t.Fatal(err)
+	} else if target.Session != "gpu" || target.Alpha || !target.Resolved || target.SourceNode != "gpu" ||
+		target.Node != "server" || target.Via != "center" || target.Edge != "server" {
+		t.Fatalf("target misreported: %+v", target)
+	}
+	report, err := remote.FlushWithProgress(ctx, connection, nil)
+	if err != nil {
+		t.Fatal("flush failed:", err)
+	} else if err := <-order; err != nil {
+		t.Fatal(err)
+	} else if len(report.Problems) != 1 || report.Problems[0].Path != "gpu" || report.Destination == nil ||
+		len(report.Destination.Problems) != 1 || report.Destination.Problems[0].Path != "server" {
+		t.Fatalf("report misses an edge: %+v", report)
+	}
+
+	// A returning flush, after a command, synchronizes the destination's edge
+	// first, through a submission pinned to it.
+	pinned := &remote.Selection{Target: target}
+	order = flushes("server", "gpu")
+	if connection, _, err = submit(pinned, &remote.Submission{Operation: remote.OperationFlush, Direction: remote.FlushReturning}); err != nil {
+		t.Fatal(err)
+	} else if _, err := remote.FlushWithProgress(ctx, connection, nil); err != nil {
+		t.Fatal("returning flush failed:", err)
+	} else if err := <-order; err != nil {
+		t.Fatal(err)
+	}
+
+	// A flush in both directions, without a command, synchronizes the
+	// submitting node's edge again after the destination's.
+	order = flushes("gpu", "server", "gpu")
+	if connection, _, err = submit(pinned, &remote.Submission{Operation: remote.OperationFlush, Direction: remote.FlushBoth}); err != nil {
+		t.Fatal(err)
+	} else if _, err := remote.FlushWithProgress(ctx, connection, nil); err != nil {
+		t.Fatal("flush in both directions failed:", err)
+	} else if err := <-order; err != nil {
+		t.Fatal(err)
+	}
+
+	// Conflict operations are refused as operation errors before they reach
+	// either edge.
+	for _, operation := range []remote.Operation{remote.OperationConflicts, remote.OperationClaim, remote.OperationRelease} {
+		if refused, _, err := submit(pinned, &remote.Submission{Operation: operation}); err == nil {
+			refused.Close()
+			t.Fatalf("operation %d accepted through the center", operation)
+		} else if remote.ClassifyError(err) != remote.ErrorKindOperation || !strings.Contains(err.Error(), "remote --node server --conflicts from center") {
+			t.Fatalf("operation %d not refused as an operation error: %v", operation, err)
+		}
+	}
+
+	// Stopping the destination's relay ends a flush that waits for it.
+	connection, _, err = submit(pinned, &remote.Submission{Operation: remote.OperationFlush})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case request := <-source.flushRequests:
+		request <- nil
+	case <-ctx.Done():
+		t.Fatal("flush of the submitting node's edge did not start")
+	}
+	stopDestination()
+	if _, err := remote.FlushWithProgress(ctx, connection, nil); err == nil || remote.ClassifyError(err) != remote.ErrorKindConnection {
+		t.Fatal("flush survived the destination's relay:", err)
+	}
+
+	// Replacing the destination's edge fails pinned submissions, while
+	// replacing another edge doesn't.
+	relays["server"].ctx = context.Background()
+	stars.update(&controller{session: starTestEdge("extra")}, false)
+	if refused, _, err := submit(pinned, &remote.Submission{Operation: remote.OperationResolve}); err != nil {
+		t.Fatal("added node failed a pinned submission:", err)
+	} else {
+		refused.Close()
+	}
+	replacement := starTestEdge("server")
+	replacement.Identifier = "server-replacement"
+	stars.update(relays["server"].controller, true)
+	stars.update(&controller{session: replacement}, false)
+	if refused, _, err := submit(pinned, &remote.Submission{Operation: remote.OperationResolve}); err == nil {
+		refused.Close()
+		t.Fatal("pinned submission accepted for a replaced destination edge")
+	} else if !strings.Contains(err.Error(), errNodeGraphChanged.Error()) {
+		t.Fatal("pinned submission for a replaced destination edge misreported:", err)
+	}
+
+	// The relay releases its routes once its channel closes.
+	channel.Close()
+	drained := make(chan struct{})
+	go func() {
+		source.routes.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-ctx.Done():
+		t.Fatal("relay retained completed routes")
+	}
+}
+
+// other names the other node of TestStarAcrossEdges.
+func other(name string) string {
+	if name == "gpu" {
+		return "server"
+	}
+	return "gpu"
+}
+
+// TestStarAcrossEdgesAvailability verifies that a node reached through the
+// center must execute commands, as its own edge's remote command mode permits,
+// whatever the center's remote settings, and that a star problem refuses
+// operations through the center unless they were pinned before it arose.
+func TestStarAcrossEdgesAvailability(t *testing.T) {
+	gpu, server := starTestEdge("gpu"), starTestEdge("server")
+	gpu.Configuration.RemoteCommandMode = RemoteCommandMode_RemoteCommandModeDisabled
+	gpu.Configuration.RemoteSubmissionMode = RemoteCommandMode_RemoteCommandModeBeta
+	server.Configuration.RemoteCommandMode = RemoteCommandMode_RemoteCommandModeBeta
+	stars, relays := starTestRegistry([]*Session{gpu, server}, "gpu", "server")
+	if _, err := relays["gpu"].resolveSubmission(1, &remote.Submission{Node: "server", Resolve: true}); err != nil {
+		t.Fatal("executing node refused through a non-executing center:", err)
+	} else if _, err := relays["server"].resolveSubmission(1, &remote.Submission{Node: "gpu", Resolve: true}); err == nil ||
+		remote.ClassifyError(err) != remote.ErrorKindOperation || !strings.Contains(err.Error(), errExecutionDisabled.Error()) {
+		t.Fatal("non-executing node not refused through the center:", err)
+	} else if _, err := relays["gpu"].resolveSubmission(1, &remote.Submission{Resolve: true}); err == nil ||
+		!strings.Contains(err.Error(), errExecutionDisabled.Error()) {
+		t.Fatal("non-executing center not refused as the default destination:", err)
+	}
+
+	// A star problem refuses operations through the center, unless pinned.
+	pinned := &remote.Submission{Node: "server", Resolve: true, Pinned: true, Edge: "server"}
+	if _, err := relays["gpu"].resolveSubmission(1, pinned); err != nil {
+		t.Fatal(err)
+	}
+	stray := starTestEdge("stray")
+	stray.Alpha = &url.URL{Protocol: url.Protocol_SSH, Host: "center", Path: "~/elsewhere"}
+	stars.update(&controller{session: stray}, false)
+	if _, err := relays["gpu"].resolveSubmission(1, &remote.Submission{Node: "server", Resolve: true}); err == nil ||
+		!strings.Contains(err.Error(), "operations through the center node center are unavailable until the star is repaired") {
+		t.Fatal("star problem didn't refuse an operation through the center:", err)
+	} else if _, err := relays["gpu"].resolveSubmission(1, pinned); err != nil {
+		t.Fatal("star problem refused a pinned operation through the center:", err)
+	} else if _, err := relays["gpu"].resolveSubmission(1, &remote.Submission{Resolve: true, Node: "center"}); err == nil ||
+		!strings.Contains(err.Error(), errExecutionDisabled.Error()) {
+		t.Fatal("star problem changed the refusal of the center:", err)
+	}
+}
+
+// TestSubmittingEndpoints verifies which endpoints submit commands under each
+// remote submission mode: by default, those whose opposite endpoints execute
+// commands, and otherwise those that the mode names if their opposite
+// endpoints execute commands, or, at a star's node other than the center,
+// regardless.
+func TestSubmittingEndpoints(t *testing.T) {
+	const (
+		dflt     = RemoteCommandMode_RemoteCommandModeDefault
+		disabled = RemoteCommandMode_RemoteCommandModeDisabled
+		alpha    = RemoteCommandMode_RemoteCommandModeAlpha
+		beta     = RemoteCommandMode_RemoteCommandModeBeta
+		both     = RemoteCommandMode_RemoteCommandModeBoth
+	)
+	for _, test := range []struct {
+		star                      bool
+		execution                 RemoteCommandMode
+		submission                RemoteCommandMode
+		alphaSubmits, betaSubmits bool
+	}{
+		{false, dflt, dflt, false, false},
+		{false, alpha, dflt, false, true},
+		{false, beta, dflt, true, false},
+		{false, both, dflt, true, true},
+		{false, both, alpha, true, false},
+		{false, both, disabled, false, false},
+		{false, alpha, both, false, true},
+		{false, disabled, beta, false, false},
+		{true, disabled, dflt, false, false},
+		{true, disabled, beta, false, true},
+		{true, disabled, both, false, true},
+		{true, beta, both, true, true},
+		{true, alpha, alpha, false, false},
+		{true, both, beta, false, true},
+	} {
+		session := starTestEdge("gpu")
+		if !test.star {
+			session.Star = nil
+		}
+		session.Configuration = &Configuration{RemoteCommandMode: test.execution, RemoteSubmissionMode: test.submission}
+		if alphaSubmits, betaSubmits := submittingEndpoints(session); alphaSubmits != test.alphaSubmits || betaSubmits != test.betaSubmits {
+			t.Errorf("star %t, execution %v, submission %v: submitters %t and %t, expected %t and %t", test.star,
+				test.execution, test.submission, alphaSubmits, betaSubmits, test.alphaSubmits, test.betaSubmits)
+		}
 	}
 }

@@ -461,7 +461,7 @@ func TestResolvedRouteIgnoresKnowRoot(t *testing.T) {
 				connection.Close()
 				continue
 			}
-			AcknowledgeRoute(connection)
+			AcknowledgeRoute(connection, Route{})
 			connection.Close()
 		}
 	}()

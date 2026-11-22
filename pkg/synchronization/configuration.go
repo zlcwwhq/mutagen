@@ -220,14 +220,19 @@ func (c *Configuration) EnsureValid(endpointSpecific bool) error {
 		}
 	}
 
-	// Verify that the remote command mode is unspecified or supported.
+	// Verify that the remote command and submission modes are unspecified or
+	// supported.
 	if endpointSpecific {
 		if !c.RemoteCommandMode.IsDefault() {
 			return errors.New("remote command mode cannot be specified on an endpoint-specific basis")
+		} else if !c.RemoteSubmissionMode.IsDefault() {
+			return errors.New("remote submission mode cannot be specified on an endpoint-specific basis")
 		}
 	} else {
 		if !(c.RemoteCommandMode.IsDefault() || c.RemoteCommandMode.Supported()) {
 			return errors.New("unknown or unsupported remote command mode")
+		} else if !(c.RemoteSubmissionMode.IsDefault() || c.RemoteSubmissionMode.Supported()) {
+			return errors.New("unknown or unsupported remote submission mode")
 		}
 	}
 
@@ -272,7 +277,8 @@ func (c *Configuration) Equal(other *Configuration) bool {
 		c.DefaultGroup == other.DefaultGroup &&
 		c.CompressionAlgorithm == other.CompressionAlgorithm &&
 		c.RemoteCommandMode == other.RemoteCommandMode &&
-		c.RemotePrologue == other.RemotePrologue
+		c.RemotePrologue == other.RemotePrologue &&
+		c.RemoteSubmissionMode == other.RemoteSubmissionMode
 }
 
 // MergeConfigurations merges two configurations of differing priorities. Both
@@ -436,6 +442,13 @@ func MergeConfigurations(lower, higher *Configuration) *Configuration {
 		result.RemotePrologue = higher.RemotePrologue
 	} else {
 		result.RemotePrologue = lower.RemotePrologue
+	}
+
+	// Merge the remote submission mode.
+	if !higher.RemoteSubmissionMode.IsDefault() {
+		result.RemoteSubmissionMode = higher.RemoteSubmissionMode
+	} else {
+		result.RemoteSubmissionMode = lower.RemoteSubmissionMode
 	}
 
 	// Done.

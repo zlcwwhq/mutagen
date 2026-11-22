@@ -469,6 +469,19 @@ func printSession(state *synchronization.State, mode common.SessionDisplayMode) 
 			remoteCommandModeDescription += fmt.Sprintf(" (%s)", defaultRemoteCommandMode.Description())
 		}
 		fmt.Println("\tRemote commands:", remoteCommandModeDescription)
+
+		// Compute and print the remote submission mode, whose default
+		// depends on the remote command mode.
+		remoteSubmissionModeDescription := configuration.RemoteSubmissionMode.SubmissionDescription()
+		if configuration.RemoteSubmissionMode.IsDefault() {
+			remoteCommandMode := configuration.RemoteCommandMode
+			if remoteCommandMode.IsDefault() {
+				remoteCommandMode = state.Session.Version.DefaultRemoteCommandMode()
+			}
+			defaultRemoteSubmissionMode := synchronization.DefaultRemoteSubmissionMode(remoteCommandMode)
+			remoteSubmissionModeDescription += fmt.Sprintf(" (%s)", defaultRemoteSubmissionMode.SubmissionDescription())
+		}
+		fmt.Println("\tRemote submission:", remoteSubmissionModeDescription)
 	}
 
 	// Compute and print alpha-specific configuration.

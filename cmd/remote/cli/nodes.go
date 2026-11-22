@@ -81,10 +81,15 @@ func printNodes(graph *remote.NodeGraph, asJSON bool, writer io.Writer) error {
 		if node.Mode != "" {
 			details = append(details, node.Mode)
 		}
+		// A destination reached through the center lists it between the
+		// source and itself.
+		if len(node.Path) > 2 {
+			details = append(details, "through "+strings.Join(node.Path[1:len(node.Path)-1], ", "))
+		}
 		fmt.Fprintf(output, "  %s: %s\n", clean(node.Name), clean(strings.Join(details, "; ")))
 	}
 	if graph.Problem != "" {
-		fmt.Fprintln(output, "Operations from the center fail until the star is repaired, such as by applying the project again.")
+		fmt.Fprintln(output, "Operations from and through the center fail until the star is repaired, such as by applying the project again.")
 	}
 	fmt.Fprintln(output, "Available means that a node executes commands and the edge to it is connected at both ends, not that it's in sync; commands still synchronize and report conflicts unless given --no-flush.")
 	return output.err

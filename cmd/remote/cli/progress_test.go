@@ -347,3 +347,36 @@ func TestProgressFlush(t *testing.T) {
 		}
 	}
 }
+
+func TestProgressAcrossEdges(t *testing.T) {
+	// For a destination reached through the center, the phases of each edge
+	// are kept apart, the center is named on the submitting node's edge, and
+	// the destination's edge names its nodes, or the edge itself for statuses
+	// that refer to neither endpoint.
+	setProgressTiming(t, time.Second, 10*time.Second, time.Hour)
+	var output strings.Builder
+	display := newProgressDisplay(&progressOutput{writer: &output}, &remote.Target{Alpha: false, Root: "/root", Contained: true, Node: "gpu", Via: "local"})
+	clock := &testClock{now: time.Unix(1000, 0)}
+	display.now = clock.read
+	update := display.begin()
+	update(&remote.Progress{Status: "scanning"})
+	clock.advance(2 * time.Second)
+	update(&remote.Progress{Status: "staging-alpha"})
+	clock.advance(2 * time.Second)
+	update(&remote.Progress{Status: "scanning", Destination: true})
+	clock.advance(2 * time.Second)
+	update(&remote.Progress{Status: "staging-beta", Destination: true})
+	clock.advance(2 * time.Second)
+	update(&remote.Progress{Status: "staging-alpha", Destination: true})
+	clock.advance(2 * time.Second)
+	display.finish(context.Background(), nil)
+	expected := "remote: synchronizing for 2s: staging on alpha (center local)\n" +
+		"remote: synchronizing for 4s: scanning (edge to gpu)\n" +
+		"remote: synchronizing for 6s: staging on beta (gpu)\n" +
+		"remote: synchronizing for 8s: staging on alpha (center local, edge to gpu)\n" +
+		"remote: synchronized in 10s: scanning 2s; staging on alpha (center local) 2s; scanning (edge to gpu) 2s; " +
+		"staging on beta (gpu) 2s; staging on alpha (center local, edge to gpu) 2s\n"
+	if output.String() != expected {
+		t.Fatalf("incorrect progress output:\n%s\ninstead of:\n%s", output.String(), expected)
+	}
+}

@@ -56,8 +56,13 @@ sync:
 mutagen sync create --remote=true ~/project server:~/project
 ```
 
-Stars use `star.remote` and each node's `remote` instead; see
-[Star workspaces](stars.md#remote-commands).
+The `remoteSubmit` setting, or `--remote-submit`, names the endpoints from
+which commands may be submitted, with the same values. By default, commands may
+be submitted from each endpoint whose opposite endpoint executes them, so
+pairs rarely need it.
+
+Stars use `star.remote` and `star.remoteSubmit`, and each node's `remote` and
+`remoteSubmit`, instead; see [Star workspaces](stars.md#remote-commands).
 
 Any process running as your user on a system that submits commands can run
 commands on the executing endpoint. Only enable execution on an endpoint if you
@@ -86,7 +91,8 @@ remote --nodes --json
 remote --node beta make test   # select a node
 ```
 
-`--node` can be omitted when there's exactly one other node. Each call stays on
+`--node` can be omitted when there's exactly one other node, or, at a star's
+node other than the center, to select the center. Each call stays on
 the node it selected and never switches to another one after a failure. Repeat
 `--node` for later operations on the same node, such as `--wait` and `--kill`
 for a detached job. The commands that `remote` suggests include it.
@@ -440,7 +446,7 @@ failures use these statuses:
 | :--- | :--- |
 | 1 | `--diff`: copies differ. `--ignores`: a path is ignored |
 | 124 | Timeout |
-| 125 | `remote`'s own failure: invalid arguments or input, a failed operation, an unknown node, a node that only a star's center reaches, a star problem, or a lost job |
+| 125 | `remote`'s own failure: invalid arguments or input, a failed operation, an unknown node, a node that doesn't execute commands, a star problem, or a lost job |
 | 126 | The command couldn't start, such as because of its working directory or prologue |
 | 127 | Command not found |
 | 128+N | Killed by signal N |

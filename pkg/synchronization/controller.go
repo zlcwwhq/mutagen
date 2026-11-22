@@ -309,11 +309,13 @@ func loadSession(logger *logging.Logger, tracker *state.Tracker, stars *commandS
 	// support Git mode load (see Version_Version2). Give them the Git mode
 	// version and record it, so that those daemons no longer load them. If it
 	// can't be recorded, then the session still runs, and it's recorded when
-	// the session is next paused, resumed, or loaded.
-	if session.Version == DefaultVersion && versionFor(session.Configuration) == gitModeVersion {
-		session.Version = gitModeVersion
+	// the session is next paused, resumed, or loaded. Sessions that restrict
+	// remote submission are created with their own version (see
+	// Version_Version3), which is likewise recorded if they lack it.
+	if version := versionFor(session.Configuration); session.Version < version {
+		session.Version = version
 		if err := encoding.MarshalAndSaveProtobuf(sessionPath, session); err != nil {
-			logger.Warn("Unable to record the session version of Git mode:", err)
+			logger.Warn("Unable to record the session version:", err)
 		}
 	}
 

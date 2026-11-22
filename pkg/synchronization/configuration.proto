@@ -169,6 +169,16 @@ message Configuration {
     // value specifies that no prologue should be used.
     string remotePrologue = 92;
 
-    // Fields 93-100 are reserved for future remote command configuration
+    // RemoteSubmissionMode specifies which endpoints may submit commands via
+    // the remote executable, with the values of RemoteCommandMode, which name
+    // endpoints. An endpoint that it names submits commands if the opposite
+    // endpoint executes them, and, if it's a star node other than the center,
+    // which also reaches the nodes of the star's other edges through the
+    // center, even if the opposite endpoint doesn't. An endpoint that it
+    // doesn't name never submits commands. By default, each endpoint submits
+    // commands if and only if the opposite endpoint executes them.
+    RemoteCommandMode remoteSubmissionMode = 93;
+
+    // Fields 94-100 are reserved for future remote command configuration
     // parameters.
 }

@@ -110,8 +110,17 @@ type Configuration struct {
 	// while other paths are resolved against its synchronization root. An empty
 	// value specifies that no prologue should be used.
 	RemotePrologue string `protobuf:"bytes,92,opt,name=remotePrologue,proto3" json:"remotePrologue,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// RemoteSubmissionMode specifies which endpoints may submit commands via
+	// the remote executable, with the values of RemoteCommandMode, which name
+	// endpoints. An endpoint that it names submits commands if the opposite
+	// endpoint executes them, and, if it's a star node other than the center,
+	// which also reaches the nodes of the star's other edges through the
+	// center, even if the opposite endpoint doesn't. An endpoint that it
+	// doesn't name never submits commands. By default, each endpoint submits
+	// commands if and only if the opposite endpoint executes them.
+	RemoteSubmissionMode RemoteCommandMode `protobuf:"varint,93,opt,name=remoteSubmissionMode,proto3,enum=synchronization.RemoteCommandMode" json:"remoteSubmissionMode,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *Configuration) Reset() {
@@ -305,11 +314,19 @@ func (x *Configuration) GetRemotePrologue() string {
 	return ""
 }
 
+func (x *Configuration) GetRemoteSubmissionMode() RemoteCommandMode {
+	if x != nil {
+		return x.RemoteSubmissionMode
+	}
+	return RemoteCommandMode_RemoteCommandModeDefault
+}
+
 var File_synchronization_configuration_proto protoreflect.FileDescriptor
 
 const file_synchronization_configuration_proto_rawDesc = "" +
 	"\n" +
-	"#synchronization/configuration.proto\x12\x0fsynchronization\x1a$filesystem/behavior/probe_mode.proto\x1a\x1esynchronization/git_mode.proto\x1a)synchronization/remote_command_mode.proto\x1a\x1fsynchronization/scan_mode.proto\x1a synchronization/stage_mode.proto\x1a synchronization/watch_mode.proto\x1a+synchronization/compression/algorithm.proto\x1a\x1fsynchronization/core/mode.proto\x1a+synchronization/core/permissions_mode.proto\x1a-synchronization/core/symbolic_link_mode.proto\x1a(synchronization/core/ignore/syntax.proto\x1a1synchronization/core/ignore/ignore_vcs_mode.proto\x1a'synchronization/hashing/algorithm.proto\"\xec\t\n" +
+	"#synchronization/configuration.proto\x12\x0fsynchronization\x1a$filesystem/behavior/probe_mode.proto\x1a\x1esynchronization/git_mode.proto\x1a)synchronization/remote_command_mode.proto\x1a\x1fsynchronization/scan_mode.proto\x1a synchronization/stage_mode.proto\x1a synchronization/watch_mode.proto\x1a+synchronization/compression/algorithm.proto\x1a\x1fsynchronization/core/mode.proto\x1a+synchronization/core/permissions_mode.proto\x1a-synchronization/core/symbolic_link_mode.proto\x1a(synchronization/core/ignore/syntax.proto\x1a1synchronization/core/ignore/ignore_vcs_mode.proto\x1a'synchronization/hashing/algorithm.proto\"\xc4\n" +
+	"\n" +
 	"\rConfiguration\x12K\n" +
 	"\x13synchronizationMode\x18\v \x01(\x0e2\x19.core.SynchronizationModeR\x13synchronizationMode\x12>\n" +
 	"\x10hashingAlgorithm\x18\x11 \x01(\x0e2\x12.hashing.AlgorithmR\x10hashingAlgorithm\x12,\n" +
@@ -333,7 +350,8 @@ const file_synchronization_configuration_proto_rawDesc = "" +
 	"\fdefaultGroup\x18B \x01(\tR\fdefaultGroup\x12J\n" +
 	"\x14compressionAlgorithm\x18Q \x01(\x0e2\x16.compression.AlgorithmR\x14compressionAlgorithm\x12P\n" +
 	"\x11remoteCommandMode\x18[ \x01(\x0e2\".synchronization.RemoteCommandModeR\x11remoteCommandMode\x12&\n" +
-	"\x0eremotePrologue\x18\\ \x01(\tR\x0eremotePrologueB3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
+	"\x0eremotePrologue\x18\\ \x01(\tR\x0eremotePrologue\x12V\n" +
+	"\x14remoteSubmissionMode\x18] \x01(\x0e2\".synchronization.RemoteCommandModeR\x14remoteSubmissionModeB3Z1github.com/mutagen-io/mutagen/pkg/synchronizationb\x06proto3"
 
 var (
 	file_synchronization_configuration_proto_rawDescOnce sync.Once
@@ -378,11 +396,12 @@ var file_synchronization_configuration_proto_depIdxs = []int32{
 	11, // 10: synchronization.Configuration.permissionsMode:type_name -> core.PermissionsMode
 	12, // 11: synchronization.Configuration.compressionAlgorithm:type_name -> compression.Algorithm
 	13, // 12: synchronization.Configuration.remoteCommandMode:type_name -> synchronization.RemoteCommandMode
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	13, // 13: synchronization.Configuration.remoteSubmissionMode:type_name -> synchronization.RemoteCommandMode
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_synchronization_configuration_proto_init() }

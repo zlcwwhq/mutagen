@@ -315,6 +315,17 @@ type Submission struct {
 	// and fails if the edge was replaced or removed in the meantime. Other
 	// edges don't affect it.
 	Pinned bool `json:",omitempty"`
+	// Edge identifies the destination's edge for a pinned submission, as the
+	// earlier submission's acknowledgement reported it (see Target.Edge),
+	// since the destination's edge isn't the edge through which the
+	// submission enters if it's reached through a star's center (see
+	// Target.Via).
+	Edge string `json:",omitempty"`
+	// Direction orders the synchronization of both edges by an OperationFlush
+	// submission whose destination is reached through a star's center (see
+	// Target.Via). It doesn't affect other submissions, which synchronize a
+	// single edge once.
+	Direction FlushDirection `json:",omitempty"`
 	// Progress requests progress messages (see ReportProgress) while the
 	// daemon waits for the synchronization cycle of an OperationFlush or
 	// OperationConflicts submission. Submissions must accept a final response
@@ -322,6 +333,29 @@ type Submission struct {
 	// to report.
 	Progress bool `json:",omitempty"`
 }
+
+// FlushDirection orders the synchronization of the edges that a flush crosses
+// if its destination is reached through a star's center (see
+// Submission.Direction), so that changes reach where they're needed: a flush
+// synchronizes an edge in both directions, but changes cross the center only
+// if the edge on their far side is synchronized after the edge on their near
+// side.
+type FlushDirection uint8
+
+const (
+	// FlushOutbound synchronizes the submitting node's edge and then the
+	// destination's, so that the submitting node's changes reach the
+	// destination, as before a command.
+	FlushOutbound FlushDirection = iota
+	// FlushReturning synchronizes the destination's edge and then the
+	// submitting node's, so that the destination's changes reach the
+	// submitting node, as after a command.
+	FlushReturning
+	// FlushBoth synchronizes the submitting node's edge, the destination's,
+	// and the submitting node's again, so that changes in both directions
+	// arrive, as for a flush without a command.
+	FlushBoth
+)
 
 // status reports whether a command route reached an executing endpoint. It is
 // written by the executing endpoint on success or by any intermediate hop that

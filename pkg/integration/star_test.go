@@ -247,10 +247,16 @@ func TestStarCommands(t *testing.T) {
 		}
 	}
 
-	// Stars have no multi-hop routes.
-	code, _, diagnostic = runRemote(t, f.roots["server"], "--node", "gpu", "true")
-	if code != 125 || !strings.Contains(diagnostic, "no multi-hop") || !strings.Contains(diagnostic, "center node local") {
-		t.Fatalf("node-to-node command not refused: %d %s", code, diagnostic)
+	// Other nodes reach each other through the center, over both edges, so
+	// that a change made on the submitting node reaches the destination
+	// before the command, here through the gpu's one-way edge.
+	if err := os.WriteFile(filepath.Join(f.roots["server"], "sub", "from-server"), []byte("server"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, output, diagnostic = runRemote(t, filepath.Join(f.roots["server"], "sub"), "--node", "gpu", "sh", "-c",
+		`cat from-server; printf ':%s:' "$MUTAGEN_REMOTE_NODE"; pwd -P`)
+	if code != 0 || output != "server:gpu:"+filepath.Join(f.roots["gpu"], "sub")+"\n" {
+		t.Fatalf("node-to-node command failed: %d %q %s", code, output, diagnostic)
 	}
 
 	// The center must name its destination, which must exist and be
@@ -353,15 +359,22 @@ func TestStarNodeDiscovery(t *testing.T) {
 		}
 	}
 
-	// Another node lists itself and the center.
+	// Another node lists itself, the center over its own edge, and the other
+	// nodes through the center, over their own edges.
 	listing, output = listStar(t, f.roots["gpu"])
-	if listing.Current != "gpu" || len(listing.Nodes) != 2 || listing.Nodes[0].Name != "gpu" || listing.Nodes[1].Name != "local" {
+	if listing.Current != "gpu" || len(listing.Nodes) != 4 || listing.Nodes[0].Name != "gpu" || listing.Nodes[1].Name != "local" {
 		t.Fatalf("incorrect listing from a node: %s", output)
 	} else if center := listing.Nodes[1]; !center.Center || !center.Available || center.Mode != "one-way-safe" || strings.Join(center.Path, ",") != "gpu,local" {
 		t.Fatalf("center misreported from a node: %s", output)
 	}
+	for _, node := range listing.Nodes[2:] {
+		if node.Center || node.Mode != "two-way-safe" || strings.Join(node.Path, ",") != "gpu,local,"+node.Name || node.Available != (node.Name == "server") {
+			t.Fatalf("node misreported through the center: %+v", node)
+		}
+	}
 	code, output, diagnostic := runRemote(t, f.roots["gpu"], "--nodes")
-	if code != 0 || !strings.Contains(output, "Current node: gpu") || !strings.Contains(output, "local: center; available;") {
+	if code != 0 || !strings.Contains(output, "Current node: gpu") || !strings.Contains(output, "local: center; available;") ||
+		!strings.Contains(output, "two-way-safe; through local") {
 		t.Fatalf("incorrect text listing: %d %q %s", code, output, diagnostic)
 	}
 	if contents, err := os.ReadFile(filepath.Join(f.roots["server"], "sub", "input")); err != nil || string(contents) != "base" {
@@ -501,7 +514,9 @@ func TestStarNodeRemoteSetting(t *testing.T) {
 	})
 
 	// A center that doesn't execute commands can still run them on the nodes
-	// that do, but no node can submit commands to it.
+	// that do, which other nodes reach through it, but no node can submit
+	// commands to it. A node that reaches no executing node doesn't connect
+	// for commands.
 	t.Run("center", func(t *testing.T) {
 		f := startStarProject(t, []string{"local", "server", "private"}, `star:
   remote: true
@@ -512,12 +527,39 @@ func TestStarNodeRemoteSetting(t *testing.T) {
     local: {endpoint: ./local, remote: false}
     server: {endpoint: ./server}
     private: {endpoint: ./private, remote: false}
-`, map[string][]string{"local": {"server"}})
+`, map[string][]string{"local": {"server"}, "private": {"server"}})
 		listsDisabled(t, f)
-		for _, node := range []string{"server", "private"} {
-			if code, _, diagnostic := runRemote(t, f.roots[node], "true"); code != 255 || !strings.Contains(diagnostic, "no connected node contains the current directory") {
-				t.Fatalf("node %s submitted a command to a center with disabled commands: %d %s", node, code, diagnostic)
-			}
+		if code, _, diagnostic := runRemote(t, f.roots["server"], "true"); code != 255 || !strings.Contains(diagnostic, "no connected node contains the current directory") {
+			t.Fatalf("node that reaches no executing node connected for commands: %d %s", code, diagnostic)
+		} else if code, _, diagnostic := runRemote(t, f.roots["private"], "true"); code != 125 || !strings.Contains(diagnostic, "node local is unavailable: command execution is disabled") {
+			t.Fatalf("node submitted a command to a center with disabled commands: %d %s", code, diagnostic)
+		} else if code, output, diagnostic := runRemote(t, f.roots["private"], "--node", "server", "sh", "-c", `printf %s "$MUTAGEN_REMOTE_NODE"`); code != 0 || output != "server" {
+			t.Fatalf("node couldn't run a command on another node through a center with disabled commands: %d %q %s", code, output, diagnostic)
+		}
+	})
+
+	// A node whose remoteSubmit setting is false doesn't connect for commands,
+	// while it still executes them, and the center's remoteSubmit setting
+	// doesn't affect the nodes that reach each other through it.
+	t.Run("submit", func(t *testing.T) {
+		f := startStarProject(t, []string{"local", "server", "private"}, `star:
+  remote: true
+  sync:
+    watch: {mode: no-watch}
+  center: local
+  nodes:
+    local: {endpoint: ./local, remoteSubmit: false}
+    server: {endpoint: ./server}
+    private: {endpoint: ./private, remoteSubmit: false}
+`, map[string][]string{"server": {"local", "private"}})
+		if code, _, diagnostic := runRemote(t, f.roots["private"], "true"); code != 255 || !strings.Contains(diagnostic, "no connected node contains the current directory") {
+			t.Fatalf("node that may not submit commands submitted one: %d %s", code, diagnostic)
+		} else if code, _, diagnostic := runRemote(t, f.roots["local"], "true"); code != 255 || !strings.Contains(diagnostic, "no connected node contains the current directory") {
+			t.Fatalf("center that may not submit commands submitted one: %d %s", code, diagnostic)
+		} else if code, output, diagnostic := runRemote(t, f.roots["server"], "--node", "private", "sh", "-c", `printf %s "$MUTAGEN_REMOTE_NODE"`); code != 0 || output != "private" {
+			t.Fatalf("node that may not submit commands didn't execute one: %d %q %s", code, output, diagnostic)
+		} else if code, output, diagnostic := runRemote(t, f.roots["server"], "sh", "-c", `printf %s "$MUTAGEN_REMOTE_NODE"`); code != 0 || output != "local" {
+			t.Fatalf("center that may not submit commands didn't execute one: %d %q %s", code, output, diagnostic)
 		}
 	})
 
@@ -545,6 +587,184 @@ func TestStarNodeRemoteSetting(t *testing.T) {
 			t.Fatalf("center submitted to nodes that don't execute commands: %d %s", code, diagnostic)
 		}
 	})
+}
+
+// TestStarAcrossEdges verifies commands from a node on another node, which it
+// reaches through the center: the submitting node's changes reach the
+// destination before the command, and the command's changes come back after
+// it, through both edges; detached jobs work as on the center; and conflict
+// listing, which belongs to each edge, is refused.
+func TestStarAcrossEdges(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("commands require a POSIX shell")
+	}
+	f := startStarProject(t, []string{"local", "server", "gpu"}, `star:
+  remote: true
+  sync:
+    watch: {mode: no-watch}
+  center: local
+  nodes:
+    local: {endpoint: ./local}
+    server: {endpoint: ./server}
+    gpu: {endpoint: ./gpu}
+`, map[string][]string{"server": {"local", "gpu"}, "gpu": {"local", "server"}})
+	sub := filepath.Join(f.roots["server"], "sub")
+	if err := os.Mkdir(sub, 0700); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(filepath.Join(sub, "input"), []byte("server"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, output, diagnostic := runRemote(t, sub, "--node", "gpu", "sh", "-c", `cat input; printf ':%s:' "$MUTAGEN_REMOTE_NODE"; pwd -P; printf gpu > output`)
+	if code != 0 || output != "server:gpu:"+filepath.Join(f.roots["gpu"], "sub")+"\n" {
+		t.Fatalf("command through the center failed: %d %q %s", code, output, diagnostic)
+	}
+	for _, node := range []string{"server", "local"} {
+		if contents, err := os.ReadFile(filepath.Join(f.roots[node], "sub", "output")); err != nil || string(contents) != "gpu" {
+			t.Fatalf("command's change didn't reach %s: %q %v", node, contents, err)
+		}
+	}
+
+	// Detached jobs are started, waited for, and listed through the center,
+	// and the commands that remote suggests select the destination again.
+	code, output, diagnostic = runRemote(t, sub, "--node", "gpu", "--detach", "sh", "-c", `printf job > job-output`)
+	if code != 0 {
+		t.Fatalf("job through the center didn't start: %d %s", code, diagnostic)
+	}
+	wait := suggestedCommand(t, diagnostic, "--wait")
+	if !slices.Contains(wait, "gpu") {
+		t.Fatalf("suggested command doesn't select the destination: %v", wait)
+	} else if code, _, diagnostic = runRemote(t, sub, wait...); code != 0 {
+		t.Fatalf("waiting for a job through the center failed: %d %s", code, diagnostic)
+	} else if contents, err := os.ReadFile(filepath.Join(sub, "job-output")); err != nil || string(contents) != "job" {
+		t.Fatalf("job's change didn't return: %q %v", contents, err)
+	}
+
+	// A flush without a command brings changes back, too, such as those of a
+	// job that has finished.
+	if code, _, diagnostic = runRemote(t, sub, "--node", "gpu", "--detach", "sh", "-c", `printf later > later-output`); code != 0 {
+		t.Fatalf("job through the center didn't start: %d %s", code, diagnostic)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if contents, _ := os.ReadFile(filepath.Join(f.roots["gpu"], "sub", "later-output")); string(contents) == "later" {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatal("job through the center didn't finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if code, _, diagnostic = runRemote(t, sub, "--node", "gpu", "--flush"); code != 0 {
+		t.Fatalf("flush through the center failed: %d %s", code, diagnostic)
+	} else if contents, err := os.ReadFile(filepath.Join(sub, "later-output")); err != nil || string(contents) != "later" {
+		t.Fatalf("flush through the center didn't bring the job's change back: %q %v", contents, err)
+	}
+
+	// Conflicts belong to each edge.
+	if code, _, diagnostic = runRemote(t, sub, "--node", "gpu", "--conflicts"); code != 125 || !strings.Contains(diagnostic, "remote --node gpu --conflicts from local") {
+		t.Fatalf("conflict listing through the center not refused: %d %s", code, diagnostic)
+	} else if code, _, diagnostic = runRemote(t, sub, "--conflicts"); code != 0 {
+		t.Fatalf("conflict listing on the node's own edge failed: %d %s", code, diagnostic)
+	}
+}
+
+// TestStarAcrossEdgesStop verifies that a command from a node on another node,
+// which it reaches through the center, ends promptly with status 255, and is
+// terminated, when either edge stops, so that pausing an edge doesn't wait for
+// a command that runs over another edge's channel.
+func TestStarAcrossEdgesStop(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("commands require a POSIX shell")
+	}
+	f := startStarProject(t, []string{"local", "server", "gpu"}, `star:
+  remote: true
+  sync:
+    watch: {mode: no-watch}
+    ignore: {paths: [ignored]}
+  center: local
+  nodes:
+    local: {endpoint: ./local}
+    server: {endpoint: ./server}
+    gpu: {endpoint: ./gpu}
+`, map[string][]string{"server": {"local", "gpu"}})
+	for _, node := range []string{"server", "gpu"} {
+		if err := os.Mkdir(filepath.Join(f.roots[node], "ignored"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	beat := filepath.Join(f.roots["gpu"], "ignored", "beat")
+	t.Chdir(f.roots["server"])
+	for _, stopped := range []string{"server", "gpu"} {
+		os.Remove(beat)
+		type result struct {
+			code       int
+			diagnostic string
+		}
+		done := make(chan result, 1)
+		go func() {
+			var output, errorOutput strings.Builder
+			code := cli.Run([]string{"--node", "gpu", "--timeout", "60", "sh", "-c", `while :; do date +%s%N > ignored/beat; sleep 0.05; done`},
+				strings.NewReader(""), &output, &errorOutput)
+			done <- result{code, errorOutput.String()}
+		}()
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			if _, err := os.Stat(beat); err == nil {
+				break
+			}
+			select {
+			case r := <-done:
+				t.Fatalf("command ended early: %d %s", r.code, r.diagnostic)
+			default:
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("command didn't start")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// Pausing the edge must neither wait for the command nor leave it
+		// running.
+		edge := &selection.Selection{Specifications: []string{f.sessions["star-"+stopped]}}
+		paused := make(chan error, 1)
+		go func() { paused <- f.manager.Pause(ctx, edge, "") }()
+		select {
+		case err := <-paused:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatalf("pausing the %s edge waited for the command", stopped)
+		}
+		select {
+		case r := <-done:
+			if r.code != 255 {
+				t.Fatalf("command didn't fail as a connection loss once the %s edge stopped: %d %s", stopped, r.code, r.diagnostic)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatalf("command survived the %s edge", stopped)
+		}
+		deadline = time.Now().Add(15 * time.Second)
+		for {
+			first, _ := os.ReadFile(beat)
+			time.Sleep(300 * time.Millisecond)
+			if second, _ := os.ReadFile(beat); string(first) == string(second) {
+				break
+			} else if time.Now().After(deadline) {
+				t.Fatalf("command kept running once the %s edge stopped", stopped)
+			}
+		}
+		if err := f.manager.Resume(ctx, edge, ""); err != nil {
+			t.Fatal(err)
+		}
+		deadline = time.Now().Add(15 * time.Second)
+		for !f.available(f.roots["server"], "server", "local", "gpu") {
+			if time.Now().After(deadline) {
+				t.Fatal("edge didn't reconnect")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 func TestStarConflicts(t *testing.T) {
@@ -834,7 +1054,7 @@ func TestStarIndependentEdges(t *testing.T) {
 // TestStarPull verifies that pulls resolve their source node through the daemon
 // before reading or writing anything, as commands do: the center must select
 // one of several nodes and pulls from the selected one, while another node
-// can only pull from the center.
+// pulls from the center by default, or from another node through the center.
 func TestStarPull(t *testing.T) {
 	f := newStarFixture(t)
 	for _, node := range []string{"server", "gpu"} {
@@ -867,13 +1087,15 @@ func TestStarPull(t *testing.T) {
 		t.Fatalf("pull from the selected node failed: %d %q %s", code, read("local"), diagnostic)
 	}
 
-	// Another node can't pull from a node other than the center, which would
-	// now provide the gpu's content.
+	// Another node pulls from a node other than the center through the
+	// center, whose content now differs from the gpu's, and from the center
+	// by default.
+	if err := os.WriteFile(filepath.Join(f.roots["gpu"], "ignored", "data"), []byte("gpu only"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	code, _, diagnostic = runRemote(t, f.roots["server"], "--pull", "--node", "gpu", "ignored/data")
-	if code != 125 || !strings.Contains(diagnostic, "no multi-hop") {
-		t.Fatalf("multi-hop pull not refused: %d %s", code, diagnostic)
-	} else if contents := read("server"); contents != "server" {
-		t.Fatalf("refused pull replaced the node's content with %q", contents)
+	if code != 0 || read("server") != "gpu only" {
+		t.Fatalf("pull through the center failed: %d %q %s", code, read("server"), diagnostic)
 	}
 	code, _, diagnostic = runRemote(t, f.roots["server"], "--pull", "ignored/data")
 	if code != 0 || read("server") != "gpu" {

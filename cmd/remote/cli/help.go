@@ -19,7 +19,8 @@ const usage = `Usage: remote [options] <command> [<args>...]
        remote --nodes [--json] | --ignores [<path>...] | --help <topic>
 
 Run on a destination node in the corresponding directory.
-Use --nodes to discover targets and --node NAME when there is more than one.
+Use --nodes to discover targets and --node NAME when there is more than one,
+unless the center of a star is meant, which its other nodes select if omitted.
 Synchronize before and after; forward stdin, stdout, stderr, and exit status.
 Options precede the command. No terminal is allocated.
 
@@ -55,24 +56,24 @@ var helpTopics = []struct {
 A node is a workspace. --nodes asks the daemon which nodes the current
 workspace can reach, including paused or disconnected ones. It marks the
 current node and a star's center, and shows each node's configured host and
-root and the synchronization mode of the edge to it. This is read-only: it
-neither synchronizes files nor executes commands. Available means that the
-node executes commands and the edge to it is connected at both ends, not that
-it's conflict-free. Operations on a node whose session's remote setting
-disables execution there, such as a star node with remote: false, fail with
-125.
+root, the synchronization mode of the edge to it, and the center that it's
+reached through, if any. This is read-only: it neither synchronizes files nor
+executes commands. Available means that the node executes commands and the
+edge to it is connected, not that it's conflict-free. Operations on a node
+whose session's remote setting disables execution there, such as a star node
+with remote: false, fail with 125.
 
   - A project's star names its nodes. Its center is joined to every other
-    node by its own synchronization pair, so the center reaches every node,
-    while every other node reaches only the center. A command from one
-    non-center node to another fails with 125: stars have no multi-hop
-    routes, so run it from the center. An ordinary pair has nodes alpha and
-    beta.
-  - Omit --node only when there is exactly one other node, as from a
-    non-center node; an offline node still counts. Creation order and
-    availability never choose among several targets. Repeat --node for later
-    operations on the node, such as --wait and --kill for a detached job;
-    the commands that remote suggests include it.
+    node by its own synchronization pair, called an edge, so the center
+    reaches every node over its edge, while every other node reaches the
+    center over its own edge, and each other node through the center, over
+    both nodes' edges. An ordinary pair has nodes alpha and beta.
+  - Omit --node only at a star's non-center node, whose default is the
+    center, or when there is exactly one other node; an offline node still
+    counts. Creation order and availability never choose among several
+    targets. Repeat --node for later operations on the node, such as --wait
+    and --kill for a detached job; the commands that remote suggests include
+    it.
   - The current directory identifies the source workspace. A star's edges
     share the center's root; independent pairs sharing a root are ambiguous
     and should be declared as one star. Outside every root, explicit --node
@@ -86,15 +87,25 @@ disables execution there, such as a star node with remote: false, fail with
     target system. Ignored directories (in Git mode, also those that .gitignore
     rules ignore) require an explicit --cwd, and ignored content isn't
     synchronized. --ignores without --node inspects local rules.
-  - Every operation crosses exactly one edge, which is an ordinary pair
-    session, and behaves as for a pair: commands, scripts, detached jobs,
-    --flush, --no-flush, --pull, --diff, --ignores, and conflicts (see
-    --help sync and --help conflicts). Conflicts produce warnings rather than
-    preventing commands. Pausing, replacing, removing, or adding other nodes
-    doesn't affect an operation, and no operation uses another edge: while a
-    node's edge isn't connected at the center, such as while it reconnects,
-    the node is unavailable and operations on it fail with 255, so retry once
-    it reconnects.
+  - An operation on the center, or from it, crosses one edge, which is an
+    ordinary pair session, and behaves as for a pair: commands, scripts,
+    detached jobs, --flush, --no-flush, --pull, --diff, --ignores, and
+    conflicts (see --help sync and --help conflicts). Conflicts produce
+    warnings rather than preventing commands. Pausing, replacing, removing,
+    or adding other nodes doesn't affect an operation, and no operation uses
+    other edges: while a node's edge isn't connected at the center, such as
+    while it reconnects, the node is unavailable from the center and
+    operations on it fail with 255, so retry once it reconnects.
+  - An operation from one non-center node on another crosses both of their
+    edges, through the center: it synchronizes the submitting node's edge
+    and then the destination's before a command, and the reverse after it
+    (--flush without a command does both), and reports both edges'
+    conflicts. Everything else works as above,
+    except conflict listing and resolution, which belong to each edge and
+    fail with 125 there: run them from the center or from the destination.
+    One-way edges flow from the center only, so a one-way submitting node's
+    changes don't reach the destination, and a one-way destination's don't
+    come back.
   - Each non-center node's mode configures its own edge. One-way modes flow
     from the center to the node, so the node's changes, including files that
     commands write there, don't reach the center.
@@ -103,26 +114,35 @@ disables execution there, such as a star node with remote: false, fail with
     or whose node already has an edge. Sessions outside the star aren't
     checked; overlapping them behaves like overlapping pairs. If loaded edges
     disagree on the center's endpoint anyway, --nodes reports the star
-    problem, and new operations from the center fail with 125 until the star
-    is repaired. Operations in progress and other nodes keep using their own
-    edges. A terminated edge only removes its node.
+    problem, and new operations from or through the center fail with 125
+    until the star is repaired. Operations in progress, and operations of
+    other nodes on the center, keep using their own edges. A terminated edge
+    only removes its node.
   - Execution uses the target's remotePrologue or workspace override.
     MUTAGEN_REMOTE_NODE identifies the target and overrides submitted values.
     Use it in shared scripts: the center is alpha on every edge.
 
-Any node can be the center, but only the center reaches every node, so put it
-where you usually work, such as where agents run. The daemon relays every
-edge, so every endpoint must be reachable from the daemon, which relays a
-center on another system as it relays a pair whose endpoints are both
-remote. Each node's remote setting, including the center's, decides whether
-it executes commands from the nodes joined to it: every other node for the
-center, and the center for any other node. A node that executes none can
-still submit commands to nodes that do. star.remote explicitly enables
-execution on the nodes that don't set their own; prologues come only from each
-node's remotePrologue, never from synchronization defaults.
+Any node can be the center, but only the center reaches every node over a
+single edge, so put it where you usually work, such as where agents run. The
+daemon relays every edge, so every endpoint must be reachable from the
+daemon, which relays a center on another system as it relays a pair whose
+endpoints are both remote. Each node's remote setting, including the
+center's, decides whether it executes commands from the nodes that reach it,
+and its remoteSubmit setting whether commands may be submitted from it. A
+node reaches another if it may submit commands and the other executes them;
+the settings of the center that a node reaches another through don't matter.
+A node that executes none can still submit commands to nodes that do, and a
+node that may not submit commands, or reaches no node that executes them,
+doesn't connect for commands, so remote there finds no connected node (255).
+star.remote explicitly enables execution on the nodes that don't set their
+own, and star.remoteSubmit, which defaults to true, submission; prologues
+come only from each node's remotePrologue, never from synchronization
+defaults.
 `},
-	{"sync", "synchronization, ignored paths, --pull, and --diff", `Each operation synchronizes the pair session that it crosses, such as the edge
-between a star's center and one of its nodes:
+	{"sync", "synchronization, ignored paths, --pull, and --diff", `Each operation synchronizes the pair sessions that it crosses, such as the edge
+between a star's center and one of its nodes, or, between two other nodes of
+a star, both of their edges, in the order that brings changes to where they're
+needed:
 
   - The session is synchronized before and after the command. Failure to
     synchronize only produces a warning. Keep these synchronizations: without
@@ -300,7 +320,7 @@ Example .remote-prologue.sh, activating a conda environment on beta only:
 remote's own input errors and operation failures exit with 125; read the
 remote: diagnostic and correct the cause before retrying. Connection setup,
 lost connections, protocol failures, and an unreachable node exit with 255.
-An unknown node, a node that only the center reaches, or a star problem is
+An unknown node, a node that doesn't execute commands, or a star problem is
 125. Commands and completed
 jobs pass through their own statuses unchanged, including 125 and 255, so
 status alone cannot always identify who failed. --diff/--ignores use 1 only for a result;

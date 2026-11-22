@@ -307,3 +307,46 @@ func TestListedConflictChangesLimited(t *testing.T) {
 		t.Fatalf("incorrect summary: %q", summary)
 	}
 }
+
+func TestReporterAcrossEdges(t *testing.T) {
+	// For a destination reached through the center, the submitting node's
+	// edge names the center as its other side and suggests resolving its
+	// conflicts through that edge, while the destination's edge names both of
+	// its nodes and says where its conflicts can be resolved.
+	var output strings.Builder
+	target := &remote.Target{Root: t.TempDir(), Contained: true, Alpha: false, Node: "gpu", Via: "local"}
+	conflict := remote.Conflict{
+		Root:  "a",
+		Alpha: []remote.Change{{Path: "a", Old: "file", New: "file"}},
+		Beta:  []remote.Change{{Path: "a", Old: "file"}},
+	}
+	report := &remote.Report{
+		Conflicts:  []remote.Conflict{conflict},
+		Problems:   []remote.Problem{{Alpha: true, Path: "x", Error: "unreadable"}},
+		Resolution: true,
+		Destination: &remote.Report{
+			Conflicts:  []remote.Conflict{{Root: "b", Alpha: []remote.Change{{Path: "b", New: "file"}}, Beta: []remote.Change{{Path: "b", New: "directory"}}}},
+			Problems:   []remote.Problem{{Path: "y", Error: "too large", Warning: true}},
+			Resolution: true,
+			Repository: &remote.RepositoryConflict{Alpha: remote.Repository{Commit: "1111", Branch: "main"}, Beta: remote.Repository{Commit: "2222", Branch: "main"}},
+		},
+	}
+	newReporter(&output, target, "remote --node gpu").print(report)
+	expected := "remote: warning: on the edge to the center local, these conflicts aren't synchronized until resolved (see remote --diff and remote --help conflicts):\n" +
+		"remote:   a: deleted file locally, modified file on the center local\n" +
+		"remote: warning: this content couldn't be synchronized:\n" +
+		"remote:   x (center local): unreadable\n" +
+		"remote: warning: on gpu's edge with the center local, these conflicts aren't synchronized until resolved there " +
+		"(list them with remote --node gpu --conflicts on the center local, or with remote --conflicts on gpu, and see remote --help conflicts):\n" +
+		"remote:   b: created file on the center local, created directory on gpu\n" +
+		"remote: warning: on gpu's edge with the center local, " + repositoryConflictHeading + "\n" +
+		"remote:   center local main at 1111, gpu main at 2222 (they never agreed)\n" +
+		"remote:   to resolve it, run remote --node gpu on the center local, or remote on gpu, which explain how\n" +
+		"remote: warning: on gpu's edge with the center local, this content isn't synchronized, by design:\n" +
+		"remote:   y (gpu): too large\n"
+	if output.String() != expected {
+		t.Fatalf("incorrect report:\n%s\nexpected:\n%s", output.String(), expected)
+	} else if paths := conflictPaths(report); strings.Join(paths, ",") != "a,b" {
+		t.Fatal("incorrect conflict paths:", paths)
+	}
+}

@@ -89,10 +89,57 @@ func (m RemoteCommandMode) Description() string {
 	}
 }
 
+// SubmissionDescription returns a human-readable description of a remote
+// command mode that specifies which endpoints submit commands (see
+// Configuration.RemoteSubmissionMode).
+func (m RemoteCommandMode) SubmissionDescription() string {
+	switch m {
+	case RemoteCommandMode_RemoteCommandModeDefault:
+		return "Default"
+	case RemoteCommandMode_RemoteCommandModeDisabled:
+		return "Disabled"
+	case RemoteCommandMode_RemoteCommandModeAlpha:
+		return "Submitted from Alpha"
+	case RemoteCommandMode_RemoteCommandModeBeta:
+		return "Submitted from Beta"
+	case RemoteCommandMode_RemoteCommandModeBoth:
+		return "Submitted from Alpha and Beta"
+	default:
+		return "Unknown"
+	}
+}
+
+// DefaultRemoteSubmissionMode returns the remote command mode that names the
+// endpoints that submit commands by default (see
+// Configuration.RemoteSubmissionMode) under the specified remote command mode,
+// which must not be the default mode: those whose opposite endpoints execute
+// commands.
+func DefaultRemoteSubmissionMode(execution RemoteCommandMode) RemoteCommandMode {
+	alpha, beta := execution.Executes()
+	return RemoteCommandModeFor(beta, alpha)
+}
+
+// RemoteCommandModeFor returns the remote command mode that names the specified
+// endpoints.
+func RemoteCommandModeFor(alpha, beta bool) RemoteCommandMode {
+	switch {
+	case alpha && beta:
+		return RemoteCommandMode_RemoteCommandModeBoth
+	case alpha:
+		return RemoteCommandMode_RemoteCommandModeAlpha
+	case beta:
+		return RemoteCommandMode_RemoteCommandModeBeta
+	default:
+		return RemoteCommandMode_RemoteCommandModeDisabled
+	}
+}
+
 // Executes indicates which endpoints execute commands submitted from the
 // opposite endpoint. The remote command mode must not be the default mode,
 // which should be resolved with Version.DefaultRemoteCommandMode first.
-// Unsupported modes execute commands on neither endpoint.
+// Unsupported modes execute commands on neither endpoint. Since the mode names
+// endpoints, this also indicates which endpoints a remote submission mode
+// names (see Configuration.RemoteSubmissionMode).
 func (m RemoteCommandMode) Executes() (alpha, beta bool) {
 	switch m {
 	case RemoteCommandMode_RemoteCommandModeAlpha:

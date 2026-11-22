@@ -46,7 +46,8 @@ follow the code and update this file.
   center. `pkg/synchronization/star.go` validates star membership,
   topology, and overlaps for both project apply and the daemon, and
   `pkg/synchronization/stars.go` provides node discovery and resolves
-  `remote --node` targets, center to node or node to center only.
+  `remote --node` targets: the center reaches each node over its edge,
+  and other nodes reach each other through the center, over both edges.
   `remote` exposes nodes; session selectors are deprecated.
 - `cmd/mutagen-sidecar` is the sidecar entry point. It is built
   separately from the main `scripts/build.go` flow.

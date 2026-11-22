@@ -84,6 +84,9 @@ func terminalWidth(output io.Writer) (bool, int) {
 type progressPhase struct {
 	// status is the session's status (see remote.Progress.Status).
 	status string
+	// destination indicates that the status is that of the destination's edge
+	// (see remote.Progress.Destination).
+	destination bool
 	// duration is the time spent in the phase.
 	duration time.Duration
 	// staged indicates whether staging progress was received for the phase.
@@ -106,6 +109,11 @@ type progressDisplay struct {
 	locator *locator
 	// alpha indicates whether the submitting endpoint is alpha.
 	alpha bool
+	// via names a star's center if the destination is reached through it (see
+	// remote.Target.Via), and is empty otherwise.
+	via string
+	// node names the destination.
+	node string
 	// now returns the current time. Tests can replace it.
 	now func() time.Time
 	// start is the time at which the synchronization started.
@@ -145,6 +153,8 @@ func newProgressDisplay(output *progressOutput, target *remote.Target) *progress
 		output:  output,
 		locator: newLocator(target),
 		alpha:   target.Alpha,
+		via:     target.Via,
+		node:    target.Node,
 		now:     time.Now,
 	}
 }
@@ -205,7 +215,7 @@ func (d *progressDisplay) update(progress *remote.Progress) {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 	now := d.now()
-	changed := d.latest == nil || d.latest.Status != progress.Status
+	changed := d.latest == nil || d.latest.Status != progress.Status || d.latest.Destination != progress.Destination
 	if changed {
 		// The session is only briefly between cycles while a submission waits
 		// (see statusLabels), so the time until the following sample, which
@@ -217,7 +227,7 @@ func (d *progressDisplay) update(progress *remote.Progress) {
 			d.phaseStart = now
 		}
 		if progress.Status != watchingStatus {
-			d.phase(progress.Status)
+			d.phase(progress.Status, progress.Destination)
 		} else {
 			changed = false
 		}
@@ -240,14 +250,15 @@ func (d *progressDisplay) update(progress *remote.Progress) {
 	}
 }
 
-// phase returns the phase for a status, adding it if it's new.
-func (d *progressDisplay) phase(status string) *progressPhase {
+// phase returns the phase for a status of the submitting node's edge or, if
+// destination is true, of the destination's edge, adding it if it's new.
+func (d *progressDisplay) phase(status string, destination bool) *progressPhase {
 	for _, phase := range d.phases {
-		if phase.status == status {
+		if phase.status == status && phase.destination == destination {
 			return phase
 		}
 	}
-	phase := &progressPhase{status: status}
+	phase := &progressPhase{status: status, destination: destination}
 	d.phases = append(d.phases, phase)
 	return phase
 }
@@ -268,7 +279,7 @@ func (d *progressDisplay) recordStaging(completed bool) {
 	if !d.staged {
 		return
 	}
-	phase := d.phase(d.latest.Status)
+	phase := d.phase(d.latest.Status, d.latest.Destination)
 	phase.staged = true
 	phase.files += d.staging.ExpectedFiles
 	phase.size += d.staging.ReceivedSize
@@ -287,7 +298,7 @@ func (d *progressDisplay) endPhase(now time.Time, completed bool) {
 		return
 	}
 	d.recordStaging(completed)
-	d.phase(d.latest.Status).duration += now.Sub(d.phaseStart)
+	d.phase(d.latest.Status, d.latest.Destination).duration += now.Sub(d.phaseStart)
 }
 
 // show shows the current progress, on a single line on a terminal.
@@ -345,7 +356,7 @@ func (d *progressDisplay) describe(now time.Time) string {
 	if d.latest == nil || d.latest.Status == "" {
 		return description
 	}
-	description += ": " + d.label(d.latest.Status)
+	description += ": " + d.label(d.latest.Status, d.latest.Destination)
 	if staging := d.latest.Staging; staging != nil {
 		description += fmt.Sprintf(", %d of %d files, %s", staging.ReceivedFiles, staging.ExpectedFiles, humanize.IBytes(staging.ReceivedSize))
 		if staging.Path != "" {
@@ -390,13 +401,29 @@ var statusEndpoints = map[string]bool{
 }
 
 // label describes a session's status (see statusLabels), naming endpoints from
-// the submitting endpoint's perspective as well. Statuses that remote doesn't
+// the submitting endpoint's perspective as well, or, for the destination's edge
+// if the destination is reached through a star's center (see
+// remote.Progress.Destination), by their nodes, with statuses that refer to
+// neither endpoint naming the edge. The center is named in place of the remote
+// endpoint of the submitting node's edge, too. Statuses that remote doesn't
 // know, such as those added by later daemons, are shown as they are.
-func (d *progressDisplay) label(status string) string {
+func (d *progressDisplay) label(status string, destination bool) string {
 	label, ok := statusLabels[status]
 	if !ok {
-		return terminal.NeutralizeControlCharacters(status)
-	} else if alpha, ok := statusEndpoints[status]; ok {
+		label = terminal.NeutralizeControlCharacters(status)
+	}
+	alpha, endpoint := statusEndpoints[status]
+	switch {
+	case destination && endpoint && alpha:
+		label += " (" + centerName(d.via) + ", edge to " + terminal.NeutralizeControlCharacters(d.node) + ")"
+	case destination && endpoint:
+		label += " (" + terminal.NeutralizeControlCharacters(d.node) + ")"
+	case destination:
+		label += " (edge to " + terminal.NeutralizeControlCharacters(d.node) + ")"
+	case !ok:
+	case endpoint && d.via != "" && sideOf(alpha, d.alpha) != sideLocal:
+		label += " (" + centerName(d.via) + ")"
+	case endpoint:
 		label += " (" + sideOf(alpha, d.alpha) + ")"
 	}
 	return label
@@ -444,7 +471,7 @@ func (d *progressDisplay) describePhases() string {
 		if phase.duration < time.Second/2 && phase.files == 0 {
 			continue
 		}
-		description := d.label(phase.status) + " " + formatElapsed(phase.duration)
+		description := d.label(phase.status, phase.destination) + " " + formatElapsed(phase.duration)
 		if phase.staged {
 			files := "files"
 			if phase.files == 1 {

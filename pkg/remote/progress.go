@@ -17,6 +17,11 @@ type Progress struct {
 	// Staging describes the files being staged, if Status is staging-alpha or
 	// staging-beta and the staging endpoint has started receiving them.
 	Staging *StagingProgress `json:",omitempty"`
+	// Destination indicates that the progress is that of the destination's
+	// edge for an operation whose destination is reached through a star's
+	// center (see Target.Via), whose alpha is the center and whose beta is the
+	// destination, rather than that of the submitting node's edge.
+	Destination bool `json:",omitempty"`
 }
 
 // StagingProgress describes the staging of files on an endpoint, which receives
@@ -45,7 +50,8 @@ type StagingProgress struct {
 func equalProgress(first, second *Progress) bool {
 	if first == nil || second == nil {
 		return first == second
-	} else if first.Status != second.Status || (first.Staging == nil) != (second.Staging == nil) {
+	} else if first.Status != second.Status || first.Destination != second.Destination ||
+		(first.Staging == nil) != (second.Staging == nil) {
 		return false
 	}
 	return first.Staging == nil || *first.Staging == *second.Staging

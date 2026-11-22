@@ -626,8 +626,9 @@ func (r *router) submit(header *remote.Submission) (net.Conn, *remote.Target, er
 // resolve has the daemon select the destination, as it does for every
 // submission, without performing an operation, and pins later submissions to
 // it, as dial does, unless an earlier submission already resolved it. The
-// daemon then refuses unknown or unavailable nodes, multi-hop selections, an
-// omitted node with several destinations, and star problems, exactly as it
+// daemon then refuses unknown or unavailable nodes, nodes that don't execute
+// commands, an omitted node with several destinations, star problems, and
+// conflict operations through a star's center, exactly as it
 // does for commands, before the caller reads or writes anything.
 func (r *router) resolve() (*remote.Target, error) {
 	if target := r.selection.Target; target != nil && target.Resolved {
@@ -659,10 +660,12 @@ func (r *router) locate() (*remote.Target, error) {
 // synchronize forces a synchronization cycle for the session, showing its
 // progress if enabled (see newProgressOutput), and warns about content that
 // couldn't be synchronized, omitting warnings issued by previous cycles. It
-// returns the target if the session was located, along with the report.
-func (r *router) synchronize() (*remote.Target, *remote.Report, error) {
+// returns the target if the session was located, along with the report. If
+// the destination is reached through a star's center, then both edges are
+// synchronized in the specified direction (see remote.FlushDirection).
+func (r *router) synchronize(direction remote.FlushDirection) (*remote.Target, *remote.Report, error) {
 	output := newProgressOutput(r.stderr, r.progress)
-	connection, target, err := r.submit(&remote.Submission{Operation: remote.OperationFlush, Progress: output.writer != nil})
+	connection, target, err := r.submit(&remote.Submission{Operation: remote.OperationFlush, Progress: output.writer != nil, Direction: direction})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -776,7 +779,13 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 	var report *remote.Report
 	var err error
 	if !options.noFlush {
-		target, report, err = router.synchronize()
+		// Without a command, changes must arrive in both directions, as they
+		// do for a pair.
+		direction := remote.FlushOutbound
+		if request == nil && !options.diff {
+			direction = remote.FlushBoth
+		}
+		target, report, err = router.synchronize(direction)
 		if (err != nil && (target == nil || request == nil)) || router.ctx.Err() != nil {
 			return router.exit("synchronizing", 0, err)
 		} else if err != nil {
@@ -841,7 +850,7 @@ func runCommand(router *router, options *options, request *remote.Request, stdin
 	// Synchronize the command's changes back, which can fail without changing
 	// the command's status (see router.finished).
 	if !options.noFlush {
-		_, _, err = router.synchronize()
+		_, _, err = router.synchronize(remote.FlushReturning)
 	}
 	return router.finished("command", code, err)
 }

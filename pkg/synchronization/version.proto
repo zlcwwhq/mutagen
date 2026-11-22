@@ -19,4 +19,11 @@ enum Version {
     // such sessions, which they would otherwise synchronize as ordinary ones,
     // including their repositories' Git directories.
     Version2 = 2;
+    // Version3 represents session version 3, which is the version of sessions
+    // whose remote submission mode keeps an endpoint from submitting commands
+    // that it would submit by default, whether in Git mode or not. Its
+    // defaults are those of session version 1, but daemons that don't support
+    // remote submission modes don't support it either, so they don't load
+    // such sessions, which would otherwise let that endpoint submit commands.
+    Version3 = 3;
 }

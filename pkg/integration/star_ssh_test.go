@@ -224,9 +224,11 @@ func TestStarFakeSSH(t *testing.T) {
 	var listing starListing
 	if code != 0 || json.Unmarshal([]byte(output), &listing) != nil {
 		t.Fatalf("node listing failed on SSH node: %d %q %s", code, output, diagnostic)
-	} else if listing.Current != "server" || !listing.Star || len(listing.Nodes) != 2 || !listing.Nodes[0].Center || listing.Nodes[0].Name != "local" ||
-		!listing.Nodes[0].Available || listing.Nodes[0].Root != local {
+	} else if listing.Current != "server" || !listing.Star || len(listing.Nodes) != 3 || !listing.Nodes[1].Center || listing.Nodes[1].Name != "local" ||
+		!listing.Nodes[1].Available || listing.Nodes[1].Root != local {
 		t.Fatalf("incorrect listing on SSH node: %s", output)
+	} else if gpu := listing.Nodes[0]; gpu.Name != "gpu" || !gpu.Available || strings.Join(gpu.Path, ",") != "server,local,gpu" {
+		t.Fatalf("node through the center misreported on SSH node: %s", output)
 	}
 	if err := os.WriteFile(filepath.Join(home, "server", "result"), []byte("from the node"), 0600); err != nil {
 		t.Fatal(err)
@@ -235,8 +237,15 @@ func TestStarFakeSSH(t *testing.T) {
 	if code != 0 || output != fmt.Sprintf("from the node:local:%s\n", local) {
 		t.Fatalf("command on the center from SSH node failed: %d %q %s", code, output, diagnostic)
 	}
-	code, _, diagnostic = nodeRemote("--node", "gpu", "true")
-	if code != 125 || !strings.Contains(diagnostic, "no multi-hop") || !strings.Contains(diagnostic, "center node local") {
-		t.Fatalf("multi-hop command not refused on SSH node: %d %s", code, diagnostic)
+	// The SSH node reaches the other SSH node through the center, over both
+	// edges, before and after the command.
+	if err := os.WriteFile(filepath.Join(home, "server", "for-gpu"), []byte("from server"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, output, diagnostic = nodeRemote("--node", "gpu", "sh", "-c", `cat for-gpu; printf ':%s' "$MUTAGEN_REMOTE_NODE"; printf done > from-gpu`)
+	if code != 0 || output != "from server:gpu" {
+		t.Fatalf("command through the center from SSH node failed: %d %q %s", code, output, diagnostic)
+	} else if contents, err := os.ReadFile(filepath.Join(home, "server", "from-gpu")); err != nil || string(contents) != "done" {
+		t.Fatalf("command's change didn't return to SSH node: %q %v", contents, err)
 	}
 }

@@ -21,8 +21,8 @@ Sessions are matched by type and name within the project. Unchanged sessions
 retain their identifiers, synchronization history, caches, and paused state.
 New sessions are created, removed sessions are terminated, and sessions with
 changed endpoints or configurations are terminated and recreated. This includes
-changes to the remote and remotePrologue settings of synchronization sessions,
-even though they only affect remote commands. Recreated sessions retain their
+changes to the remote, remoteSubmit, and remotePrologue settings of
+synchronization sessions, even though they only affect remote commands. Recreated sessions retain their
 paused state unless --paused is specified, which pauses all newly created
 sessions. Renaming a session removes it and creates a new one.
 

@@ -458,6 +458,14 @@ func createMain(_ *cobra.Command, arguments []string) error {
 		}
 	}
 
+	// Validate and convert the remote submission mode specification.
+	var remoteSubmissionMode synchronization.RemoteCommandMode
+	if createConfiguration.remoteSubmit != "" {
+		if err := remoteSubmissionMode.UnmarshalText([]byte(createConfiguration.remoteSubmit)); err != nil {
+			return fmt.Errorf("unable to parse remote submission mode: %w", err)
+		}
+	}
+
 	// Create the command line configuration and merge it into our cumulative
 	// configuration.
 	configuration = synchronization.MergeConfigurations(configuration, &synchronization.Configuration{
@@ -483,6 +491,7 @@ func createMain(_ *cobra.Command, arguments []string) error {
 		CompressionAlgorithm:   compressionAlgorithm,
 		RemoteCommandMode:      remoteCommandMode,
 		RemotePrologue:         createConfiguration.remotePrologue,
+		RemoteSubmissionMode:   remoteSubmissionMode,
 	})
 
 	// Create the creation specification.
@@ -701,6 +710,9 @@ var createConfiguration struct {
 	// remote specifies which endpoints execute commands submitted from the
 	// opposite endpoint via the remote executable.
 	remote string
+	// remoteSubmit specifies which endpoints may submit commands via the remote
+	// executable.
+	remoteSubmit string
 	// remotePrologue specifies the shell script that executing endpoints
 	// source before running remote commands, with endpoint-specific
 	// specifications taking priority.
@@ -792,6 +804,7 @@ func init() {
 
 	// Wire up remote command flags.
 	flags.StringVar(&createConfiguration.remote, "remote", "", "Specify which endpoints execute remote commands (true|alpha|beta|false)")
+	flags.StringVar(&createConfiguration.remoteSubmit, "remote-submit", "", "Specify which endpoints may submit remote commands (true|alpha|beta|false)")
 	flags.StringVar(&createConfiguration.remotePrologue, "remote-prologue", "", "Specify a shell script that executing endpoints source before remote commands")
 	flags.StringVar(&createConfiguration.remotePrologueAlpha, "remote-prologue-alpha", "", "Specify a shell script that alpha sources before remote commands")
 	flags.StringVar(&createConfiguration.remotePrologueBeta, "remote-prologue-beta", "", "Specify a shell script that beta sources before remote commands")

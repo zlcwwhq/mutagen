@@ -34,11 +34,18 @@ type StarNode struct {
 	// which is the edge's alpha. It can't be set on the center.
 	Mode core.SynchronizationMode `yaml:"mode"`
 	// Remote, if set, takes precedence over StarConfiguration.Remote for the
-	// node: it specifies whether the node executes commands submitted from
-	// across its edges. The center executes commands submitted from every
+	// node: it specifies whether the node executes commands submitted from the
+	// nodes that reach it. The center executes commands submitted from every
 	// other node, and every other node executes commands submitted from the
+	// center and from the star's other nodes, which reach it through the
 	// center.
 	Remote *bool `yaml:"remote"`
+	// RemoteSubmit, if set, takes precedence over
+	// StarConfiguration.RemoteSubmit for the node: it specifies whether
+	// commands may be submitted from the node to the nodes that it reaches.
+	// The center reaches every other node, and every other node reaches the
+	// center and, through the center, the star's other nodes.
+	RemoteSubmit *bool `yaml:"remoteSubmit"`
 	// RemotePrologue is the node's default execution prologue.
 	RemotePrologue string `yaml:"remotePrologue"`
 }
@@ -46,15 +53,23 @@ type StarNode struct {
 // StarConfiguration declares one star managed by the project's daemon: a
 // center node and other nodes, each joined to the center by its own pair
 // session. Remote explicitly authorizes every node to execute commands
-// submitted from across its edges, unless the node's own remote setting says
-// otherwise. Sync is shared by every edge; endpoint-specific pair defaults,
-// and the remote command mode and prologue of the synchronization defaults,
+// submitted from the nodes that reach it, and RemoteSubmit, which defaults to
+// true, permits every node to submit commands to the nodes that it reaches,
+// unless the node's own settings say otherwise. A node reaches another if
+// commands may be submitted from it and the other executes them, whatever the
+// settings of the center through which a node reaches another node. Sync is
+// shared by every edge; endpoint-specific pair defaults, and the remote
+// command and submission modes and prologue of the synchronization defaults,
 // don't apply to star nodes.
 type StarConfiguration struct {
 	// Remote specifies whether the nodes that don't set their own remote
-	// setting, including the center, execute commands submitted from across
-	// their edges.
+	// setting, including the center, execute commands submitted from the
+	// nodes that reach them.
 	Remote bool `yaml:"remote"`
+	// RemoteSubmit specifies whether commands may be submitted from the nodes
+	// that don't set their own remoteSubmit setting, including the center, to
+	// the nodes that they reach. It defaults to true.
+	RemoteSubmit *bool `yaml:"remoteSubmit"`
 	// Sync contains the synchronization settings shared by every edge.
 	Sync models.Configuration `yaml:"sync"`
 	// Center names the node that every edge joins to another node.
@@ -77,20 +92,22 @@ func starSpecifications(star *StarConfiguration, defaults *synchronization.Confi
 
 	// Compute the shared configuration. Execution settings belong to nodes,
 	// not edges. The defaults (which include the global configuration) target
-	// ordinary pairs: their command mode must not grant star-wide execution,
-	// and their prologue must not reach the shared configuration, which
-	// underlies every node's merged endpoint configuration and would run it on
-	// each node without its own. Only star.remote and each node's remote and
-	// remotePrologue apply to star commands, and each edge's remote command
-	// mode is set below.
+	// ordinary pairs: their command and submission modes must not grant or
+	// restrict star-wide execution, and their prologue must not reach the
+	// shared configuration, which underlies every node's merged endpoint
+	// configuration and would run it on each node without its own. Only
+	// star.remote and star.remoteSubmit, and each node's remote, remoteSubmit,
+	// and remotePrologue, apply to star commands, and each edge's remote
+	// command and submission modes are set below.
 	configuration := star.Sync.ToInternal()
-	if !configuration.RemoteCommandMode.IsDefault() || configuration.RemotePrologue != "" {
-		return nil, errors.New("use star.remote and each node's remote and remotePrologue for star commands")
+	if !configuration.RemoteCommandMode.IsDefault() || !configuration.RemoteSubmissionMode.IsDefault() || configuration.RemotePrologue != "" {
+		return nil, errors.New("use star.remote and star.remoteSubmit, and each node's remote, remoteSubmit, and remotePrologue, for star commands")
 	} else if err := configuration.EnsureValid(false); err != nil {
 		return nil, err
 	}
 	configuration = synchronization.MergeConfigurations(defaults, configuration)
 	configuration.RemoteCommandMode = synchronization.RemoteCommandMode_RemoteCommandModeDisabled
+	configuration.RemoteSubmissionMode = synchronization.RemoteCommandMode_RemoteCommandModeDefault
 	configuration.RemotePrologue = ""
 	if configuration.SynchronizationMode.IsDefault() {
 		configuration.SynchronizationMode = core.SynchronizationMode_SynchronizationModeTwoWaySafe
@@ -148,18 +165,35 @@ func starSpecifications(star *StarConfiguration, defaults *synchronization.Confi
 	// Expand the star into one edge per non-center node. A node's mode
 	// overrides the shared one for its own edge. Each edge's remote command
 	// mode combines whether the center, which is alpha, and the node, which is
-	// beta, execute commands.
+	// beta, execute commands, and its remote submission mode whether they
+	// submit them (see remoteSubmissionMode).
 	sort.Strings(names)
 	center := star.Nodes[star.Center]
 	centerExecutes := star.executes(center)
+	executors := 0
+	for _, name := range names {
+		if star.executes(star.Nodes[name]) {
+			executors++
+		}
+	}
 	var result []*svc.CreationSpecification
 	for _, name := range names {
 		node := star.Nodes[name]
+		nodeExecutes := star.executes(node)
 		edgeConfiguration := proto.Clone(configuration).(*synchronization.Configuration)
 		if !node.Mode.IsDefault() {
 			edgeConfiguration.SynchronizationMode = node.Mode
 		}
-		edgeConfiguration.RemoteCommandMode = remoteCommandMode(centerExecutes, star.executes(node))
+		edgeConfiguration.RemoteCommandMode = synchronization.RemoteCommandModeFor(centerExecutes, nodeExecutes)
+		others := executors
+		if nodeExecutes {
+			others--
+		}
+		edgeConfiguration.RemoteSubmissionMode = remoteSubmissionMode(
+			star.submits(center) && nodeExecutes,
+			star.submits(node) && (centerExecutes || others > 0),
+			centerExecutes, nodeExecutes,
+		)
 		result = append(result, &svc.CreationSpecification{
 			Name:  starSessionPrefix + name,
 			Alpha: proto.Clone(endpoints[star.Center]).(*url.URL), Beta: endpoints[name],
@@ -199,19 +233,35 @@ func (star *StarConfiguration) executes(node StarNode) bool {
 	return star.Remote
 }
 
-// remoteCommandMode returns the remote command mode of an edge whose alpha and
-// beta execute commands as specified.
-func remoteCommandMode(alpha, beta bool) synchronization.RemoteCommandMode {
-	switch {
-	case alpha && beta:
-		return synchronization.RemoteCommandMode_RemoteCommandModeBoth
-	case alpha:
-		return synchronization.RemoteCommandMode_RemoteCommandModeAlpha
-	case beta:
-		return synchronization.RemoteCommandMode_RemoteCommandModeBeta
-	default:
-		return synchronization.RemoteCommandMode_RemoteCommandModeDisabled
+// submits reports whether commands may be submitted from a node: its own
+// remoteSubmit setting takes precedence over the star's, which defaults to
+// true.
+func (star *StarConfiguration) submits(node StarNode) bool {
+	if node.RemoteSubmit != nil {
+		return *node.RemoteSubmit
+	} else if star.RemoteSubmit != nil {
+		return *star.RemoteSubmit
 	}
+	return true
+}
+
+// remoteSubmissionMode returns the remote submission mode of an edge whose
+// alpha, the center, and beta, another node, submit commands as specified, and
+// whose remote command mode lets them execute commands as specified. The
+// center submits commands to the node if commands may be submitted from it and
+// the node executes them, and the node to the nodes that it reaches if
+// commands may be submitted from it and any of them, the center or another
+// node, executes them, so that a node that reaches no executing node doesn't
+// connect for commands. The default mode is used whenever it describes the
+// same submitters, each endpoint submitting commands if the opposite one
+// executes them, so that edges whose behavior is that of earlier releases,
+// which only knew the default, aren't replaced, since applying the project
+// replaces an edge whose configuration changed.
+func remoteSubmissionMode(alphaSubmits, betaSubmits, alphaExecutes, betaExecutes bool) synchronization.RemoteCommandMode {
+	if alphaSubmits == betaExecutes && betaSubmits == alphaExecutes {
+		return synchronization.RemoteCommandMode_RemoteCommandModeDefault
+	}
+	return synchronization.RemoteCommandModeFor(alphaSubmits, betaSubmits)
 }
 
 // specificationSession describes a planned session without assigning its

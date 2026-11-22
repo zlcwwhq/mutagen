@@ -87,6 +87,10 @@ type Configuration struct {
 	// RemotePrologue specifies the path of a POSIX shell script that executing
 	// endpoints source before running remote commands.
 	RemotePrologue string `json:"remotePrologue,omitempty" yaml:"remotePrologue" mapstructure:"remotePrologue"`
+	// RemoteSubmit specifies which endpoints may submit commands via the remote
+	// executable. By default, each endpoint does if the opposite endpoint
+	// executes commands.
+	RemoteSubmit synchronization.RemoteCommandMode `json:"remoteSubmit,omitempty" yaml:"remoteSubmit" mapstructure:"remoteSubmit"`
 }
 
 // loadFromInternal sets a configuration to match an internal
@@ -131,6 +135,7 @@ func (c *Configuration) loadFromInternal(configuration *synchronization.Configur
 	// Propagate remote command configuration.
 	c.Remote = configuration.RemoteCommandMode
 	c.RemotePrologue = configuration.RemotePrologue
+	c.RemoteSubmit = configuration.RemoteSubmissionMode
 }
 
 // ToInternal converts a public configuration representation to an internal
@@ -160,5 +165,6 @@ func (c *Configuration) ToInternal() *synchronization.Configuration {
 		GitMode:                c.Git,
 		RemoteCommandMode:      c.Remote,
 		RemotePrologue:         c.RemotePrologue,
+		RemoteSubmissionMode:   c.RemoteSubmit,
 	}
 }

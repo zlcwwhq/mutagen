@@ -51,6 +51,7 @@ git: enabled
 
 remote: true
 remotePrologue: "~/.remote-prologue"
+remoteSubmit: alpha
 `
 )
 
@@ -81,6 +82,7 @@ var expectedConfiguration = &synchronization.Configuration{
 	GitMode:              synchronization.GitMode_GitModeEnabled,
 	RemoteCommandMode:    synchronization.RemoteCommandMode_RemoteCommandModeBoth,
 	RemotePrologue:       "~/.remote-prologue",
+	RemoteSubmissionMode: synchronization.RemoteCommandMode_RemoteCommandModeAlpha,
 }
 
 // TestLoadConfiguration tests loading a YAML-based session configuration.
@@ -176,6 +178,9 @@ func TestLoadConfiguration(t *testing.T) {
 	}
 	if configuration.RemotePrologue != expectedConfiguration.RemotePrologue {
 		t.Error("remote prologue mismatch:", configuration.RemotePrologue, "!=", expectedConfiguration.RemotePrologue)
+	}
+	if configuration.RemoteSubmissionMode != expectedConfiguration.RemoteSubmissionMode {
+		t.Error("remote submission mode mismatch:", configuration.RemoteSubmissionMode, "!=", expectedConfiguration.RemoteSubmissionMode)
 	}
 }
 

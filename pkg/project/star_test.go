@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -246,6 +247,154 @@ star:
 			t.Fatalf("center's remote setting didn't replace the edge as expected: %+v", change)
 		}
 	}
+}
+
+// TestStarRemoteSubmission verifies each edge's remote submission mode, which
+// combines whether commands may be submitted from the center, which is alpha,
+// and from the node, which is beta, given the nodes that each reaches: the
+// center submits commands to an executing node, and another node to the
+// executing nodes that it reaches, the center or, through it, the other nodes.
+// Edges whose submitters are those of the default mode, under which each
+// endpoint submits commands if the opposite one executes them, keep the
+// default, as in earlier releases.
+func TestStarRemoteSubmission(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const (
+		dflt     = synchronization.RemoteCommandMode_RemoteCommandModeDefault
+		disabled = synchronization.RemoteCommandMode_RemoteCommandModeDisabled
+		alpha    = synchronization.RemoteCommandMode_RemoteCommandModeAlpha
+		beta     = synchronization.RemoteCommandMode_RemoteCommandModeBeta
+		both     = synchronization.RemoteCommandMode_RemoteCommandModeBoth
+	)
+	for _, test := range []struct {
+		name, star, center, gpu, server string
+		expected                        map[string]synchronization.RemoteCommandMode
+	}{
+		// Earlier releases' behavior.
+		{"no-commands", "", "", "", "", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": dflt, "star-server": dflt,
+		}},
+		{"all-execute", "remote: true", "", "", "", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": dflt, "star-server": dflt,
+		}},
+		{"center-executes", "", "remote: true", "", "", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": dflt, "star-server": dflt,
+		}},
+		// A node that reaches an executing node only through the center
+		// submits commands although the center doesn't execute them, while the
+		// executing node reaches no other executing node.
+		{"node-executes", "", "", "remote: true", "", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": dflt, "star-server": beta,
+		}},
+		{"nodes-execute", "", "remote: false", "remote: true", "remote: true", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": both, "star-server": both,
+		}},
+		// Commands may not be submitted from a node, or from the center.
+		{"node-opt-out", "remote: true", "", "remoteSubmit: false", "", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": alpha, "star-server": dflt,
+		}},
+		{"center-opt-out", "remote: true", "remoteSubmit: false", "", "", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": beta, "star-server": beta,
+		}},
+		{"star-opt-out", "{remote: true, remoteSubmit: false}", "", "remoteSubmit: true", "", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": beta, "star-server": disabled,
+		}},
+		{"star-opt-out-center-in", "{remote: true, remoteSubmit: false}", "remoteSubmit: true", "", "", map[string]synchronization.RemoteCommandMode{
+			"star-gpu": alpha, "star-server": alpha,
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			specifications := testSpecifications(t, fmt.Sprintf(`
+sync:
+  defaults: {remote: true, remoteSubmit: alpha}
+star: %s
+  center: local
+  nodes:
+    local: {endpoint: ./local, %s}
+    server: {endpoint: ./server, %s}
+    gpu: {endpoint: ./gpu, %s}
+`, starPrefix(test.star), test.center, test.server, test.gpu))
+			modes := make(map[string]synchronization.RemoteCommandMode)
+			for _, s := range specifications.Synchronization {
+				modes[s.Name] = s.Configuration.RemoteSubmissionMode
+			}
+			if !reflect.DeepEqual(modes, test.expected) {
+				t.Fatalf("incorrect remote submission modes: %v, expected %v", modes, test.expected)
+			}
+		})
+	}
+
+	// Changing a node's remoteSubmit setting replaces only its own edge, while
+	// changing the center's replaces the edges of the nodes that execute
+	// commands.
+	configuration := testConfiguration(t, `
+star:
+  center: local
+  nodes:
+    local: {endpoint: ./local, remote: true}
+    server: {endpoint: ./server}
+    gpu: {endpoint: ./gpu, remote: true}
+`)
+	initial, err := NewSessionSpecifications(configuration, nil, "project", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaced := func(modify func()) []string {
+		t.Helper()
+		_, states := testSessionStates(initial)
+		modify()
+		desired, err := NewSessionSpecifications(configuration, nil, "project", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := NewPlan(desired, nil, states)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, change := range plan.synchronization {
+			names = append(names, change.specification.GetName())
+		}
+		slices.Sort(names)
+		initial = desired
+		return names
+	}
+	setSubmit := func(name string, value bool) {
+		node := configuration.Star.Nodes[name]
+		node.RemoteSubmit = &value
+		configuration.Star.Nodes[name] = node
+	}
+	if names := replaced(func() { setSubmit("server", false) }); !slices.Equal(names, []string{"star-server"}) {
+		t.Fatal("node's remoteSubmit setting replaced other edges:", names)
+	} else if names := replaced(func() { setSubmit("local", false) }); !slices.Equal(names, []string{"star-gpu"}) {
+		t.Fatal("center's remoteSubmit setting replaced unexpected edges:", names)
+	}
+
+	// Submission settings must be booleans, and the synchronization settings
+	// shared by every edge can't set them.
+	if _, err := NewSessionSpecifications(testConfiguration(t,
+		"star: {center: a, sync: {remoteSubmit: beta}, nodes: {a: {endpoint: ./a}, b: {endpoint: ./b}}}"), nil, "project", false); err == nil ||
+		!strings.Contains(err.Error(), "star.remoteSubmit") {
+		t.Fatal("submission mode in star.sync accepted:", err)
+	}
+	for _, setting := range []string{"remoteSubmit: beta", "remoteSubmit: sometimes"} {
+		path := filepath.Join(t.TempDir(), DefaultConfigurationFileName)
+		if err := os.WriteFile(path, []byte("star: {center: a, nodes: {a: {endpoint: ./a}, b: {endpoint: ./b, "+setting+"}}}"), 0600); err != nil {
+			t.Fatal(err)
+		} else if _, err := LoadConfiguration(path); err == nil {
+			t.Fatal("invalid node setting accepted:", setting)
+		}
+	}
+}
+
+// starPrefix formats the settings of a star in TestStarRemoteSubmission as a
+// flow mapping whose remaining settings follow.
+func starPrefix(settings string) string {
+	settings = strings.TrimSuffix(strings.TrimPrefix(settings, "{"), "}")
+	if settings == "" {
+		return ""
+	}
+	return "\n  " + strings.ReplaceAll(settings, ", ", "\n  ")
 }
 
 // TestStarValidation verifies that invalid stars are rejected before any

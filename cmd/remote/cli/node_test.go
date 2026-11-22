@@ -98,7 +98,7 @@ func TestNodeListingWithStarProblem(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, expected := range []string{
-		"Star problem: " + problem, "gpu: unavailable: star problem", "Operations from the center fail until the star is repaired",
+		"Star problem: " + problem, "gpu: unavailable: star problem", "Operations from and through the center fail until the star is repaired",
 	} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("listing omitted %q: %s", expected, output.String())
@@ -148,7 +148,7 @@ func replyTestRoute(connection io.ReadWriteCloser, header *remote.Submission, se
 		remote.Reject(connection, errors.New("unknown node"))
 		return false
 	}
-	if err := remote.AcknowledgeRoute(connection); err != nil {
+	if err := remote.AcknowledgeRoute(connection, remote.Route{}); err != nil {
 		connection.Close()
 		return false
 	}

@@ -17,6 +17,7 @@ import (
 var supportedSessionVersions = []Version{
 	Version_Version1,
 	Version_Version2,
+	Version_Version3,
 }
 
 // TestSupportedVersions verifies that session version support is as expected.
@@ -29,7 +30,8 @@ func TestSupportedVersions(t *testing.T) {
 		{Version_Invalid, false},
 		{Version_Version1, true},
 		{Version_Version2, true},
-		{Version_Version2 + 1, false},
+		{Version_Version3, true},
+		{Version_Version3 + 1, false},
 	}
 
 	// Process test cases.
@@ -82,9 +84,10 @@ func TestDefaultDirectoryModeValid(t *testing.T) {
 	}
 }
 
-// TestGitModeVersionDefaults verifies that the Git mode session version has the
-// defaults of the default session version, so that the version that a session
-// gets for being in Git mode doesn't change what its configuration means.
+// TestGitModeVersionDefaults verifies that the Git mode and restricted
+// submission session versions have the defaults of the default session
+// version, so that the version that a session gets for its configuration
+// doesn't change what the configuration means.
 func TestGitModeVersionDefaults(t *testing.T) {
 	versionType := reflect.TypeOf(DefaultVersion)
 	checked := 0
@@ -94,9 +97,11 @@ func TestGitModeVersionDefaults(t *testing.T) {
 			continue
 		}
 		expected := method.Func.Call([]reflect.Value{reflect.ValueOf(DefaultVersion)})
-		actual := method.Func.Call([]reflect.Value{reflect.ValueOf(gitModeVersion)})
-		if !reflect.DeepEqual(expected[0].Interface(), actual[0].Interface()) {
-			t.Errorf("%s differs for the Git mode version: %v != %v", method.Name, actual[0], expected[0])
+		for _, version := range []Version{gitModeVersion, restrictedSubmissionVersion} {
+			actual := method.Func.Call([]reflect.Value{reflect.ValueOf(version)})
+			if !reflect.DeepEqual(expected[0].Interface(), actual[0].Interface()) {
+				t.Errorf("%s differs for version %s: %v != %v", method.Name, version, actual[0], expected[0])
+			}
 		}
 		checked++
 	}
@@ -194,6 +199,47 @@ func TestGitModeSessionVersion(t *testing.T) {
 		}
 		if actual := recorded(identifier); actual != version {
 			t.Errorf("session %s recorded with version %s instead of %s", identifier, actual, version)
+		}
+	}
+}
+
+// TestRestrictedSubmissionVersion verifies that sessions get the restricted
+// submission version, which daemons that don't support remote submission
+// modes don't load, if and only if their remote submission mode keeps an
+// endpoint from submitting commands that it would submit by default, in Git
+// mode or not, since those daemons would let it submit them.
+func TestRestrictedSubmissionVersion(t *testing.T) {
+	const (
+		dflt     = RemoteCommandMode_RemoteCommandModeDefault
+		disabled = RemoteCommandMode_RemoteCommandModeDisabled
+		alpha    = RemoteCommandMode_RemoteCommandModeAlpha
+		beta     = RemoteCommandMode_RemoteCommandModeBeta
+		both     = RemoteCommandMode_RemoteCommandModeBoth
+	)
+	for _, test := range []struct {
+		execution, submission RemoteCommandMode
+		git                   bool
+		expected              Version
+	}{
+		{dflt, dflt, false, DefaultVersion},
+		{both, dflt, true, gitModeVersion},
+		{both, both, false, DefaultVersion},
+		{alpha, beta, false, DefaultVersion},
+		{disabled, beta, false, DefaultVersion},
+		{disabled, both, true, gitModeVersion},
+		{dflt, disabled, false, DefaultVersion},
+		{both, alpha, false, restrictedSubmissionVersion},
+		{both, beta, true, restrictedSubmissionVersion},
+		{alpha, disabled, false, restrictedSubmissionVersion},
+		{beta, beta, false, restrictedSubmissionVersion},
+	} {
+		configuration := &Configuration{RemoteCommandMode: test.execution, RemoteSubmissionMode: test.submission}
+		if test.git {
+			configuration.GitMode = GitMode_GitModeEnabled
+		}
+		if version := versionFor(configuration); version != test.expected {
+			t.Errorf("execution %v, submission %v, Git mode %t: version %s instead of %s",
+				test.execution, test.submission, test.git, version, test.expected)
 		}
 	}
 }

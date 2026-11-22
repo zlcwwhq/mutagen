@@ -6,6 +6,7 @@ import (
 	"io"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/mutagen-io/mutagen/pkg/platform/terminal"
@@ -117,6 +118,12 @@ type reporter struct {
 	// followUp starts the remote command lines that reports suggest (see
 	// followUpCommand).
 	followUp string
+	// via names a star's center if the destination is reached through it (see
+	// remote.Target.Via), and is empty otherwise. The opposite endpoint of the
+	// submitting node's edge is then the center, rather than the destination.
+	via string
+	// node names the destination.
+	node string
 	// printed records printed lines.
 	printed map[string]bool
 }
@@ -124,14 +131,43 @@ type reporter struct {
 // newReporter creates a reporter for the target of a submission, whose
 // suggested remote command lines start with followUp (see followUpCommand).
 func newReporter(output io.Writer, target *remote.Target, followUp string) *reporter {
-	return &reporter{output: output, locator: newLocator(target), alpha: target.Alpha, followUp: followUp, printed: make(map[string]bool)}
+	return &reporter{
+		output: output, locator: newLocator(target), alpha: target.Alpha, followUp: followUp,
+		via: target.Via, node: target.Node, printed: make(map[string]bool),
+	}
 }
 
-// print prints a report.
+// side names the endpoint of the submitting node's edge that alpha identifies
+// (see sideOf): local or remote, or, if the destination is reached through a
+// star's center, local or the center (see centerName).
+func (r *reporter) side(alpha bool) string {
+	if side := sideOf(alpha, r.alpha); side == sideLocal || r.via == "" {
+		return side
+	}
+	return centerName(r.via)
+}
+
+// centerName names a star's center, through which a destination is reached,
+// such as "center local", so that it isn't mistaken for the local endpoint
+// even if the center's node is named local.
+func centerName(center string) string {
+	return "center " + neutralizeLine(center)
+}
+
+// print prints a report, followed by the report of the destination's edge, if
+// any (see printDestination).
 func (r *reporter) print(report *remote.Report) {
 	if report.Empty() {
 		return
 	}
+	r.printEdge(report)
+	if report.Destination != nil {
+		r.printDestination(report.Destination)
+	}
+}
+
+// printEdge prints the report of the submitting node's edge.
+func (r *reporter) printEdge(report *remote.Report) {
 	var conflicts []string
 	for _, conflict := range report.Conflicts {
 		conflicts = append(conflicts, r.describeConflict(conflict))
@@ -139,19 +175,33 @@ func (r *reporter) print(report *remote.Report) {
 	if report.ExcludedConflicts > 0 {
 		conflicts = append(conflicts, fmt.Sprintf("...and %d more conflicts", report.ExcludedConflicts))
 	}
-	// Only sessions that support resolution refer to it.
-	heading := fmt.Sprintf("these conflicts aren't synchronized until one side's copy is deleted (see %s --diff):", r.followUp)
+	// Only sessions that support resolution refer to it. Conflicts on the
+	// submitting node's edge with a star's center through which the
+	// destination is reached are resolved through that edge, with the center
+	// as the destination.
+	followUp := r.followUp
+	if r.via != "" {
+		followUp = followUpCommand("")
+	}
+	heading := fmt.Sprintf("these conflicts aren't synchronized until one side's copy is deleted (see %s --diff):", followUp)
 	if report.Resolution {
-		heading = fmt.Sprintf("these conflicts aren't synchronized until resolved (see %s --diff and remote --help conflicts):", r.followUp)
+		heading = fmt.Sprintf("these conflicts aren't synchronized until resolved (see %s --diff and remote --help conflicts):", followUp)
+	}
+	if r.via != "" {
+		heading = fmt.Sprintf("on the edge to the %s, %s", centerName(r.via), heading)
 	}
 	r.section(heading, conflicts)
 	if conflict := report.Repository; conflict != nil {
-		r.section(repositoryConflictHeading, r.describeRepositoryConflict(conflict))
+		heading := repositoryConflictHeading
+		if r.via != "" {
+			heading = fmt.Sprintf("on the edge to the %s, %s", centerName(r.via), heading)
+		}
+		r.section(heading, r.describeRepositoryConflict(conflict))
 	}
 	var problems, byDesign []string
 	for _, problem := range report.Problems {
 		line := fmt.Sprintf("%s (%s): %s",
-			r.locator.display(problem.Path), sideOf(problem.Alpha, r.alpha), terminal.NeutralizeControlCharacters(problem.Error))
+			r.locator.display(problem.Path), r.side(problem.Alpha), terminal.NeutralizeControlCharacters(problem.Error))
 		if problem.Warning {
 			byDesign = append(byDesign, line)
 		} else {
@@ -193,11 +243,22 @@ func (r *reporter) sides(conflict remote.Conflict) ([]remote.Change, []remote.Ch
 // directory locally, modified file out/log remotely".
 func (r *reporter) describeConflict(conflict remote.Conflict) string {
 	local, opposite := r.sides(conflict)
+	remotely := "remotely"
+	if r.via != "" {
+		remotely = "on the " + centerName(r.via)
+	}
+	return r.describeChanges(conflict, local, opposite, "locally", remotely)
+}
+
+// describeChanges describes a conflict on one line (see describeConflict),
+// given the changes of each side, in the specified order, and where they were
+// made.
+func (r *reporter) describeChanges(conflict remote.Conflict, first, second []remote.Change, firstWhere, secondWhere string) string {
 	var changes []string
 	for _, side := range []struct {
 		changes []remote.Change
 		name    string
-	}{{local, "locally"}, {opposite, "remotely"}} {
+	}{{first, firstWhere}, {second, secondWhere}} {
 		for _, change := range side.changes {
 			description := describeChange(change)
 			if change.Path != conflict.Root {
@@ -210,6 +271,57 @@ func (r *reporter) describeConflict(conflict remote.Conflict) string {
 		changes = append(changes, fmt.Sprintf("...and %d more changes (specify paths with %s --diff to compare them)", conflict.ExcludedChanges, r.followUp))
 	}
 	return r.locator.display(conflict.Root) + ": " + strings.Join(changes, ", ")
+}
+
+// printDestination prints the report of the destination's edge, for a
+// destination reached through a star's center (see remote.Report.Destination),
+// naming the center, which is the edge's alpha, and the destination, which is
+// its beta. Its conflicts can't be resolved from the submitting node, which
+// isn't an endpoint of the edge, so the report says where they can.
+func (r *reporter) printDestination(report *remote.Report) {
+	center, node := centerName(r.via), neutralizeLine(r.node)
+	edge := fmt.Sprintf("on %s's edge with the %s, ", node, center)
+	var conflicts []string
+	for _, conflict := range report.Conflicts {
+		conflicts = append(conflicts, r.describeChanges(conflict, conflict.Alpha, conflict.Beta, "on the "+center, "on "+node))
+	}
+	if report.ExcludedConflicts > 0 {
+		conflicts = append(conflicts, fmt.Sprintf("...and %d more conflicts", report.ExcludedConflicts))
+	}
+	there := fmt.Sprintf("remote --node %[2]s on the %[1]s, or remote on %[2]s", center, node)
+	heading := fmt.Sprintf("these conflicts aren't synchronized until one side's copy is deleted there (compare the copies with %s --diff):", r.followUp)
+	if report.Resolution {
+		heading = fmt.Sprintf("these conflicts aren't synchronized until resolved there (list them with remote --node %[2]s --conflicts on the %[1]s, or with remote --conflicts on %[2]s, and see remote --help conflicts):", center, node)
+	}
+	r.section(edge+heading, conflicts)
+	if conflict := report.Repository; conflict != nil {
+		agreed := "they never agreed"
+		if conflict.Ancestor != nil {
+			agreed = "they last agreed on " + describeRepository(*conflict.Ancestor)
+		}
+		r.section(edge+repositoryConflictHeading, []string{
+			fmt.Sprintf("%s %s, %s %s (%s)", center, describeRepository(conflict.Alpha), node, describeRepository(conflict.Beta), agreed),
+			fmt.Sprintf("to resolve it, run %s, which explain how", there),
+		})
+	}
+	var problems, byDesign []string
+	for _, problem := range report.Problems {
+		side := node
+		if problem.Alpha {
+			side = center
+		}
+		line := fmt.Sprintf("%s (%s): %s", r.locator.display(problem.Path), side, terminal.NeutralizeControlCharacters(problem.Error))
+		if problem.Warning {
+			byDesign = append(byDesign, line)
+		} else {
+			problems = append(problems, line)
+		}
+	}
+	if report.ExcludedProblems > 0 {
+		problems = append(problems, fmt.Sprintf("...and %d more problems", report.ExcludedProblems))
+	}
+	r.section(edge+"this content couldn't be synchronized:", problems)
+	r.section(edge+"this content isn't synchronized, by design:", byDesign)
 }
 
 // repositoryConflictHeading is the warning that introduces a repository
@@ -230,9 +342,15 @@ func (r *reporter) describeRepositoryConflict(conflict *remote.RepositoryConflic
 	if conflict.Ancestor != nil {
 		agreed = "they last agreed on " + describeRepository(*conflict.Ancestor)
 	}
-	description := fmt.Sprintf("local %s, remote %s (%s)", describeRepository(local), describeRepository(opposite), agreed)
+	// If the destination is reached through a star's center, the opposite
+	// repository is the center's, which remote reaches by default.
+	opposing, followUp := "remote", r.followUp
+	if r.via != "" {
+		opposing, followUp = centerName(r.via), followUpCommand("")
+	}
+	description := fmt.Sprintf("local %s, %s %s (%s)", describeRepository(local), opposing, describeRepository(opposite), agreed)
 	here := strings.Join(resetCommands("", local, opposite), ", then ")
-	remotely := strings.Join(resetCommands(r.followUp+" ", opposite, local), ", then ")
+	remotely := strings.Join(resetCommands(followUp+" ", opposite, local), ", then ")
 	var resolution string
 	switch {
 	case !conflict.OneWay:
@@ -289,11 +407,16 @@ func describeChange(change remote.Change) string {
 }
 
 // conflictPaths returns the distinct paths of a report's conflicting changes,
-// in conflict order.
+// in conflict order, including those of the destination's edge, if reported
+// (see remote.Report.Destination).
 func conflictPaths(report *remote.Report) []string {
 	var paths []string
 	seen := make(map[string]bool)
-	for _, conflict := range report.Conflicts {
+	conflicts := report.Conflicts
+	if report.Destination != nil {
+		conflicts = append(slices.Clone(conflicts), report.Destination.Conflicts...)
+	}
+	for _, conflict := range conflicts {
 		// A truncated list may omit the root change, but comparing the root
 		// still shows file differences or a directory replaced by a file.
 		if conflict.ExcludedChanges > 0 && !seen[conflict.Root] {

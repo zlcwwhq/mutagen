@@ -85,3 +85,53 @@ func TestDefaultGitMode(t *testing.T) {
 		}
 	}
 }
+
+// TestConfigurationRemoteSubmissionMode tests validation, comparison, and
+// merging of remote submission modes, which can't be specified on an
+// endpoint-specific basis, and their defaults, which follow the remote command
+// mode.
+func TestConfigurationRemoteSubmissionMode(t *testing.T) {
+	// Verify validation.
+	for _, mode := range []RemoteCommandMode{
+		RemoteCommandMode_RemoteCommandModeDefault,
+		RemoteCommandMode_RemoteCommandModeDisabled,
+		RemoteCommandMode_RemoteCommandModeAlpha,
+		RemoteCommandMode_RemoteCommandModeBeta,
+		RemoteCommandMode_RemoteCommandModeBoth,
+	} {
+		if err := (&Configuration{RemoteSubmissionMode: mode}).EnsureValid(false); err != nil {
+			t.Errorf("valid remote submission mode (%s) rejected: %v", mode, err)
+		}
+		if err := (&Configuration{RemoteSubmissionMode: mode}).EnsureValid(true); mode.IsDefault() && err != nil {
+			t.Errorf("default remote submission mode rejected for endpoint-specific configuration: %v", err)
+		} else if !mode.IsDefault() && err == nil {
+			t.Errorf("remote submission mode (%s) accepted for endpoint-specific configuration", mode)
+		}
+	}
+	if (&Configuration{RemoteSubmissionMode: RemoteCommandMode_RemoteCommandModeBoth + 1}).EnsureValid(false) == nil {
+		t.Error("unsupported remote submission mode accepted")
+	}
+
+	// Verify comparison and merging.
+	alpha, beta := &Configuration{RemoteSubmissionMode: RemoteCommandMode_RemoteCommandModeAlpha}, &Configuration{RemoteSubmissionMode: RemoteCommandMode_RemoteCommandModeBeta}
+	if alpha.Equal(beta) || alpha.Equal(&Configuration{}) {
+		t.Error("remote submission mode difference not detected")
+	} else if merged := MergeConfigurations(alpha, beta); merged.RemoteSubmissionMode != beta.RemoteSubmissionMode {
+		t.Error("higher-priority remote submission mode not used:", merged.RemoteSubmissionMode)
+	} else if merged = MergeConfigurations(alpha, &Configuration{}); merged.RemoteSubmissionMode != alpha.RemoteSubmissionMode {
+		t.Error("lower-priority remote submission mode not inherited:", merged.RemoteSubmissionMode)
+	}
+
+	// By default, each endpoint submits commands if the opposite one executes
+	// them.
+	for execution, expected := range map[RemoteCommandMode]RemoteCommandMode{
+		RemoteCommandMode_RemoteCommandModeDisabled: RemoteCommandMode_RemoteCommandModeDisabled,
+		RemoteCommandMode_RemoteCommandModeAlpha:    RemoteCommandMode_RemoteCommandModeBeta,
+		RemoteCommandMode_RemoteCommandModeBeta:     RemoteCommandMode_RemoteCommandModeAlpha,
+		RemoteCommandMode_RemoteCommandModeBoth:     RemoteCommandMode_RemoteCommandModeBoth,
+	} {
+		if actual := DefaultRemoteSubmissionMode(execution); actual != expected {
+			t.Errorf("default remote submission mode for %s is %s instead of %s", execution, actual, expected)
+		}
+	}
+}

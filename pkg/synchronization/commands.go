@@ -59,9 +59,11 @@ var errFlushTerminated = remote.ConnectionError(errors.New("synchronization stop
 var errResolutionUnsupported = errors.New("conflict resolution requires the two-way-safe or one-way-safe synchronization mode")
 
 // commandRelay routes commands submitted on each endpoint's system to the
-// opposite endpoint. Routes always pass through the daemon, so neither endpoint
-// needs connectivity to the other, regardless of where the daemon runs. It also
-// performs flushes requested by submissions.
+// opposite endpoint, or, from a star's node other than the center, to the
+// star's other nodes through the center, over their own edges' relays. Routes
+// always pass through the daemon, so no endpoint needs connectivity to
+// another, regardless of where the daemon runs. It also performs flushes
+// requested by submissions.
 type commandRelay struct {
 	// stars is the daemon's index of sessions and relays, which describes the
 	// nodes that a submission can reach (see resolveSubmission).
@@ -91,11 +93,14 @@ type commandRelay struct {
 	channelsLock sync.Mutex
 	// channels holds the connected alpha and beta channels (or nil).
 	channels [2]remote.Channel
-	// routes tracks the accept loops and the routes that they accept, each of
-	// which only uses this relay's state, since operations never cross another
-	// edge than the one through which they were submitted. Accept loops are
-	// added by the channel maintainers, which stop before routes are waited
-	// for, and routes by their accept loops while those are tracked.
+	// routes tracks the accept loops and the routes that they accept. Accept
+	// loops are added by the channel maintainers, which stop before routes are
+	// waited for, and routes by their accept loops while those are tracked. A
+	// route only uses this relay's state, unless it continues through a star's
+	// center over another node's edge (see resolveSubmission), whose relay
+	// doesn't track it: it then also ends once that relay stops, and only uses
+	// that relay's channels, whose closure ends their routes, and its flush
+	// requests, which observe its stop as well (see route).
 	routes sync.WaitGroup
 }
 
@@ -112,7 +117,8 @@ func endpointName(index int) string {
 // and commands to terminate.
 func (c *controller) startCommandRelay(ctx context.Context) func() {
 	alphaExecutes, betaExecutes := executingEndpoints(c.session)
-	if !alphaExecutes && !betaExecutes {
+	alphaSubmits, betaSubmits := submittingEndpoints(c.session)
+	if !alphaExecutes && !betaExecutes && !alphaSubmits && !betaSubmits {
 		return func() {}
 	}
 
@@ -148,9 +154,9 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 		relay.release = c.releaseCheckout
 	}
 
-	// Each endpoint submits commands if and only if its opposite executes.
-	// Prologues are endpoint-specific, since they're interpreted on the
-	// executing endpoint's system.
+	// Each endpoint submits commands as its remote submission mode permits (see
+	// submittingEndpoints). Prologues are endpoint-specific, since they're
+	// interpreted on the executing endpoint's system.
 	prologues := [2]string{
 		c.mergedAlphaConfiguration.RemotePrologue,
 		c.mergedBetaConfiguration.RemotePrologue,
@@ -165,7 +171,15 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 	c.stars.setRelay(c, relay)
 	var maintainers sync.WaitGroup
 	urls := [2]*urlpkg.URL{c.session.Alpha, c.session.Beta}
+	submits := [2]bool{alphaSubmits, betaSubmits}
+	executes := [2]bool{alphaExecutes, betaExecutes}
 	for index, url := range urls {
+		// An endpoint that neither submits nor executes commands needs no
+		// channel, such as a star's center on the edge of a node that only
+		// submits commands to the star's other nodes.
+		if !submits[index] && !executes[index] {
+			continue
+		}
 		// Star endpoints are named by their nodes, and the endpoints of other
 		// sessions form an implicit pair of nodes named alpha and beta.
 		names := []string{"alpha", "beta"}
@@ -181,8 +195,8 @@ func (c *controller) startCommandRelay(ctx context.Context) func() {
 			Root:           url.Path,
 			Alpha:          index == 0,
 			SessionCreated: c.session.CreationTime.AsTime(),
-			Submit:         (index == 0 && betaExecutes) || (index == 1 && alphaExecutes),
-			Execute:        (index == 0 && alphaExecutes) || (index == 1 && betaExecutes),
+			Submit:         submits[index],
+			Execute:        executes[index],
 			Prologue:       prologues[index],
 			Ignores:        ignores,
 		}
@@ -278,9 +292,9 @@ func (r *commandRelay) accept(ctx context.Context, index int, channel remote.Cha
 }
 
 // route handles a submission by performing a flush or by connecting it to the
-// executor of the specified endpoint, which is always the opposite endpoint of
-// this relay's session: a submission that selects a node on another edge is
-// refused (see resolveSubmission).
+// executor of its destination (see resolveSubmission), which is the endpoint
+// with the specified index of this relay's session, unless the submission
+// continues through a star's center over another node's edge.
 //
 // The route ends once the context is cancelled, when the relay stops, since
 // stopping it waits for every route: the cancellation closes the submission,
@@ -290,7 +304,9 @@ func (r *commandRelay) accept(ctx context.Context, index int, channel remote.Cha
 // close the submissions that it delivered, and an executor's channel only
 // closes the other half of a splice. Every operation closes the submission
 // once it's handled, which makes closing it again harmless, and the closure
-// completes before the route returns.
+// completes before the route returns. A route that continues over another
+// node's edge also ends once that edge's relay stops, which doesn't wait for
+// it: the stop cancels the route's context and closes the submission as well.
 func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser, target int) {
 	closed := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
@@ -307,24 +323,50 @@ func (r *commandRelay) route(ctx context.Context, submission io.ReadWriteCloser,
 		remote.Reject(submission, err)
 		return
 	}
+	destination := &destination{relay: r, index: target}
 	if header.Resolve || header.Node != "" {
-		if err := r.resolveSubmission(1-target, header); err != nil {
+		if destination, err = r.resolveSubmission(1-target, header); err != nil {
 			remote.Reject(submission, err)
 			return
-		} else if header.Resolve {
-			if err := remote.AcknowledgeRoute(submission); err != nil {
-				submission.Close()
-				return
-			}
 		}
 	}
-	r.routeResolved(ctx, submission, target, header)
+	if destination.via != "" && (header.Operation == remote.OperationConflicts ||
+		header.Operation == remote.OperationClaim || header.Operation == remote.OperationRelease) {
+		remote.Reject(submission, errAcrossEdges(destination))
+		return
+	} else if destination.relay != r {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		closedAcross := make(chan struct{})
+		stopAcross := context.AfterFunc(destination.relay.ctx, func() {
+			defer close(closedAcross)
+			cancel()
+			submission.Close()
+		})
+		defer func() {
+			if !stopAcross() {
+				<-closedAcross
+			}
+		}()
+	}
+	if header.Resolve {
+		if err := remote.AcknowledgeRoute(submission, destination.route()); err != nil {
+			submission.Close()
+			return
+		}
+	}
+	r.routeResolved(ctx, submission, 1-target, destination, header)
 }
 
-// routeResolved executes an operation after its destination is resolved. The
-// submission is closed once the context is cancelled (see route), which also
-// interrupts the progress messages that a flush sends while it waits.
-func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWriteCloser, target int, header *remote.Submission) {
+// routeResolved executes an operation submitted from the endpoint of this
+// relay's session with the specified index once its destination is resolved.
+// The submission is closed once the context is cancelled (see route), which
+// also interrupts the progress messages that a flush sends while it waits.
+// Conflict listing and resolution only reach it over the edge through which
+// the operation entered, since they belong to the edge (see route), and a
+// flush synchronizes every edge that the operation crosses (see flushAcross).
+func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWriteCloser, source int, destination *destination, header *remote.Submission) {
 	var err error
 	operation := header.Operation
 	if operation == remote.OperationResolve {
@@ -332,7 +374,7 @@ func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWrit
 		return
 	}
 	if operation == remote.OperationNodes {
-		graph, err := r.stars.nodes(r, 1-target)
+		graph, err := r.stars.nodes(r, source)
 		remote.RespondWithNodes(submission, graph, err)
 		return
 	} else if operation == remote.OperationConflicts {
@@ -340,7 +382,7 @@ func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWrit
 		var listing *remote.Listing
 		if r.conflicts == nil {
 			err = errResolutionUnsupported
-		} else if err = r.flushReporting(ctx, submission, header.Progress); err == nil {
+		} else if err = r.flushReporting(ctx, submission, header.Progress, false); err == nil {
 			listing, err = r.conflicts()
 		}
 		if err := remote.RespondWithConflicts(submission, listing, err); err != nil {
@@ -348,9 +390,8 @@ func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWrit
 		}
 		return
 	} else if operation == remote.OperationClaim || operation == remote.OperationRelease {
-		// Checkouts belong to the submitting endpoint, which is the opposite
-		// of the target.
-		alpha := target == 1
+		// Checkouts belong to the submitting endpoint.
+		alpha := source == 0
 		path, token, err := remote.ReceiveCheckout(ctx, submission)
 		var status remote.CheckoutStatus
 		if err == nil && r.claim == nil {
@@ -367,7 +408,9 @@ func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWrit
 	} else if operation == remote.OperationFlush {
 		r.logger.Debug("Forcing synchronization cycle for submission")
 		var report *remote.Report
-		if err = r.flushReporting(ctx, submission, header.Progress); err == nil {
+		if destination.via != "" {
+			report, err = r.flushAcross(ctx, submission, destination.relay, header.Progress, header.Direction)
+		} else if err = r.flushReporting(ctx, submission, header.Progress, false); err == nil {
 			report = r.report()
 			report.Resolution = r.conflicts != nil
 		}
@@ -376,21 +419,68 @@ func (r *commandRelay) routeResolved(ctx context.Context, submission io.ReadWrit
 		}
 		return
 	}
-	r.channelsLock.Lock()
-	channel := r.channels[target]
-	r.channelsLock.Unlock()
+	name := endpointName(destination.index)
+	if destination.via != "" {
+		name = "node " + destination.node
+	}
+	destination.relay.channelsLock.Lock()
+	channel := destination.relay.channels[destination.index]
+	destination.relay.channelsLock.Unlock()
 	if channel == nil {
-		remote.Reject(submission, remote.ConnectionError(fmt.Errorf("%s is not connected for remote commands", endpointName(target))))
+		remote.Reject(submission, remote.ConnectionError(fmt.Errorf("%s is not connected for remote commands", name)))
 		return
 	}
 	openCtx, cancel := context.WithTimeout(ctx, commandRouteOpenTimeout)
 	execution, err := channel.Open(openCtx)
 	cancel()
 	if err != nil {
-		remote.Reject(submission, remote.ConnectionError(fmt.Errorf("unable to reach %s: %w", endpointName(target), err)))
+		remote.Reject(submission, remote.ConnectionError(fmt.Errorf("unable to reach %s: %w", name, err)))
 		return
 	}
+
+	// The route's context ends when a relay that it uses stops (see route),
+	// which closes the submission. Close the execution then, too, since the
+	// channel through which it was opened belongs to the destination's relay,
+	// which may keep running if the route continues over another node's edge,
+	// so that the executor terminates the command, rather than relying on
+	// the closed submission to end the splice, and the stopping relay doesn't
+	// wait for the command.
+	stopExecution := context.AfterFunc(ctx, func() { execution.Close() })
+	defer stopExecution()
 	remote.Splice(submission, execution)
+}
+
+// flushAcross performs a flush for a submission whose destination is another
+// node of the star, which the submitting node reaches through the center (see
+// resolveSubmission), by synchronizing both edges in the order that the
+// direction specifies (see remote.FlushDirection): the submitting node's edge
+// and then the destination's, which the specified relay runs, so that the
+// submitting node's changes reach the destination through the center, the
+// reverse, so that the destination's changes reach the submitting node, or
+// the submitting node's edge again after both, for both. Unknown directions
+// are treated as both. The report describes the submitting node's edge, with
+// that of the destination's edge as its Destination, and progress messages,
+// if requested, follow each edge's synchronization in turn. Every
+// synchronization must succeed. The context ends when either relay stops (see
+// route).
+func (r *commandRelay) flushAcross(ctx context.Context, submission io.Writer, destination *commandRelay, progress bool, direction remote.FlushDirection) (*remote.Report, error) {
+	edges := []*commandRelay{r, destination, r}
+	switch direction {
+	case remote.FlushOutbound:
+		edges = edges[:2]
+	case remote.FlushReturning:
+		edges = edges[1:]
+	}
+	for _, edge := range edges {
+		if err := edge.flushReporting(ctx, submission, progress, edge == destination); err != nil {
+			return nil, err
+		}
+	}
+	report := r.report()
+	report.Resolution = r.conflicts != nil
+	report.Destination = destination.report()
+	report.Destination.Resolution = destination.conflicts != nil
+	return report, nil
 }
 
 // flush forces a synchronization cycle and waits for it to complete, failing if
@@ -412,17 +502,29 @@ func (r *commandRelay) flush(ctx context.Context) error {
 
 // flushReporting performs a flush (see flush) for a submission, sending it
 // progress messages while it waits if it requested them (see
-// remote.ReportProgress). Messages stop before it returns, so that the final
-// response follows them. Submissions that don't request progress, such as
-// those of earlier versions, which expect a single response, receive none.
-func (r *commandRelay) flushReporting(ctx context.Context, submission io.Writer, progress bool) error {
+// remote.ReportProgress), which are marked as the progress of the destination's
+// edge if destination is true (see remote.Progress.Destination). Messages stop
+// before it returns, so that the final response follows them. Submissions
+// that don't request progress, such as those of earlier versions, which expect
+// a single response, receive none.
+func (r *commandRelay) flushReporting(ctx context.Context, submission io.Writer, progress, destination bool) error {
 	if !progress || r.progress == nil {
 		return r.flush(ctx)
+	}
+	sample := r.progress
+	if destination {
+		sample = func() *remote.Progress {
+			progress := r.progress()
+			if progress != nil {
+				progress.Destination = true
+			}
+			return progress
+		}
 	}
 	stop, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(stopped)
-		remote.ReportProgress(submission, r.progress, progressSampleInterval, progressHeartbeatInterval, stop)
+		remote.ReportProgress(submission, sample, progressSampleInterval, progressHeartbeatInterval, stop)
 	}()
 	err := r.flush(ctx)
 	close(stop)

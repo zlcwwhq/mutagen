@@ -381,7 +381,7 @@ func waitJob(router *router, options *options, output io.Writer) int {
 		code = failureExitCode
 	}
 	if !options.noFlush {
-		_, _, err = router.synchronize()
+		_, _, err = router.synchronize(remote.FlushReturning)
 	}
 	status := router.finished("job", code, err)
 

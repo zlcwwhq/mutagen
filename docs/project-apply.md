@@ -18,8 +18,8 @@ Sessions are matched by type and name within the project:
 
 - New sessions are created, and removed ones are terminated.
 - Sessions whose endpoints or merged configuration changed are recreated. This
-  includes the `remote` and `remotePrologue` settings of synchronization
-  sessions, although they only affect remote commands.
+  includes the `remote`, `remoteSubmit`, and `remotePrologue` settings of
+  synchronization sessions, although they only affect remote commands.
 - Unchanged sessions keep their identifiers, synchronization history, scan
   caches, and paused state.
 - Renaming a session removes the old session and creates a new one.
